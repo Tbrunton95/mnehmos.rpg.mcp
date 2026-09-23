@@ -239,6 +239,24 @@ export class AgentRepository {
         return row ? rowToAgent(row) : null;
     }
 
+    /**
+     * FINDINGS #69: truncated-UUID rescue. Every handoff block the project has
+     * ever written carries 8-char short ids; a miss on the full lookup tries a
+     * prefix match and resolves ONLY when exactly one row matches (two hits =
+     * ambiguous = null, never a guess). Minimum 6 chars.
+     */
+    findByIdPrefix(prefix: string): Agent | null {
+        if (prefix.length < 6) return null;
+        const rows = this.db.prepare('SELECT * FROM agents WHERE id LIKE ? LIMIT 2').all(`${prefix}%`) as AgentRow[];
+        return rows.length === 1 ? rowToAgent(rows[0]) : null;
+    }
+
+    findByCharacterIdPrefix(prefix: string): Agent | null {
+        if (prefix.length < 6) return null;
+        const rows = this.db.prepare('SELECT * FROM agents WHERE character_id LIKE ? LIMIT 2').all(`${prefix}%`) as AgentRow[];
+        return rows.length === 1 ? rowToAgent(rows[0]) : null;
+    }
+
     findByCharacterId(characterId: string): Agent | null {
         const row = this.db.prepare('SELECT * FROM agents WHERE character_id = ?').get(characterId) as AgentRow | undefined;
         return row ? rowToAgent(row) : null;

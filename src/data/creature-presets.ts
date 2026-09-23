@@ -72,6 +72,187 @@ interface CreatureVariant {
 // ═══════════════════════════════════════════════════════════════════════════
 
 export const CREATURE_PRESETS: Record<string, CreaturePreset> = {
+    // ═══════════════ ZONE BESTIARY (Escape from Pripyat patch) ═══════════════
+    psy_dog: {
+        name: 'Psy Dog', stats: { str: 13, dex: 15, con: 12, int: 6, wis: 14, cha: 8 },
+        hp: 20, maxHp: 20, ac: 13, level: 3, characterType: 'enemy', race: 'Mutant', size: 'medium', speed: 45,
+        perceptionBonus: 5, stealthBonus: 4, cr: 1.5, xpValue: 300,
+        defaultAttack: { name: 'Bite', damage: '2d4+2', damageType: 'piercing', toHit: 5 },
+        traits: ['Phantom Pack: projects 2-3 illusory copies — attacks vs phantoms waste the action; kill the real one', 'Phantoms deal real fear, no damage']
+    },
+    karlik: {
+        name: 'Karlik', stats: { str: 8, dex: 13, con: 12, int: 10, wis: 11, cha: 6 },
+        hp: 16, maxHp: 16, ac: 13, level: 3, characterType: 'enemy', race: 'Mutant', size: 'small', speed: 30,
+        perceptionBonus: 3, stealthBonus: 5, cr: 1, xpValue: 200,
+        defaultAttack: { name: 'Kinetic Shove', damage: '1d8+2', damageType: 'bludgeoning', toHit: 4 },
+        traits: ['ALWAYS spawns in packs of 3-5', 'Pack telekinesis: two karliks focusing one target knock it prone, STR 13 negates']
+    },
+    lurker: {
+        name: 'Lurker', stats: { str: 12, dex: 14, con: 11, int: 5, wis: 12, cha: 4 },
+        hp: 13, maxHp: 13, ac: 12, level: 2, characterType: 'enemy', race: 'Mutant', size: 'medium', speed: 40,
+        perceptionBonus: 3, stealthBonus: 6, cr: 0.5, xpValue: 100,
+        defaultAttack: { name: 'Raking Claws', damage: '1d6+2', damageType: 'slashing', toHit: 4 },
+        traits: ['Squad hunter: bigger squads in the north, smaller south', 'Ambushes from ruins; retreats when isolated', 'Tail is a crafting drop']
+    },
+    fracture: {
+        name: 'Fracture', stats: { str: 16, dex: 9, con: 15, int: 4, wis: 8, cha: 3 },
+        hp: 28, maxHp: 28, ac: 13, level: 3, characterType: 'enemy', race: 'Mutant', size: 'medium', speed: 30,
+        perceptionBonus: 1, stealthBonus: 1, cr: 1.5, xpValue: 300,
+        defaultAttack: { name: 'Deformed Limbs', damage: '2d6+3', damageType: 'bludgeoning', toHit: 5 },
+        traits: ['Ex-human, wrongly rebuilt — the joints bend the other way', 'Can spawn in packs', 'Relentless melee; no ranged answer']
+    },
+    psysucker: {
+        name: 'Psysucker', stats: { str: 16, dex: 16, con: 14, int: 9, wis: 14, cha: 8 },
+        hp: 40, maxHp: 40, ac: 14, level: 4, characterType: 'enemy', race: 'Mutant', size: 'medium', speed: 40,
+        perceptionBonus: 5, stealthBonus: 7, cr: 3, xpValue: 700,
+        defaultAttack: { name: 'Claws', damage: '2d6+2', damageType: 'slashing', toHit: 6 },
+        traits: ['Bloodsucker variant: Cloak + first strike advantage', 'Psi Lash: instead of claws, 2d4 psychic at 30ft + psi exposure', 'Feeds on the mind mid-grapple — Composure drain, not blood']
+    },
+    renegade: {
+        name: 'Renegade', stats: { str: 10, dex: 11, con: 10, int: 8, wis: 8, cha: 7 },
+        hp: 9, maxHp: 9, ac: 11, level: 1, characterType: 'enemy', race: 'Human', size: 'medium', speed: 30,
+        perceptionBonus: 0, stealthBonus: 1, cr: 0.125, xpValue: 25,
+        defaultAttack: { name: 'Makarov PM', damage: '1d6', damageType: 'piercing', toHit: 2 },
+        traits: ['Fringe scum: breaks and runs at half HP', 'Hated by everyone including bandits']
+    },
+    sin_cultist: {
+        name: 'Sin Cultist', stats: { str: 14, dex: 12, con: 14, int: 8, wis: 13, cha: 10 },
+        hp: 14, maxHp: 14, ac: 12, level: 2, characterType: 'enemy', race: 'Human', size: 'medium', speed: 30,
+        perceptionBonus: 2, stealthBonus: 3, cr: 0.5, xpValue: 100,
+        immunities: [],
+        defaultAttack: { name: 'Rusted Blade', damage: '1d6+2', damageType: 'slashing', toHit: 4 },
+        traits: ['Fights to the death: never morale-breaks', 'Psi-touched: immune to FRIGHTENED', 'Does not loot the dead — takes them']
+    },
+    unisg_operator: {
+        name: 'UNISG Operator', stats: { str: 13, dex: 14, con: 13, int: 12, wis: 13, cha: 10 },
+        hp: 24, maxHp: 24, ac: 14, level: 3, characterType: 'enemy', race: 'Human', size: 'medium', speed: 30,
+        perceptionBonus: 4, stealthBonus: 4, cr: 1.5, xpValue: 300,
+        defaultAttack: { name: 'Suppressed 5.56 Carbine', damage: '1d10', damageType: 'piercing', toHit: 5 },
+        traits: ['Squad discipline: advantage when 2+ operators within 10ft', 'NVG: ignores DARKNESS', 'Shots at TALK volume (suppressed)', 'Does not exist officially']
+    },
+    blind_dog: {
+        name: 'Blind Dog', stats: { str: 10, dex: 14, con: 10, int: 3, wis: 12, cha: 5 },
+        hp: 6, maxHp: 6, ac: 12, level: 1, characterType: 'enemy', race: 'Mutant', size: 'small', speed: 40,
+        perceptionBonus: 4, stealthBonus: 3, cr: 0.125, xpValue: 25,
+        defaultAttack: { name: 'Bite', damage: '1d4+1', damageType: 'piercing', toHit: 3 },
+        traits: ['Pack Tactics: advantage when packmate within 5ft', 'Pack Break: flees when pack takes 50% losses']
+    },
+    pseudodog: {
+        name: 'Pseudodog', stats: { str: 14, dex: 15, con: 13, int: 5, wis: 13, cha: 7 },
+        hp: 22, maxHp: 22, ac: 13, level: 2, characterType: 'enemy', race: 'Mutant', size: 'medium', speed: 45,
+        perceptionBonus: 5, stealthBonus: 4, cr: 0.5, xpValue: 100,
+        defaultAttack: { name: 'Bite', damage: '2d4+2', damageType: 'piercing', toHit: 4 },
+        traits: ['Phantom Doubles: first attack against it each fight has disadvantage (which one is real)']
+    },
+    flesh: {
+        name: 'Flesh', stats: { str: 13, dex: 9, con: 13, int: 2, wis: 10, cha: 3 },
+        hp: 15, maxHp: 15, ac: 12, level: 1, characterType: 'enemy', race: 'Mutant', size: 'medium', speed: 30,
+        perceptionBonus: 2, stealthBonus: 0, cr: 0.25, xpValue: 50,
+        defaultAttack: { name: 'Gore', damage: '1d6+1', damageType: 'piercing', toHit: 3 },
+        traits: ['Skittish: attacks only if cornered or in numbers', 'Human eyes track you']
+    },
+    zone_boar: {
+        name: 'Boar', stats: { str: 15, dex: 10, con: 14, int: 2, wis: 9, cha: 4 },
+        hp: 20, maxHp: 20, ac: 12, level: 2, characterType: 'enemy', race: 'Mutant', size: 'medium', speed: 35,
+        perceptionBonus: 1, stealthBonus: 0, cr: 0.5, xpValue: 100,
+        defaultAttack: { name: 'Charge', damage: '2d4+2', damageType: 'bludgeoning', toHit: 4 },
+        traits: ['Relentless Charge: +1d4 damage after moving 15ft straight']
+    },
+    tushkano: {
+        name: 'Tushkano', stats: { str: 4, dex: 15, con: 8, int: 2, wis: 10, cha: 3 },
+        hp: 3, maxHp: 3, ac: 13, level: 1, characterType: 'enemy', race: 'Mutant', size: 'tiny', speed: 40,
+        perceptionBonus: 2, stealthBonus: 5, cr: 0.125, xpValue: 10,
+        defaultAttack: { name: 'Bite', damage: '1d3', damageType: 'piercing', toHit: 3 },
+        traits: ['Swarm: they come in dozens']
+    },
+    snork: {
+        name: 'Snork', stats: { str: 14, dex: 16, con: 13, int: 5, wis: 11, cha: 4 },
+        hp: 18, maxHp: 18, ac: 13, level: 2, characterType: 'enemy', race: 'Mutant', size: 'medium', speed: 40,
+        perceptionBonus: 3, stealthBonus: 5, cr: 0.5, xpValue: 100,
+        defaultAttack: { name: 'Leaping Claws', damage: '2d4+2', damageType: 'slashing', toHit: 4 },
+        traits: ['Leap: 15ft jump; attacks from above at advantage', 'Dog tags still legible on the corpse']
+    },
+    zombified_stalker: {
+        name: 'Zombified Stalker', stats: { str: 12, dex: 7, con: 14, int: 4, wis: 5, cha: 3 },
+        hp: 16, maxHp: 16, ac: 11, level: 2, characterType: 'enemy', race: 'Zombified', size: 'medium', speed: 20,
+        perceptionBonus: 0, stealthBonus: 0, cr: 0.5, xpValue: 100,
+        defaultAttack: { name: 'Rifle Burst', damage: '1d8', damageType: 'piercing', toHit: 2 },
+        traits: ['Undying: only stops for the head (02 §4)', 'Walks its old patrol route; keys the radio in a flat voice']
+    },
+    bloodsucker: {
+        name: 'Bloodsucker', stats: { str: 17, dex: 16, con: 15, int: 7, wis: 13, cha: 6 },
+        hp: 45, maxHp: 45, ac: 14, level: 4, characterType: 'enemy', race: 'Mutant', size: 'medium', speed: 40,
+        perceptionBonus: 4, stealthBonus: 7, cr: 3, xpValue: 700,
+        defaultAttack: { name: 'Claws', damage: '2d6+3', damageType: 'slashing', toHit: 6 },
+        traits: ['Cloak: unseen until it attacks; first strike at advantage', 'Feed: grappled target drained 2d4/turn', 'Caches kills; drinks over days (02 §4)']
+    },
+    burer: {
+        name: 'Burer', stats: { str: 10, dex: 8, con: 15, int: 12, wis: 12, cha: 6 },
+        hp: 35, maxHp: 35, ac: 13, level: 3, characterType: 'enemy', race: 'Mutant', size: 'small', speed: 20,
+        perceptionBonus: 3, stealthBonus: 2, cr: 2, xpValue: 450,
+        defaultAttack: { name: 'Telekinetic Slam', damage: '2d6+2', damageType: 'bludgeoning', toHit: 5 },
+        traits: ['Telekinetic Shield: reaction — ranged attacks vs it at disadvantage', 'Disarm: on a hit, DEX 13 or the weapon flies 15ft', 'Hoards']
+    },
+    poltergeist_entity: {
+        name: 'Poltergeist', stats: { str: 1, dex: 16, con: 10, int: 8, wis: 12, cha: 10 },
+        hp: 25, maxHp: 25, ac: 14, level: 3, characterType: 'enemy', race: 'Mutant', size: 'medium', speed: 40,
+        perceptionBonus: 4, stealthBonus: 8, cr: 2, xpValue: 450,
+        resistances: ['slashing', 'piercing'], vulnerabilities: ['lightning'],
+        defaultAttack: { name: 'Hurled Object', damage: '1d8+2', damageType: 'bludgeoning', toHit: 5 },
+        traits: ['Interiors only', 'A glowing distortion; the room attacks you']
+    },
+    pseudogiant: {
+        name: 'Pseudogiant', stats: { str: 20, dex: 8, con: 18, int: 4, wis: 10, cha: 5 },
+        hp: 85, maxHp: 85, ac: 16, level: 6, characterType: 'enemy', race: 'Mutant', size: 'large', speed: 30,
+        perceptionBonus: 2, stealthBonus: 0, cr: 5, xpValue: 1800,
+        defaultAttack: { name: 'Stomp', damage: '3d8+4', damageType: 'bludgeoning', toHit: 7 },
+        traits: ['Seismic Stomp: all within 10ft DEX 13 or prone', 'Interiors collapse around it']
+    },
+    chimera: {
+        name: 'Chimera', stats: { str: 18, dex: 17, con: 16, int: 6, wis: 14, cha: 7 },
+        hp: 60, maxHp: 60, ac: 15, level: 5, characterType: 'enemy', race: 'Mutant', size: 'large', speed: 50,
+        perceptionBonus: 6, stealthBonus: 6, cr: 4, xpValue: 1100,
+        defaultAttack: { name: 'Twin Maws', damage: '2d6+3', damageType: 'piercing', toHit: 6 },
+        traits: ['Two Hearts: must be dropped twice — runs the second death track (02 §4)', 'Night hunter; attacks camps']
+    },
+    controller: {
+        name: 'Controller', stats: { str: 11, dex: 10, con: 14, int: 15, wis: 17, cha: 14 },
+        hp: 40, maxHp: 40, ac: 12, level: 5, characterType: 'enemy', race: 'Mutant', size: 'medium', speed: 25,
+        perceptionBonus: 6, stealthBonus: 2, cr: 4, xpValue: 1100,
+        immunities: ['psychic'],
+        defaultAttack: { name: 'Psi Lash', damage: '2d6', damageType: 'psychic', toHit: 5 },
+        traits: ['Dominate: opposed WIS vs targets (02 §6); it converts, it does not kill', 'Commands zombified within 60ft', 'Psi aura: +psi exposure per round in 30ft']
+    },
+    zone_bandit: {
+        name: 'Bandit', stats: { str: 11, dex: 12, con: 11, int: 9, wis: 9, cha: 10 },
+        hp: 11, maxHp: 11, ac: 12, level: 1, characterType: 'enemy', race: 'Human', size: 'medium', speed: 30,
+        perceptionBonus: 1, stealthBonus: 2, cr: 0.25, xpValue: 50,
+        defaultAttack: { name: 'Makarov PM', damage: '1d6', damageType: 'piercing', toHit: 3 },
+        traits: ['Toll logic: fights for money, runs from losses']
+    },
+    zone_bandit_boss: {
+        name: 'Toll Boss', stats: { str: 13, dex: 12, con: 13, int: 11, wis: 10, cha: 13 },
+        hp: 22, maxHp: 22, ac: 13, level: 2, characterType: 'enemy', race: 'Human', size: 'medium', speed: 30,
+        perceptionBonus: 2, stealthBonus: 2, cr: 1, xpValue: 200,
+        defaultAttack: { name: 'TOZ-34 Sawn-off', damage: '2d6', damageType: 'piercing', toHit: 4 },
+        traits: ['Executes threats on his own clock', 'Boots first']
+    },
+    zone_merc: {
+        name: 'Mercenary', stats: { str: 12, dex: 14, con: 12, int: 11, wis: 12, cha: 10 },
+        hp: 20, maxHp: 20, ac: 13, level: 2, characterType: 'enemy', race: 'Human', size: 'medium', speed: 30,
+        perceptionBonus: 3, stealthBonus: 4, cr: 1, xpValue: 200,
+        defaultAttack: { name: 'Viper 5', damage: '1d8', damageType: 'piercing', toHit: 5 },
+        traits: ['Contracts do not care who', 'Works in pairs; one always overwatches']
+    },
+    monolith_fighter: {
+        name: 'Monolith Fighter', stats: { str: 14, dex: 12, con: 14, int: 8, wis: 6, cha: 8 },
+        hp: 25, maxHp: 25, ac: 14, level: 3, characterType: 'enemy', race: 'Human', size: 'medium', speed: 30,
+        perceptionBonus: 2, stealthBonus: 2, cr: 1, xpValue: 200,
+        immunities: ['psychic'],
+        defaultAttack: { name: 'AKM-74/2', damage: '1d10', damageType: 'piercing', toHit: 5 },
+        traits: ['Fearless: never morale-breaks, never retreats', 'The Crystal speaks; he listens']
+    },
+
     // ─────────────────────────────────────────────────────────────────────────
     // HUMANOIDS - Low CR
     // ─────────────────────────────────────────────────────────────────────────
@@ -816,6 +997,78 @@ export const CREATURE_PRESETS: Record<string, CreaturePreset> = {
             toHit: 7
         },
         traits: ['Water Form: Move through 1-inch spaces', 'Freeze: 1 cold damage freezes 1 ft', 'Whelm: Engulf and drown']
+    },
+
+    // ═══ FINDINGS #96-C: THE WITCHER ROSTER — nine quick-spawn taxa for the
+    // Continent (drowner packs at last: spawn_quick_enemy {creature:'drowner',
+    // count:4}). Silver-vulnerability rides the vulnerabilities column;
+    // spectral insubstantiality is Law 5 (GM-side, Yrden lifts it). ═══
+    drowner: {
+        name: 'Drowner', stats: { str: 13, dex: 12, con: 12, int: 4, wis: 8, cha: 4 },
+        hp: 11, maxHp: 11, ac: 12, level: 1, characterType: 'enemy', race: 'Necrophage', size: 'medium', speed: 30,
+        cr: 0.5, xpValue: 100, vulnerabilities: ['silver'],
+        defaultAttack: { name: 'Claws', damage: '1d6+1', damageType: 'slashing', toHit: 3 },
+        traits: ['Amphibious', 'Pack hunter: advantage when an ally is adjacent to the target', 'Mud lurk: ambushes from water at Stealth +5']
+    },
+    nekker: {
+        name: 'Nekker', stats: { str: 8, dex: 15, con: 10, int: 5, wis: 8, cha: 4 },
+        hp: 7, maxHp: 7, ac: 13, level: 1, characterType: 'enemy', race: 'Ogroid', size: 'small', speed: 35,
+        cr: 0.25, xpValue: 50, vulnerabilities: ['silver'],
+        defaultAttack: { name: 'Bite', damage: '1d4+2', damageType: 'piercing', toHit: 4 },
+        traits: ['Warren swarm: never alone — 1d4+2 more within 60ft', 'Burrow: emerges adjacent, Stealth +6', 'Craven: flees at half pack losses']
+    },
+    // ('ghoul' spawns the base D&D undead above — the Continent's ghoul-kin
+    // ships as ALGHOUL, the canonical tougher cousin, to avoid the key clash.)
+    alghoul: {
+        name: 'Alghoul', stats: { str: 14, dex: 13, con: 13, int: 6, wis: 10, cha: 5 },
+        hp: 16, maxHp: 16, ac: 13, level: 2, characterType: 'enemy', race: 'Necrophage', size: 'medium', speed: 35,
+        cr: 1, xpValue: 200, vulnerabilities: ['silver'],
+        defaultAttack: { name: 'Bite', damage: '1d8+2', damageType: 'piercing', toHit: 4 },
+        traits: ['Carrion frenzy: +2 damage while any corpse lies within 30ft', 'Grave-fever: bite forces DC 11 CON or poisoned 1hr', 'Feeds mid-fight if a body drops']
+    },
+    rotfiend: {
+        name: 'Rotfiend', stats: { str: 14, dex: 10, con: 14, int: 4, wis: 8, cha: 4 },
+        hp: 22, maxHp: 22, ac: 11, level: 2, characterType: 'enemy', race: 'Necrophage', size: 'medium', speed: 30,
+        cr: 1, xpValue: 200, vulnerabilities: ['silver'],
+        defaultAttack: { name: 'Rake', damage: '1d8+2', damageType: 'slashing', toHit: 4 },
+        traits: ['DEATH BURST: at 0 HP explodes — 2d6 acid, 10ft, DC 12 DEX half; the corpse is DESTROYED (no harvest)', 'Stench: DC 10 CON within 5ft or disadvantage 1 round']
+    },
+    grave_hag: {
+        name: 'Grave Hag', stats: { str: 15, dex: 14, con: 14, int: 9, wis: 12, cha: 7 },
+        hp: 45, maxHp: 45, ac: 14, level: 4, characterType: 'enemy', race: 'Necrophage', size: 'medium', speed: 35,
+        cr: 3, xpValue: 700, vulnerabilities: ['silver'],
+        defaultAttack: { name: 'Prehensile tongue', damage: '2d6+2', damageType: 'bludgeoning', toHit: 5 },
+        traits: ['Tongue lash: 15ft reach, hit pulls the target 10ft closer', 'Bone-yard speed: ignores difficult terrain among graves', 'Regenerates 3/round unless silver wounded this round']
+    },
+    noonwraith: {
+        name: 'Noonwraith', stats: { str: 6, dex: 16, con: 10, int: 8, wis: 12, cha: 14 },
+        hp: 30, maxHp: 30, ac: 14, level: 4, characterType: 'enemy', race: 'Specter', size: 'medium', speed: 40,
+        cr: 3, xpValue: 700, vulnerabilities: ['silver'], resistances: ['bludgeoning', 'piercing', 'slashing'],
+        immunities: ['poison'],
+        defaultAttack: { name: 'Spectral scythe', damage: '2d8', damageType: 'necrotic', toHit: 6 },
+        traits: ['INSUBSTANTIAL (Law 5): attacks vs her at disadvantage, half damage — LIFTED inside Yrden or once her anchor is named', 'Noon fury: advantage on everything in direct sun', 'Blur step: 20ft teleport as bonus action', 'ANCHORED: cannot leave 300ft of her tether; the anchor is always a story']
+    },
+    werewolf: {
+        name: 'Werewolf', stats: { str: 17, dex: 15, con: 16, int: 10, wis: 11, cha: 10 },
+        hp: 58, maxHp: 58, ac: 14, level: 5, characterType: 'enemy', race: 'Cursed One', size: 'medium', speed: 40,
+        cr: 4, xpValue: 1100, vulnerabilities: ['silver'], resistances: ['bludgeoning', 'piercing', 'slashing'],
+        defaultAttack: { name: 'Claws', damage: '2d6+3', damageType: 'slashing', toHit: 6 },
+        traits: ['Regenerates 5/round unless silver wounded this round', 'Frenzy below half HP: extra claw attack, −2 AC', 'A PERSON is inside — the curse is a secret row; killing it is one resolution and rarely the paid one']
+    },
+    forktail: {
+        name: 'Forktail', stats: { str: 18, dex: 13, con: 16, int: 5, wis: 11, cha: 7 },
+        hp: 68, maxHp: 68, ac: 15, level: 6, characterType: 'enemy', race: 'Draconid', size: 'large', speed: 30,
+        cr: 5, xpValue: 1800,
+        defaultAttack: { name: 'Tail scythe', damage: '2d8+4', damageType: 'slashing', toHit: 7 },
+        traits: ['FLIGHT 60ft — strafes, does not brawl; grounding it is the fight', 'Tail sweep: hits two adjacent targets', 'Dive: +1d8 after moving 30ft airborne', 'Hide too thick for arrows: ranged disadvantage beyond 30ft']
+    },
+    leshen: {
+        name: 'Leshen', stats: { str: 18, dex: 12, con: 18, int: 14, wis: 16, cha: 14 },
+        hp: 105, maxHp: 105, ac: 16, level: 8, characterType: 'enemy', race: 'Relict', size: 'large', speed: 30,
+        cr: 7, xpValue: 2900, vulnerabilities: ['fire'], resistances: ['bludgeoning', 'piercing'],
+        immunities: ['poison', 'charm'],
+        defaultAttack: { name: 'Root spears', damage: '2d10+4', damageType: 'piercing', toHit: 7 },
+        traits: ['Root eruption: 20ft range, DC 14 DEX or restrained', 'Summons: 1d4 wolves or a crow murder each round it chooses', 'Marked territory: it knows where everything in its forest stands — no ambushing it at home', 'THE REGION\'S KETER: relicts do not negotiate and Axii does not touch them']
     },
 };
 

@@ -219,6 +219,39 @@ export class CombatRNG {
     }
 
     /**
+     * 5e attack roll (Findings #32): the crit is the NATURAL DIE, never the
+     * margin. checkDegreeDetailed below is PF2e-flavored (margin >= 10 crits)
+     * and silently inflated every high-bonus attacker when used for attacks.
+     * Supports advantage/disadvantage natively (2d20 keep high/low).
+     */
+    rollAttackD20(
+        modifier: number,
+        dc: number,
+        advantage?: boolean,
+        disadvantage?: boolean
+    ): CheckResult & { allRolls: number[] } {
+        const r1 = this.rollDie(20);
+        let roll = r1;
+        const allRolls = [r1];
+        if (advantage !== disadvantage) {   // one flag set, not both
+            const r2 = this.rollDie(20);
+            allRolls.push(r2);
+            roll = advantage ? Math.max(r1, r2) : Math.min(r1, r2);
+        }
+        const total = roll + modifier;
+        const margin = total - dc;
+        const isNat20 = roll === 20;
+        const isNat1 = roll === 1;
+        const isHit = isNat1 ? false : (isNat20 ? true : total >= dc);
+        const isCrit = isNat20 && isHit;
+        const degree = isCrit ? 'critical-success'
+            : isHit ? 'success'
+            : isNat1 ? 'critical-failure'
+            : 'failure';
+        return { roll, modifier, total, dc, margin, degree, isNat20, isNat1, isHit, isCrit, allRolls };
+    }
+
+    /**
      * Detailed check result with full dice mechanics exposed
      * This is the TRANSPARENT version - shows exactly what was rolled
      */

@@ -8,6 +8,7 @@
 import { z } from 'zod';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { SessionContext } from '../types.js';
+import { getDb } from '../../storage/index.js';
 import { RichFormatter } from '../utils/formatter.js';
 import {
     handleGetWorldMapOverview,
@@ -23,7 +24,7 @@ import {
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['overview', 'region', 'tiles', 'patch', 'preview', 'find_poi', 'suggest_poi'] as const;
+const ACTIONS = ['overview', 'region', 'tiles', 'patch', 'preview', 'find_poi', 'suggest_poi', 'list_pois'] as const;
 type WorldMapAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -60,6 +61,11 @@ const PreviewSchema = z.object({
     action: z.literal('preview'),
     worldId: z.string().describe('World ID'),
     script: z.string().describe('DSL patch script to preview')
+});
+
+const ListPoisSchema = z.object({
+    action: z.literal('list_pois'),
+    worldId: z.string().describe('World to list POIs for')
 });
 
 const FindPoiSchema = z.object({
@@ -202,6 +208,23 @@ const definitions: Record<WorldMapAction, ActionDefinition> = {
         aliases: ['find_location', 'locate'],
         description: 'Find valid locations for placing a POI/structure'
     },
+    list_pois: {
+        schema: ListPoisSchema,
+        handler: async (args: z.infer<typeof ListPoisSchema>) => {
+            // FINDINGS #34 T2.9: the missing POI list — travel-probing ends today.
+            const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+            try {
+                const rows = db.prepare(
+                    `SELECT id, name, x, y, discoveryState FROM pois WHERE worldId = ? ORDER BY name`
+                ).all(args.worldId) as Array<Record<string, unknown>>;
+                return { success: true, actionType: 'list_pois', worldId: args.worldId, count: rows.length, pois: rows };
+            } catch (err) {
+                return { error: true, actionType: 'list_pois', message: `POI table read failed: ${(err as Error).message}` };
+            }
+        },
+        aliases: ['pois', 'locations'],
+        description: 'List all POIs in a world with coordinates and discovery state'
+    },
     suggest_poi: {
         schema: SuggestPoiSchema,
         handler: handleSuggestPoi,
@@ -318,6 +341,16 @@ export async function handleWorldMap(args: unknown, ctx: SessionContext): Promis
                     });
                     if (parsed.errors?.length) {
                         output += `\n**Errors:** ${parsed.errors.join(', ')}\n`;
+                    }
+                    break;
+                case 'list_pois':
+                    output = RichFormatter.header(`POIs (${parsed.count})`, '📍');
+                    if (parsed.pois?.length > 0) {
+                        parsed.pois.forEach((p: { id: string; name: string; x: number; y: number; discoveryState: string }) => {
+                            output += `• **${p.name}** (${p.x},${p.y}) — ${p.discoveryState} \`${p.id}\`\n`;
+                        });
+                    } else {
+                        output += 'No POIs in this world.\n';
                     }
                     break;
                 case 'find_poi':

@@ -8,6 +8,7 @@
 import { ToolMetadata, ToolCategory, ToolRegistry } from './tool-metadata.js';
 import { ConsolidatedTools } from './consolidated/index.js';
 import { SessionContext } from './types.js';
+import { setToolContext } from './tool-context.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // METADATA HELPERS
@@ -69,6 +70,10 @@ const TOOL_CATEGORIES: Record<string, ToolCategory> = {
     agent_manage: 'agent',
     perception_manage: 'meta',
     scene_manage: 'narrative',
+    hull_manage: 'world',
+    siege_manage: 'world',
+    container_manage: 'inventory',
+    horde_manage: 'world',
 };
 
 // Map tool names to keywords
@@ -104,6 +109,10 @@ const TOOL_KEYWORDS: Record<string, string[]> = {
     agent_manage: ['agent', 'llm', 'npc', 'ai', 'persona', 'invoke', 'prompt', 'memory', 'autonomous'],
     perception_manage: ['perception', 'hazard', 'control', 'safety', 'sight', 'blind-spot', 'attention', 'operator'],
     scene_manage: ['scene', 'set_scene', 'frame', 'dm', 'narration', 'shared', 'state', 'context'],
+    hull_manage: ['hull', 'station', 'pressure', 'vent', 'power', 'atmosphere', 'life-support', 'section', 'keeper'],
+    siege_manage: ['siege', 'compound', 'zone', 'barricade', 'wall', 'supplies', 'fortify', 'survival', 'zombie'],
+    container_manage: ['container', 'stash', 'cache', 'safe', 'backpack', 'boot', 'storage', 'put', 'take'],
+    horde_manage: ['horde', 'zombie', 'mass', 'noise', 'swarm', 'press', 'attraction', 'drift', 'walker'],
 };
 
 // Map tool names to capabilities
@@ -139,6 +148,10 @@ const TOOL_CAPABILITIES: Record<string, string[]> = {
     agent_manage: ['LLM-driven NPC minds', 'Modular prompt slices', 'Plain-text intent declarations', 'Auto-invoke on initiative'],
     perception_manage: ['Hierarchy-of-Controls hazard scanning', 'Attentional-capacity metering', 'Blind-spot detection (§3.5)', 'Disposition discipline'],
     scene_manage: ['DM-committed shared scenes', 'Auto-injected into agent prompts', 'Engine-side source of truth for "what is happening now"'],
+    hull_manage: ['Station sections: pressure/atmosphere/integrity/power', 'Power budget sum-vs-generation', 'Venting with Register-B occupant resolution', 'Life-support decay clock'],
+    siege_manage: ['Fortified-compound zones (hull_manage alias)', 'Generator budget and dark zones', 'Zone sacrifice with occupant enumeration', 'Supply pool decay'],
+    container_manage: ['Things inside things: stashes, safes, caches, boots', 'put/take moves real inventory rows', 'Locked/hidden/trapped flags', 'Capacity or unlimited'],
+    horde_manage: ['Mass entities: one object, not N combatants', 'Noise as a place-owned decaying value', 'Drift toward the loudest pull', 'resolve_press: how many reach the wall'],
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -171,11 +184,43 @@ export function buildConsolidatedRegistry(): ToolRegistry {
             ),
             schema: tool.inputSchema,
             actionSchemas: (tool as { actionSchemas?: unknown }).actionSchemas,
-            handler: handler as (args: unknown, ctx: SessionContext) => Promise<any>
+            handler: (async (args: unknown, ctx: SessionContext) => {
+                // FINDINGS #34 T1.4: stamp every dispatch so state-writing
+                // repos can attribute their writes. Ghost writes end here.
+                const action = (args as { action?: string })?.action;
+                setToolContext(action ? `${name}.${action}` : name);
+                return (handler as (a: unknown, c: SessionContext) => Promise<unknown>)(args, ctx);
+            }) as (args: unknown, ctx: SessionContext) => Promise<any>
         };
     }
 
+    runBootMirrorAudit(cachedRegistry);
     return cachedRegistry;
+}
+
+/**
+ * FINDINGS #34 T4.19 (interim form): the mirror law has six casualties.
+ * Until outer schemas are auto-generated, audit them at every boot and
+ * shout about drift where it cannot be missed.
+ */
+function runBootMirrorAudit(registry: ToolRegistry): void {
+    for (const [name, entry] of Object.entries(registry)) {
+        const outerShape = (entry.schema as { shape?: Record<string, unknown> }).shape;
+        const actionSchemas = entry.actionSchemas as Record<string, { schema?: { shape?: Record<string, unknown> } }> | undefined;
+        if (!outerShape || !actionSchemas) continue;
+        const outerKeys = new Set(Object.keys(outerShape));
+        const missing = new Set<string>();
+        for (const def of Object.values(actionSchemas)) {
+            const innerShape = def?.schema?.shape;
+            if (!innerShape) continue;
+            for (const k of Object.keys(innerShape)) {
+                if (k !== 'action' && !outerKeys.has(k)) missing.add(k);
+            }
+        }
+        if (missing.size > 0) {
+            console.error(`[MIRROR AUDIT] ${name}: outer inputSchema missing inner params: ${[...missing].sort().join(', ')} — clients WILL strip these (Findings #14/#27/#33)`);
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

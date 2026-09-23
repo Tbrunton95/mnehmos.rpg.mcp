@@ -28,6 +28,7 @@ export interface GuidingError {
     input: string;
     suggestions: Array<{ value: string; similarity: number }>;
     message: string;
+    writes?: string;
 }
 
 export type MatchOutcome<T extends string> = MatchResult<T> | GuidingError;
@@ -190,6 +191,9 @@ export function matchAction<T extends string>(
         error: 'invalid_action',
         input,
         suggestions: topSuggestions,
+        // FINDINGS #64: an unrecognized action never reaches a handler —
+        // write-freedom is provable at this site, so it is asserted.
+        writes: 'none',
         message: `Unknown action "${input}". Did you mean: ${
             topSuggestions.map(s => `"${s.value}" (${s.similarity}%)`).join(', ')
         }?`

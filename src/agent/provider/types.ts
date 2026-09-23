@@ -37,6 +37,8 @@ export interface ProviderCallResult {
     durationMs: number;
     /** finish_reason from provider (stop / length / content_filter / etc). */
     finishReason?: string;
+    /** Model the provider REPORTS having served — may differ from the requested model. FINDINGS #69: turns silent model substitution from invisible into obvious. */
+    model?: string;
 }
 
 export class ProviderError extends Error {

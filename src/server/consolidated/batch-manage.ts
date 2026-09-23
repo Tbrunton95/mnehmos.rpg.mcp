@@ -14,6 +14,7 @@ import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
 import { ItemRepository } from '../../storage/repos/item.repo.js';
 import { SessionContext } from '../types.js';
 import { buildConsolidatedRegistry } from '../consolidated-registry.js';
+import * as pda from '../../render/pda.js';
 
 export interface McpResponse {
     content: Array<{ type: 'text'; text: string }>;
@@ -707,6 +708,28 @@ function getNestedValue(obj: Record<string, unknown>, path: string): unknown {
     return current;
 }
 
+/**
+ * FINDINGS #16a repair: array params inside step args arrive as objects with
+ * sequential numeric keys ({"0":"a","1":"b"}) after MCP serialization.
+ * Recursively convert array-like objects back into real arrays so tool
+ * schemas validate. A legit object with exactly the keys 0..n-1 is
+ * vanishingly rare in these schemas; the heuristic is safe here.
+ */
+function repairMangledArrays(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(repairMangledArrays);
+    if (value && typeof value === 'object') {
+        const keys = Object.keys(value as Record<string, unknown>);
+        const isArrayLike = keys.length > 0 && keys.every((k, i) => k === String(i));
+        if (isArrayLike) {
+            return keys.map(k => repairMangledArrays((value as Record<string, unknown>)[k]));
+        }
+        const out: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = repairMangledArrays(v);
+        return out;
+    }
+    return value;
+}
+
 async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContext): Promise<McpResponse> {
     if (!input.steps || input.steps.length === 0) {
         return {
@@ -741,6 +764,18 @@ async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContex
 
         output += `**Step ${i + 1}/${input.steps.length}**: \`${step.tool}\`\n`;
 
+        // FINDINGS #93: THE BATCH LAW BECOMES A WALL — arrays mangle into
+        // objects in batched steps (#16a). Refusing is strictly better than
+        // corrupting: the refusal names every offending param and the fix.
+        const arrayParams = Object.entries(step.args ?? {}).filter(([, v]) => Array.isArray(v)).map(([k]) => k);
+        if (arrayParams.length) {
+            const error = `BATCH LAW (#16a): array param(s) [${arrayParams.join(', ')}] would MANGLE in a batched step — refused, nothing executed for this step. Make this call DIRECTLY (arrays are safe outside batch), or restructure without arrays.`;
+            output += `  ❌ ${error}\n`;
+            executedSteps.push({ stepIndex: i, stepId, tool: step.tool, success: false, error });
+            if (input.stopOnError !== false) { output += `\n⛔ Sequence stopped (stopOnError).\n`; break; }
+            continue;
+        }
+
         if (!toolEntry) {
             const error = `Unknown tool: ${step.tool}`;
             output += `  ❌ ${error}\n`;
@@ -762,40 +797,109 @@ async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContex
 
         try {
             // Resolve any references to previous step results
-            const resolvedArgs = resolveStepReferences(step.args, stepResults);
+            const resolvedArgs = repairMangledArrays(resolveStepReferences(step.args, stepResults)) as Record<string, unknown>;
 
             // Execute the tool
             const response = await toolEntry.handler(resolvedArgs, ctx);
 
-            // Parse the result from the response
+            // Parse the result from the response.
+            // FINDINGS #20: the old pattern /<!--JSON:...-->/ matched NOTHING —
+            // tools emit <!-- TOOL_NAME_JSON ... TOOL_NAME_JSON -->. Every result
+            // became {raw}, which made success detection always-true (the banner
+            // lie) and killed {{step.prop}} references. One regex, two laws.
             let result: unknown = null;
             if (response.content?.[0]?.text) {
-                // Try to extract JSON from embedded data
                 const text = response.content[0].text;
-                const jsonMatch = text.match(/<!--JSON:([^>]+)-->/);
+                const jsonMatch = text.match(/<!--\s*([A-Z_]*JSON)\s*\n?([\s\S]*?)\n?\1\s*-->/);
                 if (jsonMatch) {
                     try {
-                        result = JSON.parse(jsonMatch[1]);
+                        result = JSON.parse(jsonMatch[2]);
                     } catch {
-                        // Use raw text if JSON parsing fails
                         result = { raw: text };
                     }
                 } else {
-                    result = { raw: text };
+                    // FINDINGS #108-B: legacy-router tools (secret_manage confirmed;
+                    // zero embedJson in its dist) return PURE JSON text with no
+                    // marker — parse the whole payload before surrendering to {raw}.
+                    // This restores three-state detection AND {{step.prop}} refs
+                    // for the entire marker-less class.
+                    try {
+                        const whole = JSON.parse(text.trim());
+                        result = (whole !== null && typeof whole === 'object') ? whole : { raw: text };
+                    } catch {
+                        result = { raw: text };
+                    }
                 }
             }
 
             // Store result for reference by later steps
             stepResults.set(stepId, result);
 
-            const success = !(result as Record<string, unknown> | null)?.error;
-            output += success ? `  ✅ Success\n` : `  ⚠️ Completed with warnings\n`;
+            // FINDINGS #96 (BUG 7): validation refusals emit NO embedded JSON —
+            // they land in the {raw} fallback where .error is undefined and the
+            // step banner said ✅ while nothing was written. The raw lane now
+            // gets inspected for error markers; a payload that says error IS one.
+            let success = !(result as Record<string, unknown> | null)?.error && (result as Record<string, unknown> | null)?.success !== false;
+            const rawText = (result as { raw?: unknown } | null)?.raw;
+            if (success && typeof rawText === 'string' && /validation_error|❌|\bERROR\b|GUARD REFUSAL|"error"\s*:/.test(rawText)) {
+                success = false;
+                (result as Record<string, unknown>).error = `error detected in unparsed payload (#96): ${(rawText.match(/validation_error[^\n]*|ERROR[^\n]{0,120}/)?.[0] ?? 'see raw').trim()}`;
+            }
+            // FINDINGS #106: the banner lie's last hiding place — a parsed payload
+            // that declares NEITHER success nor error, carrying failure only in
+            // prose ('Room not found'). ✅ requires a declared outcome; error-shaped
+            // prose flips to ❌; anything else prints ⚠ AMBIGUOUS, never a tick.
+            const parsedR = result as Record<string, unknown> | null;
+            const declaresOutcome = parsedR !== null && typeof parsedR === 'object' && (('success' in parsedR) || ('error' in parsedR));
+            let ambiguous = false;
+            if (success && !declaresOutcome) {
+                if (typeof rawText === 'string') {
+                    // FINDINGS #108-B: the raw-wrap escape — a string blob that dodged
+                    // the #96 error-regex was falling through to ✅. A payload nobody
+                    // could parse and nobody declared is AMBIGUOUS, never a tick.
+                    ambiguous = true;
+                } else {
+                    const msg = typeof parsedR?.message === 'string' ? parsedR.message : '';
+                    if (/\b(not found|no such|missing|cannot|unable|refused|failed|denied)\b/i.test(msg)) {
+                        success = false;
+                        parsedR!.error = `soft failure (#106): payload declares no outcome and its message reads as an error — "${msg}"`;
+                    } else {
+                        ambiguous = true;
+                    }
+                }
+            }
+            if (ambiguous) {
+                const msg = typeof parsedR?.message === 'string' && parsedR.message
+                    ? parsedR.message
+                    : (typeof rawText === 'string' ? `${rawText.slice(0, 120)}…` : 'no message');
+                output += `  ⚠ AMBIGUOUS — payload declares neither success nor error; READ IT: ${msg}\n`;
+            } else if (success) {
+                // FINDINGS #61: '✅ Success' swallowed nested tool output — dice
+                // rolls vanished into the step banner (#16a family). #66 goes
+                // further: steps that produce a roll print the FULL disclosure
+                // block under the step line — no collapsing to a tick.
+                const at = (result as Record<string, unknown> | null)?.actionType;
+                if (at === 'roll_skill_check' || at === 'roll_ability_check' || at === 'roll_saving_throw' || at === 'stunt') {
+                    output += pda.renderCheck(result as Parameters<typeof pda.renderCheck>[0]);
+                } else if (at === 'roll') {
+                    output += pda.renderRawRoll(result as Parameters<typeof pda.renderRawRoll>[0]);
+                } else {
+                    const msg = (result as Record<string, unknown> | null)?.message;
+                    output += `  ✅ ${typeof msg === 'string' && msg ? msg : 'Success'}\n`;
+                    const bd = (result as Record<string, unknown> | null)?.breakdown;
+                    if (Array.isArray(bd) && bd.length) output += `     ${bd.join(' │ ')}\n`;
+                }
+            } else {
+                const errMsg = (result as Record<string, unknown>)?.message || 'embedded error';
+                output += `  ❌ ${errMsg}\n`;
+            }
 
             executedSteps.push({
                 stepIndex: i,
                 stepId,
                 tool: step.tool,
                 success,
+                ...(ambiguous ? { ambiguous: true } : {}),
                 result
             });
 
@@ -820,13 +924,18 @@ async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContex
 
     const successCount = executedSteps.filter(s => s.success).length;
     const failureCount = executedSteps.filter(s => !s.success).length;
+    // FINDINGS #109 (chair's ask): the ⚠ census, greppable — ambiguous steps
+    // count as succeeded (the write landed) but are tallied separately so a
+    // batch containing undeclared payloads never reads as fully clean.
+    const ambiguousCount = executedSteps.filter(s => (s as { ambiguous?: boolean }).ambiguous).length;
 
     output += RichFormatter.section('Summary');
     output += RichFormatter.keyValue({
         'Total Steps': input.steps.length,
         'Executed': executedSteps.length,
         'Succeeded': successCount,
-        'Failed': failureCount
+        'Failed': failureCount,
+        ...(ambiguousCount ? { 'Ambiguous ⚠': ambiguousCount } : {})
     });
 
     const resultPayload = {
@@ -836,6 +945,7 @@ async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContex
         executedSteps: executedSteps.length,
         successCount,
         failureCount,
+        ...(ambiguousCount ? { ambiguousCount } : {}),
         steps: executedSteps,
         stepResults: Object.fromEntries(stepResults)
     };

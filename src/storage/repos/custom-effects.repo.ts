@@ -84,6 +84,36 @@ export class CustomEffectsRepository {
             return this.incrementStacks(existing.id);
         }
 
+        // BUG2 FIX (validate-before-write): reject malformed mechanics/triggers
+        // BEFORE anything touches the table, using the exact schema the read
+        // path enforces. Previously a bad mechanic type persisted while the
+        // call returned a validation error, poisoning every later read of the
+        // target's ledger.
+        CustomEffectSchema.parse({
+            id: 0,
+            target_id: args.target_id,
+            target_type: args.target_type,
+            name: args.name,
+            description: args.description,
+            source_type: args.source.type,
+            source_entity_id: args.source.entity_id || null,
+            source_entity_name: args.source.entity_name || null,
+            category: args.category,
+            power_level: args.power_level,
+            mechanics: args.mechanics,
+            duration_type: args.duration.type,
+            duration_value: args.duration.value || null,
+            rounds_remaining: args.duration.type === 'rounds' ? args.duration.value ?? null : null,
+            triggers: args.triggers,
+            removal_conditions: args.removal_conditions,
+            stackable: args.stackable,
+            max_stacks: args.max_stacks ?? 1,
+            current_stacks: 1,
+            is_active: true,
+            created_at: now,
+            expires_at: expiresAt
+        });
+
         // Insert new effect
         const stmt = this.db.prepare(`
             INSERT INTO custom_effects (
@@ -182,7 +212,7 @@ export class CustomEffectsRepository {
 
         const stmt = this.db.prepare(query);
         const rows = stmt.all(...params) as CustomEffectRow[];
-        return rows.map(row => this.rowToEffect(row));
+        return rows.map(row => this.rowToEffectSafe(row)).filter((e): e is CustomEffect => e !== null);
     }
 
     /**
@@ -335,14 +365,20 @@ export class CustomEffectsRepository {
     /**
      * Check and remove expired time-based effects
      */
-    cleanupExpired(): number {
+    cleanupExpired(targetId?: string): number {
+        // FINDINGS #102: was GLOBAL + wall-clock — every campaign's boot reaped
+        // every OTHER campaign's effects whose real-world expires_at had passed,
+        // regardless of their fiction clocks. Scoped to the target being
+        // advanced; without a target it now touches NOTHING. The wall-clock
+        // predicate itself stays queued (fiction-clock durations are the fix).
+        if (!targetId) return 0;
         const now = new Date().toISOString();
         const stmt = this.db.prepare(`
             UPDATE custom_effects
             SET is_active = 0
-            WHERE is_active = 1 AND expires_at IS NOT NULL AND expires_at < ?
+            WHERE is_active = 1 AND expires_at IS NOT NULL AND expires_at < ? AND target_id = ?
         `);
-        const result = stmt.run(now);
+        const result = stmt.run(now, targetId);
         return result.changes;
     }
 
@@ -384,6 +420,22 @@ export class CustomEffectsRepository {
      * Convert database row to CustomEffect object
      */
     private rowToEffect(row: CustomEffectRow): CustomEffect {
+        // BUG2 FIX (lenient read): validate strictly, but never let one
+        // malformed legacy row poison the target's whole ledger — skip it
+        // with a logged warning instead of throwing.
+        return this.parseRowStrict(row);
+    }
+
+    private rowToEffectSafe(row: CustomEffectRow): CustomEffect | null {
+        try {
+            return this.parseRowStrict(row);
+        } catch (err) {
+            console.error(`[custom-effects] Skipping malformed effect row id=${row.id} name="${row.name}" target=${row.target_id}: ${err instanceof Error ? err.message.split('\n')[0] : err}`);
+            return null;
+        }
+    }
+
+    private parseRowStrict(row: CustomEffectRow): CustomEffect {
         return CustomEffectSchema.parse({
             id: row.id,
             target_id: row.target_id,

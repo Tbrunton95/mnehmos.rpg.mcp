@@ -273,6 +273,17 @@ export function migrate(db: Database.Database) {
   CREATE INDEX IF NOT EXISTS idx_nation_events_world ON nation_events(world_id);
   CREATE INDEX IF NOT EXISTS idx_nation_events_turn ON nation_events(world_id, turn_number);
 
+  CREATE TABLE IF NOT EXISTS write_audit(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id TEXT NOT NULL,
+    field TEXT NOT NULL,
+    old_value TEXT,
+    new_value TEXT,
+    source TEXT NOT NULL DEFAULT 'unknown',
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_write_audit_char ON write_audit(character_id, id);
+
   CREATE TABLE IF NOT EXISTS secrets(
     id TEXT PRIMARY KEY,
     world_id TEXT NOT NULL,
@@ -630,6 +641,55 @@ function runMigrations(db: Database.Database) {
     db.exec(`ALTER TABLE characters ADD COLUMN character_type TEXT DEFAULT 'pc';`);
   }
 
+  // FINDINGS #34 T2.8: secrets gain a status field (active/parked/spent)
+  const secretColumns = db.prepare("PRAGMA table_info(secrets)").all() as { name: string }[];
+  if (!secretColumns.some(col => col.name === 'status')) {
+    console.error('[Migration] Adding status column to secrets table');
+    db.exec(`ALTER TABLE secrets ADD COLUMN status TEXT NOT NULL DEFAULT 'active';`);
+  }
+  // FINDINGS #45: engine-side time accumulation — check_conditions was
+  // per-call, so per-scene deltas could NEVER ring a clock (#44).
+  if (!secretColumns.some(col => col.name === 'hours_accumulated')) {
+    console.error('[Migration] Adding hours_accumulated column to secrets table');
+    db.exec(`ALTER TABLE secrets ADD COLUMN hours_accumulated REAL NOT NULL DEFAULT 0;`);
+  }
+
+  // FINDINGS #57: per-instance item state — a specific gun with its own
+  // condition and its own mounted parts. Closes the #34 deferred debt.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS item_instances (
+      id TEXT PRIMARY KEY,
+      template_id TEXT NOT NULL,
+      owner_character_id TEXT,
+      condition REAL,
+      attachments TEXT NOT NULL DEFAULT '{}',
+      custom_name TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(template_id) REFERENCES items(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_item_instances_owner ON item_instances(owner_character_id);
+    CREATE INDEX IF NOT EXISTS idx_item_instances_template ON item_instances(template_id);
+  `);
+
+  // FINDINGS #60: THE MEND CLOCK — scheduled state changes the boot executes
+  // instead of numbers a chair remembers. fires_at_day is the IN-FICTION
+  // campaign day (wall-clock time is meaningless to the fiction, #58).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS scheduled_state_changes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      character_id TEXT NOT NULL,
+      fires_at_day REAL NOT NULL,
+      writes TEXT NOT NULL DEFAULT '[]',
+      note TEXT,
+      fired INTEGER NOT NULL DEFAULT 0,
+      fired_at TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_scheduled_changes_due ON scheduled_state_changes(fired, fires_at_day);
+    CREATE INDEX IF NOT EXISTS idx_scheduled_changes_char ON scheduled_state_changes(character_id);
+  `);
+
   // Check if regions table has owner_nation_id and control_level columns
   const regionColumns = db.prepare("PRAGMA table_info(regions)").all() as { name: string }[];
   const hasOwnerNationId = regionColumns.some(col => col.name === 'owner_nation_id');
@@ -855,6 +915,16 @@ function runMigrations(db: Database.Database) {
   if (!hasOrigin) {
     console.error('[Migration] Adding origin column to characters table');
     db.exec(`ALTER TABLE characters ADD COLUMN origin TEXT;`);
+  }
+
+  // PROFICIENCY TRIO: schema carried skillProficiencies/saveProficiencies/
+  // expertise fully enumerated with no columns behind them — the same
+  // silent-drop pattern the background/alignment comment above confesses to.
+  for (const col of ['skill_proficiencies', 'save_proficiencies', 'expertise']) {
+    if (!charColumns.some(c => c.name === col)) {
+      console.error(`[Migration] Adding ${col} column to characters table`);
+      db.exec(`ALTER TABLE characters ADD COLUMN ${col} TEXT DEFAULT '[]';`);
+    }
   }
 
   // Migration: Rename world_x/world_y to local_x/local_y if needed
@@ -1102,4 +1172,33 @@ function createPostMigrationIndexes(db: Database.Database) {
   } catch (e) {
     console.error('[Migration] Note: Could not create idx_regions_owner_nation:', (e as Error).message);
   }
+
+  // POI + rooms tables for travel_manage / spawn_preset_location / spawn_location
+  // (camelCase columns to match the raw SQL in those handlers)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS pois(
+      id TEXT PRIMARY KEY,
+      worldId TEXT,
+      name TEXT NOT NULL,
+      type TEXT,
+      x INTEGER,
+      y INTEGER,
+      discoveryState TEXT NOT NULL DEFAULT 'discovered',
+      discoveryDc INTEGER,
+      networkId TEXT,
+      createdAt TEXT,
+      updatedAt TEXT
+    );
+    CREATE TABLE IF NOT EXISTS rooms(
+      id TEXT PRIMARY KEY,
+      networkId TEXT,
+      name TEXT NOT NULL,
+      description TEXT,
+      exits TEXT DEFAULT '[]',
+      createdAt TEXT,
+      updatedAt TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_pois_world ON pois(worldId);
+    CREATE INDEX IF NOT EXISTS idx_rooms_network ON rooms(networkId);
+  `);
 }

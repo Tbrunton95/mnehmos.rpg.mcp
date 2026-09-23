@@ -72,6 +72,8 @@ export const SecretSchema = z.object({
     
     // Sensitivity for filtering
     sensitivity: z.enum(['low', 'medium', 'high', 'critical']).default('medium'),
+    status: z.enum(['active', 'parked', 'spent']).optional().default('active').describe('parked: conditions kept but never fire; spent: resolved history'),
+    hoursAccumulated: z.number().optional().default(0).describe('#45: engine-side running total for time_passed clocks — hoursPassed deltas accumulate here; resets on fire and on re-arm'),
     
     // Leak detection patterns
     leakPatterns: z.array(z.string()).default([]), // ["vampire", "undead", "blood"]

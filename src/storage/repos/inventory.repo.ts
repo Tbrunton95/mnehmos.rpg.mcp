@@ -27,9 +27,25 @@ export class InventoryRepository {
         return InventorySchema.parse({
             characterId,
             items,
-            capacity: 100, // Default
+            capacity: this.carryCapacity(characterId), // #95 R1c: pool-derived, 100 only when absent
             currency
         });
+    }
+
+    // FINDINGS #95 (RULING R1c): capacity reads the character's carry_capacity
+    // pool when present; hardcoded 100 is only the ABSENT-pool default. Pool
+    // max < 0 encodes the "unlimited" sentinel (0 is a real state — a man who
+    // can carry nothing; null is indistinguishable from unset — Tom's ruling).
+    private carryCapacity(characterId: string): number | 'unlimited' {
+        try {
+            const row = this.db.prepare('SELECT resource_pools FROM characters WHERE id = ?').get(characterId) as { resource_pools?: string | null } | undefined;
+            if (row?.resource_pools) {
+                const pools = JSON.parse(row.resource_pools) as Record<string, { current?: number; max?: number }>;
+                const cc = pools['carry_capacity'];
+                if (cc && typeof cc.max === 'number') return cc.max < 0 ? 'unlimited' : cc.max;
+            }
+        } catch { /* column shape unexpected — default */ }
+        return 100;
     }
 
     addItem(characterId: string, itemId: string, quantity: number = 1): void {
@@ -151,7 +167,7 @@ export class InventoryRepository {
             characterId,
             items,
             totalWeight,
-            capacity: 100,
+            capacity: this.carryCapacity(characterId), // #95 R1c
             currency
         };
     }
@@ -315,8 +331,8 @@ interface InventoryWithItems {
         equipped: boolean;
         slot?: string;
     }>;
-    totalWeight: number;
-    capacity: number;
+        totalWeight: number;
+    capacity: number | 'unlimited';
     currency: { gold: number; silver: number; copper: number };
 }
 

@@ -114,15 +114,14 @@ export const CharacterSchema = z.object({
         lastRefilledAt: z.string().optional(),
     })).optional().default({}),
 
-    // Skill and Save Proficiencies
-    skillProficiencies: z.array(z.enum([
-        'acrobatics', 'animal_handling', 'arcana', 'athletics', 'deception',
-        'history', 'insight', 'intimidation', 'investigation', 'medicine',
-        'nature', 'perception', 'performance', 'persuasion', 'religion',
-        'sleight_of_hand', 'stealth', 'survival'
-    ])).optional().default([]).describe('Skills the character is proficient in'),
-    saveProficiencies: z.array(z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']))
-        .optional().default([]).describe('Saving throws the character is proficient in'),
+    // Skill and Save Proficiencies — free strings by design: skill LISTS are
+    // theme data (5e's eighteen, Cyberpunk's, WoD's...), not engine rules.
+    // roll_skill_check maps known 5e skills to abilities automatically and
+    // takes an explicit `ability` for everything else.
+    skillProficiencies: z.array(z.string())
+        .optional().default([]).describe('Skills the character is proficient in (any theme skill list)'),
+    saveProficiencies: z.array(z.string())
+        .optional().default([]).describe('Saving throws the character is proficient in (str/dex/con/int/wis/cha)'),
     expertise: z.array(z.string()).optional().default([])
         .describe('Skills with double proficiency bonus (rogues, bards)'),
 

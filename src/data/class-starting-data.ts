@@ -8,7 +8,8 @@
 // Type for valid D&D 5e class names
 export type D5EClass = 'barbarian' | 'bard' | 'cleric' | 'druid' | 'fighter' | 
                        'monk' | 'paladin' | 'ranger' | 'rogue' | 'sorcerer' | 
-                       'warlock' | 'wizard';
+                       'warlock' | 'wizard' |
+                       'stalker' | 'ex_military' | 'bandit' | 'ecologist' | 'monolith_deserter' | 'sin_initiate';
 
 export interface ClassStartingData {
     hitDice: string;
@@ -168,6 +169,73 @@ const HALF_CASTER_SLOTS: Record<number, number[]> = {
 };
 
 export const CLASS_DATA: Record<string, ClassStartingData> = {
+    // ═══════════ ZONE BACKGROUNDS (Escape from Pripyat patch) ═══════════
+    sin_initiate: {
+        hitDice: 'd8',
+        startingHP: (conMod) => 8 + conMod,
+        savingThrows: ['wisdom', 'constitution'],
+        armorProficiencies: ['light'],
+        weaponProficiencies: ['simple'],
+        startingEquipment: [
+            { fixed: ['Hunting Knife', 'Bandage', 'Bandage'] }
+        ],
+        startingGold: 50
+    },
+    stalker: {
+        hitDice: 'd8',
+        startingHP: (conMod) => 8 + conMod,
+        savingThrows: ['dexterity', 'constitution'],
+        armorProficiencies: ['light', 'medium'],
+        weaponProficiencies: ['simple', 'martial'],
+        startingEquipment: [
+            { fixed: ['Leather Jacket', 'Makarov PM', 'Mag 9x18 FMJ', 'Mag 9x18 FMJ', 'Bandage', 'Bandage', 'Bandage', 'Bolts (bundle)'] }
+        ],
+        startingGold: 800
+    },
+    ex_military: {
+        hitDice: 'd10',
+        startingHP: (conMod) => 10 + conMod,
+        savingThrows: ['strength', 'constitution'],
+        armorProficiencies: ['light', 'medium', 'heavy'],
+        weaponProficiencies: ['simple', 'martial'],
+        startingEquipment: [
+            { fixed: ['Leather Jacket', 'AKM-74/2U', 'Mag 5.45 FMJ', 'Bandage', 'Bandage', 'Bolts (bundle)'] }
+        ],
+        startingGold: 400
+    },
+    bandit: {
+        hitDice: 'd8',
+        startingHP: (conMod) => 8 + conMod,
+        savingThrows: ['dexterity', 'charisma'],
+        armorProficiencies: ['light'],
+        weaponProficiencies: ['simple', 'martial'],
+        startingEquipment: [
+            { fixed: ['Leather Jacket', 'TOZ-34 Sawn-off', '12ga Buck Box', 'Vodka', 'Vodka', 'Bandage', 'Bolts (bundle)'] }
+        ],
+        startingGold: 600
+    },
+    ecologist: {
+        hitDice: 'd6',
+        startingHP: (conMod) => 6 + conMod,
+        savingThrows: ['intelligence', 'wisdom'],
+        armorProficiencies: ['light'],
+        weaponProficiencies: ['simple'],
+        startingEquipment: [
+            { fixed: ['Leather Jacket', 'Makarov PM', 'Mag 9x18 FMJ', 'Echo Detector', 'Psi-block', 'Anti-rad', 'Bandage', 'Bandage', 'Bolts (bundle)'] }
+        ],
+        startingGold: 500
+    },
+    monolith_deserter: {
+        hitDice: 'd8',
+        startingHP: (conMod) => 8 + conMod,
+        savingThrows: ['wisdom', 'constitution'],
+        armorProficiencies: ['light', 'medium'],
+        weaponProficiencies: ['simple', 'martial'],
+        startingEquipment: [
+            { fixed: ['AKM-74/2', 'Mag 5.45 FMJ', 'Bolts (bundle)'] }
+        ],
+        startingGold: 0
+    },
     // ═══════════════════════════════════════════════════════════════════════════
     // BARBARIAN
     // ═══════════════════════════════════════════════════════════════════════════

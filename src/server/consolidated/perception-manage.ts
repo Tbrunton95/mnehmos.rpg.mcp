@@ -728,6 +728,7 @@ Actions: assess, list_hazards, read_hazard, recover, get_capacity`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
+        _interrupt: z.boolean().optional().describe('Internal interrupt flag (perception subsystem)'),
         observerId: z.string().optional(),
         targetRef: z.any().optional(),
         hazardId: z.string().optional(),

@@ -52,6 +52,127 @@ export interface EncounterPreset {
 // ═══════════════════════════════════════════════════════════════════════════
 
 export const ENCOUNTER_PRESETS: Record<string, EncounterPreset> = {
+    // ═══════════ ZONE ENCOUNTERS (Escape from Pripyat patch) ═══════════
+    zone_renegade_ambush: {
+        id: 'zone_renegade_ambush', name: 'Renegade Ambush',
+        description: 'Four renegades rise out of the reeds, already arguing over who shoots first.',
+        difficulty: 'easy', recommendedLevel: { min: 1, max: 2 },
+        participants: [{ template: 'renegade', position: '13,7', count: 4 }],
+        terrain: { difficultTerrain: ['10,6', '11,6', '10,8', '11,8'], cover: ['8,8', '14,9'] },
+        partyPositions: ['4,8'],
+        tags: ['cordon', 'swamps', 'garbage', 'd1', 'human', 'renegade', 'travel'],
+        narrativeHook: 'Even the bandits shoot these men on sight. They break and run at half strength — and they will remember you to no one, because nobody listens to renegades.'
+    },
+    zone_sin_procession: {
+        id: 'zone_sin_procession', name: 'The Procession',
+        description: 'Five figures in ash-grey walking single file through the dark, carrying something wrapped between them. They stop when they see you. They put the bundle down gently.',
+        difficulty: 'hard', recommendedLevel: { min: 2, max: 5 },
+        participants: [{ template: 'sin_cultist', position: '13,8', count: 5 }],
+        terrain: { difficultTerrain: ['11,7', '11,9'], cover: ['9,8'] },
+        partyPositions: ['4,8'],
+        tags: ['dark_valley', 'red_forest', 'agroprom', 'd3', 'd4', 'human', 'sin', 'night', 'horror'],
+        narrativeHook: 'They fight to the last and fear nothing. They do not loot corpses — they collect them. If any escape, Sin now knows a name and a face.'
+    },
+    zone_unisg_recon: {
+        id: 'zone_unisg_recon', name: 'Men Who Are Not Here',
+        description: 'Three operators in unmarked kit moving bounding overwatch. Their suppressed shots sound like polite coughs. Their gear is newer than anything the Zone sells.',
+        difficulty: 'hard', recommendedLevel: { min: 3, max: 6 },
+        participants: [{ template: 'unisg_operator', position: '14,7', count: 3 }],
+        terrain: { obstacles: ['12,8'], cover: ['15,6', '15,9', '9,8', '10,11'] },
+        partyPositions: ['4,8'],
+        tags: ['radar', 'pripyat', 'yantar', 'd4', 'd5', 'human', 'unisg', 'post_scorcher'],
+        narrativeHook: 'Squad discipline, NVG, suppressed everything. Their PDAs are encrypted and their dog tags are blank. Killing them means someone very far away updates a file.'
+    },
+    zone_dog_pack: {
+        id: 'zone_dog_pack', name: 'Blind Dog Pack',
+        description: 'A pack of blind dogs crosses the field, noses down. Then the noses come up.',
+        difficulty: 'easy', recommendedLevel: { min: 1, max: 2 },
+        participants: [{ template: 'blind_dog', position: '14,8', count: 4 }],
+        terrain: { difficultTerrain: ['8,8', '9,8', '8,9'], cover: ['6,10'] },
+        partyPositions: ['4,10'],
+        tags: ['cordon', 'garbage', 'd1', 'd2', 'mutant', 'travel'],
+        narrativeHook: 'The grass goes quiet before they come. Pack breaks at 50% losses.'
+    },
+    zone_toll: {
+        id: 'zone_toll', name: 'Garbage Toll',
+        description: 'Three bandits and a boss working a road chokepoint. The price is whatever you look like you have.',
+        difficulty: 'medium', recommendedLevel: { min: 1, max: 3 },
+        participants: [
+            { template: 'zone_bandit', position: '12,6', count: 2 },
+            { template: 'zone_bandit', position: '12,12' },
+            { template: 'zone_bandit_boss', position: '14,9' }
+        ],
+        terrain: { obstacles: ['13,8', '13,10'], cover: ['10,7', '10,11', '8,9'] },
+        partyPositions: ['4,9'],
+        tags: ['garbage', 'dark_valley', 'd2', 'human', 'bandit', 'travel', 'toll'],
+        narrativeHook: 'They saw you first. Talking is on the table until it is not; the boss executes threats on his own clock.'
+    },
+    zone_flesh_herd: {
+        id: 'zone_flesh_herd', name: 'Flesh Herd',
+        description: 'Fleshes rooting through irradiated soil, a boar among them. Skittish until cornered.',
+        difficulty: 'easy', recommendedLevel: { min: 1, max: 2 },
+        participants: [
+            { template: 'flesh', position: '12,8', count: 3 },
+            { template: 'zone_boar', position: '15,9' }
+        ],
+        terrain: { difficultTerrain: ['11,7', '12,7', '11,9', '13,9'] },
+        partyPositions: ['4,8'],
+        tags: ['cordon', 'agroprom', 'd1', 'd2', 'mutant', 'travel', 'avoidable'],
+        narrativeHook: 'They only fight if pressed — this encounter is a choice. The boar charges first if it comes.'
+    },
+    zone_snork_nest: {
+        id: 'zone_snork_nest', name: 'Snork Nest',
+        description: 'A collapsed interior. Gas-mask hoses hiss in the dark, and something moves on all fours across the ceiling line.',
+        difficulty: 'medium', recommendedLevel: { min: 2, max: 4 },
+        participants: [{ template: 'snork', position: '13,7', count: 3 }],
+        terrain: { obstacles: ['10,6', '10,7', '14,10', '15,10'], difficultTerrain: ['11,8', '12,8', '12,9'], cover: ['9,9'] },
+        partyPositions: ['5,9'],
+        tags: ['agroprom', 'wild_territory', 'yantar', 'd3', 'mutant', 'interior', 'lab'],
+        narrativeHook: 'They leap from elevation at advantage. The dog tags on the corpses are still legible — someone at the Bar pays for names.'
+    },
+    zone_sucker_hunt: {
+        id: 'zone_sucker_hunt', name: 'The Invisible',
+        description: 'Something has been taking men from this stretch. It is still here. You will hear it breathing before you see anything.',
+        difficulty: 'deadly', recommendedLevel: { min: 3, max: 5 },
+        participants: [{ template: 'bloodsucker', position: '15,9' }],
+        terrain: { obstacles: ['12,7', '12,11'], cover: ['9,8', '9,10'] },
+        partyPositions: ['4,9'],
+        tags: ['wild_territory', 'red_forest', 'army_warehouses', 'd3', 'd4', 'mutant', 'apex', 'night'],
+        narrativeHook: 'Cloaked until it strikes; first hit at advantage. It tries to grapple and drag. It has a larder. Fighting it fair at level 1 is a death sentence — the encounter does not care.'
+    },
+    zone_merc_team: {
+        id: 'zone_merc_team', name: 'Contract Work',
+        description: 'A merc pair working overwatch and approach. Professional, patient, and already in position.',
+        difficulty: 'hard', recommendedLevel: { min: 2, max: 4 },
+        participants: [
+            { template: 'zone_merc', position: '16,6' },
+            { template: 'zone_merc', position: '12,11' }
+        ],
+        terrain: { obstacles: ['14,8'], cover: ['13,6', '9,9', '10,12'] },
+        partyPositions: ['4,9'],
+        tags: ['wild_territory', 'yantar', 'd3', 'human', 'merc'],
+        narrativeHook: 'One always overwatches. The contract does not name you — it describes you. Killing them raises the question of who paid.'
+    },
+    zone_zombie_shuffle: {
+        id: 'zone_zombie_shuffle', name: 'The Old Patrol',
+        description: 'Four dead men in rotting fatigues walk their old route. One of them keys a dead radio and speaks into it, flat and endless.',
+        difficulty: 'medium', recommendedLevel: { min: 2, max: 4 },
+        participants: [{ template: 'zombified_stalker', position: '13,8', count: 4 }],
+        terrain: { difficultTerrain: ['10,7', '11,7', '10,9', '11,9'], cover: ['8,8'] },
+        partyPositions: ['4,8'],
+        tags: ['yantar', 'radar', 'd3', 'd4', 'zombified', 'psi', 'horror'],
+        narrativeHook: 'Slow, relentless, only the head stops them. Their PDAs hold names, routes, and last messages — the real loot is paper.'
+    },
+    zone_monolith_patrol: {
+        id: 'zone_monolith_patrol', name: 'The Faithful',
+        description: 'Three Monolith fighters holding a line that protects nothing anyone else can see. They open fire the moment identification is certain.',
+        difficulty: 'deadly', recommendedLevel: { min: 4, max: 6 },
+        participants: [{ template: 'monolith_fighter', position: '14,7', count: 3 }],
+        terrain: { obstacles: ['12,8', '12,9'], cover: ['15,6', '15,10', '9,9'] },
+        partyPositions: ['4,8'],
+        tags: ['radar', 'pripyat', 'red_forest', 'd5', 'd6', 'human', 'monolith'],
+        narrativeHook: 'No morale checks — they never break, never retreat, never negotiate. Psi-immune. They fight from cover and they are not afraid of you.'
+    },
     goblin_ambush: {
         id: 'goblin_ambush',
         name: 'Goblin Ambush',

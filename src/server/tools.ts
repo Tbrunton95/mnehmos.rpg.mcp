@@ -223,6 +223,35 @@ export async function handleGenerateWorld(args: unknown, ctx: SessionContext) {
 }
 
 // Helper to get world from memory or restore from DB
+
+// ── Region persistence (patch: activate strategy-layer territorial claims) ──
+// Worlds regenerate deterministically from seed, but the strategy layer's
+// claim_region FK-requires real rows in `regions`. Persist idempotently.
+export function persistWorldRegions(db: import('better-sqlite3').Database, worldId: string, world: { regions: Array<{ id: number; name: string; capitalX?: number; capitalY?: number; dominantBiome?: string }> }) {
+    try {
+        const now = new Date().toISOString();
+        const stmt = db.prepare(`
+            INSERT OR IGNORE INTO regions (id, world_id, name, type, center_x, center_y, color, owner_nation_id, control_level, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?)
+        `);
+        for (const r of world.regions) {
+            stmt.run(
+                `${worldId}:${r.id}`,
+                worldId,
+                r.name ?? `Region ${r.id + 1}`,
+                'wilderness',
+                (r as any).capitalX ?? 0,
+                (r as any).capitalY ?? 0,
+                '#888888',
+                now,
+                now
+            );
+        }
+    } catch (e) {
+        console.error('[Regions] persist failed:', (e as Error).message);
+    }
+}
+
 async function getOrRestoreWorld(worldId: string, sessionId: string) {
     const manager = getWorldManager();
     const sessionKey = `${sessionId}:${worldId}`;
@@ -249,6 +278,7 @@ async function getOrRestoreWorld(worldId: string, sessionId: string) {
         width: storedWorld.width,
         height: storedWorld.height
     });
+    persistWorldRegions(db, worldId, world as any);
 
     const genTime = Date.now() - startTime;
     console.error(`[WorldGen] World restored in ${genTime}ms`);

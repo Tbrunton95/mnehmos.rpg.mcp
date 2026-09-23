@@ -1,0 +1,57 @@
+diff --git a/src/server/consolidated/travel-manage.ts b/src/server/consolidated/travel-manage.ts
+index 1faff29..0789ef8 100644
+--- a/src/server/consolidated/travel-manage.ts
++++ b/src/server/consolidated/travel-manage.ts
+@@ -193,12 +193,12 @@ async function handleTravel(input: TravelManageInput, _ctx: SessionContext): Pro
+ 
+     // Update POI discovery state
+     if (poi.discoveryState === 'unknown') {
+-        db.prepare('UPDATE pois SET discoveryState = ?, updated_at = ? WHERE id = ?')
++        db.prepare('UPDATE pois SET discoveryState = ?, updatedAt = ? WHERE id = ?')
+             .run('discovered', new Date().toISOString(), input.poiId);
+     }
+ 
+     // Update party position
+-    db.prepare('UPDATE parties SET currentLocation = ?, updated_at = ? WHERE id = ?')
++    db.prepare('UPDATE parties SET current_location = ?, updated_at = ? WHERE id = ?')
+         .run(poi.name, new Date().toISOString(), input.partyId);
+ 
+     // Enter location if requested
+diff --git a/src/storage/migrations.ts b/src/storage/migrations.ts
+index df035eb..06de518 100644
+--- a/src/storage/migrations.ts
++++ b/src/storage/migrations.ts
+@@ -1102,4 +1102,33 @@ function createPostMigrationIndexes(db: Database.Database) {
+   } catch (e) {
+     console.error('[Migration] Note: Could not create idx_regions_owner_nation:', (e as Error).message);
+   }
++
++  // POI + rooms tables for travel_manage / spawn_preset_location / spawn_location
++  // (camelCase columns to match the raw SQL in those handlers)
++  db.exec(`
++    CREATE TABLE IF NOT EXISTS pois(
++      id TEXT PRIMARY KEY,
++      worldId TEXT,
++      name TEXT NOT NULL,
++      type TEXT,
++      x INTEGER,
++      y INTEGER,
++      discoveryState TEXT NOT NULL DEFAULT 'discovered',
++      discoveryDc INTEGER,
++      networkId TEXT,
++      createdAt TEXT,
++      updatedAt TEXT
++    );
++    CREATE TABLE IF NOT EXISTS rooms(
++      id TEXT PRIMARY KEY,
++      networkId TEXT,
++      name TEXT NOT NULL,
++      description TEXT,
++      exits TEXT DEFAULT '[]',
++      createdAt TEXT,
++      updatedAt TEXT
++    );
++    CREATE INDEX IF NOT EXISTS idx_pois_world ON pois(worldId);
++    CREATE INDEX IF NOT EXISTS idx_rooms_network ON rooms(networkId);
++  `);
+ }

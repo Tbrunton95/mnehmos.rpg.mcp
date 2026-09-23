@@ -19,7 +19,7 @@ const ACTIONS = [
     'create', 'get', 'get_by_character',
     'list_in_encounter', 'list_nearby', 'get_inventory',
     'loot', 'harvest', 'generate_loot',
-    'advance_decay', 'cleanup',
+    'advance_decay', 'cleanup', 'delete',
     'loot_table_create', 'loot_table_get', 'loot_table_list'
 ] as const;
 type CorpseAction = typeof ACTIONS[number];
@@ -42,6 +42,13 @@ function getRepo(): CorpseRepository {
 // ACTION SCHEMAS
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Guard: clients sometimes pass structured params as JSON strings; parse
+// them instead of letting a string reach array/object logic (a hang, before).
+const jsonIfString = (v: unknown): unknown => {
+    if (typeof v !== 'string') return v;
+    try { return JSON.parse(v); } catch { return v; }
+};
+
 const CreateSchema = z.object({
     action: z.literal('create'),
     characterId: z.string().optional().describe('ID of the dead character (optional for ephemeral enemies)'),
@@ -52,7 +59,12 @@ const CreateSchema = z.object({
     worldId: z.string().optional(),
     regionId: z.string().optional(),
     encounterId: z.string().optional(),
-    position: z.object({ x: z.number(), y: z.number() }).optional()
+    position: z.object({ x: z.number(), y: z.number() }).optional(),
+    currency: z.preprocess(jsonIfString, z.object({
+        gold: z.number().int().min(0).optional(),
+        silver: z.number().int().min(0).optional(),
+        copper: z.number().int().min(0).optional()
+    }).optional()).describe('RU on the body at creation (persists to the corpse; looted via loot lootAll)')
 });
 
 const GetSchema = z.object({
@@ -75,7 +87,7 @@ const ListNearbySchema = z.object({
     worldId: z.string().describe('World ID to search in'),
     x: z.number().int().describe('X coordinate'),
     y: z.number().int().describe('Y coordinate'),
-    radius: z.number().int().min(1).max(20).default(3).describe('Search radius')
+    radius: z.number().int().min(1).max(60).default(3).describe('Search radius — FINDINGS #87: cap raised 20→60; 60 covers a 40×40 map corner-to-corner from any point (list_all in one call: x:20 y:20 radius:60)')
 });
 
 const GetInventorySchema = z.object({
@@ -110,7 +122,7 @@ const GenerateLootSchema = z.object({
 
 const AdvanceDecaySchema = z.object({
     action: z.literal('advance_decay'),
-    hoursAdvanced: z.number().int().min(1).describe('Hours of game time to advance')
+    hoursAdvanced: z.number().int().min(0).describe('Hours of game time to advance — 0 is a legal no-op (FINDINGS #98: cold boots have zero elapsed time and the boot sequence still runs this step)')
 });
 
 const CleanupSchema = z.object({
@@ -132,23 +144,23 @@ const LootTableEntrySchema = z.object({
 const LootTableCreateSchema = z.object({
     action: z.literal('loot_table_create'),
     name: z.string().describe('Name of the loot table'),
-    creatureTypes: z.array(z.string()).describe('Creature types this table applies to'),
-    crRange: z.object({
+    creatureTypes: z.preprocess(jsonIfString, z.array(z.string())).describe('Creature types this table applies to'),
+    crRange: z.preprocess(jsonIfString, z.object({
         min: z.number().min(0).default(0),
         max: z.number().min(0).default(30)
-    }).optional().describe('CR range for this table'),
-    guaranteedDrops: z.array(LootTableEntrySchema).default([]).describe('Items that always drop'),
-    randomDrops: z.array(LootTableEntrySchema).default([]).describe('Items with chance to drop'),
-    currencyRange: z.object({
+    }).optional()).describe('CR range for this table'),
+    guaranteedDrops: z.preprocess(jsonIfString, z.array(LootTableEntrySchema).default([])).describe('Items that always drop'),
+    randomDrops: z.preprocess(jsonIfString, z.array(LootTableEntrySchema).default([])).describe('Items with chance to drop'),
+    currencyRange: z.preprocess(jsonIfString, z.object({
         gold: z.object({ min: z.number(), max: z.number() }),
         silver: z.object({ min: z.number(), max: z.number() }).optional(),
         copper: z.object({ min: z.number(), max: z.number() }).optional()
-    }).optional().describe('Currency drop ranges'),
-    harvestableResources: z.array(z.object({
+    }).optional()).describe('Currency drop ranges'),
+    harvestableResources: z.preprocess(jsonIfString, z.array(z.object({
         resourceType: z.string(),
         quantity: z.object({ min: z.number(), max: z.number() }),
         dcRequired: z.number().int().optional()
-    })).optional().describe('Harvestable resources')
+    })).optional()).describe('Harvestable resources')
 });
 
 const LootTableGetSchema = z.object({
@@ -186,7 +198,8 @@ const definitions: Record<CorpseAction, ActionDefinition> = {
                     worldId: params.worldId,
                     regionId: params.regionId,
                     encounterId: params.encounterId,
-                    position: params.position
+                    position: params.position,
+                    currency: params.currency
                 }
             );
             return {
@@ -309,13 +322,16 @@ const definitions: Record<CorpseAction, ActionDefinition> = {
             const repo = getRepo();
 
             if (params.lootAll) {
-                const looted = repo.lootAll(params.corpseId, params.characterId);
+                const looted = repo.lootAll(params.corpseId, params.characterId, true);
+                const cur = repo.lootCurrency(params.corpseId, params.characterId, true);
                 return {
                     success: true,
                     lootedBy: params.characterId,
                     corpseId: params.corpseId,
                     itemsLooted: looted,
                     totalItems: looted.length,
+                    currency: cur.success ? cur.currency : { gold: 0, silver: 0, copper: 0 },
+                    currencyTransferred: cur.success,
                     lootAll: true
                 };
             }
@@ -324,7 +340,7 @@ const definitions: Record<CorpseAction, ActionDefinition> = {
                 throw new Error('Must specify itemId or set lootAll: true');
             }
 
-            const result = repo.lootItem(params.corpseId, params.itemId, params.characterId, params.quantity);
+            const result = repo.lootItem(params.corpseId, params.itemId, params.characterId, params.quantity, true);
             return {
                 success: result.success,
                 lootedBy: params.characterId,
@@ -419,6 +435,39 @@ const definitions: Record<CorpseAction, ActionDefinition> = {
             };
         },
         aliases: ['clean', 'remove_gone', 'purge']
+    },
+
+    // FINDINGS #85: targeted corpse delete — cleanup's predicate is state='gone'
+    // only, so an orphan corpse attached to a LIVING character (the Taras case)
+    // had no removal path short of a global decay sweep that would eat placed
+    // set pieces. This deletes ONE corpse by id, any state, inventory rows
+    // included, counts from the store. It does NOT loot: deleting an unlooted
+    // orphan must not duplicate a living man's kit.
+    delete: {
+        schema: z.object({
+            action: z.literal('delete'),
+            corpseId: z.string().describe('The corpse to hard-delete, any decay state')
+        }),
+        handler: async (params: { action: 'delete'; corpseId: string }) => {
+            const repo = getRepo();
+            const existing = repo.findById(params.corpseId);
+            if (!existing) {
+                throw new Error(`No corpse with id ${params.corpseId} — nothing deleted. corpse_manage get_by_character or list_nearby to find the right id.`);
+            }
+            const result = repo.deleteById(params.corpseId);
+            return {
+                success: true,
+                actionType: 'delete',
+                corpseId: params.corpseId,
+                characterName: existing.characterName,
+                state: existing.state,
+                wasLooted: existing.looted,
+                corpseRemoved: result.corpseRemoved === 1,
+                inventoryRowsRemoved: result.inventoryRowsRemoved,
+                message: `Hard-deleted corpse of ${existing.characterName} (${existing.state}${existing.looted ? ', looted' : ', unlooted'}) — ${result.inventoryRowsRemoved} inventory row(s) went with it. Items were NOT transferred anywhere.`
+            };
+        },
+        aliases: ['destroy', 'hard_delete', 'delete_corpse']
     },
 
     loot_table_create: {
@@ -554,6 +603,7 @@ Aliases: spawn→create, take→loot, skin→harvest`,
         crRange: z.object({ min: z.number().optional(), max: z.number().optional() }).optional(),
         guaranteedDrops: z.array(z.any()).optional().describe('Items that always drop'),
         randomDrops: z.array(z.any()).optional().describe('Items with chance to drop'),
+        currency: z.record(z.number()).optional().describe('Currency on the corpse at create (e.g. {gold: 150}) — FINDINGS #33: was missing from the outer; direct create silently dropped it'),
         currencyRange: z.record(z.any()).optional().describe('Currency ranges'),
         harvestableResources: z.array(z.any()).optional().describe('Harvestable resources')
     })
@@ -648,6 +698,9 @@ export async function handleCorpseManage(args: unknown, _ctx: SessionContext): P
                 output += `  • ${item.itemId} (x${item.quantity})\n`;
             });
         }
+        if (parsed.currency && parsed.currency.gold > 0) {
+            output += `\n**RU:** ${parsed.currency.gold}${parsed.currencyTransferred ? ' (transferred)' : ''}\n`;
+        }
         output += RichFormatter.success('Items looted successfully');
     } else if (parsed.harvestedBy) {
         output = RichFormatter.header('Harvest Result', '🌿');
@@ -674,6 +727,14 @@ export async function handleCorpseManage(args: unknown, _ctx: SessionContext): P
                 output += `  • ${c.corpseId}: ${c.from} → ${c.to}\n`;
             });
         }
+    } else if (parsed.actionType === 'delete') {
+        output = RichFormatter.header('Corpse Deleted', '🪦');
+        output += RichFormatter.keyValue({
+            'Corpse': parsed.corpseId,
+            'Was': `${parsed.characterName} (${parsed.state}${parsed.wasLooted ? ', looted' : ', unlooted'})`,
+            'Inventory rows removed': parsed.inventoryRowsRemoved
+        });
+        output += RichFormatter.success(parsed.message);
     } else if (parsed.corpsesRemoved !== undefined) {
         output = RichFormatter.header('Cleanup Complete', '🧹');
         output += RichFormatter.keyValue({ 'Corpses Removed': parsed.corpsesRemoved });
@@ -686,8 +747,8 @@ export async function handleCorpseManage(args: unknown, _ctx: SessionContext): P
         });
         if (parsed.loot.items?.length > 0) {
             output += '\n**Items:**\n';
-            parsed.loot.items.forEach((item: { itemId: string; quantity: number }) => {
-                output += `  • ${item.itemId} (x${item.quantity})\n`;
+            parsed.loot.items.forEach((item: { name?: string; itemId?: string; quantity: number }) => {
+                output += `  • ${item.name ?? item.itemId} (x${item.quantity})\n`;
             });
         }
         if (parsed.loot.currency) {

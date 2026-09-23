@@ -8,6 +8,7 @@ import { randomUUID } from 'crypto';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { ItemRepository } from '../../storage/repos/item.repo.js';
 import { getDb } from '../../storage/index.js';
+import { journalSnapshot } from '../utils/write-journal.js';
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 
@@ -30,7 +31,7 @@ function ensureDb() {
             : 'rpg.db';
     const db = getDb(dbPath);
     const itemRepo = new ItemRepository(db);
-    return { itemRepo };
+    return { db, itemRepo };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -68,17 +69,27 @@ const SearchSchema = z.object({
 const UpdateSchema = z.object({
     action: z.literal('update'),
     itemId: z.string().describe('The ID of the item to update'),
+    // FINDINGS #87: destructive-write guard — a junk property landed on the
+    // wrong id this session (the 15m line took the headlamp's patch) because
+    // nothing checked the id was the thing the caller thought it was.
+    expectName: z.string().optional().describe('Guard: if the row\'s name does not match this (case-insensitive), REFUSE and name what is actually there. Cheap insurance against wrong-id writes'),
+    preview: z.boolean().optional().describe('If true: return the would-be change (current vs proposed) and write NOTHING'),
     name: z.string().optional(),
     description: z.string().optional(),
     type: z.enum(['weapon', 'armor', 'consumable', 'quest', 'misc', 'scroll']).optional(),
     weight: z.number().min(0).optional(),
     value: z.number().min(0).optional(),
-    properties: z.record(z.any()).optional()
+    properties: z.record(z.any()).optional(),
+    // #67: item_manage update replaces properties WHOLESALE — every armour
+    // edit forced re-typing the full property set or losing keys silently.
+    // mergeProperties folds the passed keys into the stored set instead.
+    mergeProperties: z.boolean().optional().describe('If true, passed properties MERGE into stored properties (shallow) instead of replacing them wholesale. Pass a key with value null to delete it.')
 });
 
 const DeleteSchema = z.object({
     action: z.literal('delete'),
-    itemId: z.string().describe('The ID of the item to delete')
+    itemId: z.string().describe('The ID of the item to delete'),
+    expectName: z.string().optional().describe('FINDINGS #87 guard: refuse unless the row\'s name matches (case-insensitive)')
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -180,9 +191,49 @@ const definitions: Record<ItemAction, ActionDefinition> = {
     update: {
         schema: UpdateSchema,
         handler: async (params: z.infer<typeof UpdateSchema>) => {
-            const { itemRepo } = ensureDb();
+            const { db, itemRepo } = ensureDb();
 
-            const { itemId, action, ...updates } = params;
+            const { itemId, action, mergeProperties, expectName, preview, ...updates } = params;
+
+            // FINDINGS #87: guard BEFORE any write path runs.
+            const target = itemRepo.findById(itemId);
+            if (!target) throw new Error(`Item not found: ${itemId}`);
+            if (expectName !== undefined && target.name.toLowerCase() !== expectName.toLowerCase()) {
+                throw new Error(`GUARD REFUSAL: item ${itemId} is "${target.name}", not "${expectName}" — NOTHING was written. Check the id (item_manage search by name).`);
+            }
+
+            // #67: shallow merge lane — stored properties survive; passed keys
+            // overwrite; explicit null deletes a key. Silent wholesale loss dies.
+            let mergedFrom: string[] | undefined;
+            if (mergeProperties && updates.properties) {
+                const base = { ...((target.properties as Record<string, unknown>) ?? {}) };
+                mergedFrom = Object.keys(base);
+                for (const [k, v] of Object.entries(updates.properties)) {
+                    if (v === null) delete base[k];
+                    else base[k] = v;
+                }
+                updates.properties = base;
+            }
+
+            // FINDINGS #87: preview lane — the diff, no write.
+            if (preview) {
+                const proposed: Record<string, { from: unknown; to: unknown }> = {};
+                for (const [k, v] of Object.entries(updates)) {
+                    if (v !== undefined) proposed[k] = { from: (target as Record<string, unknown>)[k], to: v };
+                }
+                return {
+                    success: true,
+                    preview: true,
+                    itemId,
+                    itemName: target.name,
+                    wouldChange: proposed,
+                    message: `PREVIEW ONLY — nothing written. ${Object.keys(proposed).length} field(s) would change on "${target.name}".`
+                };
+            }
+
+            // FINDINGS #88: journal the prior row — every update is revertable.
+            const journalId = journalSnapshot(db, 'items', itemId, 'update', 'item_manage update');
+
             const item = itemRepo.update(itemId, updates);
 
             if (!item) {
@@ -192,7 +243,9 @@ const definitions: Record<ItemAction, ActionDefinition> = {
             return {
                 success: true,
                 item,
-                message: `Item "${item.name}" updated`
+                journalId,
+                ...(mergedFrom && { propertyMerge: { preservedKeys: mergedFrom, mode: 'shallow-merge' } }),
+                message: `Item "${item.name}" updated${mergedFrom ? ' (properties merged, not replaced)' : ''} — revertable: session_manage revert {writeId:${journalId}}`
             };
         },
         aliases: ['modify', 'edit', 'patch']
@@ -201,19 +254,27 @@ const definitions: Record<ItemAction, ActionDefinition> = {
     delete: {
         schema: DeleteSchema,
         handler: async (params: z.infer<typeof DeleteSchema>) => {
-            const { itemRepo } = ensureDb();
+            const { db, itemRepo } = ensureDb();
 
             const existing = itemRepo.findById(params.itemId);
             if (!existing) {
                 throw new Error(`Item not found: ${params.itemId}`);
             }
+            // FINDINGS #87: destructive-write guard on the hardest write of all.
+            if (params.expectName !== undefined && existing.name.toLowerCase() !== params.expectName.toLowerCase()) {
+                throw new Error(`GUARD REFUSAL: item ${params.itemId} is "${existing.name}", not "${params.expectName}" — NOTHING was deleted.`);
+            }
+
+            // FINDINGS #88: journal before delete — the row can come back whole.
+            const journalId = journalSnapshot(db, 'items', params.itemId, 'delete', 'item_manage delete');
 
             itemRepo.delete(params.itemId);
 
             return {
                 success: true,
                 deletedItem: existing,
-                message: `Item "${existing.name}" deleted`
+                journalId,
+                message: `Item "${existing.name}" deleted — revertable: session_manage revert {writeId:${journalId}}`
             };
         },
         aliases: ['remove', 'destroy']
@@ -262,6 +323,10 @@ Aliases: new→create, fetch→get, query→search`,
         weight: z.number().optional().describe('Item weight in lbs'),
         value: z.number().optional().describe('Item value in gp'),
         properties: z.record(z.any()).optional().describe('Additional properties'),
+        mergeProperties: z.boolean().optional().describe('update: MERGE passed properties into stored set (shallow) instead of wholesale replace; null value deletes a key'),
+        // FINDINGS #87 (mirror law): the destructive-write guard params
+        expectName: z.string().optional().describe('update/delete guard: refuse unless the row\'s name matches (case-insensitive) — names what IS there on refusal'),
+        preview: z.boolean().optional().describe('update: return the field-by-field diff, write NOTHING'),
         minValue: z.number().optional().describe('Minimum value for search'),
         maxValue: z.number().optional().describe('Maximum value for search')
     })

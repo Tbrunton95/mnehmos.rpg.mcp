@@ -63,7 +63,7 @@ const CreateSchema = z.object({
     worldId: z.string().describe('The world this secret belongs to'),
     type: z.enum(['npc', 'location', 'item', 'quest', 'plot', 'mechanic', 'custom'])
         .describe('Category of entity this secret relates to'),
-    category: z.string().describe('Subcategory like "motivation", "trap", "puzzle", "weakness"'),
+    category: z.string().optional().default('general').describe('Subcategory like "motivation", "trap", "puzzle", "weakness" — #96: optional with default; a required-but-undocumented field cost four secrets inside a batch'),
     name: z.string().describe('Short name for the secret'),
     publicDescription: z.string().describe('What the player knows publicly'),
     secretDescription: z.string().describe('The hidden truth only the DM knows'),
@@ -96,7 +96,9 @@ const UpdateSchema = z.object({
     sensitivity: z.enum(['low', 'medium', 'high', 'critical']).optional(),
     leakPatterns: z.array(z.string()).optional(),
     revealConditions: z.array(RevealConditionSchema).optional(),
-    notes: z.string().optional()
+    notes: z.string().optional(),
+    status: z.enum(['active', 'parked', 'spent']).optional().describe('FINDINGS #34 T2.8: parked secrets keep their revealConditions but never fire; spent = resolved history'),
+    revealed: z.boolean().optional().describe('FINDINGS #47: explicit reveal-state control — false un-reveals (clears revealedAt/revealedBy); supplying new revealConditions without this flag auto-clears it anyway (re-arm implies alive)')
 });
 
 const DeleteSchema = z.object({
@@ -114,7 +116,8 @@ const RevealSchema = z.object({
 const CheckConditionsSchema = z.object({
     action: z.literal('check_conditions'),
     worldId: z.string(),
-    event: GameEventSchema
+    event: GameEventSchema,
+    showClocks: z.boolean().optional().describe('FINDINGS #111: opt IN to countdown numbers (hoursAccumulated/hoursRequired). Default prints armed clocks by NAME ONLY — the GM voice must not know when the emission fires (00 law: never foreshadow)')
 });
 
 const GetContextSchema = z.object({
@@ -141,6 +144,8 @@ async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<object>
         ...data,
         id: randomUUID(),
         revealed: false,
+        status: 'active' as const,
+        hoursAccumulated: 0,
         createdAt: now,
         updatedAt: now
     };
@@ -288,16 +293,39 @@ async function handleCheckConditions(args: z.infer<typeof CheckConditionsSchema>
 
     const secretsToReveal = secretRepo.checkRevealConditions(args.worldId, args.event);
 
+    // Findings #45: expose the running clocks so a silent clock is impossible —
+    // every time_passed check answers with where each armed timer stands.
+    // FINDINGS #111: — but NOT with the numbers by default. #45 proved the clock
+    // is armed; the countdown law says the GM voice may never know the hour.
+    // Names only unless showClocks:true (audits, dev seats).
+    let clocks: Array<{ secretId: string; name: string; hoursAccumulated?: number; hoursRequired?: number; armed?: true }> | undefined;
+    if (args.event.type === 'time_passed') {
+        clocks = secretRepo.getActiveSecrets(args.worldId)
+            .filter(s => ((s as { status?: string }).status ?? 'active') === 'active')
+            .flatMap(s => s.revealConditions
+                .filter(cn => cn.type === 'time_passed' && (cn.hoursRequired || 0) > 0)
+                .map(cn => args.showClocks
+                    ? {
+                        secretId: s.id,
+                        name: s.name,
+                        hoursAccumulated: (s as unknown as { hoursAccumulated?: number }).hoursAccumulated ?? 0,
+                        hoursRequired: cn.hoursRequired || 0
+                    }
+                    : { secretId: s.id, name: s.name, armed: true as const }));
+    }
+
     if (secretsToReveal.length === 0) {
         return {
             message: 'No secrets triggered by this event',
-            event: args.event
+            event: args.event,
+            clocks
         };
     }
 
     return {
         message: `${secretsToReveal.length} secret(s) can be revealed`,
         event: args.event,
+        clocks,
         secretsToReveal: secretsToReveal.map(s => ({
             id: s.id,
             name: s.name,
@@ -499,10 +527,13 @@ Aliases: new→create, reveal→disclose, check→check_conditions`,
         linkedEntityId: z.string().optional(),
         linkedEntityType: z.string().optional(),
         sensitivity: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+        status: z.enum(['active', 'parked', 'spent']).optional().describe('Secret lifecycle (update/list)'),
+        revealed: z.boolean().optional().describe('Explicit reveal-state control (update) — Findings #47'),
         leakPatterns: z.array(z.string()).optional(),
         revealConditions: z.array(RevealConditionSchema).optional(),
         notes: z.string().optional(),
         includeRevealed: z.boolean().optional(),
+        showClocks: z.boolean().optional().describe('FINDINGS #111 (mirror): check_conditions — opt in to countdown numbers; default is armed-by-name only'),
         triggeredBy: z.string().optional(),
         partial: z.boolean().optional(),
         event: GameEventSchema.optional(),

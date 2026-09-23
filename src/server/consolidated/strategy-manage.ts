@@ -23,7 +23,7 @@ import { randomUUID } from 'crypto';
 // ═══════════════════════════════════════════════════════════════════════════
 
 const ACTIONS = [
-    'create_nation', 'get_state', 'propose_alliance', 'claim_region', 'resolve_turn', 'list_nations'
+    'create_nation', 'get_state', 'propose_alliance', 'claim_region', 'resolve_turn', 'list_nations', 'update_nation'
 ] as const;
 type StrategyAction = typeof ACTIONS[number];
 
@@ -98,8 +98,7 @@ const ListNationsSchema = z.object({
 // ACTION HANDLERS
 // ═══════════════════════════════════════════════════════════════════════════
 
-async function handleCreateNation(args: z.infer<typeof CreateNationSchema>): Promise<object> {
-    const { nationRepo } = getRepos();
+async function handleCreateNation(args: z.infer<typeof CreateNationSchema>): Promise<object> {    const { nationRepo } = getRepos();
     const nationManager = new NationManager(nationRepo);
 
     const { startingResources, action: _action, ...params } = args;
@@ -125,6 +124,48 @@ async function handleCreateNation(args: z.infer<typeof CreateNationSchema>): Pro
             paranoia: nation.paranoia
         },
         resources: nation.resources
+    };
+}
+
+// FINDINGS #97: nations are RENAMEABLE — the seeded-name-vs-canon-name gap
+// (Vandrene Tide → Nilfgaard) had no verb; delete didn't exist either and a
+// dead nation blocks turn resolution (all-ready gate). Direct SQL against the
+// nations DDL (columns verified in nation.repo.ts). expectName guards the row.
+const UpdateNationSchema = z.object({
+    action: z.literal('update_nation'),
+    nationId: z.string().describe('Nation id from create_nation / list_nations'),
+    expectName: z.string().optional().describe('Guard: refuse unless the row name matches (case-insensitive)'),
+    name: z.string().min(1).optional(),
+    leader: z.string().min(1).optional(),
+    ideology: z.enum(['democracy', 'autocracy', 'theocracy', 'tribal']).optional(),
+    aggression: z.number().min(0).max(100).optional(),
+    trust: z.number().min(0).max(100).optional(),
+    paranoia: z.number().min(0).max(100).optional()
+});
+
+async function handleUpdateNation(args: z.infer<typeof UpdateNationSchema>): Promise<object> {
+    const { db } = getRepos();
+    const row = db.prepare('SELECT id, name, leader, ideology FROM nations WHERE id = ?').get(args.nationId) as { id: string; name: string; leader: string; ideology: string } | undefined;
+    if (!row) return { error: true, actionType: 'update_nation', message: `Nation ${args.nationId} not found — nothing updated` };
+    if (args.expectName && row.name.toLowerCase() !== args.expectName.toLowerCase()) {
+        return { error: true, actionType: 'update_nation', message: `Guard refused: row is "${row.name}", not "${args.expectName}" — nothing updated` };
+    }
+    const sets: string[] = []; const params: unknown[] = [];
+    if (args.name !== undefined) { sets.push('name = ?'); params.push(args.name); }
+    if (args.leader !== undefined) { sets.push('leader = ?'); params.push(args.leader); }
+    if (args.ideology !== undefined) { sets.push('ideology = ?'); params.push(args.ideology); }
+    if (args.aggression !== undefined) { sets.push('aggression = ?'); params.push(args.aggression); }
+    if (args.trust !== undefined) { sets.push('trust = ?'); params.push(args.trust); }
+    if (args.paranoia !== undefined) { sets.push('paranoia = ?'); params.push(args.paranoia); }
+    if (!sets.length) return { error: true, actionType: 'update_nation', message: 'No updates provided' };
+    sets.push('updated_at = ?'); params.push(new Date().toISOString()); params.push(args.nationId);
+    db.prepare(`UPDATE nations SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+    const after = db.prepare('SELECT name, leader, ideology, aggression, trust, paranoia FROM nations WHERE id = ?').get(args.nationId) as Record<string, unknown>;
+    return {
+        success: true, actionType: 'update_nation', nationId: args.nationId,
+        was: { name: row.name, leader: row.leader, ideology: row.ideology },
+        now: after,
+        message: `Nation updated: ${row.name}${args.name && args.name !== row.name ? ` → ${args.name}` : ''}`
     };
 }
 
@@ -337,6 +378,12 @@ const definitions: Record<StrategyAction, ActionDefinition> = {
         handler: async (args) => handleListNations(args as z.infer<typeof ListNationsSchema>),
         aliases: ['nations', 'all_nations', 'get_nations'],
         description: 'List all nations in a world'
+    },
+    update_nation: {
+        schema: UpdateNationSchema,
+        handler: async (args) => handleUpdateNation(args as z.infer<typeof UpdateNationSchema>),
+        aliases: ['rename_nation', 'edit_nation'],
+        description: 'FINDINGS #97: update a nation in place — name, leader, ideology, traits. expectName guards the row; was/now reported'
     }
 };
 

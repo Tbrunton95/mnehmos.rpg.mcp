@@ -21,7 +21,7 @@ import { ItemRepository } from '../../storage/repos/item.repo.js';
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'list', 'assign', 'update_objective', 'complete_objective', 'complete', 'get_log'] as const;
+const ACTIONS = ['create', 'get', 'list', 'assign', 'update_objective', 'complete_objective', 'complete', 'fail', 'abandon', 'add_objective', 'get_log'] as const;
 type QuestManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -62,11 +62,25 @@ const CreateSchema = z.object({
         current: z.number().int().default(0),
         completed: z.boolean().default(false)
     })).min(1).describe('Quest objectives'),
-    rewards: z.object({
+    rewards: z.preprocess((v) => {
+        // FINDINGS #80: aliases in, STRICT after — 'xp' passed here was silently
+        // dropped by the bare object (family appearance nine: quest XP eaten by
+        // a zod strip). The campaign says RU and xp; the schema says gold and
+        // experience. Translate the aliases, then refuse anything unrecognised
+        // LOUDLY instead of stripping it.
+        if (v && typeof v === 'object' && !Array.isArray(v)) {
+            const r = { ...(v as Record<string, unknown>) };
+            if ('xp' in r && !('experience' in r)) { r.experience = r.xp; delete r.xp; }
+            if ('ru' in r && !('gold' in r)) { r.gold = r.ru; delete r.ru; }
+            if ('RU' in r && !('gold' in r)) { r.gold = r.RU; delete r.RU; }
+            return r;
+        }
+        return v;
+    }, z.object({
         experience: z.number().int().min(0).default(0),
         gold: z.number().int().min(0).default(0),
         items: z.array(z.string()).default([])
-    }).default({ experience: 0, gold: 0, items: [] }),
+    }).strict()).default({ experience: 0, gold: 0, items: [] }),
     prerequisites: z.array(z.string()).default([]).describe('Required completed quest IDs'),
     status: z.enum(['available', 'active', 'completed', 'failed']).default('available')
 });
@@ -104,13 +118,101 @@ const CompleteObjectiveSchema = z.object({
 const CompleteSchema = z.object({
     action: z.literal('complete'),
     characterId: z.string().describe('Character ID'),
-    questId: z.string().describe('Quest ID to complete')
+    questId: z.string().describe('Quest ID to complete'),
+    // FINDINGS #80: the GM named the trap — auto-pay doubles RU when the money
+    // already changed hands in fiction. skipRewards names the lanes already
+    // paid; they are reported as 'paid in fiction', not granted again.
+    skipRewards: z.array(z.enum(['experience', 'gold', 'items'])).optional().describe('Reward lanes already settled in fiction — skipped, reported, never double-paid')
 });
 
 const GetLogSchema = z.object({
     action: z.literal('get_log'),
     characterId: z.string().describe('Character ID')
 });
+
+// #67-D: the README ghosts, made real.
+const FailSchema = z.object({
+    action: z.literal('fail'),
+    questId: z.string(),
+    characterId: z.string(),
+    reason: z.string().optional().describe('Why it failed — canon (rival finished it first, timer expired, giver died)')
+});
+const AbandonSchema = z.object({
+    action: z.literal('abandon'),
+    questId: z.string(),
+    characterId: z.string().describe('Quest returns to available — walking away is not failing')
+});
+const AddObjectiveSchema = z.object({
+    action: z.literal('add_objective'),
+    questId: z.string(),
+    objectives: z.array(z.object({
+        id: z.string().optional(),
+        description: z.string(),
+        type: z.enum(['kill', 'collect', 'deliver', 'explore', 'interact', 'custom']),
+        target: z.string().default(''),
+        required: z.number().int().min(1).default(1)
+    })).min(1).describe('Objectives to APPEND to the quest (jobs grow mid-flight)')
+});
+
+// #67-D handlers — fail moves the log entry and marks the quest; abandon
+// releases it (re-acceptable); add_objective appends to a live quest.
+async function handleFail(args: z.infer<typeof FailSchema>): Promise<object> {
+    const { questRepo, characterRepo } = ensureDb();
+    const quest = questRepo.findById(args.questId);
+    if (!quest) return { error: true, message: `Quest ${args.questId} not found` };
+    const character = characterRepo.findById(args.characterId);
+    if (!character) return { error: true, message: `Character ${args.characterId} not found` };
+    const log = questRepo.getLog(args.characterId);
+    if (!log || !log.activeQuests.includes(args.questId))
+        return { error: true, message: `Quest "${quest.name}" is not active for ${character.name}` };
+    log.activeQuests = log.activeQuests.filter(q => q !== args.questId);
+    if (!log.failedQuests.includes(args.questId)) log.failedQuests.push(args.questId);
+    questRepo.updateLog(log);
+    questRepo.update(args.questId, { status: 'failed' } as never);
+    return {
+        success: true, actionType: 'fail', questId: args.questId, questName: quest.name,
+        characterId: args.characterId, reason: args.reason,
+        message: `"${quest.name}" FAILED for ${character.name}${args.reason ? ` — ${args.reason}` : ''}. No rewards. The Zone doesn't wait.`
+    };
+}
+
+async function handleAbandon(args: z.infer<typeof AbandonSchema>): Promise<object> {
+    const { questRepo, characterRepo } = ensureDb();
+    const quest = questRepo.findById(args.questId);
+    if (!quest) return { error: true, message: `Quest ${args.questId} not found` };
+    const character = characterRepo.findById(args.characterId);
+    if (!character) return { error: true, message: `Character ${args.characterId} not found` };
+    const log = questRepo.getLog(args.characterId);
+    if (!log || !log.activeQuests.includes(args.questId))
+        return { error: true, message: `Quest "${quest.name}" is not active for ${character.name}` };
+    log.activeQuests = log.activeQuests.filter(q => q !== args.questId);
+    questRepo.updateLog(log);
+    questRepo.update(args.questId, { status: 'available' } as never);
+    return {
+        success: true, actionType: 'abandon', questId: args.questId, questName: quest.name,
+        characterId: args.characterId,
+        message: `${character.name} walked away from "${quest.name}". It goes back on the board.`
+    };
+}
+
+async function handleAddObjective(args: z.infer<typeof AddObjectiveSchema>): Promise<object> {
+    const { questRepo } = ensureDb();
+    const quest = questRepo.findById(args.questId);
+    if (!quest) return { error: true, message: `Quest ${args.questId} not found` };
+    const added = args.objectives.map((o, idx) => ({
+        id: o.id ?? `obj-${Date.now()}-${idx}`,
+        description: o.description, type: o.type, target: o.target ?? '',
+        required: o.required ?? 1, current: 0, completed: false
+    }));
+    const objectives = [...(quest.objectives ?? []), ...added] as never;
+    const updated = questRepo.update(args.questId, { objectives } as never);
+    if (!updated) return { error: true, message: `Update failed on ${args.questId}` };
+    return {
+        success: true, actionType: 'add_objective', questId: args.questId, questName: quest.name,
+        addedObjectives: added, objectiveCount: (updated.objectives ?? []).length,
+        message: `"${quest.name}" grew: +${added.length} objective${added.length > 1 ? 's' : ''} (${added.map(a => a.description).join('; ')})`
+    };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ACTION HANDLERS
@@ -373,14 +475,15 @@ async function handleComplete(args: z.infer<typeof CompleteSchema>): Promise<obj
     }
 
     // Grant rewards
+    const skip = new Set(args.skipRewards ?? []);
     const rewardsGranted: { xp: number; gold: number; items: string[] } = {
-        xp: quest.rewards.experience || 0,
-        gold: quest.rewards.gold || 0,
+        xp: skip.has('experience') ? 0 : (quest.rewards.experience || 0),
+        gold: skip.has('gold') ? 0 : (quest.rewards.gold || 0),
         items: []
     };
 
     // Grant items
-    for (const itemId of quest.rewards.items) {
+    for (const itemId of (skip.has('items') ? [] : quest.rewards.items)) {
         try {
             inventoryRepo.addItem(args.characterId, itemId, 1);
             const item = itemRepo.findById(itemId);
@@ -398,15 +501,26 @@ async function handleComplete(args: z.infer<typeof CompleteSchema>): Promise<obj
     // Update quest status
     questRepo.update(args.questId, { status: 'completed' });
 
+    // PAY THE MAN: rewards were previously announced and never credited —
+    // items granted, XP and RU returned as prose. Both write paths work now.
+    if (rewardsGranted.gold > 0) {
+        inventoryRepo.addCurrency(args.characterId, { gold: rewardsGranted.gold });
+    }
+    if (rewardsGranted.xp > 0) {
+        const currentXp = (character as { xp?: number }).xp || 0;
+        characterRepo.update(args.characterId, { xp: currentXp + rewardsGranted.xp } as Partial<import('../../schema/character.js').Character>);
+    }
+
     return {
         success: true,
         actionType: 'complete',
         questId: args.questId,
         questName: quest.name,
+        ...(args.skipRewards?.length ? { skippedRewards: args.skipRewards, skippedNote: 'paid in fiction — not re-granted' } : {}),
         characterId: args.characterId,
         characterName: character.name,
         rewards: rewardsGranted,
-        message: `${character.name} completed "${quest.name}"! Rewards: ${rewardsGranted.xp} XP, ${rewardsGranted.gold} gold`
+        message: `${character.name} completed "${quest.name}"! Rewards credited: ${rewardsGranted.xp} XP, ${rewardsGranted.gold} RU`
     };
 }
 
@@ -494,6 +608,24 @@ const definitions: Record<QuestManageAction, ActionDefinition> = {
         aliases: ['finish', 'turn_in'],
         description: 'Complete quest and grant rewards'
     },
+    fail: {
+        schema: FailSchema,
+        handler: handleFail,
+        aliases: ['failed', 'botch'],
+        description: '#67-D: Fail an active quest — log moves to failedQuests, quest marked failed, no rewards. Rivals finish bounties first; timers expire'
+    },
+    abandon: {
+        schema: AbandonSchema,
+        handler: handleAbandon,
+        aliases: ['drop', 'walk_away'],
+        description: '#67-D: Abandon an active quest — removed from the log, quest returns to available (re-acceptable)'
+    },
+    add_objective: {
+        schema: AddObjectiveSchema,
+        handler: handleAddObjective,
+        aliases: ['append_objective', 'grow'],
+        description: '#67-D: Append objectives to an existing quest — jobs grow mid-flight'
+    },
     get_log: {
         schema: GetLogSchema,
         handler: handleGetLog,
@@ -545,9 +677,11 @@ Each objective requires a "type" field. Valid values:
         worldId: z.string().optional().describe('World ID'),
         giver: z.string().optional().describe('Quest giver name'),
         objectives: z.array(z.any()).optional().describe('Quest objectives. Each requires { description, type } where type is one of: kill, collect, deliver, explore, interact, custom'),
-        rewards: z.any().optional().describe('Quest rewards'),
+        skipRewards: z.array(z.string()).optional().describe('FINDINGS #80 (mirror): complete — reward lanes already paid in fiction (experience|gold|items); skipped, never double-paid'),
+        rewards: z.any().optional().describe('Quest rewards — accepts xp/ru aliases; unknown keys refuse loudly (#80)'),
         prerequisites: z.array(z.string()).optional(),
         status: z.string().optional(),
+        reason: z.string().optional().describe('fail: why it failed — canon'),
         progress: z.number().optional().describe('Progress increment')
     })
 };
@@ -644,10 +778,13 @@ export async function handleQuestManage(args: unknown, _ctx: SessionContext): Pr
                 output += '\n**Rewards:**\n';
                 output += RichFormatter.keyValue({
                     'XP': parsed.rewards?.xp || 0,
-                    'Gold': parsed.rewards?.gold || 0
+                    'RU': parsed.rewards?.gold || 0
                 });
                 if (parsed.rewards?.items?.length > 0) {
                     output += '**Items:** ' + parsed.rewards.items.join(', ') + '\n';
+                }
+                if (parsed.skippedRewards?.length > 0) {
+                    output += `\n🤝 Paid in fiction (not re-granted): ${parsed.skippedRewards.join(', ')}\n`;
                 }
                 break;
             case 'get_log':

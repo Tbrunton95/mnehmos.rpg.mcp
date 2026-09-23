@@ -186,7 +186,24 @@ async function main() {
 
   const registry = buildConsolidatedRegistry();
   const toolCount = Object.keys(registry).length;
-  const sessionIdSchema = z.object({ sessionId: z.string().optional() });
+  const sessionIdSchema = z.object({ sessionId: z.string().optional(), output_mode: z.enum(['json', 'banner']).optional() });
+
+  // FINDINGS #88: output_mode:'json' — ONE wrapper, every consolidated tool.
+  // The banner is already rendered FROM the embedded JSON everywhere (the
+  // #20/#61/#66 family closed the render divergence); this strips it for
+  // chairs that want only the data. Banner mode is untouched default.
+  const withOutputMode = (handler: (args: Record<string, unknown>, extra: unknown) => Promise<{ content?: Array<{ type: string; text: string }> }>) =>
+    async (args: Record<string, unknown>, extra: unknown) => {
+      const wantJson = args?.output_mode === 'json' || args?.outputMode === 'json';
+      if (args) { delete args.output_mode; delete args.outputMode; }
+      const res = await handler(args, extra);
+      if (wantJson && res?.content?.[0]?.text) {
+        const text = res.content[0].text;
+        const m = text.match(/<!--\s*([A-Z_]*JSON)\s*\n?([\s\S]*?)\n?\1\s*-->/);
+        if (m) return { ...res, content: [{ type: 'text', text: m[2].trim() }] };
+      }
+      return res;
+    };
   
   for (const [toolName, entry] of Object.entries(registry)) {
     // Handle all Zod schema types (object, omit, pick, etc.)
@@ -207,10 +224,10 @@ async function main() {
       toolName,
       entry.metadata.description,
       extendedSchema.shape || extendedSchema._def?.schema?.shape || {},
-      auditLogger.wrapHandler(
+      withOutputMode(auditLogger.wrapHandler(
         toolName,
         withSession(entry.schema, entry.handler as any)
-      )
+      ) as (args: Record<string, unknown>, extra: unknown) => Promise<{ content?: Array<{ type: string; text: string }> }>) as any
     );
   }
 

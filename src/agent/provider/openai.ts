@@ -25,6 +25,7 @@ export interface OpenAIProviderConfig {
 }
 
 interface OpenAIChatResponse {
+    model?: string;
     choices?: Array<{
         message?: { content?: string | null };
         finish_reason?: string;
@@ -138,7 +139,8 @@ export class OpenAIProvider implements LLMProvider {
             completionTokens: parsed.usage?.completion_tokens,
             raw: rawText,
             durationMs,
-            finishReason: choice?.finish_reason
+            finishReason: choice?.finish_reason,
+            model: parsed.model
         };
     }
 }

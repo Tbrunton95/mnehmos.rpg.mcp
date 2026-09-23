@@ -24,6 +24,7 @@ export type CompetencyLadderEntry = z.infer<typeof CompetencyLadderEntrySchema>;
 
 export interface ResolvedCompetency extends CompetencyLadderEntry {
     source: CompetencySource;
+    overrideError?: string;
 }
 
 const LADDER_PATH = fileURLToPath(new URL('../../../config/competency-ladder.json', import.meta.url));
@@ -71,8 +72,23 @@ export function resolveCompetency(
     const hasOverride = override !== null && override !== undefined
         && (override.model !== undefined || override.reasoningEffort !== undefined);
 
+    // FINDINGS #98 (KEEPER 1.1): STRICT ON WRITE, LENIENT ON READ. A stored
+    // override that violates the model rule used to THROW here — and since
+    // every get/list/invoke/update/delete loads the row through this resolve,
+    // one bad write bricked the agent with no tool-side recovery. Now a bad
+    // override DEGRADES to the INT ladder with overrideError attached; the
+    // write path refuses bad overrides before persisting (validateOverride).
     const model = override?.model ?? entry.model;
-    assertNoProModel(model);
+    try {
+        assertNoProModel(model);
+    } catch (e) {
+        return {
+            ...entry,
+            int,
+            source: 'stat_derived',
+            overrideError: `stored override model "${override?.model}" is invalid (${e instanceof Error ? e.message : String(e)}) — serving the INT-ladder model; clear or fix via agent_manage update {competencyOverride}`
+        };
+    }
 
     return {
         ...entry,
@@ -83,4 +99,19 @@ export function resolveCompetency(
             : entry.reasoningEffort,
         source: hasOverride ? 'override' : 'stat_derived'
     };
+}
+
+// FINDINGS #98: the WRITE-SIDE gate — call BEFORE persisting an override.
+// Returns null when valid, or an honest error naming the actual rule and the
+// ladder's known-good models (the allowlist was previously discoverable only
+// by trial and error, and trial and error is how rows got bricked).
+export function validateOverride(override?: CompetencyOverride | null): string | null {
+    if (!override || override.model === undefined) return null;
+    try {
+        assertNoProModel(override.model);
+        return null;
+    } catch {
+        const known = [...new Set(loadCompetencyLadder().map(e => e.model))].join(', ');
+        return `Model "${override.model}" is refused (rule: no -pro model variants). Known-good ladder models: ${known}. Test any other string on a disposable agent before a live one.`;
+    }
 }

@@ -78,6 +78,7 @@ export class CorpseRepository {
         regionId?: string;
         creatureType?: string;
         cr?: number;
+        currency?: { gold?: number; silver?: number; copper?: number };
     } = {}): Corpse {
         const now = new Date().toISOString();
         const id = uuid();
@@ -107,6 +108,13 @@ export class CorpseRepository {
             now,
             now
         );
+
+        // Currency passed at creation persists to the corpse row (previously
+        // silently dropped — schema stripped it, banner said success).
+        if (options.currency && ((options.currency.gold ?? 0) > 0 || (options.currency.silver ?? 0) > 0 || (options.currency.copper ?? 0) > 0)) {
+            this.db.prepare('UPDATE corpses SET currency = ? WHERE id = ?')
+                .run(JSON.stringify({ gold: options.currency.gold ?? 0, silver: options.currency.silver ?? 0, copper: options.currency.copper ?? 0 }), id);
+        }
 
         return this.findById(id)!;
     }
@@ -286,6 +294,16 @@ export class CorpseRepository {
         if (transferToLooter) {
             this.inventoryRepo.addItem(looterId, itemId, toLoot);
             transferred = true;
+            // FINDINGS #59: a looted gun carries its wear and its glass — the
+            // instance row follows the item off the body. #57 welded trade;
+            // this welds the third lane (loot). Ephemeral corpses without a
+            // characterId have no instances to carry — the guard is honest.
+            try {
+                if (corpse.characterId) {
+                    this.db.prepare('UPDATE item_instances SET owner_character_id = ?, updated_at = ? WHERE owner_character_id = ? AND template_id = ?')
+                        .run(looterId, now, corpse.characterId, itemId);
+                }
+            } catch { /* instances table absent pre-migration — nothing to carry */ }
         }
 
         return { success: true, itemId, quantity: toLoot, transferred };
@@ -357,10 +375,12 @@ export class CorpseRepository {
         itemsAdded: Array<{ name: string; quantity: number }>;
         currency: { gold: number; silver: number; copper: number };
         harvestable: Array<{ resourceType: string; quantity: number }>;
+        persisted: number;
+        unresolved: string[];
     } {
         const corpse = this.findById(corpseId);
         if (!corpse || corpse.lootGenerated) {
-            return { itemsAdded: [], currency: { gold: 0, silver: 0, copper: 0 }, harvestable: [] };
+            return { itemsAdded: [], currency: { gold: 0, silver: 0, copper: 0 }, harvestable: [], persisted: 0, unresolved: [] };
         }
 
         // Find matching loot table
@@ -368,7 +388,7 @@ export class CorpseRepository {
         if (!lootTable) {
             // Mark as generated but empty
             this.markLootGenerated(corpseId);
-            return { itemsAdded: [], currency: { gold: 0, silver: 0, copper: 0 }, harvestable: [] };
+            return { itemsAdded: [], currency: { gold: 0, silver: 0, copper: 0 }, harvestable: [], persisted: 0, unresolved: [] };
         }
 
         const itemsAdded: Array<{ name: string; quantity: number }> = [];
@@ -430,9 +450,25 @@ export class CorpseRepository {
             );
         }
 
+        // PERSIST the rolled manifest (previously computed-and-dropped: the
+        // whole kill->loot->paid loop was decorative). Resolve item names to
+        // template ids and write corpse_inventory rows; aggregate duplicate
+        // names first so the (corpse_id,item_id) insert never collides.
+        const byName = new Map<string, number>();
+        for (const it of itemsAdded) byName.set(it.name, (byName.get(it.name) ?? 0) + it.quantity);
+        const resolveStmt = this.db.prepare('SELECT id FROM items WHERE name = ? LIMIT 1');
+        const invStmt = this.db.prepare('INSERT INTO corpse_inventory (corpse_id, item_id, quantity, looted) VALUES (?, ?, ?, 0)');
+        let persisted = 0;
+        const unresolved: string[] = [];
+        for (const [name, qty] of byName) {
+            const row = resolveStmt.get(name) as { id: string } | undefined;
+            if (row) { invStmt.run(corpseId, row.id, qty); persisted++; }
+            else unresolved.push(name);
+        }
+
         this.markLootGenerated(corpseId, { gold, silver, copper });
 
-        return { itemsAdded, currency: { gold, silver, copper }, harvestable };
+        return { itemsAdded, currency: { gold, silver, copper }, harvestable, persisted, unresolved };
     }
 
     /**
@@ -520,29 +556,36 @@ export class CorpseRepository {
      */
     processDecay(hoursAdvanced: number): { corpseId: string; oldState: CorpseState; newState: CorpseState }[] {
         const changes: { corpseId: string; oldState: CorpseState; newState: CorpseState }[] = [];
+        // FINDINGS #98-B: decay ran on WALL-CLOCK time (now − state_updated_at)
+        // with hoursAdvanced merely added — corpses aged by real days between
+        // sessions regardless of the fiction's clock (observed live: 18 spurious
+        // transitions on a zero-hour call). Decay now runs on FICTION HOURS
+        // ONLY, accumulated per corpse in decay_hours; 0 is a true no-op.
+        try { this.db.exec('ALTER TABLE corpses ADD COLUMN decay_hours REAL DEFAULT 0'); } catch { /* column exists */ }
         const stmt = this.db.prepare(`SELECT * FROM corpses WHERE state != 'gone'`);
-        const corpses = stmt.all() as CorpseRow[];
-
-        const now = new Date();
+        const corpses = stmt.all() as Array<CorpseRow & { decay_hours?: number | null }>;
+        const bump = this.db.prepare('UPDATE corpses SET decay_hours = ? WHERE id = ?');
 
         for (const row of corpses) {
-            const stateUpdated = new Date(row.state_updated_at);
-            const hoursSinceUpdate = Math.floor((now.getTime() - stateUpdated.getTime()) / (1000 * 60 * 60)) + hoursAdvanced;
+            const accum = (typeof row.decay_hours === 'number' ? row.decay_hours : 0) + hoursAdvanced;
 
             let currentState = row.state as CorpseState;
             let newState = currentState;
 
-            if (currentState === 'fresh' && hoursSinceUpdate >= CORPSE_DECAY_RULES.fresh_to_decaying) {
+            if (currentState === 'fresh' && accum >= CORPSE_DECAY_RULES.fresh_to_decaying) {
                 newState = 'decaying';
-            } else if (currentState === 'decaying' && hoursSinceUpdate >= CORPSE_DECAY_RULES.decaying_to_skeletal) {
+            } else if (currentState === 'decaying' && accum >= CORPSE_DECAY_RULES.decaying_to_skeletal) {
                 newState = 'skeletal';
-            } else if (currentState === 'skeletal' && hoursSinceUpdate >= CORPSE_DECAY_RULES.skeletal_to_gone) {
+            } else if (currentState === 'skeletal' && accum >= CORPSE_DECAY_RULES.skeletal_to_gone) {
                 newState = 'gone';
             }
 
             if (newState !== currentState) {
                 this.updateState(row.id, newState);
+                bump.run(0, row.id); // stage clock resets on transition
                 changes.push({ corpseId: row.id, oldState: currentState, newState });
+            } else if (hoursAdvanced > 0) {
+                bump.run(accum, row.id);
             }
         }
 
@@ -558,6 +601,19 @@ export class CorpseRepository {
             UPDATE corpses SET state = ?, state_updated_at = ?, updated_at = ? WHERE id = ?
         `);
         stmt.run(newState, now, now, corpseId);
+    }
+
+    /**
+     * FINDINGS #85: targeted hard delete — the ONLY path that removes a corpse
+     * regardless of decay state. cleanupGoneCorpses only eats state='gone';
+     * an orphan row (a living man's corpse — the Taras case) is fresh forever
+     * and was undeletable without a global decay sweep. Inventory rows go
+     * first, then the corpse; both counts reported from the store.
+     */
+    deleteById(corpseId: string): { corpseRemoved: number; inventoryRowsRemoved: number } {
+        const inv = this.db.prepare(`DELETE FROM corpse_inventory WHERE corpse_id = ?`).run(corpseId);
+        const row = this.db.prepare(`DELETE FROM corpses WHERE id = ?`).run(corpseId);
+        return { corpseRemoved: row.changes, inventoryRowsRemoved: inv.changes };
     }
 
     /**
@@ -701,6 +757,9 @@ export class CorpseRepository {
     // ============================================================
 
     private rollQuantity(min: number, max: number): number {
+        // Guard: non-finite bounds (string/undefined params) previously
+        // produced NaN loops downstream. Zero drops beat a hung server.
+        if (!Number.isFinite(min) || !Number.isFinite(max) || max < min) return 0;
         return Math.floor(Math.random() * (max - min + 1)) + min;
     }
 

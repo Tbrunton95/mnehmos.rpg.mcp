@@ -32,7 +32,8 @@ export function rollConcentrationSave(constitutionModifier: number): { roll: num
 export function checkConcentration(
     character: Character | NPC,
     damageAmount: number,
-    concentrationRepo: ConcentrationRepository
+    concentrationRepo: ConcentrationRepository,
+    extraSaveBonus: number = 0
 ): ConcentrationCheckResult {
     const concentration = concentrationRepo.findByCharacterId(character.id);
 
@@ -46,7 +47,7 @@ export function checkConcentration(
     }
 
     const dc = calculateConcentrationDC(damageAmount);
-    const constitutionModifier = Math.floor((character.stats.con - 10) / 2);
+    const constitutionModifier = Math.floor((character.stats.con - 10) / 2) + extraSaveBonus;
     const { roll, total } = rollConcentrationSave(constitutionModifier);
 
     const success = total >= dc;

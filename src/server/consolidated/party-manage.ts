@@ -103,7 +103,15 @@ const UpdateSchema = z.object({
     description: z.string().optional(),
     currentLocation: z.string().optional(),
     formation: z.string().optional(),
-    status: PartyStatusSchema.optional()
+    status: PartyStatusSchema.optional(),
+    // FINDINGS #78: notes is accepted ONLY to be REFUSED loudly in the
+    // handler. Party notes was removed by GM ruling; before that ruling this
+    // schema silently stripped the field (family appearance eight — the write
+    // vanished with updatedAt still moving, three rebuilds running). Zod
+    // strips unknown keys, so the only way to refuse honestly is to accept
+    // the key into the parse and throw. Never delete this line without
+    // deleting the reject below it.
+    notes: z.string().optional()
 });
 
 const DeleteSchema = z.object({
@@ -285,7 +293,13 @@ async function handleList(args: z.infer<typeof ListSchema>): Promise<object> {
 
 async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object> {
     const { partyRepo } = ensureDb();
-    const { partyId, action: _action, ...updates } = args;
+    // FINDINGS #78: refuse, don't strip — the #67-A shape. Party notes is not
+    // a stored field (GM ruling); a silent strip here cost three rebuilds of
+    // updatedAt-only ghost writes before the boundary was found.
+    if (args.notes !== undefined) {
+        throw new Error(`party 'notes' is not a stored field (removed by GM ruling, FINDINGS #78) — campaign text lives in narrative_manage; per-member notes live on update_member. NOTHING WAS WRITTEN.`);
+    }
+    const { partyId, action: _action, notes: _notes, ...updates } = args;
 
     const updated = partyRepo.update(partyId, updates);
     if (!updated) {

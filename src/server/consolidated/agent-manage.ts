@@ -29,6 +29,7 @@ import {
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { RichFormatter } from '../utils/formatter.js';
 import { getAgentRuntime, buildAgentRuntime } from '../../agent/runtime/deps.js';
+import { CompetencyOverrideSchema, resolveCompetency, validateOverride } from '../../agent/runtime/competency.js';
 import { invokeAgent } from '../../agent/runtime/invoke.js';
 import { composePrompt } from '../../agent/prompt/compose.js';
 import { replayCall } from '../../agent/audit/replay.js';
@@ -70,8 +71,11 @@ function ensureDb() {
 }
 
 function resolveAgent(repo: AgentRepository, args: { agentId?: string; characterId?: string }): ReturnType<AgentRepository['findById']> {
-    if (args.agentId) return repo.findById(args.agentId);
-    if (args.characterId) return repo.findByCharacterId(args.characterId);
+    // FINDINGS #69: exact first, then truncated-UUID rescue — the short forms
+    // in every handoff block resolve when unambiguous instead of wasting a
+    // call on 'agent_not_found'.
+    if (args.agentId) return repo.findById(args.agentId) ?? repo.findByIdPrefix(args.agentId);
+    if (args.characterId) return repo.findByCharacterId(args.characterId) ?? repo.findByCharacterIdPrefix(args.characterId);
     return null;
 }
 
@@ -107,7 +111,8 @@ const CreateSchema = z.object({
     temperature: z.number().min(0).max(2).optional(),
     maxTokens: z.number().int().positive().optional(),
     budgetTokens: z.number().int().positive().optional(),
-    timeoutMs: z.number().int().positive().optional()
+    timeoutMs: z.number().int().positive().optional(),
+    competencyOverride: CompetencyOverrideSchema.nullable().optional().describe('FINDINGS #69: per-agent competency override {model?, reasoningEffort?}. Without this, the INT ladder resolves the served model and agents.model is ADVISORY ONLY')
 });
 
 const GetSchema = z.object({
@@ -133,7 +138,8 @@ const UpdateSchema = z.object({
     temperature: z.number().min(0).max(2).optional(),
     maxTokens: z.number().int().positive().optional(),
     budgetTokens: z.number().int().positive().nullable().optional(),
-    timeoutMs: z.number().int().positive().optional()
+    timeoutMs: z.number().int().positive().optional(),
+    competencyOverride: CompetencyOverrideSchema.nullable().optional().describe('FINDINGS #69: set the per-agent override; pass null to CLEAR it and return to the INT ladder')
 }).refine(d => d.agentId || d.characterId, { message: 'agentId or characterId required' });
 
 const DeleteSchema = z.object({
@@ -294,6 +300,11 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         return { error: true, message: `Agent already bound to ${character.name} (id=${existing.id})`, agentId: existing.id };
     }
 
+    // FINDINGS #98 (KEEPER 1.1): VALIDATE BEFORE WRITE — a refused override
+    // must never reach the row. Honest message names the rule + the allowlist.
+    const overrideErr = validateOverride(args.competencyOverride);
+    if (overrideErr) return { error: true, actionType: 'create', message: overrideErr, writes: 'none' };
+
     const agent = agentRepo.create({
         characterId: args.characterId,
         provider: args.provider,
@@ -303,15 +314,26 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         temperature: args.temperature,
         maxTokens: args.maxTokens,
         budgetTokens: args.budgetTokens ?? null,
-        timeoutMs: args.timeoutMs
+        timeoutMs: args.timeoutMs,
+        competencyOverride: args.competencyOverride ?? null
     });
+
+    // FINDINGS #69: the INT ladder resolves the served model; agents.model is
+    // advisory unless an override is set. Say so AT CREATE TIME, not on the
+    // billing page three sessions later.
+    const resolved = resolveCompetency(character.stats.int, agent.competencyOverride);
+    const modelAdvisory = !agent.competencyOverride?.model && args.model !== resolved.model
+        ? `⚠ agents.model ('${args.model}') is ADVISORY — INT ${character.stats.int} resolves to '${resolved.model}' via the competency ladder. Set competencyOverride to pin a model for this agent.`
+        : null;
 
     return {
         actionType: 'create',
         success: true,
         agent,
         characterName: character.name,
-        message: `Agent created for ${character.name} (${args.provider}:${args.model})`
+        resolvedCompetency: { model: resolved.model, reasoningEffort: resolved.reasoningEffort, tier: resolved.tier, source: resolved.source },
+        ...(modelAdvisory ? { modelAdvisory } : {}),
+        message: `Agent created for ${character.name} (${args.provider}; serves ${resolved.model} [${resolved.source}])`
     };
 }
 
@@ -323,10 +345,23 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
     const slices = agentRepo.listSlices(agent.id);
     const character = characterRepo.findById(agent.characterId);
 
+    // FINDINGS #69: report the model that will actually be SERVED, not just the
+    // stored advisory one. resolveCompetency is exactly what invoke runs.
+    const resolved = character
+        ? resolveCompetency(character.stats.int, agent.competencyOverride)
+        : null;
+
     return {
         actionType: 'get',
         agent,
         characterName: character?.name ?? null,
+        storedModel: agent.model,
+        resolvedCompetency: resolved
+            ? { model: resolved.model, reasoningEffort: resolved.reasoningEffort, tier: resolved.tier, int: resolved.int, source: resolved.source }
+            : null,
+        modelAdvisory: resolved && !agent.competencyOverride?.model && agent.model !== resolved.model
+            ? `stored model '${agent.model}' is advisory — invokes serve '${resolved.model}' (INT ladder). Set competencyOverride to change that.`
+            : null,
         sliceCount: slices.length,
         slices: slices.map(s => ({ id: s.id, kind: s.kind, label: s.label, enabled: s.enabled, orderIndex: s.orderIndex }))
     };
@@ -334,7 +369,23 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
 
 async function handleList(args: z.infer<typeof ListSchema>): Promise<object> {
     const { agentRepo } = ensureDb();
-    const agents = agentRepo.list({ status: args.status, autoOnTurn: args.autoOnTurn });
+    // FINDINGS #98 (KEEPER 1.2): FAULT-ISOLATING — one poisoned row used to
+    // kill the whole listing, and listing is the first diagnostic anyone runs.
+    // Valid rows return whole; broken rows return as stubs naming their error.
+    let agents: unknown[];
+    try {
+        agents = agentRepo.list({ status: args.status, autoOnTurn: args.autoOnTurn });
+    } catch {
+        const { db } = ensureDb();
+        const raw = db.prepare('SELECT id, character_id, status FROM agents').all() as Array<{ id: string; character_id: string; status: string }>;
+        agents = raw.map(r => {
+            try {
+                return agentRepo.findById(r.id) ?? { id: r.id, characterId: r.character_id, status: r.status, error: 'row failed to load' };
+            } catch (e) {
+                return { id: r.id, characterId: r.character_id, status: r.status, error: e instanceof Error ? e.message : String(e) };
+            }
+        });
+    }
     return { actionType: 'list', count: agents.length, agents };
 }
 
@@ -342,6 +393,11 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     const { agentRepo } = ensureDb();
     const agent = resolveAgent(agentRepo, args);
     if (!agent) return { error: true, message: 'Agent not found' };
+
+    // FINDINGS #98 (KEEPER 1.1): VALIDATE BEFORE WRITE. The bricking incident:
+    // a refused override persisted anyway, then every load re-threw on it.
+    const overrideErr = validateOverride(args.competencyOverride);
+    if (overrideErr) return { error: true, actionType: 'update', message: overrideErr, writes: 'none' };
 
     const { action: _a, agentId: _id, characterId: _cid, ...updates } = args;
     const updated = agentRepo.update(agent.id, updates);
@@ -741,6 +797,7 @@ Actions: create, get, list, update, delete, resume, health, budget, set_slice, r
         maxTokens: z.number().optional(),
         budgetTokens: z.number().nullable().optional(),
         timeoutMs: z.number().optional(),
+        competencyOverride: CompetencyOverrideSchema.nullable().optional().describe('FINDINGS #69 (mirror): per-agent {model?, reasoningEffort?} — pins the served model; null clears back to the INT ladder'),
         // budget
         setBudget: z.number().nullable().optional(),
         resetUsage: z.boolean().optional(),
@@ -797,12 +854,17 @@ export async function handleAgentManage(args: unknown, ctx: SessionContext): Pro
                 case 'get':
                     output = RichFormatter.header(`Agent (${parsed.characterName || parsed.agent?.characterId})`, '');
                     output += RichFormatter.keyValue({
-                        'Provider': `${parsed.agent?.provider}:${parsed.agent?.model}`,
+                        'Provider': parsed.agent?.provider,
+                        'Serves': parsed.resolvedCompetency
+                            ? `${parsed.resolvedCompetency.model} [${parsed.resolvedCompetency.source}, effort=${parsed.resolvedCompetency.reasoningEffort ?? 'off'}]`
+                            : `${parsed.storedModel ?? parsed.agent?.model} (no character — stored model)`,
+                        'Stored model': parsed.storedModel ?? parsed.agent?.model,
                         'Status': parsed.agent?.status,
                         'Circuit': parsed.agent?.circuitState,
                         'Slices': parsed.sliceCount,
                         'Tokens used': parsed.agent?.tokensUsed
                     });
+                    if (parsed.modelAdvisory) output += RichFormatter.alert(parsed.modelAdvisory, 'warning');
                     break;
                 case 'list':
                     output = RichFormatter.header(`Agents (${parsed.count})`, '');
@@ -833,8 +895,14 @@ export async function handleAgentManage(args: unknown, ctx: SessionContext): Pro
                     const name = parsed.characterName || parsed.characterId || 'agent';
                     if (parsed.status === 'ok') {
                         output = RichFormatter.header(`${name} speaks`, '');
+                        const modelLine = parsed.servedModel
+                            ? (parsed.requestedModel && parsed.servedModel !== parsed.requestedModel
+                                ? `${parsed.servedModel} ⚠ (requested ${parsed.requestedModel})`
+                                : `${parsed.servedModel} [${parsed.competencySource ?? '?'}]`)
+                            : '—';
                         output += RichFormatter.keyValue({
                             'Status': parsed.status,
+                            'Model': modelLine,
                             'Tokens': `${parsed.promptTokens ?? '?'} in / ${parsed.completionTokens ?? '?'} out`,
                             'Duration': parsed.durationMs !== null ? `${parsed.durationMs}ms` : '—',
                             'Call ID': parsed.callId

@@ -196,9 +196,12 @@ export function createActionRouter<TActions extends string>(
             // ─────────────────────────────────────────────────────────────────
             return formatMcpSuccess(result, matchResult);
         } catch (error) {
+            // FINDINGS #64: the throw site may assert write-freedom by setting
+            // .writes = 'none' on the Error — the claim travels; the formatter
+            // prints NO WRITE iff it arrives.
             return formatMcpError(
                 error instanceof Error ? error.message : String(error),
-                { action, args }
+                { action, args, ...((error as { writes?: string })?.writes ? { writes: (error as { writes?: string }).writes } : {}) }
             );
         }
     };
@@ -268,7 +271,7 @@ export function createDiscriminatedRouter<TSchema extends z.ZodSchema>(
         } catch (error) {
             return formatMcpError(
                 error instanceof Error ? error.message : String(error),
-                { action: parsed.action }
+                { action: parsed.action, ...((error as { writes?: string })?.writes ? { writes: (error as { writes?: string }).writes } : {}) }
             );
         }
     };
@@ -373,7 +376,10 @@ export function formatValidationError(
                 action,
                 message: `Validation failed for action "${action}"`,
                 issues,
-                hint: 'Check the parameter types and required fields'
+                hint: 'Check the parameter types and required fields',
+                // FINDINGS #64: validation precedes the handler by construction —
+                // the throw site can prove write-freedom, so it asserts it.
+                writes: 'none'
             }, null, 2)
         }]
     };

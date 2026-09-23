@@ -35,14 +35,14 @@ export class SecretRepository {
                 linked_entity_id, linked_entity_type,
                 revealed, revealed_at, revealed_by,
                 reveal_conditions, sensitivity, leak_patterns,
-                notes, created_at, updated_at
+                notes, status, created_at, updated_at
             ) VALUES (
                 @id, @worldId, @type, @category, @name,
                 @publicDescription, @secretDescription,
                 @linkedEntityId, @linkedEntityType,
                 @revealed, @revealedAt, @revealedBy,
                 @revealConditions, @sensitivity, @leakPatterns,
-                @notes, @createdAt, @updatedAt
+                @notes, @status, @createdAt, @updatedAt
             )
         `);
 
@@ -63,6 +63,7 @@ export class SecretRepository {
             sensitivity: validSecret.sensitivity,
             leakPatterns: JSON.stringify(validSecret.leakPatterns),
             notes: validSecret.notes || null,
+            status: (validSecret as { status?: string }).status ?? 'active',
             createdAt: validSecret.createdAt,
             updatedAt: validSecret.updatedAt
         });
@@ -136,9 +137,19 @@ export class SecretRepository {
         const existing = this.findById(id);
         if (!existing) return null;
 
+        // FINDINGS #47 (#46 fix): supplying new revealConditions is a RE-ARM —
+        // a re-armed clock must be fully alive. revealed:true on a re-armed row
+        // made it invisible to clocks[] and unfireable: the #44 failure mode
+        // through a different door. Unless the caller sets revealed explicitly,
+        // re-arm clears the whole revealed state.
+        const rearming = (updates as { revealConditions?: unknown }).revealConditions !== undefined
+            && (updates as { revealed?: boolean }).revealed === undefined;
+        const unrevealing = (updates as { revealed?: boolean }).revealed === false;
+
         const updated = {
             ...existing,
             ...updates,
+            ...(rearming || unrevealing ? { revealed: false, revealedAt: undefined, revealedBy: undefined } : {}),
             updatedAt: new Date().toISOString()
         };
 
@@ -160,6 +171,8 @@ export class SecretRepository {
                 sensitivity = @sensitivity,
                 leak_patterns = @leakPatterns,
                 notes = @notes,
+                status = @status,
+                hours_accumulated = @hoursAccumulated,
                 updated_at = @updatedAt
             WHERE id = @id
         `);
@@ -180,6 +193,9 @@ export class SecretRepository {
             sensitivity: validSecret.sensitivity,
             leakPatterns: JSON.stringify(validSecret.leakPatterns),
             notes: validSecret.notes || null,
+            status: (validSecret as { status?: string }).status ?? 'active',
+            // #45: providing new revealConditions re-arms the clock — accumulator resets.
+            hoursAccumulated: (updates as { revealConditions?: unknown }).revealConditions !== undefined ? 0 : ((existing as unknown as { hoursAccumulated?: number }).hoursAccumulated ?? 0),
             updatedAt: validSecret.updatedAt
         });
 
@@ -214,8 +230,31 @@ export class SecretRepository {
         const toReveal: Secret[] = [];
 
         for (const secret of secrets) {
+            // FINDINGS #34 T2.8: parked/spent secrets never fire.
+            if ((secret as { status?: string }).status && (secret as { status?: string }).status !== 'active') continue;
+
+            // FINDINGS #45 (#44 fix): time_passed accumulates ENGINE-SIDE.
+            // hoursPassed is a per-call DELTA; the engine keeps the running
+            // total on the row, so per-scene deltas ring the clock the way
+            // 03 §1 always read as if they did. Reset on fire and on re-arm.
+            let accumulated = (secret as unknown as { hoursAccumulated?: number }).hoursAccumulated ?? 0;
+            const hasTimeCondition = secret.revealConditions.some(cn => cn.type === 'time_passed');
+            if (event.type === 'time_passed' && hasTimeCondition && (event.hoursPassed || 0) > 0) {
+                accumulated += event.hoursPassed || 0;
+                this.db.prepare('UPDATE secrets SET hours_accumulated = ? WHERE id = ?').run(accumulated, secret.id);
+                (secret as unknown as { hoursAccumulated?: number }).hoursAccumulated = accumulated;
+            }
+
             for (const condition of secret.revealConditions) {
-                if (this.conditionMet(event, condition)) {
+                const met = condition.type === 'time_passed'
+                    ? accumulated >= (condition.hoursRequired || 0) && (condition.hoursRequired || 0) > 0
+                    : this.conditionMet(event, condition);
+                if (met) {
+                    if (condition.type === 'time_passed') {
+                        // The clock rang: reset so a re-arm only needs a new hoursRequired.
+                        this.db.prepare('UPDATE secrets SET hours_accumulated = 0 WHERE id = ?').run(secret.id);
+                        (secret as unknown as { hoursAccumulated?: number }).hoursAccumulated = 0;
+                    }
                     toReveal.push(secret);
                     break;
                 }
@@ -396,6 +435,8 @@ but you must NEVER directly reveal it to the player unless the reveal conditions
             sensitivity: row.sensitivity,
             leakPatterns: JSON.parse(row.leak_patterns),
             notes: row.notes || undefined,
+            status: (row as { status?: string }).status ?? 'active',
+            hoursAccumulated: (row as { hours_accumulated?: number }).hours_accumulated ?? 0,
             createdAt: row.created_at,
             updatedAt: row.updated_at
         });

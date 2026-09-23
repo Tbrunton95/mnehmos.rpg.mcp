@@ -122,6 +122,7 @@ export interface CombatActionResult {
     attackRoll?: CheckResult;
     damage?: number;
     damageRolls?: number[];  // Individual damage dice
+    damageType?: string;     // Findings #40: auditable against resistances
     
     // Heal specifics (if type === 'heal')
     healAmount?: number;
@@ -601,7 +602,15 @@ export class CombatEngine {
         attackBonus: number,
         dc: number,
         damage: number | string,
-        damageType?: string  // HIGH-002: Optional damage type for resistance calculation
+        damageType?: string,  // HIGH-002: Optional damage type for resistance calculation
+        advantage?: boolean,
+        disadvantage?: boolean,
+        // FINDINGS #70: resolver damage lane — flat trait damage (Odinets et al.)
+        // applied AFTER crit doubling, BEFORE resistance: flat adds never double
+        // (spec ruling pending Tom's ratification; matches 5e dice-double law),
+        // and resistance sees the true total.
+        flatDamageBonus?: number,
+        flatDamageLabel?: string
     ): CombatActionResult {
         if (!this.state) throw new Error('No active combat');
 
@@ -613,8 +622,9 @@ export class CombatEngine {
 
         const hpBefore = target.hp;
 
-        // Roll with full transparency
-        const attackRoll = this.rng.checkDegreeDetailed(attackBonus, dc);
+        // Roll with full transparency — 5e semantics (Findings #32):
+        // crit reads the natural die, never the margin.
+        const attackRoll = this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage);
 
         let damageDealt = 0;
         let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
@@ -623,9 +633,11 @@ export class CombatEngine {
         let baseDamageVal = 0;
         let damageBreakdownStr = '';
 
+        let capturedDamageRolls: number[] | undefined;
         if (typeof damage === 'string') {
             const dmgResult = this.rng.rollDamageDetailed(damage);
             baseDamageVal = dmgResult.total;
+            capturedDamageRolls = dmgResult.rolls;
             damageBreakdownStr = ` (${dmgResult.rolls.join('+')}${dmgResult.modifier >= 0 ? '+' + dmgResult.modifier : dmgResult.modifier})`;
         } else {
             baseDamageVal = damage;
@@ -635,7 +647,10 @@ export class CombatEngine {
             // Critical Hit: Double the dice (approx. double the value for now if passing number)
             // If string was passed, we ideally double the DICE, but for now double the total is consistent with current impl.
             // TODO(medium): Implement proper crit rules (double dice) using rollDamageDetailed
-            const finalBaseDamage = attackRoll.isCrit ? baseDamageVal * 2 : baseDamageVal;
+            const critBase = attackRoll.isCrit ? baseDamageVal * 2 : baseDamageVal;
+            // FINDINGS #70: the damage lane lands here — outside the crit
+            // doubling, inside the resistance math.
+            const finalBaseDamage = critBase + (flatDamageBonus ?? 0);
             
             // HIGH-002: Apply resistance/vulnerability/immunity
             const modResult = this.calculateDamageWithModifiers(finalBaseDamage, damageType, target);
@@ -647,7 +662,10 @@ export class CombatEngine {
         const defeated = target.hp <= 0;
 
         // Build detailed breakdown
-        let breakdown = `🎲 Attack Roll: d20(${attackRoll.roll}) + ${attackBonus} = ${attackRoll.total} vs AC ${dc}\n`;
+        const diceShown = attackRoll.allRolls.length > 1
+            ? `d20(${attackRoll.allRolls.join(',')}${advantage ? ' adv' : ' dis'}→${attackRoll.roll})`
+            : `d20(${attackRoll.roll})`;
+        let breakdown = `🎲 Attack Roll: ${diceShown} + ${attackBonus} = ${attackRoll.total} vs AC ${dc}\n`;
 
         if (attackRoll.isNat20) {
             breakdown += `   ⭐ NATURAL 20!\n`;
@@ -671,7 +689,7 @@ export class CombatEngine {
                 modStr = ' [Vulnerable - Doubled!]';
             }
 
-            breakdown += `\n\n💥 Damage: ${damageDealt}${typeStr}${damageBreakdownStr}${attackRoll.isCrit ? ' (crit)' : ''}${modStr}\n`;
+            breakdown += `\n\n💥 Damage: ${damageDealt}${typeStr}${damageBreakdownStr}${attackRoll.isCrit ? ' (crit)' : ''}${flatDamageBonus ? ` + ${flatDamageLabel ?? 'trait'} ${flatDamageBonus >= 0 ? '+' : ''}${flatDamageBonus}` : ''}${modStr}\n`;
             breakdown += `   ${target.name}: ${hpBefore} → ${target.hp}/${target.maxHp} HP`;
             if (defeated) {
                 breakdown += ` [DEFEATED]`;
@@ -708,6 +726,8 @@ export class CombatEngine {
             target: { id: target.id, name: target.name, hpBefore, hpAfter: target.hp, maxHp: target.maxHp },
             attackRoll,
             damage: damageDealt,
+            damageRolls: capturedDamageRolls,
+            damageType,   // Findings #40: the AP-vs-expanding lane and every resistance list key off it
             success: attackRoll.isHit,
             defeated,
             message,

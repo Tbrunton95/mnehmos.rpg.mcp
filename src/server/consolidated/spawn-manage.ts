@@ -123,7 +123,7 @@ function buildCharacter(data: {
 
 const ACTIONS = [
     'spawn_character', 'spawn_location', 'spawn_encounter',
-    'spawn_preset_location', 'spawn_tactical'
+    'spawn_preset_location', 'spawn_tactical', 'update_poi_room'
 ] as const;
 
 type SpawnAction = typeof ACTIONS[number];
@@ -145,6 +145,9 @@ function ensureDb() {
 
 // Alias map for fuzzy action matching
 const ALIASES: Record<string, SpawnAction> = {
+    'rename_room': 'update_poi_room',
+    'rename_poi_room': 'update_poi_room',
+    'poi_room': 'update_poi_room',
     'character': 'spawn_character',
     'create_character': 'spawn_character',
     'spawn_equipped': 'spawn_character',
@@ -209,6 +212,13 @@ const SpawnManageInputSchema = z.object({
     x: z.number().int().min(0).optional().describe('X coordinate'),
     y: z.number().int().min(0).optional().describe('Y coordinate'),
     customName: z.string().optional().describe('Override default name'),
+    // FINDINGS #84: update_poi_room — POI-layer rooms had no update verb;
+    // preset shells were stuck with their spawn names forever.
+    poiId: z.string().optional().describe('update_poi_room: the POI whose room to rename'),
+    roomName: z.string().optional().describe('update_poi_room: CURRENT name of the room to change'),
+    newName: z.string().optional().describe('update_poi_room: new room name'),
+    newDescription: z.string().optional().describe('update_poi_room: new room description'),
+    newPoiName: z.string().optional().describe('FINDINGS #107: update_poi_room — rename the POI ROW itself (alone, or alongside a room edit). The repair lane for preset-named POIs'),
     spawnNpcs: z.boolean().optional().default(false),
     discoveryState: z.enum(['unknown', 'rumored', 'discovered', 'explored', 'mapped']).optional().default('discovered'),
 
@@ -749,22 +759,119 @@ async function handleSpawnPresetLocation(input: SpawnManageInput, _ctx: SessionC
                 { name: 'Clearing', description: 'A peaceful forest clearing' }
             ],
             npcs: []
+        },
+        // FINDINGS #84: STALKER presets — the three fantasy stubs put a Kitchen
+        // in a Military HQ and Upstairs Rooms in a flea market. Zone locations
+        // get Zone shells. FIRST room in each list is the seat room (travel
+        // enterLocation reads LIMIT 1), so it is always the natural arrival
+        // point. No auto-NPCs — the GM casts the Zone themselves.
+        'military_checkpoint': {
+            name: 'Military Checkpoint',
+            type: 'checkpoint',
+            rooms: [
+                { name: 'Barrier Gate', description: 'Counterweighted pole barrier across the road, concrete blocks staggered for a slalom approach' },
+                { name: 'Guardhouse', description: 'Brick guardhouse with a slit window facing the approach, a field telephone, and a duty ledger' },
+                { name: 'Sandbag Position', description: 'Machine-gun position in a sandbag horseshoe, ammunition boxes stacked as furniture' },
+                { name: 'Holding Room', description: 'Windowless back room with a bench bolted to the wall and a door that locks from outside' }
+            ],
+            npcs: []
+        },
+        'flea_market': {
+            name: 'Open-Air Market',
+            type: 'market',
+            rooms: [
+                { name: 'Market Rows', description: 'Trestle tables and tarpaulin stalls in uneven rows, goods laid out on groundsheets' },
+                { name: 'Trader Stalls', description: 'The established pitches — shipping-container kiosks with padlocks and price lists nobody honours' },
+                { name: 'Back Lot', description: 'Behind the stalls: parked vehicles, quiet deals, and the goods that never reach a table' }
+            ],
+            npcs: []
+        },
+        'trader_bunker': {
+            name: 'Trader Bunker',
+            type: 'bunker',
+            rooms: [
+                { name: 'Blast Door Entry', description: 'Steel blast door at the bottom of a concrete stair, viewing slot at eye height' },
+                { name: 'Counter Room', description: 'Low-ceilinged room split by a counter, shelving crammed to the concrete behind it' },
+                { name: 'Back Storage', description: 'Locked storage deeper in — crates the customers never see' }
+            ],
+            npcs: []
+        },
+        'rookie_village': {
+            name: 'Rookie Village',
+            type: 'settlement',
+            rooms: [
+                { name: 'Village Street', description: 'One unpaved street between abandoned houses, washing lines strung between the ones still lived in' },
+                { name: 'Communal Fire', description: 'Oil-drum fire in a cleared yard, pallet benches around it — where the village talks' },
+                { name: 'Occupied House', description: 'A weather-sealed house with boarded windows and a stove flue through the wall' },
+                { name: 'Root Cellar', description: 'Earth-floored cellar under a collapsed house, cold and dry, used for storage or hiding' }
+            ],
+            npcs: []
+        },
+        'rail_station': {
+            name: 'Rail Station',
+            type: 'station',
+            rooms: [
+                { name: 'Platform', description: 'Cracked concrete platform under a rusted canopy, rails swallowed by weeds in both directions' },
+                { name: 'Station Hall', description: 'Ticket hall with a caved ceiling panel, timetable board still showing a departure that never left' },
+                { name: 'Signal Box', description: 'Raised signal box with levers seized in position and a clear view down the line' },
+                { name: 'Sidings', description: 'Freight sidings with rotting wagons — cover, salvage, and things that nest in wagons' }
+            ],
+            npcs: []
+        },
+        'industrial_ruin': {
+            name: 'Industrial Ruin',
+            type: 'industrial',
+            rooms: [
+                { name: 'Works Yard', description: 'Open yard between buildings, rusted gantry crane overhead, drifts of scrap in the corners' },
+                { name: 'Machine Hall', description: 'High hall of dead machinery, belts perished on their pulleys, light through holed roof sheets' },
+                { name: 'Office Block', description: 'Two floors of offices — paperwork, lockers, and whatever the last shift left' },
+                { name: 'Basement Level', description: 'Service basement below the hall — pipe runs, standing water, and no natural light' }
+            ],
+            npcs: []
+        },
+        'apartment_block': {
+            name: 'Apartment Block',
+            type: 'ruins',
+            rooms: [
+                { name: 'Entryway', description: 'Concrete entryway with dead letterboxes and a lift shaft that has been open since the accident' },
+                { name: 'Stairwell', description: 'Switchback stairwell, every landing a decision, sound carrying five floors in both directions' },
+                { name: 'Second-Floor Flat', description: 'A stripped two-room flat — defendable, one entrance, windows over the approach' },
+                { name: 'Roof Access', description: 'Roof through a steel hatch — sightlines across the district and no cover from the sky' }
+            ],
+            npcs: []
+        },
+        'underground_entrance': {
+            name: 'Underground Entrance',
+            type: 'underground',
+            rooms: [
+                { name: 'Shaft Head', description: 'Surface works over a vertical shaft — headframe timber, a winch that may or may not turn' },
+                { name: 'Collar Room', description: 'Concrete collar room at the shaft top, ladder rungs descending past the reach of daylight' },
+                { name: 'Head of the Descent', description: 'Where the ladders end and the galleries begin — the last place with a way back up' }
+            ],
+            npcs: []
         }
     };
 
     const presetData = locationPresets[input.preset];
     if (!presetData) {
+        // FINDINGS #94: enum refusals name the valid set — house style
+        // (world_manage's season refusal is the model).
+        const valid = Object.keys(locationPresets).join(', ');
         return {
             content: [{
                 type: 'text',
-                text: RichFormatter.error(`Unknown location preset: ${input.preset}`) +
-                    RichFormatter.embedJson({ error: true, message: `Unknown preset: ${input.preset}` }, 'SPAWN_MANAGE')
+                text: RichFormatter.error(`Unknown location preset: ${input.preset} — valid: ${valid}`) +
+                    RichFormatter.embedJson({ error: true, message: `Unknown preset: ${input.preset}`, validPresets: Object.keys(locationPresets) }, 'SPAWN_MANAGE')
             }]
         };
     }
 
     const locationId = randomUUID();
-    const locationName = input.customName || presetData.name;
+    // FINDINGS #107: the chair passed `name` — accepted by the shared schema
+    // (spawn_character's field), ignored by THIS handler, which only read
+    // customName. Two overlapping params, one wired: Emmett Mountain filed as
+    // 'Industrial Ruin'. Both are honored now, customName winning.
+    const locationName = input.customName || input.name || presetData.name;
 
     // Create POI
     const poiId = randomUUID();
@@ -1016,6 +1123,74 @@ async function handleSpawnTactical(input: SpawnManageInput, ctx: SessionContext)
 }
 
 // Main handler
+// FINDINGS #84: POI-layer rooms live in the `rooms` table — separate from
+// spatial_manage's room_nodes — and had NO update verb: a preset shell's names
+// were stuck at spawn forever (a Military HQ keeping its Kitchen). This is
+// the missing verb. changes come from the store; a zero-change rename refuses
+// loudly and lists the rooms that ARE there.
+async function handleUpdatePoiRoom(input: SpawnManageInput, _ctx: SessionContext): Promise<McpResponse> {
+    // FINDINGS #107: the verb now also renames the POI ROW itself — pass
+    // newPoiName (alone or with room edits). The repair lane for every
+    // preset-named POI placed before the #107 create fix.
+    if (!input.poiId || (!input.newPoiName && (!input.roomName || (!input.newName && !input.newDescription)))) {
+        return {
+            content: [{
+                type: 'text',
+                text: RichFormatter.error('update_poi_room requires poiId, and either newPoiName (renames the POI row) or roomName + newName/newDescription (edits a room)') +
+                    RichFormatter.embedJson({ error: true, message: 'poiId + newPoiName, or poiId + roomName + newName/newDescription' }, 'SPAWN_MANAGE')
+            }]
+        };
+    }
+    const { db } = ensureDb();
+    const poi = db.prepare('SELECT id, name, networkId FROM pois WHERE id = ?').get(input.poiId) as { id: string; name: string; networkId: string } | undefined;
+    if (!poi) {
+        return {
+            content: [{
+                type: 'text',
+                text: RichFormatter.error(`POI ${input.poiId} not found`) +
+                    RichFormatter.embedJson({ error: true, message: `POI ${input.poiId} not found` }, 'SPAWN_MANAGE')
+            }]
+        };
+    }
+    const now = new Date().toISOString();
+    if (input.newPoiName) {
+        db.prepare('UPDATE pois SET name = ?, updatedAt = ? WHERE id = ?').run(input.newPoiName, now, input.poiId);
+        if (!input.roomName) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: RichFormatter.header('POI RENAMED', '📍') + RichFormatter.alert(`"${poi.name}" → "${input.newPoiName}" (#107)`, 'info') +
+                        RichFormatter.embedJson({ success: true, actionType: 'update_poi_room', poiId: poi.id, oldName: poi.name, newPoiName: input.newPoiName }, 'SPAWN_MANAGE')
+                }]
+            };
+        }
+    }
+    const sets: string[] = [];
+    const vals: unknown[] = [];
+    if (input.newName) { sets.push('name = ?'); vals.push(input.newName); }
+    if (input.newDescription) { sets.push('description = ?'); vals.push(input.newDescription); }
+    sets.push('updatedAt = ?'); vals.push(now);
+    const r = db.prepare(`UPDATE rooms SET ${sets.join(', ')} WHERE networkId = ? AND name = ?`).run(...vals, poi.networkId, input.roomName);
+    if (r.changes === 0) {
+        const existing = db.prepare('SELECT name FROM rooms WHERE networkId = ?').all(poi.networkId) as Array<{ name: string }>;
+        return {
+            content: [{
+                type: 'text',
+                text: RichFormatter.error(`No room named "${input.roomName}" in ${poi.name} — rooms there: ${existing.map(e => e.name).join(', ') || '(none)'} . NOTHING was renamed.`) +
+                    RichFormatter.embedJson({ error: true, poiId: poi.id, poiName: poi.name, roomsPresent: existing.map(e => e.name), message: `no room named ${input.roomName}` }, 'SPAWN_MANAGE')
+            }]
+        };
+    }
+    let output = RichFormatter.header('POI Room Updated', '🏷️');
+    output += RichFormatter.keyValue({
+        'POI': poi.name,
+        'Room': input.roomName + (input.newName ? ` → ${input.newName}` : ''),
+        'Rows changed': r.changes
+    });
+    output += RichFormatter.embedJson({ success: true, actionType: 'update_poi_room', poiId: poi.id, poiName: input.newPoiName ?? poi.name, ...(input.newPoiName ? { poiRenamedTo: input.newPoiName } : {}), room: input.roomName, newName: input.newName ?? null, newDescription: input.newDescription ?? null, changes: r.changes }, 'SPAWN_MANAGE');
+    return { content: [{ type: 'text', text: output }] };
+}
+
 export async function handleSpawnManage(args: unknown, ctx: SessionContext): Promise<McpResponse> {
     const input = SpawnManageInputSchema.parse(args);
     const matchResult = matchAction(input.action, ACTIONS, ALIASES, 0.6);
@@ -1041,6 +1216,8 @@ export async function handleSpawnManage(args: unknown, ctx: SessionContext): Pro
             return handleSpawnPresetLocation(input, ctx);
         case 'spawn_tactical':
             return handleSpawnTactical(input, ctx);
+        case 'update_poi_room':
+            return handleUpdatePoiRoom(input, ctx);
         default:
             return {
                 content: [{

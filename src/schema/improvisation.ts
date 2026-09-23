@@ -148,9 +148,25 @@ export type MechanicType = z.infer<typeof MechanicTypeSchema>;
 
 export const EffectMechanicSchema = z.object({
     type: MechanicTypeSchema,
-    value: z.union([z.number(), z.string()]),
-    condition: z.string().optional().describe('e.g., "against undead"')
-});
+    value: z.union([z.number(), z.string()]).optional().describe('Fixed value — optional when valueFromPool is present (FINDINGS #60)'),
+    condition: z.string().optional().describe('Prose gate (GM-declared) — or, on autoApply mechanics, a domain filter (damage type / save ability / skill)'),
+    autoApply: z.boolean().optional().describe('RESOLVER OPT-IN: engine consumes this mechanic at call time (attack/AC/resistance/save/skill). Only flag mechanics that are truly flat in their domain'),
+    skill: z.string().optional().describe('FINDINGS #101: which skill a skill_bonus scopes to — MUST exist here (the read/write schema), not just the tool schema, or it vanishes on the way to disk'),
+    save: z.string().optional().describe('FINDINGS #101: which save a saving_throw_bonus scopes to'),
+    damageType: z.string().optional().describe('FINDINGS #101: which damage type a resistance or damage bonus scopes to'),
+    lane: z.string().optional().describe('FINDINGS #101: chair-side audit tag — stored verbatim'),
+    note: z.string().optional().describe('FINDINGS #101: free annotation — stored verbatim'),
+    valueFromPool: z.object({
+        pool: z.string(),
+        per: z.number().optional(),
+        offset: z.number().optional(),
+        negate: z.boolean().optional(),
+        min: z.number().optional(),
+        max: z.number().optional()
+    }).optional().describe('FINDINGS #60 RESOLVER v2: value computed at consumption time — floor(pool.current/per), negate, +offset, clamp [min,max]. Pool arithmetic hidden in breakdowns by default'),
+    hidePool: z.boolean().optional().describe('Default true for pool-derived values (psi law); false opts into printing arithmetic'),
+    valueFromProficiency: z.literal(true).optional().describe('FINDINGS #72: value computed at consumption time as the ACTOR\'S proficiency bonus, floor((level-1)/4)+2 — level-scaling traits (Odinets). Mutually sufficient with value/valueFromPool. NOTE: this field MUST exist here, not just in the tool schema — zod strips unknown keys, so an outer-only field would validate at the tool and silently vanish on the way to disk (#67-F accept-then-discard class)')
+}).passthrough().refine(m => m.value !== undefined || m.valueFromPool !== undefined || m.valueFromProficiency === true, { message: 'mechanic needs value, valueFromPool, or valueFromProficiency — a mechanic with none is a silent zero' }); // FINDINGS #101: passthrough — the accept-then-discard class is closed at the LAST schema on the path, which is the only place closing it counts
 export type EffectMechanic = z.infer<typeof EffectMechanicSchema>;
 
 export const DurationTypeSchema = z.enum(['rounds', 'minutes', 'hours', 'days', 'permanent', 'until_removed']);

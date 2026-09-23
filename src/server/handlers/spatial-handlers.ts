@@ -325,6 +325,14 @@ export async function handleLookAtSurroundings(
     observer.conditions?.some((c) => c.name === "DARKVISION");
 
   if (isInDarkness && !hasLight) {
+    // FINDINGS #67: DARKNESS used to return entities: [] — indistinguishable
+    // from an empty room (banner-lies family, live-caught by the GM in the
+    // Flooded Run). Darkness withholds IDENTITY, not PRESENCE: you can hear
+    // breathing, movement, weight on the floor. The count survives; the
+    // detail dies. 'Something is in here and you cannot see it' is a
+    // completely different answer from 'nothing is here'.
+    const observerRowId = (observer as unknown as { id?: string }).id;
+    const presentCount = (currentRoom.entityIds ?? []).filter((id) => id !== observerRowId).length;
     return {
       content: [
         {
@@ -332,9 +340,14 @@ export async function handleLookAtSurroundings(
           text: JSON.stringify(
             {
               success: true,
-              description: "It's pitch black. You can't see anything.",
+              description:
+                presentCount > 0
+                  ? `It's pitch black. You can't see anything — but you are not alone in here. ${presentCount === 1 ? 'Something else is' : `${presentCount} other presences are`} in this space with you.`
+                  : "It's pitch black. You can't see anything.",
               exits: [],
               entities: [],
+              entityCountPresent: presentCount,
+              detailWithheldBy: "DARKNESS",
               atmospherics: currentRoom.atmospherics,
               roomId: currentRoom.id,
               roomName: currentRoom.name,

@@ -54,6 +54,14 @@ interface PartyMemberWithCharacterRow extends PartyMemberRow {
 
 export class PartyRepository {
     constructor(private db: Database.Database) {}
+    // FINDINGS #78: party notes REMOVED by GM ruling — the #76 surfacing was
+    // sound at every layer it touched, but the tool's inner UpdateSchema never
+    // carried the field, so nothing ever reached this repo (family appearance
+    // eight, the strip one layer above the fix). Rather than complete the
+    // wire, the field is gone: no consumer, and campaign text lives in the
+    // narrative layer. The parties.notes column added by the #76 self-ALTER
+    // stays in existing DBs as harmless dead weight (SQLite column drops
+    // aren't worth the ceremony); nothing reads or writes it.
 
     // ========== Party CRUD ==========
 
@@ -87,11 +95,52 @@ export class PartyRepository {
         return validated;
     }
 
+    /**
+     * FINDINGS #75: canonical-id resolve — exact, then prefix (≥6 chars,
+     * unique-or-nothing). Every member/position/touch method resolves through
+     * this FIRST and runs its SQL against the FULL id, because #74's half-wire
+     * proved findById alone resolves the parent while the member queries
+     * silently return an empty roster for a short id — reported as success.
+     */
+    private resolveFullId(partyId: string): string | null {
+        const p = this.findById(partyId);
+        return p ? p.id : null;
+    }
+
+    /**
+     * FINDINGS #76: THE RESIDUAL — characterId gets the same law as partyId.
+     * The #75 sweep canonicalised the party side of every member operation and
+     * left the character side raw: prefix party + prefix character refused
+     * loudly ('Member not found in party') — the honest failure shape, but
+     * still a failure. Characters table, exact then prefix, ≥6 chars,
+     * unique-or-nothing.
+     */
+    private resolveCharacterId(characterId: string): string {
+        const exact = this.db.prepare('SELECT id FROM characters WHERE id = ?').get(characterId) as { id: string } | undefined;
+        if (exact) return exact.id;
+        if (characterId.length >= 6 && characterId.length < 36) {
+            const hits = this.db.prepare('SELECT id FROM characters WHERE id LIKE ? LIMIT 2').all(`${characterId}%`) as { id: string }[];
+            if (hits.length === 1) return hits[0].id;
+        }
+        return characterId;
+    }
+
     findById(id: string): Party | null {
         const stmt = this.db.prepare('SELECT * FROM parties WHERE id = ?');
         const row = stmt.get(id) as PartyRow | undefined;
         
-        if (!row) return null;
+        if (!row) {
+            // FINDINGS #70: truncated-UUID rescue — the 8-char short forms in
+            // every handoff block resolve when unambiguous. ≥6 chars, exactly
+            // one match or nothing; two hits stay not-found, never a guess.
+            // Lives in findById so getPartyWithMembers and every tool routed
+            // through it (party_manage, travel, combat includeParty) inherit.
+            if (id.length >= 6 && id.length < 36) {
+                const hits = this.db.prepare('SELECT * FROM parties WHERE id LIKE ? LIMIT 2').all(`${id}%`) as PartyRow[];
+                if (hits.length === 1) return this.rowToParty(hits[0]);
+            }
+            return null;
+        }
         return this.rowToParty(row);
     }
 
@@ -149,7 +198,10 @@ export class PartyRepository {
             validated.currentPOI || null,
             validated.updatedAt,
             validated.lastPlayedAt || null,
-            id
+            // FINDINGS #75-A: existing.id, never the raw argument — a
+            // prefix-called update matched zero rows and returned the merged
+            // object AS IF WRITTEN. Accept-then-discard, write-shaped.
+            existing.id
         );
 
         return validated;
@@ -157,14 +209,18 @@ export class PartyRepository {
 
     delete(id: string): boolean {
         const stmt = this.db.prepare('DELETE FROM parties WHERE id = ?');
-        const result = stmt.run(id);
+        const result = stmt.run(this.resolveFullId(id) ?? id);
         return result.changes > 0;
     }
 
     // ========== Party Members ==========
 
     addMember(member: PartyMember): PartyMember {
-        const validated = PartyMemberSchema.parse(member);
+        const validated = PartyMemberSchema.parse({
+            ...member,
+            partyId: this.resolveFullId(member.partyId) ?? member.partyId,
+            characterId: this.resolveCharacterId(member.characterId)
+        });
 
         const stmt = this.db.prepare(`
             INSERT INTO party_members (id, party_id, character_id, role, is_active, 
@@ -189,15 +245,22 @@ export class PartyRepository {
     }
 
     removeMember(partyId: string, characterId: string): boolean {
+        const pid = this.resolveFullId(partyId) ?? partyId;
         const stmt = this.db.prepare(
             'DELETE FROM party_members WHERE party_id = ? AND character_id = ?'
         );
-        const result = stmt.run(partyId, characterId);
+        const result = stmt.run(pid, this.resolveCharacterId(characterId));
         return result.changes > 0;
     }
 
     updateMember(partyId: string, characterId: string, updates: Partial<PartyMember>): PartyMember | null {
-        const existing = this.findMember(partyId, characterId);
+        // FINDINGS #75-A: findMember resolves the prefix, so the read SUCCEEDS —
+        // then the UPDATE ran against the raw argument, matched zero rows, and
+        // returned the merged object as if written. Resolve once, write with it.
+        // FINDINGS #76: both halves of the key resolve now.
+        const pid = this.resolveFullId(partyId) ?? partyId;
+        const cid = this.resolveCharacterId(characterId);
+        const existing = this.findMember(pid, cid);
         if (!existing) return null;
 
         const updated = {
@@ -218,8 +281,8 @@ export class PartyRepository {
             updated.position ?? null,
             updated.sharePercentage,
             updated.notes || null,
-            partyId,
-            characterId
+            pid,
+            cid
         );
 
         return updated;
@@ -229,7 +292,7 @@ export class PartyRepository {
         const stmt = this.db.prepare(
             'SELECT * FROM party_members WHERE party_id = ? AND character_id = ?'
         );
-        const row = stmt.get(partyId, characterId) as PartyMemberRow | undefined;
+        const row = stmt.get(this.resolveFullId(partyId) ?? partyId, this.resolveCharacterId(characterId)) as PartyMemberRow | undefined;
         
         if (!row) return null;
         return this.rowToMember(row);
@@ -239,58 +302,66 @@ export class PartyRepository {
         const stmt = this.db.prepare(
             'SELECT * FROM party_members WHERE party_id = ? ORDER BY position ASC NULLS LAST, joined_at ASC'
         );
-        const rows = stmt.all(partyId) as PartyMemberRow[];
+        const rows = stmt.all(this.resolveFullId(partyId) ?? partyId) as PartyMemberRow[];
         return rows.map(row => this.rowToMember(row));
     }
 
     findPartiesByCharacter(characterId: string): Party[] {
+        const cid = this.resolveCharacterId(characterId);
         const stmt = this.db.prepare(`
             SELECT p.* FROM parties p
             INNER JOIN party_members pm ON p.id = pm.party_id
             WHERE pm.character_id = ?
             ORDER BY p.last_played_at DESC NULLS LAST
         `);
-        const rows = stmt.all(characterId) as PartyRow[];
+        const rows = stmt.all(cid) as PartyRow[];
         return rows.map(row => this.rowToParty(row));
     }
 
     // ========== Complex Queries ==========
 
     setLeader(partyId: string, characterId: string): boolean {
+        const pid = this.resolveFullId(partyId) ?? partyId;
+        const cid = this.resolveCharacterId(characterId);
         // First, demote any existing leader to member
         this.db.prepare(`
             UPDATE party_members SET role = 'member' 
             WHERE party_id = ? AND role = 'leader'
-        `).run(partyId);
+        `).run(pid);
 
         // Promote new leader
         const stmt = this.db.prepare(`
             UPDATE party_members SET role = 'leader' 
             WHERE party_id = ? AND character_id = ?
         `);
-        const result = stmt.run(partyId, characterId);
+        const result = stmt.run(pid, cid);
         return result.changes > 0;
     }
 
     setActiveCharacter(partyId: string, characterId: string): boolean {
+        const pid = this.resolveFullId(partyId) ?? partyId;
+        const cid = this.resolveCharacterId(characterId);
         // First, clear any existing active character
         this.db.prepare(`
             UPDATE party_members SET is_active = 0 
             WHERE party_id = ? AND is_active = 1
-        `).run(partyId);
+        `).run(pid);
 
         // Set new active character
         const stmt = this.db.prepare(`
             UPDATE party_members SET is_active = 1 
             WHERE party_id = ? AND character_id = ?
         `);
-        const result = stmt.run(partyId, characterId);
+        const result = stmt.run(pid, cid);
         return result.changes > 0;
     }
 
     getPartyWithMembers(partyId: string): PartyWithMembers | null {
         const party = this.findById(partyId);
         if (!party) return null;
+        // FINDINGS #75: the member query runs against party.id — the RESOLVED
+        // full id — never the raw argument. The half-wire (resolved parent,
+        // silently empty roster, reported success) is structurally dead.
 
         // Get all members with their character data
         const stmt = this.db.prepare(`
@@ -308,7 +379,7 @@ export class PartyRepository {
                 pm.joined_at ASC
         `);
 
-        const rows = stmt.all(partyId) as PartyMemberWithCharacterRow[];
+        const rows = stmt.all(party.id) as PartyMemberWithCharacterRow[];
         
         const members: PartyMemberWithCharacter[] = rows.map(row => ({
             id: row.id,
@@ -374,7 +445,7 @@ export class PartyRepository {
         const now = new Date().toISOString();
         this.db.prepare(`
             UPDATE parties SET last_played_at = ?, updated_at = ? WHERE id = ?
-        `).run(now, now, partyId);
+        `).run(now, now, this.resolveFullId(partyId) ?? partyId);
     }
 
     // ========== Party Position Management ==========
@@ -386,6 +457,13 @@ export class PartyRepository {
         locationName: string,
         poiId?: string
     ): Party | null {
+        // FINDINGS #73: this method ran raw SQL by exact id and BYPASSED
+        // findById — so the #70 prefix rescue never applied to move/travel.
+        // Resolve first (exact-or-prefix), then write against the full id.
+        const resolved = this.findById(partyId);
+        if (!resolved) {
+            throw new Error(`Party not found: ${partyId}`);
+        }
         const stmt = this.db.prepare(`
             UPDATE parties 
             SET position_x = ?, position_y = ?, current_location = ?, 
@@ -394,7 +472,7 @@ export class PartyRepository {
             RETURNING *
         `);
 
-        const result = stmt.get(x, y, locationName, poiId || null, new Date().toISOString(), partyId) as PartyRow | undefined;
+        const result = stmt.get(x, y, locationName, poiId || null, new Date().toISOString(), resolved.id) as PartyRow | undefined;
         
         if (!result) {
             throw new Error(`Party not found: ${partyId}`);
@@ -404,13 +482,16 @@ export class PartyRepository {
     }
 
     getPartyPosition(partyId: string): { x: number; y: number; locationName: string; poiId?: string } | null {
+        // FINDINGS #73: resolve exact-or-prefix before the raw-SQL read.
+        const resolved = this.findById(partyId);
+        if (!resolved) return null;
         const stmt = this.db.prepare(`
             SELECT position_x, position_y, current_location, current_poi
             FROM parties
             WHERE id = ?
         `);
 
-        const result = stmt.get(partyId) as any;
+        const result = stmt.get(resolved.id) as any;
         if (!result || result.position_x === null) {
             return null;
         }

@@ -8,18 +8,30 @@ import { z } from 'zod';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
+import * as pda from '../../render/pda.js';
 import { handleExecuteCombatAction } from '../handlers/combat-handlers.js';
 import { getCombatManager } from '../state/combat-manager.js';
 import { getDb } from '../../storage/index.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { CombatEngine } from '../../engine/combat/engine.js';
+import { CharacterRepository } from '../../storage/repos/character.repo.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['attack', 'heal', 'move', 'disengage', 'cast_spell', 'dash', 'dodge', 'help', 'ready'] as const;
-type CombatAction = typeof ACTIONS[number];
+// FINDINGS #103b/c: TWO literal tuples — the capabilities scanner text-matches
+// the first ACTIONS constant declaration in the file for QUOTED strings. A
+// spread (ENGINE_ACTIONS plus the grapple literal) advertised exactly one
+// action; then a comment spelling the pattern verbatim advertised ZERO,
+// because comments survive into dist and the scanner reads text, not syntax
+// — which is why THIS comment is worded to dodge its own regex. ACTIONS goes
+// first below and spells all ten; ENGINE_ACTIONS owns the router + the
+// definition type and deliberately excludes grapple (intercept-before-router,
+// #103). Keep the two lists in step by hand — duplication is the scanner's price.
+const ACTIONS = ['attack', 'heal', 'move', 'disengage', 'cast_spell', 'dash', 'dodge', 'help', 'ready', 'grapple'] as const;
+const ENGINE_ACTIONS = ['attack', 'heal', 'move', 'disengage', 'cast_spell', 'dash', 'dodge', 'help', 'ready'] as const;
+type CombatAction = typeof ENGINE_ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ACTION SCHEMAS
@@ -33,7 +45,14 @@ const AttackSchema = z.object({
     attackBonus: z.number().int().optional(),
     dc: z.number().int().optional(),
     damage: z.union([z.number(), z.string()]).optional(),
-    damageType: z.string().optional()
+    damageType: z.string().optional(),
+    advantage: z.boolean().optional(),
+    disadvantage: z.boolean().optional(),
+    declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('FINDINGS #34 T4.18: Register-B audit trail — declared conditional traits/cover. Values are ALREADY included in attackBonus by the GM; this array only prints them in the breakdown'),
+    declaredEffects: z.array(z.object({ name: z.string(), lane: z.string().optional() })).optional().describe('FINDINGS #60 RESOLVER v2: GM declares the conditional trait by name (+lane for multi-lane rows); the ENGINE computes the value from the effect row (incl. valueFromPool) and APPLIES it — unlike declaredModifiers, do NOT also fold it into attackBonus'),
+    ammoItemId: z.string().optional().describe('FINDINGS #58: magazine/ammo template id in the actor inventory. When present: quantity 0 or absent REFUSES the shot (dry gun is canon); otherwise decrements ammoCount after the engine resolves — no shot without a decrement, welded'),
+    ammoCount: z.number().int().min(1).optional().describe('FINDINGS #58: magazines expended this call (default 1). Exchange semantics per 01 §7 stay GM-judged; the count is the declaration'),
+    hand: z.enum(['mainhand', 'offhand']).optional().describe('FINDINGS #96-C: which equipped weapon this attack resolves with (default mainhand) — decides whose COATING surfaces and debits. The two-blades law: steel main, silver off, the oil follows the hand')
 });
 
 const HealSchema = z.object({
@@ -108,6 +127,52 @@ const definitions: Record<CombatAction, ActionDefinition> = {
         schema: AttackSchema,
         handler: async (params: z.infer<typeof AttackSchema>, ctx?: SessionContext) => {
             if (!ctx) throw new Error('No session context');
+            // ─── FINDINGS #58: THE AMMO LAW — no shot without a decrement ───
+            // Order matters: dry-check BEFORE the roll (an empty gun never rolls),
+            // decrement AFTER the engine resolves (a refused action isn't a shot —
+            // the economy or a validation refusal must not eat the magazine).
+            let adb: import('better-sqlite3').Database | undefined;
+            let ammoRow: { quantity: number; name: string } | undefined;
+            const ammoCount = params.ammoCount ?? 1;
+            if (params.ammoItemId) {
+                const { getDb } = await import('../../storage/index.js');
+                const dbPath = process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db';
+                adb = getDb(dbPath);
+                ammoRow = adb.prepare('SELECT ii.quantity, i.name FROM inventory_items ii JOIN items i ON i.id = ii.item_id WHERE ii.character_id = ? AND ii.item_id = ?').get(params.actorId, params.ammoItemId) as { quantity: number; name: string } | undefined;
+                if (!ammoRow || ammoRow.quantity < ammoCount) {
+                    return {
+                        error: true,
+                        actionType: 'attack',
+                        refused: 'dry',
+                        message: `DRY: ${ammoRow ? `${ammoRow.name} — ${ammoRow.quantity} left, ${ammoCount} needed` : 'no such ammo in the actor inventory'}. The hammer falls on nothing. No roll.`,
+                        ammoItemId: params.ammoItemId
+                    };
+                }
+            }
+            // FINDINGS #96 (COATINGS — auto-surface): the actor's equipped mainhand
+            // instance carries _coating in its attachments JSON (inventory 'coat').
+            // It surfaces here as a declaredModifier (audit lane — printed, never
+            // double-applied; the GM folds the bonus per Register B or into damage)
+            // and debits ONE hit automatically when the attack CONNECTS.
+            let coatingRead: { instanceId: string; label: string; bonus: number; remainingHits: number; name: string } | null = null;
+            let coatDb: ReturnType<typeof getDb> | null = null;
+            try {
+                coatDb = adb ?? getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+                const mh = coatDb.prepare('SELECT item_id FROM inventory_items WHERE character_id = ? AND equipped = 1 AND slot = ?').get(params.actorId, params.hand ?? 'mainhand') as { item_id: string } | undefined;
+                if (mh) {
+                    const inst = coatDb.prepare('SELECT id, attachments FROM item_instances WHERE owner_character_id = ? AND (template_id = ? OR id = ?)').get(params.actorId, mh.item_id, mh.item_id) as { id: string; attachments: string } | undefined;
+                    if (inst) {
+                        const att = JSON.parse(inst.attachments || '{}') as Record<string, unknown>;
+                        const c = att._coating as { label?: string; name?: string; bonus?: number; remainingHits?: number } | undefined;
+                        if (c && typeof c.bonus === 'number' && (c.remainingHits ?? 0) > 0) {
+                            coatingRead = { instanceId: inst.id, label: String(c.label ?? c.name ?? 'coating'), bonus: c.bonus, remainingHits: c.remainingHits ?? 0, name: String(c.name ?? 'coating') };
+                        }
+                    }
+                }
+            } catch { /* no instance layer or shape drift — attack proceeds uncoated */ }
+            const declaredModifiers = coatingRead
+                ? [...(params.declaredModifiers ?? []), { label: `🧪 ${coatingRead.label} (coating, ${coatingRead.remainingHits} left)`, value: coatingRead.bonus }]
+                : params.declaredModifiers;
             const result = await handleExecuteCombatAction({
                 encounterId: params.encounterId,
                 action: 'attack',
@@ -116,9 +181,58 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                 attackBonus: params.attackBonus,
                 dc: params.dc,
                 damage: params.damage,
-                damageType: params.damageType
+                damageType: params.damageType,
+                advantage: params.advantage,
+                disadvantage: params.disadvantage,
+                declaredModifiers,
+                declaredEffects: params.declaredEffects
             }, ctx);
-            return extractResultData(result, 'attack');
+            const data = extractResultData(result, 'attack');
+            // FINDINGS #96-C (BUG A, second pass — fixed against the OBSERVED payload):
+            // the attack result nests everything under actionResult — the flag lives
+            // at actionResult.roll.hit and damage there is an OBJECT {total, rolls}.
+            // Resolve against both the top level and the actionResult core.
+            const dRec = (data && typeof data === 'object') ? data as Record<string, unknown> : null;
+            const arCore = (dRec?.actionResult && typeof dRec.actionResult === 'object') ? dRec.actionResult as Record<string, unknown> : null;
+            const readHit = (o: Record<string, unknown> | null): boolean | undefined => {
+                if (!o) return undefined;
+                if (o.hit === true || o.hit === false) return o.hit as boolean;
+                const r = o.roll as { hit?: boolean } | undefined;
+                if (r?.hit === true || r?.hit === false) return r.hit;
+                return undefined;
+            };
+            const dmgTotal = (o: Record<string, unknown> | null): number => {
+                if (!o) return 0;
+                if (typeof o.damage === 'number') return o.damage;
+                const d = o.damage as { total?: number } | undefined;
+                return typeof d?.total === 'number' ? d.total : 0;
+            };
+            const explicit = readHit(arCore) ?? readHit(dRec);
+            const hitFlag = explicit !== undefined ? explicit : (dmgTotal(arCore) > 0 || dmgTotal(dRec) > 0);
+            if (coatingRead && coatDb && dRec && !dRec.error && hitFlag) {
+                // The edge did its work — one hit off the coating, auto-wipe at 0.
+                try {
+                    const inst = coatDb.prepare('SELECT attachments FROM item_instances WHERE id = ?').get(coatingRead.instanceId) as { attachments: string } | undefined;
+                    if (inst) {
+                        const att = JSON.parse(inst.attachments || '{}') as Record<string, unknown>;
+                        const c = att._coating as { remainingHits: number } | undefined;
+                        if (c) {
+                            c.remainingHits -= 1;
+                            const expired = c.remainingHits <= 0;
+                            if (expired) delete att._coating; else att._coating = c;
+                            coatDb.prepare('UPDATE item_instances SET attachments = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(att), new Date().toISOString(), coatingRead.instanceId);
+                            (data as Record<string, unknown>).coating = { name: coatingRead.name, bonus: coatingRead.bonus, remainingHits: Math.max(0, c.remainingHits), expired, note: expired ? 'SPENT — the edge runs dry' : undefined };
+                        }
+                    }
+                } catch { /* debit failed — coating state unchanged, attack result stands */ }
+            } else if (coatingRead && dRec && !dRec.error) {
+                dRec.coating = { name: coatingRead.name, bonus: coatingRead.bonus, remainingHits: coatingRead.remainingHits, note: 'miss — no hit debited' };
+            }
+            if (params.ammoItemId && adb && ammoRow && data && typeof data === 'object' && !(data as Record<string, unknown>).error) {
+                adb.prepare('UPDATE inventory_items SET quantity = quantity - ? WHERE character_id = ? AND item_id = ?').run(ammoCount, params.actorId, params.ammoItemId);
+                (data as Record<string, unknown>).ammo = { itemName: ammoRow.name, spent: ammoCount, remaining: ammoRow.quantity - ammoCount };
+            }
+            return data;
         },
         aliases: ['hit', 'strike', 'swing', 'shoot']
     },
@@ -341,7 +455,7 @@ function extractResultData(result: McpResponse, actionType: string): Record<stri
 // ═══════════════════════════════════════════════════════════════════════════
 
 const router = createActionRouter({
-    actions: ACTIONS,
+    actions: ENGINE_ACTIONS,
     definitions,
     threshold: 0.6
 });
@@ -380,7 +494,11 @@ Validates spell, rolls damage, applies effects, handles saves - all automatic.
 - dodge - Disadvantage on attacks against you, advantage on DEX saves
 - ready - Prepare an action with a trigger
 
-Aliases: hit/strike→attack, cast/spell→cast_spell, sprint→dash, evade→dodge.`,
+Aliases: hit/strike→attack, cast/spell→cast_spell, sprint→dash, evade→dodge.
+
+🤼 GRAPPLE (FINDINGS #99 — unarmed vocabulary):
+{ action: "grapple", encounterId, actorId, targetId, move: clinch|takedown|throw|slam|control|break, surface? }
+Internal opposed check (Athletics vs better of Athletics/Acrobatics). Win writes conditions to the character row (clinch→Clinched, takedown/slam→Prone+Grappled, throw→Prone, control→Restrained, break→clears holds on the ACTOR). throw/slam ROLL surface damage (earth d4 / concrete-wall-table d6 / edge-glass d8, margin ≥5 adds a die) and RETURN it — apply via your damage lane; the encounter sheet owns mid-combat HP.`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
@@ -390,6 +508,15 @@ Aliases: hit/strike→attack, cast/spell→cast_spell, sprint→dash, evade→do
         targetIds: z.array(z.string()).optional().describe('Multiple targets (AoE spells)'),
         targetPosition: z.object({ x: z.number(), y: z.number() }).optional().describe('Target position (move, dash)'),
         attackBonus: z.number().optional().describe('Attack bonus modifier'),
+        ammoItemId: z.string().optional().describe('FINDINGS #58 (mirror): ammo template id — dry refuses the shot; decrements after the engine resolves'),
+        hand: z.enum(['mainhand', 'offhand']).optional().describe('FINDINGS #96-C (mirror): which weapon the attack resolves with — its coating surfaces and debits (default mainhand)'),
+        ammoCount: z.number().optional().describe('FINDINGS #58 (mirror): magazines expended (default 1)'),
+        advantage: z.boolean().optional().describe('Attack with advantage — 2d20 keep highest (mirror of inner schema, Findings #32)'),
+        declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit: declared modifiers already in attackBonus, printed in the breakdown'),
+        // FINDINGS #60 (mirror law): declaredEffects — GM names the conditional
+        // trait; engine computes and APPLIES the value (incl. valueFromPool).
+        declaredEffects: z.array(z.object({ name: z.string(), lane: z.string().optional() })).optional().describe('RESOLVER v2: [{name, lane?}] — engine-computed conditional trait values; do NOT also fold into attackBonus'),
+        disadvantage: z.boolean().optional().describe('Attack with disadvantage — 2d20 keep lowest'),
         dc: z.number().optional().describe('DC for the attack'),
         damage: z.union([z.number(), z.string()]).optional().describe('Damage amount or dice'),
         damageType: z.string().optional().describe('Damage type (fire, slashing, etc.)'),
@@ -397,15 +524,142 @@ Aliases: hit/strike→attack, cast/spell→cast_spell, sprint→dash, evade→do
         spellName: z.string().optional().describe('Spell name'),
         slotLevel: z.number().optional().describe('Spell slot level'),
         readiedAction: z.string().optional().describe('Description of readied action'),
-        trigger: z.string().optional().describe('Trigger for readied action')
+        trigger: z.string().optional().describe('Trigger for readied action'),
+        move: z.enum(['clinch', 'takedown', 'throw', 'slam', 'control', 'break']).optional().describe('FINDINGS #99 grapple: the move. clinch→Clinched · takedown/slam→Prone+Grappled · throw→Prone · control→Restrained · break→clears holds on the ACTOR'),
+        surface: z.string().optional().describe("FINDINGS #99 grapple throw/slam: what they land on — earth/floor d4, concrete/wall/table d6, edge/glass/rebar d8. Free text, pattern-matched"),
+        modifier: z.number().optional().describe('FINDINGS #99 grapple: situational bonus to the attacker (footing, size, surprise) — summed into the opposed roll')
     })
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FINDINGS #99: GRAPPLE — the unarmed vocabulary. clinch / takedown / throw /
+// slam / control / break as an internal opposed check (Athletics vs the
+// defender's better of Athletics/Acrobatics), conditions written to the
+// character rows, surface damage ROLLED and RETURNED (not applied — the
+// encounter sheet owns mid-combat HP and combat_manage end overwrites
+// character hp; apply the number via your damage lane).
+// ═══════════════════════════════════════════════════════════════════════════
+
+const GRAPPLE_MOVES = ['clinch', 'takedown', 'throw', 'slam', 'control', 'break'] as const;
+type GrappleMove = typeof GRAPPLE_MOVES[number];
+const GRAPPLE_CONDITIONS = ['Clinched', 'Grappled', 'Restrained'];
+
+function surfaceDie(surface?: string): { die: number; label: string } {
+    const s = (surface ?? '').toLowerCase();
+    if (/edge|corner|glass|rebar|spike|kerb|curb/.test(s)) return { die: 8, label: surface ?? 'hard edge' };
+    if (/concrete|stone|wall|asphalt|table|furniture|bar|metal|steel|brick|tile/.test(s)) return { die: 6, label: surface ?? 'hard surface' };
+    return { die: 4, label: surface ?? 'the ground' };
+}
+
+function grappleResolve(args: Record<string, unknown>): Record<string, unknown> {
+    const actorId = String(args.actorId ?? '');
+    const targetId = String(args.targetId ?? '');
+    const moveRaw = String(args.move ?? args.action ?? 'clinch').toLowerCase().replace('break_grapple', 'break');
+    const move = (GRAPPLE_MOVES as readonly string[]).includes(moveRaw) ? moveRaw as GrappleMove : null;
+    if (!move) return { error: true, writes: 'none', message: `grapple needs move: ${GRAPPLE_MOVES.join(' | ')}` };
+    if (!actorId || !targetId) return { error: true, writes: 'none', message: 'grapple needs actorId + targetId' };
+
+    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const repo = new CharacterRepository(db);
+    type CRow = { id: string; name: string; level?: number; stats?: { str?: number; dex?: number }; skillProficiencies?: string[]; conditions?: Array<{ name: string; duration?: number; source?: string }> };
+    const actor = repo.findById(actorId) as unknown as CRow | null;
+    const target = repo.findById(targetId) as unknown as CRow | null;
+    if (!actor) return { error: true, writes: 'none', message: `No character ${actorId}` };
+    if (!target) return { error: true, writes: 'none', message: `No character ${targetId}` };
+
+    const mod = (v?: number) => Math.floor(((v ?? 10) - 10) / 2);
+    const prof = (c: CRow) => 2 + Math.floor((((c.level ?? 1) as number) - 1) / 4);
+    const hasProf = (c: CRow, skills: string[]) => (c.skillProficiencies ?? []).some(s => skills.includes(String(s).toLowerCase()));
+    const d = (sides: number) => Math.floor(Math.random() * sides) + 1;
+
+    const atkStat = Math.max(mod(actor.stats?.str), mod(actor.stats?.dex));
+    const atkProf = hasProf(actor, ['athletics']) ? prof(actor) : 0;
+    const situational = typeof args.modifier === 'number' ? args.modifier : 0;
+    const defStat = Math.max(mod(target.stats?.str), mod(target.stats?.dex));
+    const defProf = hasProf(target, ['athletics', 'acrobatics']) ? prof(target) : 0;
+
+    const atkRoll = d(20); const defRoll = d(20);
+    const atkTotal = atkRoll + atkStat + atkProf + situational;
+    const defTotal = defRoll + defStat + defProf;
+    const margin = atkTotal - defTotal;
+    const win = margin > 0; // tie holds with the defender
+
+    const breakdown = `${actor.name} d20(${atkRoll})+${atkStat}stat+${atkProf}prof${situational ? `+${situational}situational` : ''} = ${atkTotal}  vs  ${target.name} d20(${defRoll})+${defStat}stat+${defProf}prof = ${defTotal}`;
+
+    const mergeConditions = (c: CRow, add: Array<{ name: string; source: string }>, remove: string[] = []) => {
+        let list = (c.conditions ?? []).slice();
+        const rm = new Set(remove.map(n => n.toLowerCase()));
+        if (rm.size) list = list.filter(x => !rm.has(x.name.toLowerCase()));
+        for (const a of add) {
+            const i = list.findIndex(x => x.name.toLowerCase() === a.name.toLowerCase());
+            if (i >= 0) list[i] = { ...list[i], ...a }; else list.push(a);
+        }
+        repo.update(c.id, { conditions: list } as never);
+        return list;
+    };
+
+    if (!win) {
+        return {
+            success: true, actionType: 'grapple', move, hit: false, breakdown, margin,
+            writes: 'none',
+            message: move === 'break'
+                ? `${actor.name} fights the hold and loses it — still held. ${breakdown}`
+                : `${target.name} shrugs the ${move} off — no change. ${breakdown}`
+        };
+    }
+
+    const src = `grapple: ${actor.name}`;
+    let applied: string[] = []; let removed: string[] = [];
+    let surfaceDamage: number | undefined; let damageDetail: string | undefined;
+
+    switch (move) {
+        case 'clinch':
+            mergeConditions(target, [{ name: 'Clinched', source: src }]); applied = ['Clinched']; break;
+        case 'takedown':
+            mergeConditions(target, [{ name: 'Prone', source: src }, { name: 'Grappled', source: src }]); applied = ['Prone', 'Grappled']; break;
+        case 'control':
+            mergeConditions(target, [{ name: 'Restrained', source: src }]); applied = ['Restrained']; break;
+        case 'throw': case 'slam': {
+            const surf = surfaceDie(typeof args.surface === 'string' ? args.surface : undefined);
+            const dice = margin >= 5 ? 2 : 1;
+            const rolls = Array.from({ length: dice }, () => d(surf.die));
+            surfaceDamage = rolls.reduce((a, b) => a + b, 0);
+            damageDetail = `${dice}d${surf.die} [${rolls.join(',')}] into ${surf.label}${margin >= 5 ? ' (margin ≥5: extra die)' : ''}`;
+            if (move === 'throw') { mergeConditions(target, [{ name: 'Prone', source: src }]); applied = ['Prone']; }
+            else { mergeConditions(target, [{ name: 'Prone', source: src }, { name: 'Grappled', source: src }]); applied = ['Prone', 'Grappled']; }
+            break;
+        }
+        case 'break':
+            mergeConditions(actor, [], GRAPPLE_CONDITIONS); removed = GRAPPLE_CONDITIONS; break;
+    }
+
+    return {
+        success: true, actionType: 'grapple', move, hit: true, breakdown, margin,
+        ...(applied.length ? { conditionsApplied: applied, onto: target.name } : {}),
+        ...(removed.length ? { conditionsRemoved: removed, from: actor.name } : {}),
+        ...(surfaceDamage !== undefined ? { surfaceDamage, damageDetail, applyNote: 'surface damage is ROLLED, not applied — feed it to your damage lane (e.g. attack {damage: N} on the prone target, or the GM adjust verb). The encounter sheet owns mid-combat HP.' } : {}),
+        message: move === 'break'
+            ? `${actor.name} breaks the hold — ${GRAPPLE_CONDITIONS.join('/')} cleared. ${breakdown}`
+            : `${actor.name} lands the ${move} on ${target.name}${applied.length ? ` — ${applied.join(' + ')}` : ''}${surfaceDamage !== undefined ? `, ${surfaceDamage} surface damage (${damageDetail})` : ''}. ${breakdown}`
+    };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HANDLER
 // ═══════════════════════════════════════════════════════════════════════════
 
 export async function handleCombatAction(args: unknown, ctx: SessionContext): Promise<McpResponse> {
+    // FINDINGS #99: grapple intercepts before the inner engine — it is not an
+    // engine action; it resolves here and returns.
+    const a = args as Record<string, unknown>;
+    const actName = String(a?.action ?? '').toLowerCase();
+    if (actName === 'grapple' || actName === 'clinch' || actName === 'takedown' || actName === 'slam' || actName === 'break_grapple') {
+        const result = grappleResolve(a);
+        let out = result.error ? RichFormatter.error(String(result.message)) : RichFormatter.header(`Grapple — ${String(result.move)}`, '🤼') + RichFormatter.alert(String(result.message), 'info');
+        out += RichFormatter.embedJson(result, 'COMBAT_ACTION');
+        return { content: [{ type: 'text', text: out }] };
+    }
+
     const response = await router(args as Record<string, unknown>, ctx);
 
     // Wrap response with ASCII formatting
@@ -414,14 +668,9 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
         let output = '';
 
         if (parsed.error) {
-            output = RichFormatter.header('Combat Error', '❌');
-            output += RichFormatter.alert(parsed.message || 'Unknown error', 'error');
-            if (parsed.suggestions) {
-                output += RichFormatter.section('Did you mean?');
-                parsed.suggestions.forEach((s: { action: string; similarity: number }) => {
-                    output += `  • ${s.action} (${s.similarity}% match)\n`;
-                });
-            }
+            // FINDINGS #64: refusals via the payload-gated renderer — NO WRITE
+            // prints iff the throw site asserted writes:'none'.
+            output = pda.refuseFromPayload(parsed);
             if (parsed.validActions) {
                 output += RichFormatter.section('Valid Actions');
                 output += RichFormatter.list(parsed.validActions);
@@ -500,6 +749,12 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
                 output += '\n' + parsed.rawText + '\n';
             } else if (parsed.message && !parsed.effect) {
                 output += parsed.message + '\n';
+            }
+            // FINDINGS #59: formatter parity (#35) — the ammo decrement prints in
+            // the banner, not only the JSON. A tool that mutates persistent state
+            // says so out loud (#38/#50/#51 triptych law).
+            if (parsed.ammo) {
+                output += `\n▣ mag ${parsed.ammo.itemName} — spent ${parsed.ammo.spent}, ${parsed.ammo.remaining} left\n`;
             }
         }
 

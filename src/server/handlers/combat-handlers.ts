@@ -1,4 +1,6 @@
 import { z } from 'zod';
+import { loadAutoMechanics, autoAttackBonus, autoAcBonus, autoDamageBonus, applyDeclaredEffects } from '../../engine/effects-resolver.js';
+import * as pda from '../../render/pda.js';
 import { randomUUID } from 'crypto';
 import { CombatEngine, CombatParticipant, CombatState, CombatActionResult } from '../../engine/combat/engine.js';
 import { SpatialEngine } from '../../engine/spatial/engine.js';
@@ -53,6 +55,15 @@ function syncParticipantHpFromDb(state: CombatState): CombatState {
             }
             if (character.maxHp !== participant.maxHp) {
                 participant.maxHp = character.maxHp;
+            }
+            // FINDINGS #25/#26: an omitted participant `ac` silently defaulted
+            // to 10 even when the id resolved to a real character — post-un-bake
+            // that's a 4-point softness wearing correct-looking output (the
+            // resolver's trait line still prints). Fill missing AC from the
+            // character row; explicit ac always wins; ad-hoc tokens keep the
+            // 10 + dex heuristic.
+            if (participant.ac === undefined && character.ac !== undefined) {
+                participant.ac = character.ac;
             }
         }
     }
@@ -195,19 +206,29 @@ function createHpBar(percentage: number): string {
  * Format an attack result for display
  */
 function formatAttackResult(result: CombatActionResult): string {
-    let output = `\n┌─────────────────────────────────────────┐\n`;
-    output += `│ ⚔️  ATTACK ACTION\n`;
-    output += `└─────────────────────────────────────────┘\n\n`;
-    
-    output += `${result.actor.name} attacks ${result.target.name}!\n\n`;
-    output += result.detailedBreakdown;
-    
-    if (result.defeated) {
-        output += `\n\n💀 ${result.target.name} has been defeated!`;
-    }
-    
-    output += `\n\n→ Call advance_turn to proceed`;
-    
+    // FINDINGS #63 (PDA Wave B): КОНТАКТ — rebuilt from the structured result,
+    // not the engine's prose. The natural die always prints (jam law).
+    const rr = result as CombatActionResult & { damageType?: string };
+    const ar = result.attackRoll as (typeof result.attackRoll & { allRolls?: number[] }) | undefined;
+    let output = '\n' + pda.renderContact({
+        actorName: result.actor?.name,
+        targetName: result.target?.name,
+        die: ar?.roll,
+        allRolls: ar?.allRolls,
+        bonus: ar?.modifier,
+        total: ar?.total,
+        targetAc: ar?.dc,
+        hit: ar?.isHit,
+        crit: ar?.isCrit,
+        damageTotal: result.damage,
+        damageType: rr.damageType,
+        damageRolls: (result as CombatActionResult & { damageRolls?: number[] }).damageRolls,
+        hpBefore: result.target?.hpBefore,
+        hpAfter: result.target?.hpAfter,
+        defeated: result.defeated,
+        jamCheckOwed: (result as CombatActionResult & { jamCheckOwed?: { weapon?: string; condition?: number; jamsOn?: string } }).jamCheckOwed
+    });
+    output += `\n→ advance_turn to proceed`;
     return output;
 }
 
@@ -658,6 +679,10 @@ Examples:
             attackBonus: z.number().int().optional(),
             dc: z.number().int().optional(),
             damage: z.union([z.number(), z.string()]).optional().describe('Damage amount (number) or dice expression (e.g., "1d6+2")'),
+            advantage: z.boolean().optional().describe('Roll 2d20 keep highest (Findings #31/#32)'),
+            disadvantage: z.boolean().optional().describe('Roll 2d20 keep lowest'),
+            declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit trail: printed in output, never re-applied'),
+            declaredEffects: z.array(z.object({ name: z.string(), lane: z.string().optional() })).optional().describe('FINDINGS #60 RESOLVER v2: GM declares the conditional trait by name (+lane for multi-lane rows); engine computes the value (incl. valueFromPool) and APPLIES it to the attack bonus'),
             damageType: z.string().optional()
                 .describe('HIGH-002: Damage type (e.g., "fire", "cold", "slashing") for resistance calculation'),
             amount: z.number().int().optional(),
@@ -1089,6 +1114,19 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             };
         }
 
+        // FINDINGS #26: participants backed by a real character row inherit its
+        // AC when neither the caller nor a preset supplied one — an omitted `ac`
+        // silently defaulted to 10 at resolution while output looked correct
+        // (the soft-AC trap). Explicit ac still wins below; ad-hoc tokens with
+        // no row keep the heuristic.
+        if (p.ac === undefined && extraStats.ac === undefined && p.id) {
+            const acDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+            const row = new CharacterRepository(acDb).findById(p.id);
+            if (row?.ac !== undefined) {
+                extraStats.ac = row.ac;
+            }
+        }
+
         const participant = {
             // CRITICAL FIX: Auto-generate ID if not provided to prevent React key collisions
             id: p.id || randomUUID(),
@@ -1344,17 +1382,48 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             throw new Error('Attack action requires attackBonus (could not be auto-calculated from actor stats)');
         }
 
+        // RESOLVER v1 (Findings #19): consume autoApply-flagged trait mechanics.
+        // Bare/prose-conditional mechanics stay GM-declared by design.
+        const resolverDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+        const autoApplied: import('../../engine/effects-resolver.js').AutoApplication[] = [];
+        const actorMechs = loadAutoMechanics(resolverDb, parsed.actorId);
+        attackBonus += autoAttackBonus(actorMechs, autoApplied);
+        // RESOLVER v2 (FINDINGS #60): declared-effects channel — GM names the
+        // conditional trait; engine computes the value (fixed or pool-derived)
+        // and applies it to the attack bonus. Problems report loudly, apply nothing.
+        const declaredEffectRefs = (parsed as { declaredEffects?: Array<{ name: string; lane?: string }> }).declaredEffects ?? [];
+        const resolverProblems: string[] = [];
+        // FINDINGS #74: attack-lane problems are HELD until the damage lane has
+        // run — a ref that applies on either lane gets its no-mechanic noise on
+        // the other lane dropped (a damage-only trait is not an attack-lane
+        // fault, and vice versa). A ref inert on BOTH lanes still shouts.
+        let attackLaneProblems: string[] = [];
+        if (declaredEffectRefs.length) {
+            const dres = applyDeclaredEffects(resolverDb, parsed.actorId, declaredEffectRefs, 'attack_bonus', autoApplied);
+            attackBonus += dres.total;
+            attackLaneProblems = dres.problems;
+        }
+
         // 2. Target AC (DC)
         if (dc === undefined || dc === 0) {
             if (target?.ac !== undefined) {
                 dc = target.ac;
             } else {
-                // Heuristic: 10 + dex mod (if available) or just 10
-                const dex = target?.abilityScores?.dexterity ?? 10;
-                const dexMod = Math.floor((dex - 10) / 2);
-                dc = 10 + dexMod;
+                // FINDINGS #26: before the heuristic, honor the character row —
+                // covers encounters created before create-time hydration existed.
+                const rowChar = parsed.targetId ? new CharacterRepository(resolverDb).findById(parsed.targetId) : undefined;
+                if (rowChar?.ac !== undefined) {
+                    dc = rowChar.ac;
+                } else {
+                    // Heuristic: 10 + dex mod (if available) or just 10
+                    const dex = target?.abilityScores?.dexterity ?? 10;
+                    const dexMod = Math.floor((dex - 10) / 2);
+                    dc = 10 + dexMod;
+                }
             }
         }
+        const targetMechs = parsed.targetId ? loadAutoMechanics(resolverDb, parsed.targetId) : [];
+        dc += autoAcBonus(targetMechs, autoApplied);
 
         // 3. Damage - auto-calculate from multiple sources
         if (damage === undefined || damage === 0) {
@@ -1385,6 +1454,35 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             throw new Error('Attack action requires targetId');
         }
 
+        // FINDINGS #70: THE DAMAGE LANE — flat trait damage, engine-computed.
+        // autoApply damage_bonus mechanics fire themselves; declaredEffects rows
+        // with a damage_bonus mechanic resolve here too (same refs the GM already
+        // passed — one declaration can carry attack AND damage lanes of a trait).
+        // Value sources: fixed, valueFromPool, valueFromProficiency (#70 —
+        // Odinets scales with level; hard-coding +2 kills it silently at L5).
+        // Applied AFTER crit doubling, BEFORE resistance, inside executeAttack.
+        let damageLaneBonus = autoDamageBonus(actorMechs, autoApplied);
+        let damageLaneProblems: string[] = [];
+        if (declaredEffectRefs.length) {
+            const ddres = applyDeclaredEffects(resolverDb, parsed.actorId, declaredEffectRefs, 'damage_bonus', autoApplied);
+            damageLaneBonus += ddres.total;
+            damageLaneProblems = ddres.problems;
+        }
+        // FINDINGS #74: cross-lane noise suppression — one declaration feeds
+        // both lanes, so 'no X mechanic' is only a fault when the ref applied
+        // on NEITHER lane. Real faults (missing row, malformed, ambiguous
+        // lanes) always pass through.
+        {
+            const appliedRefNames = new Set(autoApplied.filter(a => a.declared).map(a => a.effect.toLowerCase()));
+            const crossLaneNoise = (p: string) => {
+                const m = p.match(/^declared effect "(.+?)": no (attack_bonus|damage_bonus) mechanic/);
+                return !!m && appliedRefNames.has(m[1].toLowerCase());
+            };
+            resolverProblems.push(...attackLaneProblems.filter(p => !crossLaneNoise(p)));
+            resolverProblems.push(...damageLaneProblems.filter(p => !crossLaneNoise(p)));
+        }
+        const damageLaneLabel = autoApplied.filter(a => a.type === 'damage_bonus').map(a => a.effect).join(' + ') || undefined;
+
         // Validate Action Economy
         const validation = engine.validateActionEconomy(parsed.actorId, 'action');
         if (!validation.valid) {
@@ -1399,7 +1497,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             attackBonus!,
             dc!,
             damage!,
-            parsed.damageType  // HIGH-002: Pass damage type for resistance calculation
+            parsed.damageType,  // HIGH-002: Pass damage type for resistance calculation
+            parsed.advantage,
+            parsed.disadvantage,
+            damageLaneBonus || undefined,  // FINDINGS #70: resolver damage lane
+            damageLaneLabel
         );
 
         // Sync HP to character database after attack
@@ -1426,7 +1528,10 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             const targetChar = charRepo.findById(parsed.targetId);
 
             if (targetChar && concentrationRepo.isConcentrating(parsed.targetId)) {
-                const concentrationCheck = checkConcentration(targetChar, result.damage, concentrationRepo);
+                // RESOLVER v1: autoApply saving_throw_bonus (con-filtered) feeds the hold.
+                const conMechs = loadAutoMechanics(getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db'), parsed.targetId);
+                const conBonus = conMechs.filter(m => m.type === 'saving_throw_bonus' && (!m.condition || 'constitution'.includes(m.condition.toLowerCase()) || m.condition.toLowerCase().includes('con'))).reduce((s, m) => s + m.value, 0);
+                const concentrationCheck = checkConcentration(targetChar, result.damage, concentrationRepo, conBonus);
                 if (concentrationCheck.broken) {
                     // Break concentration
                     breakConcentration(
@@ -1453,7 +1558,53 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             }
         }
 
+        // #66: JAM CHECK OWED — the engine does not resolve the jam; it flags
+        // that the natural die landed inside the equipped weapon's jam band
+        // (01 §7: nat 1 under cond 75, nat 1-2 under 50, nat 1-3 under 25) so
+        // the jam law is never quietly skipped. Reads the actor's mainhand
+        // instance condition — same JOIN as the status block.
+        try {
+            const natDie = (result.attackRoll as { roll?: number } | undefined)?.roll;
+            if (typeof natDie === 'number' && natDie <= 3) {
+                const jamDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+                const mh = jamDb.prepare(`
+                    SELECT i.name AS name, i.id AS templateId FROM inventory_items inv
+                    JOIN items i ON i.id = inv.item_id
+                    WHERE inv.character_id = ? AND inv.equipped = 1 AND inv.slot = 'mainhand'
+                `).get(parsed.actorId) as { name?: string; templateId?: string } | undefined;
+                if (mh?.templateId) {
+                    const inst = jamDb.prepare(`
+                        SELECT condition, custom_name FROM item_instances
+                        WHERE owner_character_id = ? AND template_id = ?
+                    `).get(parsed.actorId, mh.templateId) as { condition?: number; custom_name?: string } | undefined;
+                    if (inst && typeof inst.condition === 'number' && inst.condition < 75) {
+                        const band = inst.condition >= 50 ? 1 : inst.condition >= 25 ? 2 : 3;
+                        if (natDie <= band) {
+                            (result as unknown as Record<string, unknown>).jamCheckOwed = {
+                                weapon: inst.custom_name || mh.name,
+                                condition: inst.condition,
+                                jamsOn: band === 1 ? 'nat 1' : band === 2 ? 'nat 1-2' : 'nat 1-3'
+                            };
+                        }
+                    }
+                }
+            }
+        } catch { /* no instance row — template guns carry no jam band */ }
+
         output = formatAttackResult(result);
+        if (parsed.declaredModifiers?.length) {
+            output += `▌ ⟨audit⟩ in-bonus: ${parsed.declaredModifiers.map(d => `${d.label} ${d.value >= 0 ? '+' : ''}${d.value}`).join(' · ')}\n`;
+            // Findings #35: banner AND JSON, always — audit fields must be greppable in rawData.
+            (result as unknown as Record<string, unknown>).declaredModifiers = parsed.declaredModifiers;
+        }
+        if (autoApplied.length > 0) {
+            output += `▌ ─ ${autoApplied.map(a => `${a.effect} ${a.value >= 0 ? '+' : ''}${a.value}${a.declared ? ' ⟨declared⟩' : ''}`).join(' · ')}\n`;
+            (result as unknown as Record<string, unknown>).autoApplied = autoApplied;
+        }
+        if (resolverProblems.length > 0) {
+            output += `▌ ⚠ ${resolverProblems.join(' | ')}\n`;
+            (result as unknown as Record<string, unknown>).resolverProblems = resolverProblems;
+        }
         
         // Commit Action Economy
         engine.commitAction(parsed.actorId, 'action');
@@ -2070,9 +2221,35 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             });
         }
 
-        // Append current state JSON for frontend
+        // Append current state JSON for frontend.
+        // Findings #38: THE IRON LAW ENVELOPE — the action's structured result
+        // rides the same JSON the client parses. Prose is for eyes; this block
+        // is for audit. Every number the table narrates exists here as data.
         const stateJson = buildStateJson(state, parsed.encounterId);
-        output += `\n\n<!-- STATE_JSON\n${JSON.stringify(stateJson)}\nSTATE_JSON -->`;
+        const r = result as unknown as (CombatActionResult & { declaredModifiers?: unknown; autoApplied?: unknown }) | undefined;
+        const actionResult = r ? {
+            type: r.type,
+            actor: r.actor,
+            target: r.target,   // hpBefore / hpAfter / maxHp
+            roll: r.attackRoll ? {
+                die: r.attackRoll.roll,
+                allRolls: (r.attackRoll as { allRolls?: number[] }).allRolls,
+                bonus: r.attackRoll.modifier,
+                total: r.attackRoll.total,
+                targetAc: r.attackRoll.dc,
+                hit: r.attackRoll.isHit,
+                crit: r.attackRoll.isCrit
+            } : undefined,
+            damage: r.damage !== undefined ? { total: r.damage, rolls: r.damageRolls, type: (r as { damageType?: string }).damageType } : undefined,
+            healAmount: r.healAmount,
+            success: r.success,
+            defeated: r.defeated,
+            declaredModifiers: r.declaredModifiers,
+            autoApplied: r.autoApplied,
+            // #66: banner and JSON carry the jam flag together — parity law.
+            jamCheckOwed: (r as CombatActionResult & { jamCheckOwed?: unknown }).jamCheckOwed
+        } : undefined;
+        output += `\n\n<!-- STATE_JSON\n${JSON.stringify({ ...stateJson, actionResult })}\nSTATE_JSON -->`;
     }
 
     if (turnWarning) {
@@ -2151,6 +2328,25 @@ export async function handleEndEncounter(args: unknown, ctx: SessionContext) {
     const engine = getCombatManager().get(namespacedId);
 
     if (!engine) {
+        // FINDINGS #79: no engine in memory — but the DB row may be a ghost
+        // (status='active' with nothing running: a pre-#79 bench residue or a
+        // crash-survivor the GM wants closed, not resumed). Close the row
+        // directly instead of demanding a load-resurrect dance to bury a
+        // corpse. The store's answer drives the report: changes=0 means there
+        // was nothing to close, and THAT stays a loud not-found.
+        try {
+            const ghostDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+            const r = ghostDb.prepare(`UPDATE encounters SET status = 'completed', updated_at = ? WHERE id = ? AND status = 'active'`)
+                .run(new Date().toISOString(), parsed.encounterId);
+            if (r.changes > 0) {
+                return {
+                    content: [{
+                        type: 'text' as const,
+                        text: `\n🏁 GHOST ENCOUNTER CLOSED\nEncounter ID: ${parsed.encounterId}\n\nNo engine was running — the persisted row was still status='active' (pre-#79 residue). Row marked completed; it will no longer report as active combat at boot. Nothing was resumed, no state was replayed.`
+                    }]
+                };
+            }
+        } catch { /* encounters table absent — fall through to not-found */ }
         throw new Error(`Encounter ${parsed.encounterId} not found.`);
     }
 
@@ -2194,6 +2390,17 @@ export async function handleEndEncounter(args: unknown, ctx: SessionContext) {
 
     // Now delete the encounter from memory
     getCombatManager().delete(namespacedId);
+
+    // FINDINGS #79: end MARKS THE ROW — the encounters table row previously
+    // stayed status='active' forever (end only cleared memory), so
+    // session_manage get_context reported a ghost combat at every boot: the
+    // 03 §9 "cosmetic" pointer was a banner-lie (#67-A class) with a documented
+    // excuse. The store now agrees with the message.
+    try {
+        const endDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+        endDb.prepare(`UPDATE encounters SET status = 'completed', updated_at = ? WHERE id = ?`)
+            .run(new Date().toISOString(), parsed.encounterId);
+    } catch { /* encounters table absent (tests) — memory delete already done */ }
 
     // STALE COMBAT FIX: Also clear any other encounters containing these participants
     // This handles cases where multiple test encounters left stale state
@@ -2306,42 +2513,26 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
         throw new Error('Failed to roll death save');
     }
 
-    // Build output
-    let output = `\n┌─────────────────────────────────────────┐\n`;
-    output += `│ 💀 DEATH SAVING THROW\n`;
-    output += `└─────────────────────────────────────────┘\n\n`;
-    output += `${participant.name} makes a death saving throw...\n\n`;
-
-    output += `🎲 Roll: d20 = ${result.roll}`;
-
-    if (result.isNat20) {
-        output += ` ⭐ NATURAL 20!\n\n`;
-        output += `✨ ${participant.name} regains 1 HP and is conscious again!\n`;
-    } else if (result.isNat1) {
-        output += ` 💥 NATURAL 1! (Counts as 2 failures)\n\n`;
-    } else if (result.success) {
-        output += ` ✓ SUCCESS (10+)\n\n`;
-    } else {
-        output += ` ✗ FAILURE (9 or less)\n\n`;
-    }
-
-    // Status summary
-    const successMarkers = '●'.repeat(result.successes) + '○'.repeat(3 - result.successes);
-    const failureMarkers = '●'.repeat(result.failures) + '○'.repeat(3 - result.failures);
-
-    output += `Successes: [${successMarkers}] ${result.successes}/3\n`;
-    output += `Failures:  [${failureMarkers}] ${result.failures}/3\n\n`;
-
-    if (result.isStabilized) {
-        output += `🛡️ ${participant.name} is STABILIZED! (Unconscious but no longer dying)\n`;
-    } else if (result.isDead) {
-        output += `☠️ ${participant.name} has DIED!\n`;
-    }
+    // FINDINGS #63 (PDA Wave B): СМЕРТЬ — rail render, and the death save
+    // gains a JSON embed for the first time (it was banner-only: a #38
+    // violation on the highest-stakes roll in the game, caught this wave).
+    let output = pda.renderDeath({
+        characterName: participant.name,
+        natural: result.roll,
+        isNat20: result.isNat20,
+        isNat1: result.isNat1,
+        successes: result.successes,
+        failures: result.failures,
+        stabilized: result.isStabilized,
+        dead: result.isDead
+    } as Parameters<typeof pda.renderDeath>[0]);
 
     // Save state
     const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
     const repo = new EncounterRepository(db);
     repo.saveState(parsed.encounterId, engine.getState()!);
+
+    output += `\n<!-- STATE_JSON\n${JSON.stringify({ deathSave: { characterId: parsed.characterId, characterName: participant.name, roll: result.roll, isNat20: result.isNat20, isNat1: result.isNat1, success: result.success, successes: result.successes, failures: result.failures, stabilized: result.isStabilized, dead: result.isDead } })}\nSTATE_JSON -->`;
 
     return {
         content: [{

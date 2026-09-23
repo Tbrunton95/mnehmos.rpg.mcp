@@ -51,6 +51,13 @@ export interface InvokeResult {
     completionTokens: number | null;
     durationMs: number | null;
     finishReason?: string;
+    /** FINDINGS #69: model the runtime RESOLVED and requested (ladder or override — agents.model is advisory). */
+    requestedModel?: string | null;
+    /** FINDINGS #69: model the provider reports having SERVED. Mismatch vs requestedModel = substitution, visible. */
+    servedModel?: string | null;
+    /** FINDINGS #69: where the resolved model came from — 'stat_derived' (INT ladder) or 'override'. */
+    competencySource?: string | null;
+    reasoningEffort?: string | null;
 }
 
 function notFound(reason: string): InvokeResult {
@@ -276,7 +283,11 @@ export async function invokeAgent(input: InvokeInput, deps: AgentRuntimeDeps): P
             promptTokens: result.promptTokens ?? null,
             completionTokens: result.completionTokens ?? null,
             durationMs: result.durationMs,
-            finishReason: result.finishReason
+            finishReason: result.finishReason,
+            requestedModel: resolvedModel,
+            servedModel: result.model ?? resolvedModel,
+            competencySource: competency?.source ?? null,
+            reasoningEffort: competency?.reasoningEffort ?? null
         };
     } catch (err) {
         clearTimeout(timeout);
@@ -318,7 +329,10 @@ export async function invokeAgent(input: InvokeInput, deps: AgentRuntimeDeps): P
             reason: message,
             promptTokens: null,
             completionTokens: null,
-            durationMs: null
+            durationMs: null,
+            requestedModel: resolvedModel,
+            competencySource: competency?.source ?? null,
+            reasoningEffort: competency?.reasoningEffort ?? null
         };
     }
 }

@@ -73,7 +73,7 @@ const NewCreateSchema = z.object({
     name: z.string().min(1).describe('NPC name (required)'),
     class: z.string().optional().default('Commoner'),
     race: z.string().optional().default('Human'),
-    background: z.string().optional().default('Folk Hero'),
+    background: z.string().optional().default('Stalker'),
     alignment: z.string().optional(),
     stats: StatsSchema.optional().default({ str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 10 }),
     hp: z.number().int().min(1).optional(),
@@ -165,7 +165,8 @@ const RecordMemorySchema = z.object({
     action: z.literal('record_memory'),
     characterId: z.string().describe('ID of the player character'),
     npcId: z.string().describe('ID of the NPC'),
-    summary: z.string().describe('Summary of the conversation/interaction'),
+    summary: z.string().optional().describe('Summary of the interaction — derives from content when omitted (FINDINGS #34 T3)'),
+    content: z.string().optional().describe('Memory content — summary source when summary omitted'),
     importance: z.enum(['low', 'medium', 'high', 'critical']).default('medium')
         .describe('How important this memory is'),
     topics: z.array(z.string()).default([])
@@ -822,7 +823,7 @@ async function handleRecordMemory(args: z.infer<typeof RecordMemorySchema>): Pro
     const memory = repo.recordMemory({
         characterId: args.characterId,
         npcId: args.npcId,
-        summary: args.summary,
+        summary: args.summary ?? ((args as { content?: string }).content ?? 'unspecified memory').slice(0, 100),
         importance: args.importance as Importance,
         topics: args.topics
     });
@@ -911,23 +912,45 @@ async function handleInteract(args: z.infer<typeof InteractSchema>): Promise<obj
         return { error: true, message: `Speaker with ID ${args.speakerId} not found` };
     }
 
-    // Check speaker is in a room
-    if (!speaker.currentRoomId) {
-        return { error: true, message: `Speaker ${speaker.name} is not in any room` };
-    }
-
-    const room = spatialRepo.findById(speaker.currentRoomId);
-    if (!room) {
-        return { error: true, message: `Room ${speaker.currentRoomId} not found` };
-    }
-
-    // Validate target if specified
+    // Validate target if specified (before the spatial branch — both paths need it)
     let target = null;
     if (args.targetId) {
         target = charRepo.findById(args.targetId);
         if (!target) {
             return { error: true, message: `Target with ID ${args.targetId} not found` };
         }
+    }
+
+    // FINDINGS #81: NON-SPATIAL INTERACT — seating both parties in spatial
+    // rooms was pure overhead for village conversations, so whole scenes fell
+    // back to bare narration and the memory system recorded nothing. When the
+    // speaker has no room (or the room row is gone), degrade gracefully:
+    // dialogue processed, target memory recorded — no hearing radius, no
+    // eavesdrop rolls, and the result SAYS so instead of pretending.
+    const room = speaker.currentRoomId ? spatialRepo.findById(speaker.currentRoomId) : null;
+    if (!room) {
+        if (target) {
+            memoryRepo.recordMemory({
+                characterId: target.id,
+                npcId: speaker.id,
+                summary: `${speaker.name} said (${args.volume.toLowerCase()}): "${args.content}"${args.intent ? ` [Intent: ${args.intent}]` : ''}`,
+                importance: args.volume === 'SHOUT' ? 'high' : 'medium',
+                topics: args.intent ? [args.intent] : []
+            });
+        }
+        return {
+            success: true,
+            actionType: 'interact',
+            spatial: false,
+            note: 'non-spatial interact — speaker not seated in a room: dialogue processed and memory recorded, no eavesdrop checks, no hearing radius',
+            speaker: { id: speaker.id, name: speaker.name },
+            target: target ? { id: target.id, name: target.name, heard: true } : null,
+            volume: args.volume,
+            listeners: target ? [{ listenerId: target.id, listenerName: target.name, heardFully: true }] : [],
+            totalListeners: target ? 1 : 0,
+            whoHeard: target ? 1 : 0,
+            whoMissed: 0
+        };
     }
 
     // Calculate hearing radius
@@ -1014,6 +1037,7 @@ async function handleInteract(args: z.infer<typeof InteractSchema>): Promise<obj
     return {
         success: true,
         actionType: 'interact',
+        spatial: true,
         speaker: { id: speaker.id, name: speaker.name },
         target: target ? { id: target.id, name: target.name, heard: true } : null,
         volume: args.volume,
@@ -1081,7 +1105,7 @@ const definitions: Record<NpcManageAction, ActionDefinition> = {
     get_full_context: {
         schema: GetFullContextSchema,
         handler: handleGetFullContext,
-        aliases: ['full_context', 'bundle', 'context_bundle'],
+        aliases: ['full_context', 'bundle', 'context_bundle', 'get'],
         description: 'Full table-ready bundle: sheet + persona + relationships + memories + location + encounter + inventory + prompt blob'
     },
     get_relationship: {
