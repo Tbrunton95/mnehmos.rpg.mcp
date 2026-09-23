@@ -14,6 +14,7 @@ import {
     classifyFetchError,
     classifyHttpStatus
 } from './types.js';
+import { isReasoningModel } from './reasoning.js';
 
 const DEFAULT_BASE = 'https://openrouter.ai/api/v1';
 
@@ -27,7 +28,6 @@ export interface OpenRouterProviderConfig {
 }
 
 interface OpenRouterChatResponse {
-    model?: string;
     choices?: Array<{
         message?: { content?: string | null };
         finish_reason?: string;
@@ -35,6 +35,10 @@ interface OpenRouterChatResponse {
     usage?: {
         prompt_tokens?: number;
         completion_tokens?: number;
+        total_tokens?: number;
+        completion_tokens_details?: { reasoning_tokens?: number };
+        cost?: number;
+        cost_details?: { upstream_inference_cost?: number };
     };
     error?: { message?: string; code?: number };
 }
@@ -67,22 +71,19 @@ export class OpenRouterProvider implements LLMProvider {
         if (this.referer) headers['HTTP-Referer'] = this.referer;
         if (this.title) headers['X-Title'] = this.title;
 
+        const reasoningModel = isReasoningModel(opts.model);
         const body: Record<string, unknown> = {
             model: opts.model,
-            messages: opts.messages,
-            temperature: opts.temperature,
-            max_tokens: opts.maxTokens
+            messages: opts.messages
         };
-        // FINDINGS #69: reasoningEffort was threaded through the whole stack and
-        // dropped here — thinking burned the max_tokens budget on every invoke.
-        // OpenRouter's normalized `reasoning` param: effort string, or
-        // { enabled: false } to disable thinking outright. `null` from the
-        // competency ladder means exactly that — in-character dialogue does not
-        // need chain-of-thought. Unsupported models ignore the parameter.
-        if (opts.reasoningEffort !== undefined) {
-            body.reasoning = opts.reasoningEffort === null
-                ? { enabled: false }
-                : { effort: opts.reasoningEffort === 'xhigh' ? 'high' : opts.reasoningEffort };
+        if (opts.maxTokens !== undefined) {
+            body[reasoningModel ? 'max_completion_tokens' : 'max_tokens'] = opts.maxTokens;
+        }
+        if (opts.temperature !== undefined && !reasoningModel) {
+            body.temperature = opts.temperature;
+        }
+        if (opts.reasoningEffort !== undefined && opts.reasoningEffort !== null && reasoningModel) {
+            body.reasoning_effort = opts.reasoningEffort;
         }
 
         let response: Response;
@@ -118,6 +119,14 @@ export class OpenRouterProvider implements LLMProvider {
         const choice = parsed.choices?.[0];
         const text = choice?.message?.content ?? '';
         if (!text) {
+            if (choice?.finish_reason === 'length') {
+                const budget = body.max_completion_tokens ?? body.max_tokens;
+                throw new ProviderError(
+                    `Provider returned empty content with finish_reason="length": the completion budget (${budget}) was exhausted before any text was produced` +
+                    (reasoningModel ? ', consumed by reasoning tokens. Raise agent.maxTokens.' : '. Raise agent.maxTokens.'),
+                    'malformed', response.status, rawText
+                );
+            }
             throw new ProviderError('Provider returned empty message content', 'malformed', response.status, rawText);
         }
 
@@ -125,10 +134,16 @@ export class OpenRouterProvider implements LLMProvider {
             text,
             promptTokens: parsed.usage?.prompt_tokens,
             completionTokens: parsed.usage?.completion_tokens,
+            totalTokens: parsed.usage?.total_tokens,
+            reasoningTokens: parsed.usage?.completion_tokens_details?.reasoning_tokens,
+            ...(typeof parsed.usage?.cost === 'number'
+                ? { costUsd: parsed.usage.cost, costSource: 'provider' as const }
+                : typeof parsed.usage?.cost_details?.upstream_inference_cost === 'number'
+                    ? { costUsd: parsed.usage.cost_details.upstream_inference_cost, costSource: 'provider_upstream' as const }
+                    : {}),
             raw: rawText,
             durationMs,
-            finishReason: choice?.finish_reason,
-            model: parsed.model
+            finishReason: choice?.finish_reason
         };
     }
 }

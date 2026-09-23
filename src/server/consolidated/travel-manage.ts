@@ -11,6 +11,8 @@ import { getDb } from '../../storage/index.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { PartyRepository } from '../../storage/repos/party.repo.js';
 import { CorpseRepository } from '../../storage/repos/corpse.repo.js';
+import { SpatialRepository } from '../../storage/repos/spatial.repo.js';
+import { PoiRepository } from '../../storage/repos/poi.repo.js';
 import { SessionContext } from '../types.js';
 
 export interface McpResponse {
@@ -39,17 +41,14 @@ const ALIASES: Record<string, TravelAction> = {
 };
 
 function ensureDb() {
-    const dbPath = process.env.NODE_ENV === 'test'
-        ? ':memory:'
-        : process.env.RPG_DATA_DIR
-            ? `${process.env.RPG_DATA_DIR}/rpg.db`
-            : 'rpg.db';
-    const db = getDb(dbPath);
+    const db = getDb();
     return {
         db,
         charRepo: new CharacterRepository(db),
         partyRepo: new PartyRepository(db),
-        corpseRepo: new CorpseRepository(db)
+        corpseRepo: new CorpseRepository(db),
+        spatialRepo: new SpatialRepository(db),
+        poiRepo: new PoiRepository(db)
     };
 }
 
@@ -63,12 +62,6 @@ const TravelManageInputSchema = z.object({
     enterLocation: z.boolean().optional().default(false).describe('Enter POI room network'),
     autoDiscover: z.boolean().optional().default(false).describe('Skip discovery check'),
     discoveringCharacterId: z.string().optional().describe('Character making discovery check'),
-    radTier: z.number().int().min(1).max(6).optional().describe('FINDINGS #55: danger tier of the leg (1-6). When present, the engine runs the #54 exposure law: lead rolls Survival vs tier DC; on failure, tier income lands per member reduced by equipped-armor resistance; nat 1 = hotspot (double + encounterTriggered); nat 20 = clean + intel flag. Default track: rads'),
-    exposureTrack: z.string().optional().describe('FINDINGS #93: NAME THE TRACK — the pool tier income lands in (default "rads"). "contamination", "cold", "infection", "miasma" — any pool. Four genres, one law'),
-    resistProperty: z.string().optional().describe('FINDINGS #93: the equipped-armor property that reduces landed income (default "radResistance"). e.g. "sealRating", "insulation", "filtration"'),
-    trackMax: z.number().optional().describe('FINDINGS #93: the track pool ceiling (default 1000)'),
-    leadId: z.string().optional().describe('FINDINGS #55: character leading the leg (rolls the Survival check). Defaults to party leader, then first member'),
-    interior: z.boolean().optional().describe('FINDINGS #55: interior leg — landed rads halve after resistance'),
 
     // loot fields
     encounterId: z.string().optional().describe('Encounter ID to loot'),
@@ -130,7 +123,7 @@ async function handleTravel(input: TravelManageInput, _ctx: SessionContext): Pro
         };
     }
 
-    const { db, partyRepo, charRepo } = ensureDb();
+    const { partyRepo, spatialRepo, poiRepo } = ensureDb();
 
     // Get party
     const party = partyRepo.getPartyWithMembers(input.partyId);
@@ -145,12 +138,7 @@ async function handleTravel(input: TravelManageInput, _ctx: SessionContext): Pro
     }
 
     // Get POI
-    let poi: Record<string, unknown> | undefined;
-    try {
-        poi = db.prepare('SELECT * FROM pois WHERE id = ?').get(input.poiId) as Record<string, unknown> | undefined;
-    } catch {
-        // POIs table might not exist
-    }
+    const poi = poiRepo.getById(input.poiId);
 
     if (!poi) {
         return {
@@ -175,7 +163,7 @@ async function handleTravel(input: TravelManageInput, _ctx: SessionContext): Pro
         if (discoverer) {
             const wisBonus = Math.floor(((discoverer.stats?.wis || 10) - 10) / 2);
             discoveryRoll = Math.floor(Math.random() * 20) + 1 + wisBonus;
-            const dc = (poi.discoveryDc as number) || 15;
+            const dc = poi.discoveryDc || 15;
             discovered = discoveryRoll >= dc;
         }
     } else if (input.autoDiscover) {
@@ -199,116 +187,21 @@ async function handleTravel(input: TravelManageInput, _ctx: SessionContext): Pro
 
     // Update POI discovery state
     if (poi.discoveryState === 'unknown') {
-        db.prepare('UPDATE pois SET discoveryState = ?, updatedAt = ? WHERE id = ?')
-            .run('discovered', new Date().toISOString(), input.poiId);
+        poiRepo.markDiscovered(input.poiId);
     }
 
-    // Update party position
-    db.prepare('UPDATE parties SET current_location = ?, updated_at = ? WHERE id = ?')
-        .run(poi.name, new Date().toISOString(), input.partyId);
+    // Update party position through the canonical repository/schema.
+    partyRepo.update(input.partyId, {
+        currentLocation: poi.name,
+        currentPOI: poi.id,
+        positionX: poi.x,
+        positionY: poi.y
+    });
 
     // Enter location if requested
-    let enteredRoom: Record<string, unknown> | null = null;
+    let enteredRoom: ReturnType<SpatialRepository['findRoomsByNetwork']>[number] | null = null;
     if (input.enterLocation && poi.networkId) {
-        try {
-            enteredRoom = db.prepare(`
-                SELECT * FROM rooms WHERE networkId = ? ORDER BY createdAt LIMIT 1
-            `).get(poi.networkId) as Record<string, unknown> | null;
-        } catch {
-            // Rooms table might not exist
-        }
-    }
-
-    // ─── FINDINGS #55: THE RAD LEG (engine-enforced #54 law) ───
-    // Rads are terrain, not weather: avoidable by skill, soaked by resistance.
-    // The GM supplies the tier (danger tiers are narrative overlay); everything
-    // downstream is engine math — the items are read at the moment of crossing.
-    let radLeg: Record<string, unknown> | undefined;
-    if (input.radTier) {
-        // FINDINGS #93: the exposure law generalised — caller names the track
-        // and the resisting property; PSAR's rads are the untouched default.
-        const track = input.exposureTrack ?? 'rads';
-        const resistProp = input.resistProperty ?? 'radResistance';
-        const TIER_DC = [0, 8, 10, 12, 14, 16, 18];
-        const TIER_INCOME = [0, 10, 20, 35, 60, 90, 120];
-        const dc = TIER_DC[input.radTier];
-        const lead = input.leadId
-            ? party.members?.find(m => m.character.id === input.leadId)?.character
-            : party.members?.find(m => m.role === 'leader')?.character || party.members?.[0]?.character;
-        if (!lead) {
-            radLeg = { error: true, message: 'No lead walker found for the rad leg' };
-        } else {
-            // Party hydration predates the sheet fields — read the lead fresh
-            // so skillProficiencies/expertise actually reach the roll.
-            const leadFull = (charRepo.findById(lead.id) ?? lead) as typeof lead;
-            const lstats = (leadFull.stats || {}) as Record<string, number>;
-            const wisMod = Math.floor(((lstats.wis ?? 10) - 10) / 2);
-            let mod = wisMod;
-            const rollBreakdown: string[] = [`WIS ${wisMod >= 0 ? '+' : ''}${wisMod}`];
-            const lskills = (leadFull as { skillProficiencies?: string[] }).skillProficiencies || [];
-            const lexpertise = (leadFull as { expertise?: string[] }).expertise || [];
-            const prof = Math.floor(((leadFull.level ?? 1) - 1) / 4) + 2;
-            // FINDINGS #104-D: same case-sensitivity hole as math_manage/stunt —
-            // the radTier Survival roll composed its own membership tests, so a
-            // capitalized "Survival" on the lead's sheet rolled light by prof on
-            // EVERY surface leg. Normalize both sides.
-            const normOne = (s: string) => s.toLowerCase().replace(/[ _]/g, '');
-            const normHas = (xs: string[], s: string) => xs.some(x => normOne(x) === normOne(s));
-            if (normHas(lexpertise, 'survival')) { mod += prof * 2; rollBreakdown.push(`expertise +${prof * 2}`); }
-            else if (normHas(lskills, 'survival')) { mod += prof; rollBreakdown.push(`proficiency +${prof}`); }
-            const die = Math.floor(Math.random() * 20) + 1;
-            const total = die + mod;
-            const hotspot = die === 1;
-            const clean = !hotspot && (die === 20 || total >= dc);
-            const baseIncome = clean ? 0 : TIER_INCOME[input.radTier] * (hotspot ? 2 : 1);
-            const legMembers: Array<Record<string, unknown>> = [];
-            if (baseIncome > 0) {
-                for (const m of party.members ?? []) {
-                    const ch = m.character;
-                    let resistance = 0;
-                    let armorName: string | undefined;
-                    try {
-                        const arow = db.prepare(`SELECT i.name, i.properties FROM inventory_items ii JOIN items i ON i.id = ii.item_id WHERE ii.character_id = ? AND ii.equipped = 1 AND ii.slot = 'armor'`).get(ch.id) as { name?: string; properties?: string | Record<string, unknown> } | undefined;
-                        if (arow) {
-                            armorName = arow.name;
-                            const props = typeof arow.properties === 'string' ? JSON.parse(arow.properties) : (arow.properties || {});
-                            // FINDINGS #93: the resisting property is named by the caller
-                            const rr = (props as Record<string, unknown>)[resistProp];
-                            if (typeof rr === 'number' && rr > 0) resistance = rr > 1 ? rr / 100 : rr;
-                        }
-                    } catch { /* no armor row — unsealed */ }
-                    let landed = Math.ceil(baseIncome * (1 - resistance));
-                    if (input.interior) landed = Math.ceil(landed / 2);
-                    let radsBefore = 0, radsAfter = 0, radMax = input.trackMax ?? 1000;
-                    let poolError: string | undefined;
-                    try {
-                        const fresh = charRepo.findById(ch.id);
-                        const pools = ((fresh as unknown as { resourcePools?: Record<string, { current: number; max: number }> })?.resourcePools) ?? {};
-                        const pool = pools[track] ?? { current: 0, max: input.trackMax ?? 1000 };
-                        radsBefore = pool.current ?? 0;
-                        radMax = pool.max ?? input.trackMax ?? 1000;
-                        radsAfter = Math.min(radMax, Math.max(0, radsBefore + landed));
-                        pools[track] = { ...pool, current: radsAfter, max: radMax };
-                        charRepo.update(ch.id, { resourcePools: pools } as never);
-                    } catch (pErr) {
-                        poolError = `${track} write failed: ${(pErr as Error).message}`;
-                    }
-                    legMembers.push({ characterId: ch.id, name: ch.name, armor: armorName ?? 'unsealed', resistance, landed, [`${track}Before`]: radsBefore, [`${track}After`]: radsAfter, ...(poolError ? { poolError } : {}) });
-                }
-            }
-            radLeg = {
-                tier: input.radTier, dc,
-                track, resistProperty: resistProp,
-                lead: { id: lead.id, name: lead.name },
-                roll: { die, bonus: mod, total, breakdown: rollBreakdown },
-                clean, hotspot,
-                encounterTriggered: hotspot,
-                cleanIntel: die === 20,
-                baseIncome,
-                interior: !!input.interior,
-                members: legMembers
-            };
-        }
+        enteredRoom = spatialRepo.findRoomsByNetwork(poi.networkId)[0] || null;
     }
 
     let output = RichFormatter.header('Travel Complete', '🚶');
@@ -326,31 +219,9 @@ async function handleTravel(input: TravelManageInput, _ctx: SessionContext): Pro
     if (enteredRoom) {
         output += RichFormatter.section('Entered Location');
         output += `**${enteredRoom.name}**\n`;
-        if (enteredRoom.description) {
-            output += `${enteredRoom.description}\n`;
+        if (enteredRoom.baseDescription) {
+            output += `${enteredRoom.baseDescription}\n`;
         }
-    }
-
-    if (radLeg && !radLeg.error) {
-        const rl = radLeg as { tier: number; dc: number; track?: string; lead: { name: string }; roll: { die: number; bonus: number; total: number; breakdown: string[] }; clean: boolean; hotspot: boolean; cleanIntel: boolean; baseIncome: number; members: Array<Record<string, unknown> & { name: string; armor: string; resistance: number; landed: number }> };
-        // FINDINGS #94: the banner templates off the TRACK — an infection leg
-        // stops printing rad vocabulary ("→ rads undefined" is dead).
-        const track = rl.track ?? 'rads';
-        const icon = track === 'rads' ? '☢️' : '☣️';
-        const trackTitle = track.charAt(0).toUpperCase() + track.slice(1);
-        output += RichFormatter.section(`${trackTitle} Leg — D${rl.tier} (DC ${rl.dc})`);
-        output += `Lead: **${rl.lead.name}** — survival d20(${rl.roll.die}) + ${rl.roll.bonus} = ${rl.roll.total} [${rl.roll.breakdown.join(', ')}]\n`;
-        if (rl.clean) {
-            output += rl.cleanIntel ? `✨ NAT 20 — clean route, and the lead read the ground: one piece of true route intelligence.\n` : `✅ Clean route — 0 ${track}, whole crew.\n`;
-        } else {
-            if (rl.hotspot) output += `${icon} NAT 1 — HOTSPOT: income doubled to ${rl.baseIncome}, and the encounter FIRES (no threshold roll).\n`;
-            else output += `${icon} Route clipped contamination — ${rl.baseIncome} ${track} land, per resistance:\n`;
-            rl.members.forEach(mm => {
-                output += `  • ${mm.name} (${mm.armor}${mm.resistance ? `, resist ${Math.round(mm.resistance * 100)}%` : ''}): +${mm.landed} → ${track} ${mm[`${track}After`]}\n`;
-            });
-        }
-    } else if (radLeg && radLeg.error) {
-        output += RichFormatter.alert(String(radLeg.message), 'warning');
     }
 
     const result = {
@@ -366,8 +237,7 @@ async function handleTravel(input: TravelManageInput, _ctx: SessionContext): Pro
         },
         discoveryRoll,
         discovered: true,
-        enteredRoom: enteredRoom ? { id: enteredRoom.id, name: enteredRoom.name } : null,
-        radLeg
+        enteredRoom: enteredRoom ? { id: enteredRoom.id, name: enteredRoom.name } : null
     };
 
     output += RichFormatter.embedJson(result, 'TRAVEL_MANAGE');
@@ -495,7 +365,7 @@ async function handleLoot(input: TravelManageInput, _ctx: SessionContext): Promi
     output += RichFormatter.keyValue({
         'Corpses Looted': corpsesLooted,
         'Total Items': allItems.length,
-        'RU': totalGold,
+        'Gold': totalGold,
         'Silver': totalSilver,
         'Copper': totalCopper
     });

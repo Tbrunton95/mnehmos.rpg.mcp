@@ -26,6 +26,7 @@ import {
 } from './agent-manage.js';
 import { buildCharacterStateSlice } from '../../agent/prompt/slices/character_state.js';
 import { CharacterOriginSchema } from '../../schema/character.js';
+import { CompetencyOverrideSchema } from '../../schema/agent.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -49,7 +50,7 @@ type NpcManageAction = typeof ACTIONS[number];
 // ═══════════════════════════════════════════════════════════════════════════
 
 function getRepo(): NpcMemoryRepository {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+    const db = getDb();
     return new NpcMemoryRepository(db);
 }
 
@@ -110,6 +111,8 @@ const NewCreateSchema = z.object({
     agent: z.object({
         provider: z.enum(['openai', 'openrouter']),
         model: z.string().min(1),
+        competencyOverride: CompetencyOverrideSchema.nullable().optional()
+            .describe('Fixed model/reasoning policy for this NPC agent; overrides INT-based selection'),
         persona: z.string().optional(),
         directive: z.string().optional(),
         secrets: z.array(z.object({
@@ -270,7 +273,7 @@ async function handleCreateNpc(args: z.infer<typeof NewCreateSchema>): Promise<o
         origin: charResult.origin
     };
 
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+    const db = getDb();
     const memoryRepo = new NpcMemoryRepository(db);
 
     // STEP 5: Seed initial relationship (best-effort)
@@ -317,6 +320,7 @@ async function handleCreateNpc(args: z.infer<typeof NewCreateSchema>): Promise<o
                 characterId,
                 provider: args.agent.provider,
                 model: args.agent.model,
+                competencyOverride: args.agent.competencyOverride,
                 autoOnTurn: args.agent.autoOnTurn,
                 temperature: args.agent.temperature,
                 maxTokens: args.agent.maxTokens,
@@ -401,7 +405,7 @@ async function handleCreateNpc(args: z.infer<typeof NewCreateSchema>): Promise<o
 // ----- Full context bundle -----
 
 async function handleGetFullContext(args: z.infer<typeof GetFullContextSchema>): Promise<object> {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+    const db = getDb();
     const charRepo = new CharacterRepository(db);
     const agentRepo = new AgentRepository(db);
     const memoryRepo = new NpcMemoryRepository(db);
@@ -901,7 +905,7 @@ async function handleGetContext(args: z.infer<typeof GetContextSchema>): Promise
 }
 
 async function handleInteract(args: z.infer<typeof InteractSchema>): Promise<object> {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+    const db = getDb();
     const charRepo = new CharacterRepository(db);
     const spatialRepo = new SpatialRepository(db);
     const memoryRepo = new NpcMemoryRepository(db);
@@ -1259,8 +1263,8 @@ export async function handleNpcManage(args: unknown, _ctx: SessionContext): Prom
         output += RichFormatter.alert(parsed.message || 'Unknown error', 'error');
         if (parsed.suggestions) {
             output += '\n**Did you mean:**\n';
-            parsed.suggestions.forEach((s: { action: string; similarity: number }) => {
-                output += `  - ${s.action} (${s.similarity}% match)\n`;
+            parsed.suggestions.forEach((s: { value: string; similarity: number }) => {
+                output += `  - ${s.value} (${s.similarity}% match)\n`;
             });
         }
     } else {

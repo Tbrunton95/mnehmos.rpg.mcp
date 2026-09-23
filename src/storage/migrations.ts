@@ -1,9 +1,10 @@
 import Database from 'better-sqlite3';
+import { migrateClassProgression } from './migrations.class-progression.js';
 
 export function migrate(db: Database.Database) {
   // First, create all tables (without indexes that depend on new columns)
   db.exec(`
-    CREATE TABLE IF NOT EXISTS worlds(
+  CREATE TABLE IF NOT EXISTS worlds(
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     seed TEXT NOT NULL,
@@ -11,6 +12,13 @@ export function migrate(db: Database.Database) {
     height INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+  );
+
+    CREATE TABLE IF NOT EXISTS world_snapshots(
+    world_id TEXT PRIMARY KEY,
+    snapshot TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(world_id) REFERENCES worlds(id) ON DELETE CASCADE
   );
 
     CREATE TABLE IF NOT EXISTS regions(
@@ -211,6 +219,22 @@ export function migrate(db: Database.Database) {
     updated_at TEXT NOT NULL,
     FOREIGN KEY(world_id) REFERENCES worlds(id) ON DELETE CASCADE
   );
+
+  CREATE TABLE IF NOT EXISTS turn_actions(
+    id TEXT PRIMARY KEY,
+    world_id TEXT NOT NULL,
+    turn_number INTEGER NOT NULL,
+    nation_id TEXT NOT NULL,
+    actions TEXT NOT NULL DEFAULT '[]', -- JSON array of submitted actions
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE(world_id, turn_number, nation_id),
+    FOREIGN KEY(world_id) REFERENCES worlds(id) ON DELETE CASCADE,
+    FOREIGN KEY(nation_id) REFERENCES nations(id) ON DELETE CASCADE
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_turn_actions_pending
+    ON turn_actions(world_id, turn_number, resolved_at);
 
   CREATE TABLE IF NOT EXISTS nations(
     id TEXT PRIMARY KEY,
@@ -629,6 +653,9 @@ export function migrate(db: Database.Database) {
 
   // Now create indexes that depend on migrated columns
   createPostMigrationIndexes(db);
+
+  // Per-class progression: homebrew multiclass tracks (no single general level)
+  migrateClassProgression(db);
 }
 
 function runMigrations(db: Database.Database) {
@@ -786,6 +813,46 @@ function runMigrations(db: Database.Database) {
   if (!hasRace) {
     console.error('[Migration] Adding race column to characters table');
     db.exec(`ALTER TABLE characters ADD COLUMN race TEXT DEFAULT 'Human';`);
+  }
+
+  // Character proficiencies are part of the public CharacterSchema and must
+  // survive a character_manage create/get round-trip. Older databases do not
+  // have these columns, so add them with empty JSON arrays for compatibility.
+  const hasSkillProficiencies = charColumns.some(col => col.name === 'skill_proficiencies');
+  const hasSaveProficiencies = charColumns.some(col => col.name === 'save_proficiencies');
+  const hasExpertise = charColumns.some(col => col.name === 'expertise');
+  const hasArmorProficiencies = charColumns.some(col => col.name === 'armor_proficiencies');
+  const hasWeaponProficiencies = charColumns.some(col => col.name === 'weapon_proficiencies');
+  const hasToolProficiencies = charColumns.some(col => col.name === 'tool_proficiencies');
+  const hasLanguages = charColumns.some(col => col.name === 'languages');
+
+  if (!hasSkillProficiencies) {
+    console.error('[Migration] Adding skill_proficiencies column to characters table');
+    db.exec(`ALTER TABLE characters ADD COLUMN skill_proficiencies TEXT DEFAULT '[]';`);
+  }
+  if (!hasSaveProficiencies) {
+    console.error('[Migration] Adding save_proficiencies column to characters table');
+    db.exec(`ALTER TABLE characters ADD COLUMN save_proficiencies TEXT DEFAULT '[]';`);
+  }
+  if (!hasExpertise) {
+    console.error('[Migration] Adding expertise column to characters table');
+    db.exec(`ALTER TABLE characters ADD COLUMN expertise TEXT DEFAULT '[]';`);
+  }
+  if (!hasArmorProficiencies) {
+    console.error('[Migration] Adding armor_proficiencies column to characters table');
+    db.exec(`ALTER TABLE characters ADD COLUMN armor_proficiencies TEXT DEFAULT '[]';`);
+  }
+  if (!hasWeaponProficiencies) {
+    console.error('[Migration] Adding weapon_proficiencies column to characters table');
+    db.exec(`ALTER TABLE characters ADD COLUMN weapon_proficiencies TEXT DEFAULT '[]';`);
+  }
+  if (!hasToolProficiencies) {
+    console.error('[Migration] Adding tool_proficiencies column to characters table');
+    db.exec(`ALTER TABLE characters ADD COLUMN tool_proficiencies TEXT DEFAULT '[]';`);
+  }
+  if (!hasLanguages) {
+    console.error('[Migration] Adding languages column to characters table');
+    db.exec(`ALTER TABLE characters ADD COLUMN languages TEXT DEFAULT '[]';`);
   }
 
   // HIGH-007: Add legendary creature columns to characters table
@@ -1122,6 +1189,10 @@ function runMigrations(db: Database.Database) {
       raw_response TEXT,
       prompt_tokens INTEGER,
       completion_tokens INTEGER,
+      total_tokens INTEGER,
+      reasoning_tokens INTEGER,
+      cost_micros INTEGER,
+      cost_source TEXT,
       duration_ms INTEGER,
       status TEXT NOT NULL CHECK (status IN ('ok', 'timeout', 'rate_limited', 'error', 'circuit_open', 'budget_exhausted', 'incapable', 'paused', 'skipped')),
       reasoning_effort TEXT,
@@ -1146,6 +1217,22 @@ function runMigrations(db: Database.Database) {
   if (!callColumns.some(col => col.name === 'competency_source')) {
     console.error('[Migration] Adding competency_source column to agent_calls table');
     db.exec(`ALTER TABLE agent_calls ADD COLUMN competency_source TEXT;`);
+  }
+  if (!callColumns.some(col => col.name === 'total_tokens')) {
+    console.error('[Migration] Adding total_tokens column to agent_calls table');
+    db.exec(`ALTER TABLE agent_calls ADD COLUMN total_tokens INTEGER;`);
+  }
+  if (!callColumns.some(col => col.name === 'reasoning_tokens')) {
+    console.error('[Migration] Adding reasoning_tokens column to agent_calls table');
+    db.exec(`ALTER TABLE agent_calls ADD COLUMN reasoning_tokens INTEGER;`);
+  }
+  if (!callColumns.some(col => col.name === 'cost_micros')) {
+    console.error('[Migration] Adding cost_micros column to agent_calls table');
+    db.exec(`ALTER TABLE agent_calls ADD COLUMN cost_micros INTEGER;`);
+  }
+  if (!callColumns.some(col => col.name === 'cost_source')) {
+    console.error('[Migration] Adding cost_source column to agent_calls table');
+    db.exec(`ALTER TABLE agent_calls ADD COLUMN cost_source TEXT;`);
   }
 }
 

@@ -58,14 +58,16 @@ import { buildConsolidatedRegistry } from './consolidated-registry.js';
 
 // PubSub and utilities
 import { PubSub } from '../engine/pubsub.js';
-import { registerEventTools } from './events.js';
+import { registerEventInboxBridge, registerEventTools } from './events.js';
 import { AuditLogger } from './audit.js';
 import { withSession } from './types.js';
-import { closeDb, getDb, getDbPath } from '../storage/index.js';
+import { closeDb, campaignDbPath, assertNoLegacyDatabase, useSingleUserDatabase } from '../storage/index.js';
+import { setWorldPubSub } from './tools.js';
+import { setCombatPubSub } from './handlers/combat-handlers.js';
 
 // Agent runtime
 import { ProviderFactory } from '../agent/provider/factory.js';
-import { setAgentRuntime, buildAgentRuntime } from '../agent/runtime/deps.js';
+import { schemaShape } from './schema-shape.js';
 
 /**
  * Setup graceful shutdown handlers to ensure database is properly closed.
@@ -115,23 +117,89 @@ function setupShutdownHandlers(): void {
   });
 }
 
-async function main() {
-  setupShutdownHandlers();
-  console.error(`[Server] Database path: ${getDbPath()}`);
-
+/**
+ * Builds a fresh McpServer with every tool registered. Cheap (no I/O) —
+ * safe to call once for the long-lived stdio/tcp/unix/websocket transports,
+ * or per-request for the stateless HTTP transport, which requires a new
+ * McpServer + StreamableHTTPServerTransport pair per request (the SDK
+ * throws "Stateless transport cannot be reused across requests" otherwise).
+ * `pubsub` and `auditLogger` are app-level singletons shared across calls —
+ * only the protocol-level McpServer/tool-registration wrapper is rebuilt.
+ */
+function buildServer(pubsub: PubSub, auditLogger: AuditLogger): McpServer {
   const server = new McpServer({
     name: 'rpg-mcp',
     version: '1.0.3'
   });
 
+  registerEventTools(server, pubsub);
+
+  server.tool(
+    MetaTools.SEARCH_TOOLS.name,
+    MetaTools.SEARCH_TOOLS.description,
+    MetaTools.SEARCH_TOOLS.inputSchema.extend({ sessionId: z.string().optional() }).shape,
+    auditLogger.wrapHandler(MetaTools.SEARCH_TOOLS.name, withSession(MetaTools.SEARCH_TOOLS.inputSchema, handleSearchTools))
+  );
+
+  server.tool(
+    MetaTools.LOAD_TOOL_SCHEMA.name,
+    MetaTools.LOAD_TOOL_SCHEMA.description,
+    MetaTools.LOAD_TOOL_SCHEMA.inputSchema.extend({ sessionId: z.string().optional() }).shape,
+    auditLogger.wrapHandler(MetaTools.LOAD_TOOL_SCHEMA.name, withSession(MetaTools.LOAD_TOOL_SCHEMA.inputSchema, handleLoadToolSchema))
+  );
+
+  const registry = buildConsolidatedRegistry();
+  const toolCount = Object.keys(registry).length;
+  const sessionIdSchema = z.object({ sessionId: z.string().optional() });
+
+  for (const [toolName, entry] of Object.entries(registry)) {
+    // Handle all Zod schema types (object, omit, pick, etc.)
+    // .extend() only works on z.object(), so we use .and() which works universally
+    let extendedSchema: any;
+    if (typeof entry.schema.extend === 'function') {
+      // Standard z.object() - use .extend() for best performance
+      extendedSchema = entry.schema.extend({ sessionId: z.string().optional() });
+    } else if (typeof entry.schema.and === 'function') {
+      // .omit(), .pick(), or other transformed schemas - use .and()
+      extendedSchema = entry.schema.and(sessionIdSchema);
+    } else {
+      // Fallback: wrap in intersection
+      extendedSchema = z.intersection(entry.schema, sessionIdSchema);
+    }
+
+    server.tool(
+      toolName,
+      entry.metadata.description,
+      schemaShape(extendedSchema),
+      auditLogger.wrapHandler(
+        toolName,
+        withSession(entry.schema, entry.handler as any)
+      )
+    );
+  }
+
+  console.error(`[Server] Registered ${toolCount} tools with minimal schemas`);
+  console.error(`[Server] Meta-tools: search_tools, load_tool_schema`);
+
+  return server;
+}
+
+async function main() {
+  setupShutdownHandlers();
+
   // =========================================================================
   // AGENT RUNTIME: wire LLM providers + repos behind getAgentRuntime()
   // =========================================================================
   try {
-    const agentDb = getDb(getDbPath());
+    // Deliberately no setAgentRuntime() here any more. Runtime deps bind eight
+    // repositories to a single database, and under per-campaign databases the
+    // right one is not known until a request arrives with a verified tenant.
+    // agent_manage and combat_manage already build the runtime lazily from the
+    // request's own database, which is now the only correct place to do it.
+    // Provider initialization stays at boot: it is genuinely process-wide, and
+    // surfacing misconfiguration early is worth keeping.
     const providerFactory = new ProviderFactory();
     const providers = providerFactory.initialize();
-    setAgentRuntime(buildAgentRuntime(agentDb, providerFactory));
 
     // Diagnostic: print enough to self-diagnose the "Provider not configured"
     // error class without ever printing key values. The MCP-host-spawned-with-
@@ -153,86 +221,12 @@ async function main() {
     console.error(`[Server] Failed to initialize agent runtime: ${(err as Error).message}`);
   }
 
-  // Initialize PubSub for event subscription
+  // App-level singletons shared across every McpServer instance buildServer() creates.
   const pubsub = new PubSub();
-
-  // Register Event Tools (subscribe_to_events)
-  registerEventTools(server, pubsub);
-
-  // Initialize AuditLogger
+  setWorldPubSub(pubsub);
+  setCombatPubSub(pubsub);
+  registerEventInboxBridge(pubsub);
   const auditLogger = new AuditLogger();
-
-  // =========================================================================
-  // META-TOOLS: Register with FULL schemas (they're the discovery mechanism)
-  // =========================================================================
-  
-  server.tool(
-    MetaTools.SEARCH_TOOLS.name,
-    MetaTools.SEARCH_TOOLS.description,
-    MetaTools.SEARCH_TOOLS.inputSchema.extend({ sessionId: z.string().optional() }).shape,
-    auditLogger.wrapHandler(MetaTools.SEARCH_TOOLS.name, withSession(MetaTools.SEARCH_TOOLS.inputSchema, handleSearchTools))
-  );
-
-  server.tool(
-    MetaTools.LOAD_TOOL_SCHEMA.name,
-    MetaTools.LOAD_TOOL_SCHEMA.description,
-    MetaTools.LOAD_TOOL_SCHEMA.inputSchema.extend({ sessionId: z.string().optional() }).shape,
-    auditLogger.wrapHandler(MetaTools.LOAD_TOOL_SCHEMA.name, withSession(MetaTools.LOAD_TOOL_SCHEMA.inputSchema, handleLoadToolSchema))
-  );
-
-  // =========================================================================
-  // CONSOLIDATED TOOLS: 28 action-based tools (85% reduction from 195)
-  // =========================================================================
-
-  const registry = buildConsolidatedRegistry();
-  const toolCount = Object.keys(registry).length;
-  const sessionIdSchema = z.object({ sessionId: z.string().optional(), output_mode: z.enum(['json', 'banner']).optional() });
-
-  // FINDINGS #88: output_mode:'json' — ONE wrapper, every consolidated tool.
-  // The banner is already rendered FROM the embedded JSON everywhere (the
-  // #20/#61/#66 family closed the render divergence); this strips it for
-  // chairs that want only the data. Banner mode is untouched default.
-  const withOutputMode = (handler: (args: Record<string, unknown>, extra: unknown) => Promise<{ content?: Array<{ type: string; text: string }> }>) =>
-    async (args: Record<string, unknown>, extra: unknown) => {
-      const wantJson = args?.output_mode === 'json' || args?.outputMode === 'json';
-      if (args) { delete args.output_mode; delete args.outputMode; }
-      const res = await handler(args, extra);
-      if (wantJson && res?.content?.[0]?.text) {
-        const text = res.content[0].text;
-        const m = text.match(/<!--\s*([A-Z_]*JSON)\s*\n?([\s\S]*?)\n?\1\s*-->/);
-        if (m) return { ...res, content: [{ type: 'text', text: m[2].trim() }] };
-      }
-      return res;
-    };
-  
-  for (const [toolName, entry] of Object.entries(registry)) {
-    // Handle all Zod schema types (object, omit, pick, etc.)
-    // .extend() only works on z.object(), so we use .and() which works universally
-    let extendedSchema: any;
-    if (typeof entry.schema.extend === 'function') {
-      // Standard z.object() - use .extend() for best performance
-      extendedSchema = entry.schema.extend({ sessionId: z.string().optional() });
-    } else if (typeof entry.schema.and === 'function') {
-      // .omit(), .pick(), or other transformed schemas - use .and()
-      extendedSchema = entry.schema.and(sessionIdSchema);
-    } else {
-      // Fallback: wrap in intersection
-      extendedSchema = z.intersection(entry.schema, sessionIdSchema);
-    }
-    
-    server.tool(
-      toolName,
-      entry.metadata.description,
-      extendedSchema.shape || extendedSchema._def?.schema?.shape || {},
-      withOutputMode(auditLogger.wrapHandler(
-        toolName,
-        withSession(entry.schema, entry.handler as any)
-      ) as (args: Record<string, unknown>, extra: unknown) => Promise<{ content?: Array<{ type: string; text: string }> }>) as any
-    );
-  }
-
-  console.error(`[Server] Registered ${toolCount} tools with minimal schemas`);
-  console.error(`[Server] Meta-tools: search_tools, load_tool_schema`);
 
   // =========================================================================
   // TRANSPORT SETUP
@@ -242,12 +236,29 @@ async function main() {
   const transportType = args.includes('--tcp') ? 'tcp'
     : (args.includes('--unix') || args.includes('--socket')) ? 'unix'
     : (args.includes('--ws') || args.includes('--websocket')) ? 'websocket'
+    : (args.includes('--http') || process.env.PORT) ? 'http'
     : 'stdio';
 
   const getArgValue = (name: string): string | undefined => {
     const index = args.indexOf(name);
     return index !== -1 ? args[index + 1] : undefined;
   };
+  // Only the HTTP transport is multi-tenant; it establishes a verified tenant
+  // per request. Every other transport serves one local operator, so it opens a
+  // single database up front. Without this, getDb() would find no tenant and
+  // every storage tool would fail for local users of the npm package, the
+  // standalone binaries, and MCP client configs.
+  //
+  // The legacy-database assertion is likewise HTTP-only: for a hosted server a
+  // pre-split file means an incomplete cutover, but in single-user mode that
+  // same file is simply the operator's database.
+  if (transportType === 'http') {
+    assertNoLegacyDatabase();
+    console.error(`[Server] Campaign databases: ${campaignDbPath('<campaign-id>')}`);
+  } else {
+    useSingleUserDatabase(getArgValue('--db-path'));
+  }
+
   const networkHost = getArgValue('--host') || '127.0.0.1';
   const transportToken = getArgValue('--transport-token') || process.env.RPG_MCP_TRANSPORT_TOKEN;
   const maxMessageBytes = parseInt(getArgValue('--max-message-bytes') || '1048576', 10);
@@ -263,6 +274,7 @@ async function main() {
     const { TCPServerTransport } = await import('./transport/tcp.js');
     const port = getArgValue('--port') ? parseInt(getArgValue('--port')!, 10) : 3000;
 
+    const server = buildServer(pubsub, auditLogger);
     const transport = new TCPServerTransport(port, {
       host: networkHost,
       authToken: transportToken,
@@ -286,6 +298,7 @@ async function main() {
       socketPath = process.platform === 'win32' ? '\\\\.\\pipe\\rpg-mcp' : '/tmp/rpg-mcp.sock';
     }
 
+    const server = buildServer(pubsub, auditLogger);
     const transport = new UnixServerTransport(socketPath, { maxMessageBytes });
     await server.connect(transport);
     console.error(`RPG MCP Server running on Unix socket ${socketPath}`);
@@ -293,6 +306,7 @@ async function main() {
     const { WebSocketServerTransport } = await import('./transport/websocket.js');
     const port = getArgValue('--port') ? parseInt(getArgValue('--port')!, 10) : 3001;
 
+    const server = buildServer(pubsub, auditLogger);
     const transport = new WebSocketServerTransport(port, {
       host: networkHost,
       authToken: transportToken,
@@ -300,7 +314,21 @@ async function main() {
     });
     await server.connect(transport);
     console.error(`RPG MCP Server running on WebSocket ${networkHost}:${port}`);
+  } else if (transportType === 'http') {
+    const { startHttpServerTransport } = await import('./transport/http.js');
+    const port = getArgValue('--port') ? parseInt(getArgValue('--port')!, 10) : parseInt(process.env.PORT || '3000', 10);
+
+    // '::' binds dual-stack (IPv6 + IPv4). Required for Railway private
+    // networking, which is IPv6-only — see transport/http.ts.
+    const httpHost = getArgValue('--host') || '::';
+    await startHttpServerTransport(() => buildServer(pubsub, auditLogger), port, {
+      host: httpHost,
+      authToken: transportToken,
+      maxBodyBytes: maxMessageBytes,
+    });
+    console.error(`RPG MCP Server running on HTTP ${httpHost}:${port} (POST /mcp, GET /health)`);
   } else {
+    const server = buildServer(pubsub, auditLogger);
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error('RPG MCP Server running on stdio');

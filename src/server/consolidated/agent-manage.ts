@@ -24,7 +24,8 @@ import {
     AgentStatusSchema,
     AgentSliceKindSchema,
     AgentSecretImportanceSchema,
-    AgentJournalKindSchema
+    AgentJournalKindSchema,
+    CompetencyOverrideSchema
 } from '../../schema/agent.js';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { RichFormatter } from '../utils/formatter.js';
@@ -57,12 +58,7 @@ type AgentManageAction = typeof ACTIONS[number];
 // ═══════════════════════════════════════════════════════════════════════════
 
 function ensureDb() {
-    const dbPath = process.env.NODE_ENV === 'test'
-        ? ':memory:'
-        : process.env.RPG_DATA_DIR
-            ? `${process.env.RPG_DATA_DIR}/rpg.db`
-            : 'rpg.db';
-    const db = getDb(dbPath);
+    const db = getDb();
     return {
         db,
         agentRepo: new AgentRepository(db),
@@ -105,7 +101,8 @@ const CreateSchema = z.object({
     action: z.literal('create'),
     characterId: z.string().describe('Character to bind this agent to (1:1)'),
     provider: AgentProviderSchema.describe('LLM provider: openai or openrouter'),
-    model: z.string().min(1).describe('Model identifier (e.g. gpt-4o-mini, anthropic/claude-sonnet-4-5)'),
+    model: z.string().min(1).describe('Provider model identifier (e.g. gpt-4o-mini, openai/gpt-5.6-luna)'),
+    competencyOverride: CompetencyOverrideSchema.nullable().optional().describe('Optional fixed model/reasoning policy; when set it overrides INT-based competency selection'),
     status: AgentStatusSchema.optional(),
     autoOnTurn: z.boolean().optional().describe('Auto-invoke when this character\'s turn comes up in combat'),
     temperature: z.number().min(0).max(2).optional(),
@@ -133,6 +130,7 @@ const UpdateSchema = z.object({
     characterId: z.string().optional(),
     provider: AgentProviderSchema.optional(),
     model: z.string().min(1).optional(),
+    competencyOverride: CompetencyOverrideSchema.nullable().optional().describe('Optional fixed model/reasoning policy; null restores INT-based competency selection'),
     status: AgentStatusSchema.optional(),
     autoOnTurn: z.boolean().optional(),
     temperature: z.number().min(0).max(2).optional(),
@@ -167,6 +165,28 @@ const BudgetSchema = z.object({
     setBudget: z.number().int().positive().nullable().optional().describe('Set new budget_tokens (null clears)'),
     resetUsage: z.boolean().optional().describe('Reset tokens_used to 0')
 }).refine(d => d.agentId || d.characterId, { message: 'agentId or characterId required' });
+
+function recoveryGuidance(agent: { id: string; status: string; circuitState: string; budgetTokens: number | null; tokensUsed: number }) {
+    if (agent.circuitState === 'open') {
+        return {
+            action: 'agent_manage.resume',
+            message: 'Circuit is open after recoverable provider failures. Resume this agent for a bounded probe.'
+        };
+    }
+    if (agent.budgetTokens !== null && agent.tokensUsed >= agent.budgetTokens) {
+        return {
+            action: 'agent_manage.budget',
+            message: 'Budget is exhausted. Reset usage or set a larger session budget before invoking again.'
+        };
+    }
+    if (agent.status === 'paused') {
+        return {
+            action: 'agent_manage.resume',
+            message: 'Agent is paused. Resume it when the session should allow companion inference.'
+        };
+    }
+    return null;
+}
 
 // ----- Prompt assembly -----
 
@@ -309,6 +329,7 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         characterId: args.characterId,
         provider: args.provider,
         model: args.model,
+        competencyOverride: args.competencyOverride,
         status: args.status,
         autoOnTurn: args.autoOnTurn ?? false,
         temperature: args.temperature,
@@ -424,7 +445,15 @@ async function handleResume(args: z.infer<typeof ResumeSchema>): Promise<object>
         actionType: 'resume',
         success: true,
         agent: updated,
-        message: 'Agent resumed; circuit closed; failure counter reset.'
+        canInvoke: Boolean(updated
+            && updated.status === 'active'
+            && updated.circuitState !== 'open'
+            && (updated.budgetTokens === null || updated.tokensUsed < updated.budgetTokens)),
+        budgetRemaining: updated?.budgetTokens === null || updated?.budgetTokens === undefined
+            ? null
+            : Math.max(0, updated.budgetTokens - (updated.tokensUsed ?? 0)),
+        recovery: updated ? recoveryGuidance(updated) : null,
+        message: 'Agent resumed; circuit closed; failure counter reset. Budget state is unchanged.'
     };
 }
 
@@ -461,6 +490,7 @@ async function handleHealth(args: z.infer<typeof HealthSchema>): Promise<object>
             && agent.circuitState !== 'open'
             && providerAvailable
             && (agent.budgetTokens === null || agent.tokensUsed < agent.budgetTokens),
+        recovery: recoveryGuidance(agent),
         lastCallAt: lastCall?.createdAt ?? null,
         lastCallStatus: lastCall?.status ?? null,
         recentCallStatuses: recentCalls.map(c => c.status)
@@ -485,7 +515,8 @@ async function handleBudget(args: z.infer<typeof BudgetSchema>): Promise<object>
         tokensUsed: updated?.tokensUsed ?? 0,
         budgetRemaining: updated?.budgetTokens === null || updated?.budgetTokens === undefined
             ? null
-            : Math.max(0, updated.budgetTokens - (updated.tokensUsed ?? 0))
+            : Math.max(0, updated.budgetTokens - (updated.tokensUsed ?? 0)),
+        recovery: updated ? recoveryGuidance(updated) : null
     };
 }
 
@@ -791,6 +822,7 @@ Actions: create, get, list, update, delete, resume, health, budget, set_slice, r
         // create/update
         provider: AgentProviderSchema.optional(),
         model: z.string().optional(),
+        competencyOverride: CompetencyOverrideSchema.nullable().optional(),
         status: AgentStatusSchema.optional(),
         autoOnTurn: z.boolean().optional(),
         temperature: z.number().optional(),

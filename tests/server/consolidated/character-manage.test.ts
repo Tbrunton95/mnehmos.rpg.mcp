@@ -44,6 +44,24 @@ describe('character_manage consolidated tool', () => {
             expect(CharacterManageTool.description).toContain('add_xp');
             expect(CharacterManageTool.description).toContain('level_up');
         });
+
+        it('documents class-aware spell choices and exposes the D&D level range', () => {
+            expect(CharacterManageTool.description).toContain('knownSpells');
+            expect(CharacterManageTool.description).toContain('preparedSpells');
+            expect(CharacterManageTool.description).toContain('daily preparation is not used');
+            expect(CharacterManageTool.inputSchema.parse({ action: 'create', name: 'Level Seven', level: 7 }).level).toBe(7);
+            expect(() => CharacterManageTool.inputSchema.parse({ action: 'create', name: 'Too Powerful', level: 21 })).toThrow();
+        });
+
+        it('exposes cantripsKnown through the MCP registration schema', () => {
+            const parsed = CharacterManageTool.inputSchema.parse({
+                action: 'update',
+                characterId: randomUUID(),
+                cantripsKnown: ['Guidance'],
+            });
+
+            expect(parsed.cantripsKnown).toEqual(['Guidance']);
+        });
     });
 
     describe('action: create', () => {
@@ -72,6 +90,10 @@ describe('character_manage consolidated tool', () => {
                 maxHp: 45,
                 ac: 18,
                 stats: { str: 16, dex: 14, con: 14, int: 10, wis: 12, cha: 10 },
+                skillProficiencies: ['athletics', 'perception'],
+                expertise: ['athletics'],
+                languages: ['Common', 'Draconic'],
+                toolProficiencies: ['vehicles (land)'],
                 characterType: 'pc'
             }, ctx);
 
@@ -81,6 +103,104 @@ describe('character_manage consolidated tool', () => {
             expect(parsed.characterClass).toBe('Fighter');
             expect(parsed.race).toBe('Human');
             expect(parsed.level).toBe(5);
+            expect(parsed.saveProficiencies).toEqual(['str', 'con']);
+            expect(parsed.skillProficiencies).toEqual(['athletics', 'perception']);
+            expect(parsed.expertise).toEqual(['athletics']);
+            expect(parsed.languages).toEqual(['Common', 'Draconic']);
+            expect(parsed.toolProficiencies).toEqual(['vehicles (land)']);
+        });
+
+        it('persists explicit cantrips on create and update', async () => {
+            const createdResult = await handleCharacterManage({
+                action: 'create',
+                name: 'Spellbook Test',
+                class: 'Wizard',
+                cantripsKnown: ['Fire Bolt'],
+                knownSpells: ['Magic Missile'],
+                preparedSpells: ['Magic Missile'],
+            }, ctx);
+            const created = extractJson(createdResult.content[0].text);
+
+            expect(created.cantripsKnown).toEqual(['Fire Bolt']);
+
+            const updatedResult = await handleCharacterManage({
+                action: 'update',
+                characterId: created.id,
+                cantripsKnown: ['Ray of Frost'],
+            }, ctx);
+            const updated = extractJson(updatedResult.content[0].text);
+
+            expect(updated.cantripsKnown).toEqual(['Ray of Frost']);
+        });
+
+        it('rejects Wizard preparation outside the persisted spellbook', async () => {
+            const createdResult = await handleCharacterManage({
+                action: 'create',
+                name: 'Wizard Invariant Test',
+                class: 'Wizard',
+                knownSpells: ['Magic Missile'],
+                preparedSpells: ['Magic Missile'],
+            }, ctx);
+            const created = extractJson(createdResult.content[0].text);
+
+            const rejectedResult = await handleCharacterManage({
+                action: 'update',
+                characterId: created.id,
+                preparedSpells: ['Shield'],
+            }, ctx);
+            const rejected = extractJson(rejectedResult.content[0].text);
+
+            expect(rejected.error).toBe(true);
+            expect(rejected.message).toContain('spellbook');
+
+            const fetchedResult = await handleCharacterManage({
+                action: 'get',
+                characterId: created.id,
+            }, ctx);
+            const fetched = extractJson(fetchedResult.content[0].text);
+            expect(fetched.preparedSpells).toEqual(['Magic Missile']);
+        });
+
+        it('round-trips all character proficiency fields through get and update', async () => {
+            const createdResult = await handleCharacterManage({
+                action: 'create',
+                name: 'Proficiency Test',
+                class: 'Barbarian',
+                skillProficiencies: ['athletics'],
+                expertise: [],
+                languages: ['Common', 'Draconic'],
+                armorProficiencies: ['light', 'medium', 'shields'],
+                weaponProficiencies: ['simple', 'martial'],
+                toolProficiencies: [],
+                provisionEquipment: false,
+            }, ctx);
+            const created = extractJson(createdResult.content[0].text);
+
+            expect(created.saveProficiencies).toEqual(['str', 'con']);
+            expect(created.skillProficiencies).toEqual(['athletics']);
+            expect(created.armorProficiencies).toEqual(['light', 'medium', 'shields']);
+
+            const updatedResult = await handleCharacterManage({
+                action: 'update',
+                characterId: created.id,
+                skillProficiencies: ['perception'],
+                expertise: ['perception'],
+                languages: ['Common'],
+            }, ctx);
+            const updated = extractJson(updatedResult.content[0].text);
+
+            expect(updated.skillProficiencies).toEqual(['perception']);
+            expect(updated.expertise).toEqual(['perception']);
+            expect(updated.languages).toEqual(['Common']);
+
+            const fetchedResult = await handleCharacterManage({
+                action: 'get',
+                characterId: created.id,
+            }, ctx);
+            const fetched = extractJson(fetchedResult.content[0].text);
+            expect(fetched.skillProficiencies).toEqual(['perception']);
+            expect(fetched.expertise).toEqual(['perception']);
+            expect(fetched.languages).toEqual(['Common']);
         });
 
         it('should provision equipment by default for PCs', async () => {
@@ -580,6 +700,12 @@ describe('character_manage consolidated tool', () => {
             expect(parsed.oldLevel).toBe(1);
             expect(parsed.newLevel).toBe(2);
             expect(parsed.message).toContain('Leveled up');
+            expect(parsed.hpIncrease).toBeGreaterThan(0);
+            expect(parsed.hpProvenance.mode).toBe('average');
+
+            const stored = characterRepo.findById(characterId)!;
+            expect(stored.maxHp).toBe(parsed.newMaxHp);
+            expect(stored.hp).toBeGreaterThan(10);
         });
 
         it('should increase HP when specified', async () => {
@@ -603,6 +729,40 @@ describe('character_manage consolidated tool', () => {
 
             const parsed = extractJson(result.content[0].text);
             expect(parsed.newLevel).toBe(5);
+            expect(parsed.hpIncrease).toBe(20);
+            expect(parsed.hpProvenance.levelsGained).toBe(4);
+        });
+
+        it('derives source-backed Paladin HP for a multi-level advancement', async () => {
+            const result = await handleCharacterManage({
+                action: 'create',
+                name: 'Mara',
+                class: 'Paladin',
+                race: 'Human',
+                stats: { str: 16, dex: 10, con: 14, int: 8, wis: 10, cha: 14 },
+                level: 1,
+                hp: 12,
+                maxHp: 12
+            }, ctx);
+            const paladinId = extractJson(result.content[0].text).id;
+
+            const levelUp = await handleCharacterManage({
+                action: 'level_up',
+                characterId: paladinId,
+                targetLevel: 7
+            }, ctx);
+            const parsed = extractJson(levelUp.content[0].text);
+
+            // Paladin d10, CON +2: 8 average HP per level for six levels.
+            expect(parsed.hpIncrease).toBe(48);
+            expect(parsed.newMaxHp).toBe(60);
+            expect(parsed.hpProvenance).toMatchObject({
+                mode: 'average',
+                levelsGained: 6,
+                hitDie: 10,
+                constitutionModifier: 2,
+                hpPerLevel: 8
+            });
         });
 
         it('should reject lower target level', async () => {

@@ -27,12 +27,7 @@ const ACTIONS = ['set', 'list', 'get', 'current'] as const;
 type SceneAction = typeof ACTIONS[number];
 
 function ensureDb() {
-    const dbPath = process.env.NODE_ENV === 'test'
-        ? ':memory:'
-        : process.env.RPG_DATA_DIR
-            ? `${process.env.RPG_DATA_DIR}/rpg.db`
-            : 'rpg.db';
-    return getDb(dbPath);
+    return getDb();
 }
 
 const SetSchema = z.object({
@@ -133,7 +128,7 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
 
 async function handleCurrent(args: z.infer<typeof CurrentSchema>): Promise<object> {
     const repo = new SceneRepository(ensureDb());
-    const scene = repo.findLatestForParticipant(args.worldId, args.characterId);
+    const scene = repo.findLatestForParticipant(args.characterId, args.worldId);
     if (!scene) {
         return {
             actionType: 'current',

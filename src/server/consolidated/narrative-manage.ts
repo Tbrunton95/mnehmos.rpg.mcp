@@ -20,31 +20,31 @@ import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/a
 // CONSTANTS & ENUMS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['add', 'batch_add', 'search', 'update', 'get', 'delete', 'get_context', 'append'] as const;
+const ACTIONS = ['add', 'batch_add', 'search', 'update', 'get', 'delete', 'get_context'] as const;
 type NarrativeAction = typeof ACTIONS[number];
 
-const NoteTypeEnum = z.enum([
+const NOTE_TYPE_VALUES = [
     'plot_thread',
     'canonical_moment',
     'npc_voice',
     'foreshadowing',
-    'session_log',
-    // FINDINGS #96 (GAP 4): the growing-file type — bestiary pages, anomaly
-    // files, field notes. Pairs with the append action: entries GROW.
-    'bestiary'
-]);
+    'session_log'
+ ] as const;
+const noteTypeSchema = () => z.enum(NOTE_TYPE_VALUES);
 
-const NoteStatusEnum = z.enum([
+const NOTE_STATUS_VALUES = [
     'active',
     'resolved',
     'dormant',
     'archived'
-]);
+ ] as const;
+const noteStatusSchema = () => z.enum(NOTE_STATUS_VALUES);
 
-const VisibilityEnum = z.enum([
+const VISIBILITY_VALUES = [
     'dm_only',
     'player_visible'
-]);
+ ] as const;
+const visibilitySchema = () => z.enum(VISIBILITY_VALUES);
 
 // Type-specific metadata schemas
 const PlotThreadMetadata = z.object({
@@ -86,43 +86,7 @@ const SessionLogMetadata = z.object({
 // ═══════════════════════════════════════════════════════════════════════════
 
 function ensureDb() {
-    const dbPath = process.env.NODE_ENV === 'test'
-        ? ':memory:'
-        : process.env.RPG_DATA_DIR
-            ? `${process.env.RPG_DATA_DIR}/rpg.db`
-            : 'rpg.db';
-    const db = getDb(dbPath);
-    migrateBestiaryCheck(db);
-    return db;
-}
-
-// FINDINGS #96-C (BUG B): the Zod layer took 'bestiary'; the narrative_notes
-// CHECK constraint (baked into the table DDL) did not — schema migrated, DB
-// wasn't. SQLite cannot ALTER a CHECK: guarded one-time table rebuild inside
-// a transaction — copy, drop, rename, reindex. Runs once; every later boot
-// sees 'bestiary' in the stored DDL and skips.
-let bestiaryMigrated = false;
-function migrateBestiaryCheck(db: ReturnType<typeof getDb>): void {
-    if (bestiaryMigrated) return;
-    try {
-        const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='narrative_notes'").get() as { sql?: string } | undefined;
-        if (!row?.sql) { bestiaryMigrated = true; return; }
-        if (/bestiary/.test(row.sql) || !/CHECK/i.test(row.sql)) { bestiaryMigrated = true; return; }
-        const newSql = row.sql
-            .replace(/CREATE TABLE ("?)narrative_notes("?)/i, 'CREATE TABLE $1narrative_notes_new$2')
-            .replace(/'session_log'/g, "'session_log', 'bestiary'");
-        if (!/bestiary/.test(newSql)) { bestiaryMigrated = true; return; } // enum literal not found — leave untouched, refuse-not-corrupt
-        const indexes = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='narrative_notes' AND sql IS NOT NULL").all() as Array<{ sql: string }>;
-        const migrate = db.transaction(() => {
-            db.exec(newSql);
-            db.exec('INSERT INTO narrative_notes_new SELECT * FROM narrative_notes');
-            db.exec('DROP TABLE narrative_notes');
-            db.exec('ALTER TABLE narrative_notes_new RENAME TO narrative_notes');
-            for (const ix of indexes) { try { db.exec(ix.sql); } catch { /* index name survives rename on some builds */ } }
-        });
-        migrate();
-        bestiaryMigrated = true;
-    } catch { /* migration failed — adds of type bestiary keep refusing at the CHECK, loudly, until fixed; nothing corrupted */ }
+    return getDb();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -132,28 +96,28 @@ function migrateBestiaryCheck(db: ReturnType<typeof getDb>): void {
 const AddSchema = z.object({
     action: z.literal('add'),
     worldId: z.string().describe('World/campaign ID'),
-    type: NoteTypeEnum.describe('Note type: plot_thread, canonical_moment, npc_voice, foreshadowing, session_log'),
+    type: noteTypeSchema().describe('Note type: plot_thread, canonical_moment, npc_voice, foreshadowing, session_log'),
     content: z.string().min(1).describe('Main text content'),
     metadata: z.record(z.any()).optional().default({}).describe('Type-specific structured data'),
-    visibility: VisibilityEnum.optional().default('dm_only'),
+    visibility: visibilitySchema().optional().default('dm_only'),
     tags: z.array(z.string()).optional().default([]).describe('Tags for filtering'),
     entityId: z.string().optional().describe('Link to character/NPC/location'),
     entityType: z.enum(['character', 'npc', 'location', 'item']).optional(),
-    status: NoteStatusEnum.optional().default('active')
+    status: noteStatusSchema().optional().default('active')
 });
 
 const BatchAddSchema = z.object({
     action: z.literal('batch_add'),
     worldId: z.string().describe('World/campaign ID'),
     notes: z.array(z.object({
-        type: NoteTypeEnum.describe('Note type'),
+        type: noteTypeSchema().describe('Note type'),
         content: z.string().min(1),
         metadata: z.record(z.any()).optional().default({}),
-        visibility: VisibilityEnum.optional().default('dm_only'),
+        visibility: visibilitySchema().optional().default('dm_only'),
         tags: z.array(z.string()).optional().default([]),
         entityId: z.string().optional(),
         entityType: z.enum(['character', 'npc', 'location', 'item']).optional(),
-        status: NoteStatusEnum.optional().default('active')
+        status: noteStatusSchema().optional().default('active')
     })).min(1).max(20).describe('1–20 notes to create in one transaction')
 });
 
@@ -161,16 +125,11 @@ const SearchSchema = z.object({
     action: z.literal('search'),
     worldId: z.string().describe('World/campaign ID'),
     query: z.string().optional().describe('Text search in content'),
-    type: NoteTypeEnum.optional().describe('Filter by note type'),
-    status: NoteStatusEnum.optional().describe('Filter by status'),
-    // FINDINGS #61: the outer schema advertised these but the inner stripped them
-    // — the mirror family inverted. No defaults: absent = unfiltered (search must
-    // not silently narrow; that is get_context's job).
-    includeTypes: z.array(NoteTypeEnum).optional().describe('Filter by multiple note types (IN)'),
-    statusFilter: z.array(NoteStatusEnum).optional().describe('Filter by multiple statuses (IN)'),
+    type: noteTypeSchema().optional().describe('Filter by note type'),
+    status: noteStatusSchema().optional().describe('Filter by status'),
     tags: z.array(z.string()).optional().describe('Filter by tags (AND logic)'),
     entityId: z.string().optional().describe('Filter by linked entity'),
-    visibility: VisibilityEnum.optional().describe('Filter by visibility'),
+    visibility: visibilitySchema().optional().describe('Filter by visibility'),
     limit: z.number().optional().default(20).describe('Max results'),
     orderBy: z.enum(['created_at', 'updated_at']).optional().default('created_at')
 });
@@ -179,10 +138,9 @@ const UpdateSchema = z.object({
     action: z.literal('update'),
     noteId: z.string().describe('ID of the note to update'),
     content: z.string().optional().describe('New content'),
-    type: NoteTypeEnum.optional().describe('FINDINGS #96-C: re-type a note (e.g. plot_thread → bestiary) — the migration lane for pages that grew into a different kind'),
     metadata: z.record(z.any()).optional().describe('Merge into existing metadata'),
-    status: NoteStatusEnum.optional().describe('Change status'),
-    visibility: VisibilityEnum.optional(),
+    status: noteStatusSchema().optional().describe('Change status'),
+    visibility: visibilitySchema().optional(),
     tags: z.array(z.string()).optional().describe('Replace tags')
 });
 
@@ -199,9 +157,9 @@ const DeleteSchema = z.object({
 const GetContextSchema = z.object({
     action: z.literal('get_context'),
     worldId: z.string().describe('World/campaign ID'),
-    includeTypes: z.array(NoteTypeEnum).optional().default(['plot_thread', 'canonical_moment', 'npc_voice', 'foreshadowing']),
+    includeTypes: z.array(noteTypeSchema()).optional().default(['plot_thread', 'canonical_moment', 'npc_voice', 'foreshadowing']),
     maxPerType: z.number().optional().default(5).describe('Max notes per type'),
-    statusFilter: z.array(NoteStatusEnum).optional().default(['active']).describe('Only notes with these statuses'),
+    statusFilter: z.array(noteStatusSchema()).optional().default(['active']).describe('Only notes with these statuses'),
     forPlayer: z.boolean().optional().default(false).describe('Only return player_visible notes')
 });
 
@@ -346,18 +304,6 @@ async function handleSearch(args: z.infer<typeof SearchSchema>): Promise<object>
         params.push(args.status);
     }
 
-    // FINDINGS #61: plural filters now actually filter (IN clauses); they AND
-    // with the singular forms when both are passed.
-    if (args.includeTypes && args.includeTypes.length > 0) {
-        sql += ` AND type IN (${args.includeTypes.map(() => '?').join(',')})`;
-        params.push(...args.includeTypes);
-    }
-
-    if (args.statusFilter && args.statusFilter.length > 0) {
-        sql += ` AND status IN (${args.statusFilter.map(() => '?').join(',')})`;
-        params.push(...args.statusFilter);
-    }
-
     if (args.visibility) {
         sql += ` AND visibility = ?`;
         params.push(args.visibility);
@@ -403,58 +349,7 @@ async function handleSearch(args: z.infer<typeof SearchSchema>): Promise<object>
 
     return {
         count: results.length,
-        // FINDINGS #87: FILTER ECHO — the #61 filters ARE honored server-side,
-        // but a stale client schema strips array params before they arrive, and
-        // the server cannot refuse what it never received. Echoing what was
-        // ACTUALLY applied makes the strip visible: you passed includeTypes,
-        // the echo says none — your schema is stale; reopen the client or
-        // route raw args via batch (03 §9). session_manage capabilities
-        // confirms the server side in one call.
-        appliedFilters: {
-            query: args.query ?? null,
-            type: args.type ?? null,
-            includeTypes: args.includeTypes ?? null,
-            status: args.status ?? null,
-            statusFilter: args.statusFilter ?? null,
-            tags: args.tags ?? null,
-            entityId: args.entityId ?? null,
-            visibility: args.visibility ?? null
-        },
         notes: results
-    };
-}
-
-// FINDINGS #96 (GAP 4): APPEND — the growing-file verb. A bestiary page
-// (rumor → tracks → class guess → weakness CONFIRMED) grows by dated
-// sections instead of wholesale rewrites; the file's history IS the
-// investigation. Serves witcher bestiaries, KEEPER anomaly files, SCP
-// documents, PSAR field notes alike.
-const AppendSchema = z.object({
-    action: z.literal('append'),
-    noteId: z.string().describe('Note to grow'),
-    content: z.string().min(1).describe('The new section — appended, never replacing'),
-    day: z.union([z.number(), z.string()]).optional().describe('In-fiction date stamp for the section header, e.g. 12 or "Day 12, dusk"')
-});
-
-async function handleAppend(args: z.infer<typeof AppendSchema>): Promise<object> {
-    const db = ensureDb();
-    const existing = db.prepare('SELECT * FROM narrative_notes WHERE id = ?').get(args.noteId) as NarrativeNoteRow | undefined;
-    if (!existing) return { error: true, message: `Note ${args.noteId} not found — nothing appended` };
-    const stamp = args.day !== undefined
-        ? (/^\d+(\.\d+)?$/.test(String(args.day)) ? `Day ${args.day}` : String(args.day))
-        : new Date().toISOString().slice(0, 10);
-    const section = `\n\n── [${stamp}] ──\n${args.content}`;
-    const newContent = existing.content + section;
-    db.prepare('UPDATE narrative_notes SET content = ?, updated_at = ? WHERE id = ?').run(newContent, new Date().toISOString(), args.noteId);
-    return {
-        success: true,
-        actionType: 'append',
-        noteId: args.noteId,
-        type: existing.type,
-        stamp,
-        appendedChars: args.content.length,
-        totalChars: newContent.length,
-        message: `Section [${stamp}] appended — the file grows (${newContent.length} chars total)`
     };
 }
 
@@ -475,12 +370,6 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     if (args.content !== undefined) {
         updates.push('content = ?');
         params.push(args.content);
-    }
-
-    // FINDINGS #96-C: type is updatable — the plot_thread→bestiary migration lane.
-    if (args.type !== undefined) {
-        updates.push('type = ?');
-        params.push(args.type);
     }
 
     if (args.status !== undefined) {
@@ -521,9 +410,7 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     return {
         success: true,
         noteId: args.noteId,
-        // FINDINGS #61: was joining raw SQL fragments ("status = ?") — unbound
-        // placeholders leaking into user-facing text. Field names only.
-        message: `Updated note. Changed: ${updates.slice(0, -1).map(u => u.split(' =')[0]).join(', ')}`
+        message: `Updated note. Changes: ${updates.slice(0, -1).join(', ')}`
     };
 }
 
@@ -691,12 +578,6 @@ const definitions: Record<NarrativeAction, ActionDefinition> = {
         aliases: ['edit', 'modify'],
         description: 'Update an existing note'
     },
-    append: {
-        schema: AppendSchema,
-        handler: handleAppend,
-        aliases: ['grow', 'add_section', 'log_entry'],
-        description: 'FINDINGS #96: append a dated section to a note — bestiary pages, anomaly files, field notes GROW instead of being rewritten. {noteId, content, day?}'
-    },
     get: {
         schema: GetSchema,
         handler: handleGet,
@@ -760,34 +641,33 @@ Actions: add, batch_add, search, update, get, delete, get_context
 Aliases: add_many/bulk_add/log_session→batch_add, create→add, find→search, context→get_context`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
-        action: z.string().describe('Action: add, batch_add, search, update, get, delete, get_context, append (#96)'),
+        action: z.string().describe('Action: add, batch_add, search, update, get, delete, get_context'),
         worldId: z.string().optional().describe('World ID (required for add, search, get_context)'),
-        noteId: z.string().optional().describe('Note ID (required for get, update, delete, append)'),
-        day: z.union([z.number(), z.string()]).optional().describe('append: in-fiction date stamp for the section header (#96)'),
-        type: NoteTypeEnum.optional().describe('Note type: plot_thread, canonical_moment, npc_voice, foreshadowing, session_log, bestiary (#96)'),
-        content: z.string().optional().describe('Note content (required for add; the appended section for append)'),
+        noteId: z.string().optional().describe('Note ID (required for get, update, delete)'),
+        type: noteTypeSchema().optional().describe('Note type: plot_thread, canonical_moment, npc_voice, foreshadowing, session_log'),
+        content: z.string().optional().describe('Note content (required for add)'),
         metadata: z.record(z.any()).optional().describe('Type-specific metadata'),
-        visibility: VisibilityEnum.optional(),
+        visibility: visibilitySchema().optional(),
         tags: z.array(z.string()).optional(),
-        status: NoteStatusEnum.optional(),
+        status: noteStatusSchema().optional(),
         entityId: z.string().optional(),
         entityType: z.enum(['character', 'npc', 'location', 'item']).optional(),
         notes: z.array(z.object({
-            type: NoteTypeEnum,
+            type: noteTypeSchema(),
             content: z.string().min(1),
             metadata: z.record(z.any()).optional(),
-            visibility: VisibilityEnum.optional(),
+            visibility: visibilitySchema().optional(),
             tags: z.array(z.string()).optional(),
             entityId: z.string().optional(),
             entityType: z.enum(['character', 'npc', 'location', 'item']).optional(),
-            status: NoteStatusEnum.optional()
+            status: noteStatusSchema().optional()
         })).optional().describe('Array of notes for batch_add (1–20)'),
         query: z.string().optional().describe('Text search (for search action)'),
         limit: z.number().optional(),
         orderBy: z.enum(['created_at', 'updated_at']).optional(),
-        includeTypes: z.array(NoteTypeEnum).optional(),
+        includeTypes: z.array(noteTypeSchema()).optional(),
         maxPerType: z.number().optional(),
-        statusFilter: z.array(NoteStatusEnum).optional(),
+        statusFilter: z.array(noteStatusSchema()).optional(),
         forPlayer: z.boolean().optional()
     })
 };

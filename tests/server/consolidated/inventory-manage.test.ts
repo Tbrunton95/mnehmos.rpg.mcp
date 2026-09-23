@@ -1,6 +1,6 @@
 /**
  * Tests for consolidated inventory_manage tool
- * Validates all 8 actions: give, remove, transfer, use, equip, unequip, get, get_detailed
+ * Validates all 9 actions: give, remove, transfer, use, extinguish, equip, unequip, get, get_detailed
  */
 
 import { handleInventoryManage, InventoryManageTool } from '../../../src/server/consolidated/inventory-manage.js';
@@ -50,9 +50,10 @@ describe('inventory_manage consolidated tool', () => {
             race: 'human',
             hp: 10,
             maxHp: 10,
-            ac: 10,
-            stats: { str: 14, dex: 12, con: 13, int: 10, wis: 11, cha: 10 },
-            speed: 30,
+             ac: 10,
+             stats: { str: 14, dex: 12, con: 13, int: 10, wis: 11, cha: 10 },
+             currency: { gold: 5, silver: 0, copper: 0 },
+             speed: 30,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
         });
@@ -78,10 +79,17 @@ describe('inventory_manage consolidated tool', () => {
             expect(InventoryManageTool.description).toContain('remove');
             expect(InventoryManageTool.description).toContain('transfer');
             expect(InventoryManageTool.description).toContain('use');
+            expect(InventoryManageTool.description).toContain('extinguish');
             expect(InventoryManageTool.description).toContain('equip');
             expect(InventoryManageTool.description).toContain('unequip');
             expect(InventoryManageTool.description).toContain('get');
             expect(InventoryManageTool.description).toContain('get_detailed');
+        });
+
+        it('distinguishes a world grant from an atomic character handoff', () => {
+            expect(InventoryManageTool.description).toContain('use this for a player-to-NPC handoff');
+            expect(InventoryManageTool.description).toContain('give is a world/DM grant');
+            expect(InventoryManageTool.description).toContain('fromCharacterId and toCharacterId');
         });
     });
 
@@ -298,6 +306,39 @@ describe('inventory_manage consolidated tool', () => {
             expect(data.effect).toBe('Restore 2d4+2 HP');
         });
 
+        it('should roll and persist healing when the effect declares healing', async () => {
+            const db = getDb(':memory:');
+            const charRepo = new CharacterRepository(db);
+            charRepo.update(testCharId, { hp: 2 });
+            const potionResult = await handleItemManage({
+                action: 'create',
+                name: 'Greater Healing Potion',
+                type: 'consumable',
+                weight: 0.5,
+                value: 100,
+                properties: { healing: 4, effect: 'Restore 4 HP' }
+            }, ctx);
+            const healingId = parseItemResult(potionResult).item.id;
+            await handleInventoryManage({
+                action: 'give',
+                characterId: testCharId,
+                itemId: healingId,
+                quantity: 1
+            }, ctx);
+
+            const data = parseResult(await handleInventoryManage({
+                action: 'use',
+                characterId: testCharId,
+                itemId: healingId
+            }, ctx));
+
+            expect(data.success).toBe(true);
+            expect(data.healing).toBe(4);
+            expect(data.hpBefore).toBe(2);
+            expect(data.hpAfter).toBe(6);
+            expect(new CharacterRepository(getDb(':memory:')).findById(testCharId)?.hp).toBe(6);
+        });
+
         it('should accept "consume" alias', async () => {
             const result = await handleInventoryManage({
                 action: 'consume',
@@ -327,6 +368,139 @@ describe('inventory_manage consolidated tool', () => {
             expect(data.error).toBeDefined();
             expect(data.message).toContain('not a consumable');
         });
+
+        it('lights a torch, consumes one torch, and persists provenance and duration', async () => {
+            const torchResult = await handleItemManage({
+                action: 'create',
+                name: 'Torch',
+                type: 'misc',
+                weight: 1,
+                value: 0.01,
+            }, ctx);
+            const torchId = parseItemResult(torchResult).item.id;
+            await handleInventoryManage({
+                action: 'give',
+                characterId: testCharId,
+                itemId: torchId,
+                quantity: 2,
+            }, ctx);
+
+            const data = parseResult(await handleInventoryManage({
+                action: 'use',
+                characterId: testCharId,
+                itemId: torchId,
+            }, ctx));
+
+            expect(data.success).toBe(true);
+            expect(data.lightSource).toMatchObject({
+                kind: 'torch',
+                durationMinutes: 60,
+                brightRadiusFeet: 20,
+                dimRadiusFeet: 20,
+                active: true,
+                provenance: { itemId: torchId, itemName: 'Torch' },
+                consumesItem: true,
+                consumed: true,
+            });
+            const inventory = parseResult(await handleInventoryManage({
+                action: 'get',
+                characterId: testCharId,
+            }, ctx));
+            expect(inventory.inventory.find((entry: { item: { id: string } }) => entry.item.id === torchId).quantity).toBe(1);
+            expect(getDb(':memory:').prepare('SELECT COUNT(*) AS count FROM custom_effects WHERE target_id = ? AND name = ?').get(testCharId, 'Light source: Torch')).toEqual({ count: 1 });
+        });
+
+        it('lights a hooded lantern without consuming the reusable lantern', async () => {
+            const lanternResult = await handleItemManage({
+                action: 'create',
+                name: 'Lantern, Hooded',
+                type: 'misc',
+                weight: 2,
+                value: 5,
+            }, ctx);
+            const lanternId = parseItemResult(lanternResult).item.id;
+            await handleInventoryManage({
+                action: 'give',
+                characterId: testCharId,
+                itemId: lanternId,
+                quantity: 1,
+            }, ctx);
+
+            const data = parseResult(await handleInventoryManage({
+                action: 'use',
+                characterId: testCharId,
+                itemId: lanternId,
+            }, ctx));
+
+            expect(data.success).toBe(true);
+            expect(data.lightSource).toMatchObject({
+                kind: 'hooded_lantern',
+                consumesItem: false,
+                consumed: false,
+            });
+            const inventory = parseResult(await handleInventoryManage({
+                action: 'get',
+                characterId: testCharId,
+            }, ctx));
+            expect(inventory.inventory.find((entry: { item: { id: string } }) => entry.item.id === lanternId).quantity).toBe(1);
+        });
+
+        it('extinguishes a light source, preserves the source item, and is idempotent', async () => {
+            const torchResult = await handleItemManage({
+                action: 'create',
+                name: 'Torch',
+                type: 'misc',
+                weight: 1,
+                value: 0.01,
+            }, ctx);
+            const torchId = parseItemResult(torchResult).item.id;
+            await handleInventoryManage({
+                action: 'give',
+                characterId: testCharId,
+                itemId: torchId,
+                quantity: 1,
+            }, ctx);
+            await handleInventoryManage({
+                action: 'use',
+                characterId: testCharId,
+                itemId: torchId,
+            }, ctx);
+
+            const extinguished = parseResult(await handleInventoryManage({
+                action: 'extinguish',
+                characterId: testCharId,
+                itemId: torchId,
+            }, ctx));
+
+            expect(extinguished).toMatchObject({
+                success: true,
+                actionType: 'extinguish',
+                extinguished: true,
+                lightSource: {
+                    kind: 'torch',
+                    active: false,
+                    effectId: expect.any(Number),
+                    provenance: { itemId: torchId, itemName: 'Torch' },
+                },
+            });
+            const repeated = parseResult(await handleInventoryManage({
+                action: 'extinguish',
+                characterId: testCharId,
+                itemId: torchId,
+            }, ctx));
+            expect(repeated).toMatchObject({
+                success: true,
+                actionType: 'extinguish',
+                alreadyExtinguished: true,
+                lightSource: { active: false, effectId: null },
+            });
+
+            const inventory = parseResult(await handleInventoryManage({
+                action: 'get',
+                characterId: testCharId,
+            }, ctx));
+            expect(inventory.inventory.find((entry: { item: { id: string }; quantity: number }) => entry.item.id === torchId)?.quantity ?? 0).toBe(0);
+        });
     });
 
     describe('equip action', () => {
@@ -351,6 +525,60 @@ describe('inventory_manage consolidated tool', () => {
             expect(data.success).toBe(true);
             expect(data.actionType).toBe('equip');
             expect(data.slot).toBe('mainhand');
+        });
+
+        it('should recompute legacy starter armor and shield AC as equipment changes', async () => {
+            const armorResult = await handleItemManage({
+                action: 'create',
+                name: 'Chain Mail',
+                type: 'armor',
+                weight: 55,
+                value: 75,
+                properties: { ac: 16, stealthDisadvantage: true, strengthRequired: 13 }
+            }, ctx);
+            const armorId = parseItemResult(armorResult).item.id;
+            await handleInventoryManage({ action: 'give', characterId: testCharId, itemId: armorId, quantity: 1 }, ctx);
+
+            const equipped = parseResult(await handleInventoryManage({
+                action: 'equip',
+                characterId: testCharId,
+                itemId: armorId,
+                slot: 'armor'
+            }, ctx));
+
+            expect(equipped.success).toBe(true);
+            expect(equipped.acChange).toContain('now 16');
+            expect(new CharacterRepository(getDb(':memory:')).findById(testCharId)?.ac).toBe(16);
+
+            const shieldResult = await handleItemManage({
+                action: 'create',
+                name: 'Shield',
+                type: 'armor',
+                weight: 6,
+                value: 10,
+                properties: { acBonus: 2 }
+            }, ctx);
+            const shieldId = parseItemResult(shieldResult).item.id;
+            await handleInventoryManage({ action: 'give', characterId: testCharId, itemId: shieldId, quantity: 1 }, ctx);
+            const shieldEquipped = parseResult(await handleInventoryManage({
+                action: 'equip',
+                characterId: testCharId,
+                itemId: shieldId,
+                slot: 'offhand'
+            }, ctx));
+
+            expect(shieldEquipped.acChange).toContain('now 18');
+            expect(new CharacterRepository(getDb(':memory:')).findById(testCharId)?.ac).toBe(18);
+
+            const unequipped = parseResult(await handleInventoryManage({
+                action: 'unequip',
+                characterId: testCharId,
+                itemId: armorId
+            }, ctx));
+
+            expect(unequipped.success).toBe(true);
+            expect(unequipped.acChange).toContain('now 13');
+            expect(new CharacterRepository(getDb(':memory:')).findById(testCharId)?.ac).toBe(13);
         });
 
         it('should accept "wield" alias', async () => {
@@ -449,6 +677,8 @@ describe('inventory_manage consolidated tool', () => {
             expect(data.actionType).toBe('get');
             expect(data.inventory).toBeDefined();
             expect(data.itemCount).toBeGreaterThan(0);
+            expect(data.inventory[0].item.name).toBe('Test Sword');
+            expect(data.currency).toEqual({ gold: 5, silver: 0, copper: 0 });
         });
 
         it('should accept "list" alias', async () => {
@@ -482,7 +712,8 @@ describe('inventory_manage consolidated tool', () => {
             expect(data.success).toBe(true);
             expect(data.actionType).toBe('get_detailed');
             expect(data.totalWeight).toBeDefined();
-            expect(data.capacity).toBeDefined();
+            expect(data.capacity).toBe(210);
+            expect(data.currency).toEqual({ gold: 5, silver: 0, copper: 0 });
         });
 
         it('should accept "detailed" alias', async () => {

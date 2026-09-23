@@ -13,6 +13,12 @@ import {
     classifyFetchError,
     classifyHttpStatus
 } from './types.js';
+import {
+    isReasoningModel,
+    reasoningCompletionFloor
+} from './reasoning.js';
+
+export { isReasoningModel, REASONING_COMPLETION_FLOOR, reasoningCompletionFloor } from './reasoning.js';
 
 const DEFAULT_BASE = 'https://api.openai.com/v1';
 
@@ -33,6 +39,8 @@ interface OpenAIChatResponse {
     usage?: {
         prompt_tokens?: number;
         completion_tokens?: number;
+        total_tokens?: number;
+        completion_tokens_details?: { reasoning_tokens?: number };
     };
     error?: { message?: string; type?: string };
 }
@@ -46,14 +54,6 @@ interface OpenAIChatResponse {
  * Detect by model-name prefix. If OpenAI adds a new reasoning family in the
  * future, add the prefix here. Exported for testing.
  */
-export function isReasoningModel(model: string): boolean {
-    const m = model.toLowerCase();
-    return m.startsWith('o1')
-        || m.startsWith('o3')
-        || m.startsWith('o4')
-        || m.startsWith('gpt-5');
-}
-
 export class OpenAIProvider implements LLMProvider {
     readonly name = 'openai' as const;
     private readonly apiKey: string;
@@ -88,7 +88,12 @@ export class OpenAIProvider implements LLMProvider {
             messages: opts.messages
         };
         if (opts.maxTokens !== undefined) {
-            body[reasoningModel ? 'max_completion_tokens' : 'max_tokens'] = opts.maxTokens;
+            if (reasoningModel) {
+                // Floor so reasoning tokens can't starve the visible output (empty-content bug).
+                body.max_completion_tokens = Math.max(opts.maxTokens, reasoningCompletionFloor(opts.reasoningEffort));
+            } else {
+                body.max_tokens = opts.maxTokens;
+            }
         }
         if (opts.temperature !== undefined && !reasoningModel) {
             body.temperature = opts.temperature;
@@ -130,6 +135,14 @@ export class OpenAIProvider implements LLMProvider {
         const choice = parsed.choices?.[0];
         const text = choice?.message?.content ?? '';
         if (!text) {
+            if (choice?.finish_reason === 'length') {
+                const budget = body.max_completion_tokens ?? body.max_tokens;
+                throw new ProviderError(
+                    `Provider returned empty content with finish_reason="length": the completion budget (${budget}) was exhausted before any text was produced` +
+                    (reasoningModel ? ', consumed by reasoning tokens. Raise agent.maxTokens.' : '. Raise agent.maxTokens.'),
+                    'malformed', response.status, rawText
+                );
+            }
             throw new ProviderError('Provider returned empty message content', 'malformed', response.status, rawText);
         }
 
@@ -137,6 +150,8 @@ export class OpenAIProvider implements LLMProvider {
             text,
             promptTokens: parsed.usage?.prompt_tokens,
             completionTokens: parsed.usage?.completion_tokens,
+            totalTokens: parsed.usage?.total_tokens,
+            reasoningTokens: parsed.usage?.completion_tokens_details?.reasoning_tokens,
             raw: rawText,
             durationMs,
             finishReason: choice?.finish_reason,
