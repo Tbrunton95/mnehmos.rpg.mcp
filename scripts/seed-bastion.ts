@@ -1526,6 +1526,18 @@ async function main(): Promise<void> {
     const db = useSingleUserDatabase(dbPathArg());
     log(`Database: ${db.name}`);
 
+    // This seeder only adds to the existing world, so its absence means the
+    // wrong database was selected. Carrying on is not harmless: the character,
+    // agent, memory and room phases still write rows (orphaned, with no world
+    // and no room placement), while every narrative_manage call returns
+    // WORLD_NOT_FOUND and is counted as a zero-note success. Refuse first.
+    if (!db.prepare('SELECT id FROM worlds WHERE id = ?').get(SEBASTOPYR_WORLD_ID)) {
+        throw new Error(
+            `World ${SEBASTOPYR_WORLD_ID} (Sebastopyr) is not in ${db.name}. ` +
+            'Nothing was seeded. Select the database that holds it with --db-path or RPG_MCP_DB_PATH.'
+        );
+    }
+
     const worldId = SEBASTOPYR_WORLD_ID;
     const totals = newCounters();
     const merge = (c: PhaseCounters, label: string) => {
