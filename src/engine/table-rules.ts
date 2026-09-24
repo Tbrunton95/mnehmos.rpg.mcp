@@ -132,6 +132,13 @@ export function resolveWorldId(db: Database.Database, refs: { encounterId?: stri
             if (row?.world_id) return row.world_id;
         } catch { /* no world_id column */ }
     }
+    // Untagged rows belong everywhere (single-world saves may omit worldId).
+    // When exactly one world has table rules, that world's rules apply; with
+    // several, nothing is guessed, so rules never cross campaigns.
+    try {
+        const worlds = db.prepare('SELECT DISTINCT world_id FROM table_rules LIMIT 2').all() as Array<{ world_id: string }>;
+        if (worlds.length === 1) return worlds[0].world_id;
+    } catch { /* no table_rules table */ }
     return null;
 }
 

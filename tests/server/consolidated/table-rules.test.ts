@@ -88,3 +88,17 @@ describe('band helpers', () => {
         closeDb();
     });
 });
+
+describe('world resolution for untagged rows', () => {
+    beforeEach(() => { closeDb(); getDb(':memory:'); });
+    afterEach(() => closeDb());
+
+    it('uses the only ruled world, and guesses nothing when two worlds have rules', async () => {
+        const db = getDb();
+        expect(resolveWorldId(db, { characterIds: ['untagged'] })).toBeNull();
+        await call({ action: 'define', kind: 'progression', name: 'xp' });
+        expect(resolveWorldId(db, { characterIds: ['untagged'] })).toBe(W);
+        await handleTableRules({ action: 'define', worldId: 'other', kind: 'progression', name: 'xp' }, ctx as any);
+        expect(resolveWorldId(db, { characterIds: ['untagged'] })).toBeNull();
+    });
+});

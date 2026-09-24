@@ -1755,6 +1755,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         }
 
         output = formatAttackResult(result);
+        // Rule and audit lines start on their own line under the contact block.
+        if ((ruleLines.length || parsed.declaredModifiers?.length || autoApplied.length || resolverProblems.length) && !output.endsWith('\n')) output += '\n';
         for (const line of ruleLines) output += `▌ ${line}\n`;
         if (parsed.declaredModifiers?.length) {
             output += `▌ ⟨audit⟩ in-bonus: ${parsed.declaredModifiers.map(d => `${d.label} ${d.value >= 0 ? '+' : ''}${d.value}`).join(' · ')}\n`;
