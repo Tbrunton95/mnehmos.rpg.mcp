@@ -13,7 +13,7 @@ import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { SessionContext } from '../types.js';
 
 // CRIT-006: Import spellcasting validation and resolution
-import { validateSpellCast, consumeSpellSlot } from '../../engine/magic/spell-validator.js';
+import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
@@ -1988,10 +1988,16 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         const saveType = damageEffect?.saveType;
         const saveEffect = damageEffect?.saveEffect;
         const requiresSave = saveType && saveType !== 'none';
-        const spellSaveDC = casterChar.spellSaveDC || (8 + 2 + Math.floor((casterChar.stats?.int ?? 10) - 10) / 2);
+        const spellSaveDC = casterChar.spellSaveDC || calculateSpellSaveDC(casterChar);
+        // Each target rolls its own save below, so a save spell starts from the
+        // full roll. resolution.damage already carries the resolver's single
+        // unmodified save; using it would halve (or zero) the damage twice.
+        const baseDamage = requiresSave
+            ? (resolution.damageRolled ?? resolution.damage ?? 0)
+            : (resolution.damage ?? 0);
 
         // Apply damage/healing to ALL targets
-        if (resolution.damage && resolution.damage > 0 && allTargetIds.length > 0) {
+        if (baseDamage > 0 && allTargetIds.length > 0) {
             const db = getDb();
             const concentrationRepo = new ConcentrationRepository(db);
 
@@ -2000,7 +2006,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 if (!targetParticipant) continue;
 
                 const hpBefore = targetParticipant.hp;
-                let damageDealt = resolution.damage;
+                let damageDealt = baseDamage;
                 let saveRoll: number | undefined;
                 let saveTotal: number | undefined;
                 let saved = false;
@@ -2027,7 +2033,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
 
                     if (saved) {
                         if (saveEffect === 'half') {
-                            damageDealt = Math.floor(resolution.damage / 2);
+                            damageDealt = Math.floor(baseDamage / 2);
                         } else {
                             damageDealt = 0; // No damage on successful save (saveEffect: 'none')
                         }
@@ -2144,7 +2150,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             output += `│ ✨ ${spell.name.toUpperCase()} (AoE)\n`;
             output += `└─────────────────────────────────────────┘\n\n`;
             output += `${actor.name} casts ${spell.name}!\n\n`;
-            output += `💥 Base Damage: ${resolution.damage} ${damageType}\n`;
+            output += `💥 Base Damage: ${baseDamage} ${damageType}\n`;
             if (requiresSave) {
                 output += `🎯 Save: ${saveType!.toUpperCase()} DC ${spellSaveDC}\n`;
             }
@@ -2160,14 +2166,27 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 }
             }
         } else if (damageResults.length === 1) {
-            output = formatSpellCastResult(actor.name, resolution, primaryTarget, targetHpBefore);
+            // Show the target's own save and the damage it actually took,
+            // not the resolver's single unmodified save.
+            const only = damageResults[0];
+            const shown = requiresSave
+                ? { ...resolution, damage: only.damageDealt ?? baseDamage, saveResult: (only.saved ? 'passed' : 'failed') as 'passed' | 'failed', saveDC: spellSaveDC }
+                : resolution;
+            output = formatSpellCastResult(actor.name, shown, primaryTarget, targetHpBefore);
         } else {
             output = `\n✨ ${actor.name} casts ${spell.name}!\n`;
             if (resolution.healing && resolution.healing > 0) {
                 output += `💚 Healing: ${resolution.healing}\n`;
             }
         }
-        output += `\n[SPELL: ${spell.name}, SLOT: ${effectiveSlotLevel > 0 ? effectiveSlotLevel : 'cantrip'}, DMG: ${resolution.damage || 0}, HEAL: ${resolution.healing || 0}]`;
+        // Save spells report what targets took; with no participant targets
+        // (a point-targeted AoE) the full roll is the spell's damage.
+        const reportedDamage = requiresSave
+            ? (damageResults.length > 0
+                ? damageResults.reduce((sum, dr) => sum + (dr.damageDealt ?? 0), 0)
+                : baseDamage)
+            : (resolution.damage || 0);
+        output += `\n[SPELL: ${spell.name}, SLOT: ${effectiveSlotLevel > 0 ? effectiveSlotLevel : 'cantrip'}, DMG: ${reportedDamage}, HEAL: ${resolution.healing || 0}]`;
 
         // Commit Action Economy
         engine.commitAction(parsed.actorId, actionType, effectiveSlotLevel);
@@ -2188,7 +2207,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             defeated: firstTargetResult?.defeated || false,
             message: `${actor.name} cast ${spell.name}`,
             // CRIT-006: Include spell damage/healing in result for testing and frontend
-            damage: resolution.damage,
+            damage: requiresSave ? (firstTargetResult?.damageDealt ?? baseDamage) : resolution.damage,
             healAmount: resolution.healing,
             detailedBreakdown: output
         };
