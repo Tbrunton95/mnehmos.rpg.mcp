@@ -28,4 +28,4 @@ If the engine refuses a called strike (the target is below the attacker's band) 
 2. Set a band on every named combatant with `character_manage update {characterId, band}`. The bands, lowest first, are Mortal, Elite Mortal, Astartes, Astartes Elite, Monster/Lord and Primarch-class.
 3. Give regenerating creatures a per-round amount: `character_manage update {characterId, regeneration: N}`.
 4. Pick the pool the tiny status block shows: `table_rules define {worldId, kind: 'status_block', name: 'tiny-status', spec: {corePool: '<pool>'}}`.
-5. Only if this database holds more than one campaign with rules, tag each character with `character_manage update {characterId, worldId}`. Always create encounters with `combat_manage create {worldId, ...}`.
+5. If this database holds more than one world (another campaign sits beside this one), tag every character in this campaign with `character_manage update {characterId, worldId}`; untagged characters get no table rules there. Always create encounters with `combat_manage create {worldId, ...}`.
