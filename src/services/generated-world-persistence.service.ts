@@ -3,7 +3,7 @@ import { BiomeType } from '../schema/biome.js';
 import { Region } from '../schema/region.js';
 import { StructureType } from '../schema/structure.js';
 import { GeneratedWorld } from '../engine/worldgen/index.js';
-import { RegionRepository } from '../storage/repos/region.repo.js';
+import { RegionRepository, generatedRegionRowId } from '../storage/repos/region.repo.js';
 import { StructureRepository } from '../storage/repos/structure.repo.js';
 
 const REGION_COLORS = ['#6b7280', '#2563eb', '#059669', '#d97706', '#9333ea', '#dc2626'];
@@ -51,7 +51,14 @@ function populationForStructure(type: StructureType): number {
     }
 }
 
-/** Persist the relational projections of a newly generated procedural world. */
+/**
+ * Persist the relational projections of a generated procedural world.
+ *
+ * Idempotent: rows that already exist are left alone, so ownership, control
+ * and claims on them survive. Generation calls this for a new world; the seed
+ * restore in server/tools.ts calls it again for a world that predates durable
+ * snapshots, and must land on the same ids rather than write a second set.
+ */
 export function persistGeneratedWorldEntities(
     db: Database.Database,
     worldId: string,
@@ -59,12 +66,15 @@ export function persistGeneratedWorldEntities(
 ): void {
     const regionRepo = new RegionRepository(db);
     const structureRepo = new StructureRepository(db);
+    const regionExists = db.prepare('SELECT 1 FROM regions WHERE id = ?');
+    const structureExists = db.prepare('SELECT 1 FROM structures WHERE id = ?');
     const now = new Date().toISOString();
     const regionIds = new Map<number, string>();
 
     for (const region of world.regions) {
-        const id = `${worldId}:region:${region.id}`;
+        const id = generatedRegionRowId(worldId, region.id);
         regionIds.set(region.id, id);
+        if (regionExists.get(id)) continue;
         regionRepo.create({
             id,
             worldId,
@@ -80,10 +90,12 @@ export function persistGeneratedWorldEntities(
     }
 
     for (const [index, structure] of world.structures.entries()) {
+        const id = `${worldId}:structure:${index}`;
+        if (structureExists.get(id)) continue;
         const tileIndex = structure.location.y * world.width + structure.location.x;
         const generatedRegionId = world.regionMap[tileIndex];
         structureRepo.create({
-            id: `${worldId}:structure:${index}`,
+            id,
             worldId,
             regionId: generatedRegionId >= 0 ? regionIds.get(generatedRegionId) : undefined,
             name: structure.name,
