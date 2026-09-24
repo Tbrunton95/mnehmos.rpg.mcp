@@ -24,6 +24,8 @@ import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { CombatEngine } from '../../engine/combat/engine.js';
+import { normalizeConditions } from '../../engine/combat/conditions.js';
+import { ConditionInputSchema } from '../../schema/encounter.js';
 import { getCombatManager } from '../state/combat-manager.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { getAgentRuntime, buildAgentRuntime } from '../../agent/runtime/deps.js';
@@ -57,7 +59,8 @@ const ParticipantSchema = z.object({
      * If both `side` and `isEnemy` are provided, `isEnemy` wins.
      */
     side: z.enum(['party', 'enemy', 'hostile', 'ally', 'friendly', 'neutral']).optional(),
-    conditions: z.array(z.string()).default([]),
+    conditions: z.array(ConditionInputSchema).default([])
+        .describe('Names ("prone") or {name|type, duration?, source?} objects — normalized by create'),
     position: z.object({
         x: z.number(),
         y: z.number(),
@@ -752,7 +755,10 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     hp: params.hp ?? row.hp, maxHp: params.maxHp ?? row.maxHp,
                     ac: params.ac ?? row.ac,
                     initiativeBonus: params.initiativeBonus ?? Math.floor(((stats?.dex ?? 10) - 10) / 2),
-                    isEnemy: params.isEnemy ?? false, conditions: [],
+                    // The sheet's {name, duration?, source?} conditions join the
+                    // fight in the engine's Condition shape (was dropped to []).
+                    isEnemy: params.isEnemy ?? false,
+                    conditions: normalizeConditions(row.conditions, row.id),
                     position: params.position ?? { x: 0, y: 0 },
                     resistances: (row as { resistances?: string[] }).resistances || [],
                     vulnerabilities: (row as { vulnerabilities?: string[] }).vulnerabilities || [],

@@ -3,6 +3,8 @@ import { loadAutoMechanics, autoAttackBonus, autoAcBonus, autoDamageBonus, apply
 import * as pda from '../../render/pda.js';
 import { randomUUID } from 'crypto';
 import { CombatEngine, CombatParticipant, CombatState, CombatActionResult } from '../../engine/combat/engine.js';
+import { normalizeConditions } from '../../engine/combat/conditions.js';
+import { ConditionInputSchema } from '../../schema/encounter.js';
 import { SpatialEngine } from '../../engine/spatial/engine.js';
 
 import { PubSub } from '../../engine/pubsub.js';
@@ -631,7 +633,8 @@ Example (use real UUID from context for player character!):
                     .describe('Adds a LAIR slot at initiative 20 to the turn order'),
                 ac: z.number().int().min(0).optional()
                     .describe('Armor Class (used by attack resolution; defaults to attacker-side derivation if omitted)'),
-                conditions: z.array(z.string()).default([]),
+                conditions: z.array(ConditionInputSchema).default([])
+                    .describe('Names ("prone") or {name|type, duration?, source?} objects; unknown names are kept as custom conditions with no mechanical effect'),
                 position: z.object({ x: z.number(), y: z.number(), z: z.number().optional() }).optional()
                     .describe('CRIT-003: Spatial position for movement (x, y coordinates)'),
                 // HIGH-002: Damage modifiers
@@ -1156,9 +1159,10 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             }
         }
 
+        const id = p.id || randomUUID();
         const participant = {
             // CRITICAL FIX: Auto-generate ID if not provided to prevent React key collisions
-            id: p.id || randomUUID(),
+            id,
             name: preset ? preset.name : p.name,
             hp: p.hp,
             maxHp: p.maxHp,
@@ -1166,7 +1170,9 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             initiativeBonus: p.initiativeBonus ?? 0,
             isEnemy: p.isEnemy ?? false,
             hasLairActions: p.hasLairActions ?? false,
-            conditions: p.conditions || [],
+            // Callers send names or character-row {name, ...} entries; the
+            // engine and the encounter token schema need Condition objects.
+            conditions: normalizeConditions(p.conditions, id),
             position: p.position,
             resistances: p.resistances,
             vulnerabilities: p.vulnerabilities,

@@ -1248,10 +1248,12 @@ export class CombatEngine {
         const participant = this.state.participants.find(p => p.id === participantId);
         if (!participant || participant.hp <= 0) return false;
 
-        // Check for incapacitating conditions
+        // Check for incapacitating conditions. Custom conditions (names outside
+        // ConditionType, kept verbatim by normalizeCondition) have no entry in
+        // CONDITION_EFFECTS and no mechanical effect — never a crash.
         return !participant.conditions.some(c => {
             const effects = CONDITION_EFFECTS[c.type];
-            return effects.canTakeActions === false;
+            return effects?.canTakeActions === false;
         });
     }
 
@@ -1266,7 +1268,7 @@ export class CombatEngine {
 
         return !participant.conditions.some(c => {
             const effects = CONDITION_EFFECTS[c.type];
-            return effects.canTakeReactions === false;
+            return effects?.canTakeReactions === false;
         });
     }
 
@@ -1528,7 +1530,7 @@ export class CombatEngine {
 
         return participant.conditions.some(c => {
             const effects = CONDITION_EFFECTS[c.type];
-            return effects.attacksAgainstAdvantage === true;
+            return effects?.attacksAgainstAdvantage === true;
         });
     }
 
@@ -1543,7 +1545,7 @@ export class CombatEngine {
 
         return participant.conditions.some(c => {
             const effects = CONDITION_EFFECTS[c.type];
-            return effects.attackDisadvantage === true;
+            return effects?.attackDisadvantage === true;
         });
     }
 }

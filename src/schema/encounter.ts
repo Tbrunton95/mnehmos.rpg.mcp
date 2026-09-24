@@ -12,6 +12,27 @@ export const ConditionSchema = z.object({
     metadata: z.record(z.any()).optional()
 });
 
+/**
+ * Caller-facing condition at encounter create: a bare name ("prone"), a
+ * character-row entry ({name, duration?, source?}), or an engine-shaped
+ * object ({type, ...}). Normalized to ConditionSchema by normalizeConditions
+ * (engine/combat/conditions.ts) before it reaches the engine.
+ */
+export const ConditionInputSchema = z.union([
+    z.string(),
+    z.object({
+        id: z.string().optional(),
+        type: z.string().optional(),
+        name: z.string().optional(),
+        durationType: z.string().optional(),
+        duration: z.number().optional().describe('Duration in rounds'),
+        source: z.string().optional(),
+        sourceId: z.string().optional(),
+        saveDC: z.number().optional(),
+        saveAbility: z.string().optional()
+    })
+]);
+
 // CRIT-003: Position schema for spatial combat
 export const PositionSchema = z.object({
     x: z.number(),

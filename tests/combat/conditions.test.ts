@@ -1,5 +1,5 @@
 import { CombatEngine, CombatParticipant } from '../../src/engine/combat/engine';
-import { ConditionType, DurationType, Ability } from '../../src/engine/combat/conditions';
+import { ConditionType, DurationType, Ability, normalizeCondition, normalizeConditions } from '../../src/engine/combat/conditions';
 
 describe('Combat Conditions', () => {
     let engine: CombatEngine;
@@ -129,6 +129,45 @@ describe('Combat Conditions', () => {
             });
 
             expect(engine.attacksHaveDisadvantage('wizard')).toBe(true);
+        });
+    });
+
+    describe('Normalizing caller-supplied conditions', () => {
+        it('maps names case-insensitively onto ConditionType, permanent by default', () => {
+            const c = normalizeCondition('Prone', 'fighter')!;
+            expect(c.type).toBe(ConditionType.PRONE);
+            expect(c.durationType).toBe(DurationType.PERMANENT);
+            expect(c.id).toMatch(/^fighter-prone-/);
+        });
+
+        it('reads character-row {name, duration, source} as rounds from a source', () => {
+            expect(normalizeCondition({ name: 'Poisoned', duration: 3, source: 'trap' }, 'fighter')).toMatchObject({
+                type: ConditionType.POISONED, durationType: DurationType.ROUNDS, duration: 3, sourceId: 'trap'
+            });
+        });
+
+        it('keeps engine-shaped fields (id, durationType, save)', () => {
+            expect(normalizeCondition({
+                id: 'hold-1', type: 'restrained', durationType: 'save_ends', saveDC: 13, saveAbility: 'Strength'
+            }, 'fighter')).toEqual({
+                id: 'hold-1', type: ConditionType.RESTRAINED, durationType: DurationType.SAVE_ENDS, saveDC: 13, saveAbility: Ability.STRENGTH
+            });
+        });
+
+        it('keeps unknown names verbatim and drops nameless entries', () => {
+            const list = normalizeConditions(['Clinched', { name: '  ' }, {}], 'fighter');
+            expect(list.map(c => c.type)).toEqual(['Clinched']);
+        });
+
+        it('treats unknown condition types as having no mechanical effect', () => {
+            const state = engine.getState()!;
+            state.participants.find(p => p.id === 'fighter')!.conditions.push(normalizeCondition('Clinched', 'fighter')!);
+
+            expect(engine.canTakeActions('fighter')).toBe(true);
+            expect(engine.canTakeReactions('fighter')).toBe(true);
+            expect(engine.attacksHaveDisadvantage('fighter')).toBe(false);
+            expect(engine.attacksAgainstHaveAdvantage('fighter')).toBe(false);
+            expect(engine.validateActionEconomy('fighter', 'action').valid).toBe(true);
         });
     });
 });

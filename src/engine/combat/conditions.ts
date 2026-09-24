@@ -101,6 +101,64 @@ export interface Condition {
 }
 
 /**
+ * A condition as callers hand it to encounter create / add_participant:
+ * a bare name ("prone"), a character-row entry ({name, duration?, source?}),
+ * or an engine-shaped object ({type, durationType?, sourceId?, ...}).
+ */
+export type ConditionInput = string | {
+    id?: string;
+    type?: string;
+    name?: string;
+    durationType?: string;
+    duration?: number;
+    source?: string;
+    sourceId?: string;
+    saveDC?: number;
+    saveAbility?: string;
+};
+
+/**
+ * Normalize a caller-supplied condition into the engine's Condition shape.
+ * Known names map case-insensitively onto ConditionType; anything else is
+ * kept verbatim as a custom condition with no mechanical effect. A duration
+ * means rounds (the character-row convention); none means permanent.
+ * Returns null when there is no name to go on.
+ */
+export function normalizeCondition(input: ConditionInput, participantId: string): Condition | null {
+    const raw = typeof input === 'string' ? { name: input } : input;
+    const label = String(raw.type || raw.name || '').trim();
+    if (!label) return null;
+
+    const type = (Object.values(ConditionType) as string[]).includes(label.toLowerCase())
+        ? label.toLowerCase() as ConditionType
+        : label as ConditionType;
+    const durationType = (Object.values(DurationType) as string[]).includes(raw.durationType ?? '')
+        ? raw.durationType as DurationType
+        : raw.duration !== undefined ? DurationType.ROUNDS : DurationType.PERMANENT;
+    const sourceId = raw.sourceId ?? raw.source;
+    const saveAbility = (Object.values(Ability) as string[]).includes(raw.saveAbility?.toLowerCase() ?? '')
+        ? raw.saveAbility!.toLowerCase() as Ability
+        : undefined;
+
+    return {
+        // Same instance-id scheme as CombatEngine.applyCondition
+        id: raw.id ?? `${participantId}-${type}-${Date.now()}-${Math.random()}`,
+        type,
+        durationType,
+        ...(raw.duration !== undefined ? { duration: raw.duration } : {}),
+        ...(sourceId !== undefined ? { sourceId } : {}),
+        ...(raw.saveDC !== undefined ? { saveDC: raw.saveDC } : {}),
+        ...(saveAbility ? { saveAbility } : {})
+    };
+}
+
+export function normalizeConditions(inputs: ConditionInput[] | undefined, participantId: string): Condition[] {
+    return (inputs ?? [])
+        .map(c => normalizeCondition(c, participantId))
+        .filter((c): c is Condition => c !== null);
+}
+
+/**
  * Condition effect modifiers
  * Defines mechanical effects of each condition type
  */
