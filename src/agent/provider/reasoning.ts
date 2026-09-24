@@ -19,8 +19,12 @@ export function isReasoningModel(model: string): boolean {
  * A chat-sized ceiling can therefore produce an empty response before the
  * model has any room left to speak. The floor is only a minimum request; the
  * provider still bills the actual completion usage.
+ *
+ * `none` spends no hidden reasoning, so it needs no floor: the caller's cap
+ * passes through and the preflight budget gate has nothing extra to fund.
  */
 export const REASONING_COMPLETION_FLOOR: Record<ReasoningEffort, number> = {
+    none: 0,
     low: 4096,
     medium: 8192,
     high: 16384,

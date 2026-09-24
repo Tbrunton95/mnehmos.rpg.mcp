@@ -1,6 +1,12 @@
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
-import { resolveCompetency, loadCompetencyLadder } from '../../../src/agent/runtime/competency';
+import {
+    resolveCompetency,
+    loadCompetencyLadder,
+    validateOverride,
+    ReasoningEffortSchema
+} from '../../../src/agent/runtime/competency';
+import { ReasoningEffortSchema as StoredReasoningEffortSchema } from '../../../src/schema/agent';
 
 describe('competency mapping', () => {
     it('loads the canonical INT ladder from content config', () => {
@@ -10,38 +16,30 @@ describe('competency mapping', () => {
         expect(ladder[19].int).toBe(20);
     });
 
-    it('maps every INT score to the canon model and reasoning effort', () => {
+    // docs/bastion/07-competency-mapping.md "The active ladder (post-2026-06-02
+    // override)": one model at every INT, depth carried by reasoning_effort.
+    it('maps every INT score to the active ladder (gpt-5.5, effort by INT)', () => {
         const expected = [
-            [1, 'babbage-002', null],
-            [2, 'babbage-002', null],
-            [3, 'davinci-002', null],
-            [4, 'gpt-4', null],
-            [5, 'gpt-oss-20b', null],
-            [6, 'gpt-oss-20b', null],
-            [7, 'gpt-4o-mini', null],
-            [8, 'gpt-oss-120b', null],
-            [9, 'gpt-4.1-mini', null],
-            [10, 'gpt-4.1', null],
-            [11, 'o3', 'medium'],
-            [12, 'o3', 'high'],
-            [13, 'gpt-5-nano', 'medium'],
-            [14, 'gpt-5-mini', 'high'],
-            [15, 'gpt-5.4-nano', 'medium'],
-            [16, 'gpt-5.4-mini', 'high'],
-            [17, 'gpt-5.4', 'medium'],
-            [18, 'gpt-5.4', 'high'],
-            [19, 'gpt-5.5', 'high'],
-            [20, 'gpt-5.5', 'xhigh']
+            [1, 'none'], [2, 'none'], [3, 'none'], [4, 'none'], [5, 'none'], [6, 'none'],
+            [7, 'low'], [8, 'low'], [9, 'low'], [10, 'low'],
+            [11, 'medium'], [12, 'medium'], [13, 'medium'], [14, 'medium'],
+            [15, 'high'], [16, 'high'], [17, 'high'], [18, 'high'],
+            [19, 'xhigh'], [20, 'xhigh']
         ] as const;
 
-        for (const [intStat, model, reasoningEffort] of expected) {
+        for (const [intStat, reasoningEffort] of expected) {
             expect(resolveCompetency(intStat)).toMatchObject({
                 int: intStat,
-                model,
+                model: 'gpt-5.5',
                 reasoningEffort,
                 source: 'stat_derived'
             });
         }
+    });
+
+    it('keeps the two ReasoningEffort schemas in lockstep (ladder vs stored rows)', () => {
+        expect(ReasoningEffortSchema.options).toEqual(StoredReasoningEffortSchema.options);
+        expect(ReasoningEffortSchema.options).toContain('none');
     });
 
     it('rejects pro model variants in the ladder file', () => {
@@ -56,13 +54,13 @@ describe('competency mapping', () => {
 
     it('applies partial overrides and records override source', () => {
         expect(resolveCompetency(10, { reasoningEffort: 'high' })).toMatchObject({
-            model: 'gpt-4.1',
+            model: 'gpt-5.5',
             reasoningEffort: 'high',
             source: 'override'
         });
-        expect(resolveCompetency(10, { model: 'gpt-5.5' })).toMatchObject({
-            model: 'gpt-5.5',
-            reasoningEffort: null,
+        expect(resolveCompetency(10, { model: 'gpt-4.1' })).toMatchObject({
+            model: 'gpt-4.1',
+            reasoningEffort: 'low',
             source: 'override'
         });
         expect(resolveCompetency(10, {
@@ -75,7 +73,25 @@ describe('competency mapping', () => {
         });
     });
 
-    it('rejects pro model variants in overrides', () => {
-        expect(() => resolveCompetency(20, { model: 'gpt-5.5-pro' })).toThrow(/pro/i);
+    // FINDINGS #98: strict on write, lenient on read. A stored -pro override
+    // degrades to the INT ladder with overrideError instead of throwing; the
+    // write path refuses it via validateOverride.
+    it('degrades a stored pro override to the INT ladder instead of throwing', () => {
+        const resolved = resolveCompetency(20, { model: 'gpt-5.5-pro' });
+        expect(resolved).toMatchObject({
+            int: 20,
+            model: 'gpt-5.5',
+            reasoningEffort: 'xhigh',
+            source: 'stat_derived'
+        });
+        expect(resolved.overrideError).toMatch(/gpt-5\.5-pro/);
+        expect(resolved.overrideError).toMatch(/no-pro-model/);
+    });
+
+    it('refuses pro model variants on write', () => {
+        expect(validateOverride({ model: 'gpt-5.5-pro' })).toMatch(/refused[\s\S]*-pro/);
+        expect(validateOverride({ model: 'gpt-5.5' })).toBeNull();
+        expect(validateOverride({ reasoningEffort: 'none' })).toBeNull();
+        expect(validateOverride(null)).toBeNull();
     });
 });

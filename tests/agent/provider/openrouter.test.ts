@@ -136,6 +136,24 @@ describe('OpenRouterProvider', () => {
         expect(body.reasoning_effort).toBe('medium');
     });
 
+    it('maps effort "none" to OpenRouter\'s reasoning off-switch, not an effort string', async () => {
+        const mock = mockFetch({
+            body: JSON.stringify({ choices: [{ message: { content: 'x' } }] })
+        });
+        const provider = new OpenRouterProvider({ apiKey: 'or-test', fetchImpl: mock.fn });
+
+        await provider.call({
+            model: 'openai/gpt-5.5',
+            messages: [{ role: 'user', content: 'hi' }],
+            maxTokens: 300,
+            reasoningEffort: 'none'
+        });
+
+        const body = JSON.parse(mock.lastRequest.init?.body as string);
+        expect(body.reasoning).toEqual({ enabled: false });
+        expect(body.reasoning_effort).toBeUndefined();
+    });
+
     it('explains an empty reasoning response caused by a completion ceiling', async () => {
         const mock = mockFetch({
             body: JSON.stringify({ choices: [{ message: { content: '' }, finish_reason: 'length' }] })

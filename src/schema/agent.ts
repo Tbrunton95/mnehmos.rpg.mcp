@@ -13,7 +13,9 @@ export type AgentStatus = z.infer<typeof AgentStatusSchema>;
 export const AgentCircuitStateSchema = z.enum(['closed', 'open', 'half_open']);
 export type AgentCircuitState = z.infer<typeof AgentCircuitStateSchema>;
 
-export const ReasoningEffortSchema = z.enum(['low', 'medium', 'high', 'xhigh']);
+// 'none' = reasoning explicitly off (active ladder INT 1–6); null = no effort
+// sent. Keep in lockstep with src/agent/runtime/competency.ts.
+export const ReasoningEffortSchema = z.enum(['none', 'low', 'medium', 'high', 'xhigh']);
 export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
 
 export const CompetencySourceSchema = z.enum(['stat_derived', 'override']);

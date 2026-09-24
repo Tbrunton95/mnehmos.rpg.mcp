@@ -179,6 +179,22 @@ describe('OpenAIProvider', () => {
             expect(body.reasoning_effort).toBe('xhigh');
         });
 
+        it('sends reasoning_effort "none" explicitly (active ladder INT 1–6) rather than the API default', async () => {
+            const mock = mockFetch({
+                body: JSON.stringify({ choices: [{ message: { content: 'x' } }] })
+            });
+            const provider = new OpenAIProvider({ apiKey: 'sk', fetchImpl: mock.fn });
+
+            await provider.call({
+                model: 'gpt-5.5',
+                messages: [{ role: 'user', content: 'hi' }],
+                reasoningEffort: 'none'
+            });
+
+            const body = JSON.parse(mock.lastRequest.init?.body as string);
+            expect(body.reasoning_effort).toBe('none');
+        });
+
         it('omits reasoning_effort for non-reasoning models', async () => {
             const mock = mockFetch({
                 body: JSON.stringify({ choices: [{ message: { content: 'x' } }] })
@@ -216,6 +232,17 @@ describe('OpenAIProvider', () => {
             await provider.call({ model: 'o3', messages: [{ role: 'user', content: 'hi' }], maxTokens: 800 });
             const body = JSON.parse(mock.lastRequest.init?.body as string);
             expect(body.max_completion_tokens).toBe(REASONING_COMPLETION_FLOOR.medium);
+        });
+
+        it('does not floor effort "none" — no hidden reasoning to fund', async () => {
+            const mock = mockFetch({ body: JSON.stringify({ choices: [{ message: { content: 'x' } }] }) });
+            const provider = new OpenAIProvider({ apiKey: 'sk', fetchImpl: mock.fn });
+            await provider.call({
+                model: 'gpt-5.5', messages: [{ role: 'user', content: 'hi' }], maxTokens: 800, reasoningEffort: 'none'
+            });
+            const body = JSON.parse(mock.lastRequest.init?.body as string);
+            expect(body.max_completion_tokens).toBe(800);
+            expect(body.max_tokens).toBeUndefined();
         });
 
         it('never lowers a caller budget already above the floor', async () => {

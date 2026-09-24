@@ -2,7 +2,11 @@ import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { z } from 'zod';
 
-export const ReasoningEffortSchema = z.enum(['low', 'medium', 'high', 'xhigh']);
+// 'none' is the active ladder's INT 1–6 rung (docs/bastion/07): reasoning
+// explicitly OFF on a reasoning model. Distinct from null, which means "send
+// no effort" (OpenAI then applies its own per-model default). Keep in lockstep
+// with src/schema/agent.ts — stored call rows parse through that copy.
+export const ReasoningEffortSchema = z.enum(['none', 'low', 'medium', 'high', 'xhigh']);
 export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
 
 export const CompetencySourceSchema = z.enum(['stat_derived', 'override']);

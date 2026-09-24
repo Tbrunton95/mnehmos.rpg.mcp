@@ -83,17 +83,20 @@ export class OpenRouterProvider implements LLMProvider {
         if (opts.temperature !== undefined && !reasoningModel) {
             body.temperature = opts.temperature;
         }
-        if (opts.reasoningEffort !== undefined && opts.reasoningEffort !== null && reasoningModel) {
+        // 'none' travels only as the `reasoning` off-switch below — the shape
+        // null already used — so the top-level field never contradicts it.
+        const reasoningOff = opts.reasoningEffort === null || opts.reasoningEffort === 'none';
+        if (opts.reasoningEffort !== undefined && !reasoningOff && reasoningModel) {
             body.reasoning_effort = opts.reasoningEffort;
         }
         // FINDINGS #69: reasoningEffort was threaded through the whole stack and
         // dropped here — thinking burned the max_tokens budget on every invoke.
         // OpenRouter's normalized `reasoning` param: effort string, or
-        // { enabled: false } to disable thinking outright. `null` from the
-        // competency ladder means exactly that — in-character dialogue does not
-        // need chain-of-thought. Unsupported models ignore the parameter.
+        // { enabled: false } to disable thinking outright. `null` and the active
+        // ladder's 'none' (INT 1–6) mean exactly that — in-character dialogue
+        // does not need chain-of-thought. Unsupported models ignore the parameter.
         if (opts.reasoningEffort !== undefined) {
-            body.reasoning = opts.reasoningEffort === null
+            body.reasoning = reasoningOff
                 ? { enabled: false }
                 : { effort: opts.reasoningEffort === 'xhigh' ? 'high' : opts.reasoningEffort };
         }

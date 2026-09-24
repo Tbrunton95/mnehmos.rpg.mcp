@@ -132,12 +132,30 @@ describe('invokeAgent', () => {
         const result = await invokeAgent({ agentId: agent.id }, deps);
 
         expect(result.status).toBe('ok');
-        expect(observedModel).toBe('gpt-5.4');
+        expect(observedModel).toBe('gpt-5.5');
         expect(observedReasoningEffort).toBe('high');
         const call = deps.agentRepo.findCallById(result.callId!) as any;
-        expect(call.model).toBe('gpt-5.4');
+        expect(call.model).toBe('gpt-5.5');
         expect(call.reasoningEffort).toBe('high');
         expect(call.competencySource).toBe('stat_derived');
+    });
+
+    it('sends effort "none" at INT 1–6 and audits it; no reasoning floor gates a small budget', async () => {
+        const agent = setupAgent({ characterInt: 4, budgetTokens: 1000 });
+        let observedReasoningEffort: unknown;
+        factory.register('openai', fakeProvider(async ({ reasoningEffort }) => {
+            observedReasoningEffort = reasoningEffort;
+            return { text: 'Grug see door.', raw: '{}', durationMs: 1 };
+        }));
+
+        const result = await invokeAgent({ agentId: agent.id }, deps);
+
+        expect(result.status).toBe('ok');
+        expect(observedReasoningEffort).toBe('none');
+        expect(result.reasoningEffort).toBe('none');
+        const call = deps.agentRepo.findCallById(result.callId!) as any;
+        expect(call.model).toBe('gpt-5.5');
+        expect(call.reasoningEffort).toBe('none');
     });
 
     it('uses per-agent competency override and audits the override source', async () => {
@@ -174,8 +192,10 @@ describe('invokeAgent', () => {
         expect(updated.tokensUsed).toBe(150);
     });
 
+    // The two post-hoc budget tests pin a non-reasoning model so the preflight
+    // reasoning-floor gate (covered separately below) cannot pre-empt the call.
     it('does not report a provider response as successful when it crosses a hard budget', async () => {
-        const agent = setupAgent({ budgetTokens: 1000 });
+        const agent = setupAgent({ budgetTokens: 1000, competencyOverride: { model: 'gpt-4.1' } });
         factory.register('openai', fakeProvider(async () => ({
             text: 'too expensive', promptTokens: 800, completionTokens: 250, raw: '{}', durationMs: 1
         })));
@@ -190,7 +210,12 @@ describe('invokeAgent', () => {
     });
 
     it('treats exact budget consumption as exhausted and clears stale circuit failures', async () => {
-        const agent = setupAgent({ budgetTokens: 1000, circuitState: 'half_open', consecutiveFailures: 2 });
+        const agent = setupAgent({
+            budgetTokens: 1000,
+            circuitState: 'half_open',
+            consecutiveFailures: 2,
+            competencyOverride: { model: 'gpt-4.1' }
+        });
         factory.register('openai', fakeProvider(async () => ({
             text: 'exactly at the limit', promptTokens: 400, completionTokens: 600, raw: '{}', durationMs: 1
         })));
