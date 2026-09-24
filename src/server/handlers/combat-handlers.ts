@@ -663,7 +663,9 @@ Example (use real UUID from context for player character!):
                 vulnerabilities: z.array(z.string()).optional()
                     .describe('Damage types that deal double damage'),
                 immunities: z.array(z.string()).optional()
-                    .describe('Damage types that deal no damage')
+                    .describe('Damage types that deal no damage'),
+                band: z.string().optional().describe("Table rules: power band (defaults from the character row)"),
+                regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds (defaults from the character row)')
             })).min(1),
             terrain: z.object({
                 obstacles: z.array(z.string()).default([]).describe('Array of "x,y" strings for blocking tiles'),
@@ -1175,13 +1177,13 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
         // silently defaulted to 10 at resolution while output looked correct
         // (the soft-AC trap). Explicit ac still wins below; ad-hoc tokens with
         // no row keep the heuristic.
-        if (p.ac === undefined && extraStats.ac === undefined && p.id) {
-            const acDb = getDb();
-            const row = new CharacterRepository(acDb).findById(p.id);
-            if (row?.ac !== undefined) {
-                extraStats.ac = row.ac;
-            }
+        const row = p.id ? new CharacterRepository(getDb()).findById(p.id) : null;
+        if (p.ac === undefined && extraStats.ac === undefined && row?.ac !== undefined) {
+            extraStats.ac = row.ac;
         }
+        // Table rules: band and regeneration default from the sheet.
+        const band = p.band ?? row?.band;
+        const regeneration = p.regeneration ?? row?.regeneration;
 
         const id = p.id || randomUUID();
         const participant = {
@@ -1201,6 +1203,8 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             resistances: p.resistances,
             vulnerabilities: p.vulnerabilities,
             immunities: p.immunities,
+            ...(band ? { band } : {}),
+            ...(regeneration ? { regeneration } : {}),
             ...extraStats,
             // Caller-supplied AC wins over the preset's default so explicit
             // overrides (e.g., a goblin in chain mail) take effect.
@@ -1257,7 +1261,9 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             // Spatial visualization data
             position: p.position,
             movementSpeed: p.movementSpeed ?? 30,
-            size: p.size ?? 'medium'
+            size: p.size ?? 'medium',
+            band: p.band,
+            regeneration: p.regeneration
         })),
         round: state.round,
         activeTokenId: state.turnOrder[state.currentTurnIndex],

@@ -36,6 +36,8 @@ export interface CombatParticipant {
     hasDashed?: boolean;          // Whether dash action was used this turn
     isDodging?: boolean;          // Dodge: attacks against it roll at disadvantage until its next turn
     helpedBy?: string;            // Help: advantage on its next attack, granted by this participant
+    band?: string;                // Table rules: power band (see table_rules band)
+    regeneration?: number;        // Table rules: HP healed at the start of each of its own turns
     // HIGH-002: Damage modifiers
     resistances?: string[];    // Damage types that deal half damage
     vulnerabilities?: string[]; // Damage types that deal double damage

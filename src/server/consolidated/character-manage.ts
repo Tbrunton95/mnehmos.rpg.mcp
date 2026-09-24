@@ -148,6 +148,8 @@ const CreateSchema = z.object({
     stealthBonus: z.number().int().optional(),
     perceptionOverride: z.number().int().optional(),
     stealthOverride: z.number().int().optional(),
+    band: z.string().optional().describe("Table rules: power band, as named in the world's band rule (e.g. 'Astartes')"),
+    regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
     skillProficiencies: z.array(z.string()).optional(),
     saveProficiencies: z.array(z.string()).optional(),
     expertise: z.array(z.string()).optional()
@@ -200,6 +202,8 @@ const UpdateSchema = z.object({
     stealthBonus: z.number().int().optional().describe('RENAMED (#95): use stealthOverride — this REFUSES loudly'),
     perceptionOverride: z.number().int().optional().describe('OVERRIDES the composed WIS+prof perception column in the eavesdrop/listener layer — it does not add (#95 R4a)'),
     stealthOverride: z.number().int().optional().describe('OVERRIDES the composed DEX+prof stealth column in the eavesdrop/listener layer — it does not add (#95 R4a)'),
+    band: z.string().optional().describe("Table rules: power band, as named in the world's band rule (e.g. 'Astartes')"),
+    regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
     saveProficiencies: z.array(z.string()).optional().describe('Saving throw proficiencies (str/dex/con/int/wis/cha)'),
     expertise: z.array(z.string()).optional().describe('Skills with double proficiency'),
     startingGold: z.number().int().min(0).optional().describe('Set currency to this exact RU amount (absolute set; for deltas use inventory_manage add_currency)'),
@@ -613,6 +617,8 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         immunities: args.immunities || [],
         perceptionBonus: args.perceptionOverride ?? 0,
         stealthBonus: args.stealthOverride ?? 0,
+        band: args.band,
+        regeneration: args.regeneration,
         // FINDINGS #93: resourcePools was accepted by BOTH schemas and never
         // read by the payload — the #33/#59/#90 anatomy on the worst possible
         // verb: a create whose banner said it worked. Honored now.
@@ -855,6 +861,8 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     }
     if (args.perceptionOverride !== undefined) updateData.perceptionBonus = args.perceptionOverride;
     if (args.stealthOverride !== undefined) updateData.stealthBonus = args.stealthOverride;
+    if (args.band !== undefined) updateData.band = args.band;
+    if (args.regeneration !== undefined) updateData.regeneration = args.regeneration;
     if (args.resourcePools !== undefined) updateData.resourcePools = args.resourcePools;
 
     // FINDINGS #88: preview lane — the diff of mapped fields, zero writes.
@@ -1962,6 +1970,8 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         stealthBonus: z.number().int().optional().describe('RENAMED (#95): use stealthOverride — REFUSES loudly'),
         perceptionOverride: z.number().int().optional().describe('#95 R4a: OVERRIDES composed WIS+prof in the eavesdrop layer — does not add'),
         stealthOverride: z.number().int().optional().describe('#95 R4a: OVERRIDES composed DEX+prof in the eavesdrop layer — does not add'),
+        band: z.string().optional().describe("Table rules: power band, as named in the world's band rule (e.g. 'Astartes')"),
+        regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
         // adjust_pool fields
         pool: z.string().optional(),
         removePool: z.boolean().optional().describe('Delete the pool entirely (adjust_pool)'),
