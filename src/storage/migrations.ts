@@ -1,3 +1,4 @@
+import { runDataMigrations } from './data-migrations.js';
 import Database from 'better-sqlite3';
 import { migrateClassProgression } from './migrations.class-progression.js';
 import { migrateLegacyRegionIds } from './migrations.region-ids.js';
@@ -661,6 +662,9 @@ export function migrate(db: Database.Database) {
   // Region rows: one id format (`${worldId}:region:${n}`). Needs the
   // owner_nation_id/control_level columns runMigrations adds.
   migrateLegacyRegionIds(db);
+
+  // One-time row upgrades, after every schema step has run.
+  runDataMigrations(db);
 }
 
 function runMigrations(db: Database.Database) {

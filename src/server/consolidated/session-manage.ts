@@ -15,6 +15,23 @@ import { QuestRepository } from '../../storage/repos/quest.repo.js';
 import { WorldRepository } from '../../storage/repos/world.repo.js';
 import { SessionContext } from '../types.js';
 import { listRules } from '../../engine/table-rules.js';
+import { CHANGELOG, type ChangelogEntry } from '../../data/changelog.js';
+import { getMeta, setMeta } from '../../storage/data-migrations.js';
+
+/** Engine changes this database has not been shown yet. */
+function unseenChangelog(): ChangelogEntry[] {
+    const seen = getMeta(getDb(), 'changelog_seen') ?? '';
+    return CHANGELOG.filter(e => e.id > seen);
+}
+
+function markChangelogSeen(): void {
+    const last = CHANGELOG[CHANGELOG.length - 1];
+    if (last) setMeta(getDb(), 'changelog_seen', last.id);
+}
+
+function renderChangelog(entries: ChangelogEntry[]): string {
+    return entries.map(e => `• ${e.title}: ${e.detail}\n`).join('');
+}
 
 /**
  * A world's table rules for session boot: the enforced rules by name and
@@ -41,7 +58,7 @@ export interface McpResponse {
     content: Array<{ type: 'text'; text: string }>;
 }
 
-const ACTIONS = ['initialize', 'get_context', 'capabilities', 'find', 'journal', 'revert'] as const;
+const ACTIONS = ['initialize', 'get_context', 'capabilities', 'find', 'journal', 'revert', 'changelog'] as const;
 
 type SessionAction = typeof ACTIONS[number];
 
@@ -71,7 +88,7 @@ function ensureDb() {
 
 // Input schema
 const SessionManageInputSchema = z.object({
-    action: z.string().describe('Action: initialize, get_context, capabilities, find, journal, revert'),
+    action: z.string().describe('Action: initialize, get_context, capabilities, find, journal, revert, changelog'),
 
     // FINDINGS #88 (mirror law): find / journal / revert params — the shared
     // schema IS the outer schema here, so one addition covers both sides.
@@ -80,6 +97,7 @@ const SessionManageInputSchema = z.object({
     entityTable: z.string().optional().describe('journal: filter by table (items, item_instances, narrative_notes…)'),
     entityId: z.string().optional().describe('journal: filter by row id'),
     writeId: z.number().int().optional().describe('revert: journal entry id to restore'),
+    all: z.boolean().optional().describe('changelog: every entry, not only the ones this database has not seen'),
 
     // initialize fields
     worldId: z.string().optional().describe('World ID to load'),
@@ -124,6 +142,11 @@ const SessionManageActionSchemas = {
         schema: SessionManageInputSchema.extend({ action: z.literal('journal'), entityTable: z.string().optional(), entityId: z.string().optional(), limit: z.number().int().min(1).max(50).optional().default(10) }),
         aliases: ['write_journal', 'history', 'writes'],
         description: 'FINDINGS #88: list journaled writes (items, instances, notes…) — newest first, filterable by table/entity. Each row is revertable by id'
+    },
+    changelog: {
+        schema: SessionManageInputSchema.extend({ action: z.literal('changelog') }),
+        aliases: ['whats_new', 'changes', 'release_notes'],
+        description: 'What changed in the engine since this database last looked (all: true for everything); marks them seen'
     },
     revert: {
         schema: SessionManageInputSchema.extend({ action: z.literal('revert'), writeId: z.number().int().describe('Journal entry id to revert') }),
@@ -346,11 +369,14 @@ async function handleInitialize(input: SessionManageInput, ctx: SessionContext):
 
     const bootRules = tableRulesAtBoot(worldId);
     if (bootRules) output += renderTableRules(bootRules);
+    const whatsNew = unseenChangelog();
+    if (whatsNew.length) { output += RichFormatter.section("🆕 What's new in the engine") + renderChangelog(whatsNew); markChangelogSeen(); }
 
     const result = {
         success: true,
         actionType: 'initialize',
         ...(bootRules ? { tableRules: bootRules } : {}),
+        ...(whatsNew.length ? { whatsNew } : {}),
         sessionId: ctx.sessionId,
         worldId,
         worldName: world?.name,
@@ -378,6 +404,8 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
     const context: Record<string, any> = {};
     const bootRules = tableRulesAtBoot(input.worldId);
     if (bootRules) context.tableRules = bootRules;
+    const whatsNew = unseenChangelog();
+    if (whatsNew.length) { context.whatsNew = whatsNew; markChangelogSeen(); }
 
     // Get party context
     if (input.includeParty && input.partyId) {
@@ -568,6 +596,7 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
         else if (context.scheduled.pendingTotal > context.scheduled.due.length) output += `(+${context.scheduled.pendingTotal - context.scheduled.due.length} more pending, not yet due)\n`;
     }
 
+    if (context.whatsNew) output += RichFormatter.section("🆕 What's new in the engine") + renderChangelog(context.whatsNew);
     if (context.tableRules) output += renderTableRules(context.tableRules);
 
     if (context.activeCombat) {
@@ -622,6 +651,15 @@ export async function handleSessionManage(args: unknown, ctx: SessionContext): P
             return handleJournal(input as SessionManageInput & { entityTable?: string; entityId?: string; limit?: number }, ctx);
         case 'revert':
             return handleRevert(input as SessionManageInput & { writeId?: number }, ctx);
+        case 'changelog': {
+            const entries = input.all ? CHANGELOG : unseenChangelog();
+            markChangelogSeen();
+            const payload = { success: true, actionType: 'changelog', count: entries.length, entries };
+            let output = RichFormatter.header("What's New", '🆕');
+            output += entries.length ? renderChangelog(entries) : 'Nothing new since the last session.\n';
+            output += RichFormatter.embedJson(payload, 'SESSION_MANAGE');
+            return { content: [{ type: 'text', text: output }] };
+        }
         default:
             return {
                 content: [{
