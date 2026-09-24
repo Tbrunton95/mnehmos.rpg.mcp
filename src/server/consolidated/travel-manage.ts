@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { matchAction, isGuidingError } from '../../utils/fuzzy-enum.js';
 import { RichFormatter } from '../utils/formatter.js';
 import { getDb } from '../../storage/index.js';
+import { characterLexicon, DEFAULT_LEXICON } from '../../engine/table-rules.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { PartyRepository } from '../../storage/repos/party.repo.js';
 import { CorpseRepository } from '../../storage/repos/corpse.repo.js';
@@ -486,7 +487,7 @@ async function handleLoot(input: TravelManageInput, _ctx: SessionContext): Promi
     output += RichFormatter.keyValue({
         'Corpses Looted': corpsesLooted,
         'Total Items': allItems.length,
-        'RU': totalGold,
+        [looterId ? characterLexicon(getDb(), looterId).currency : DEFAULT_LEXICON.currency]: totalGold,
         'Silver': totalSilver,
         'Copper': totalCopper
     });

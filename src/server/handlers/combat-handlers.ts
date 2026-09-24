@@ -1794,7 +1794,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 if ('skipped' in due) { ruleLines.push(`RULE skipped: ${due.skipped}`); continue; }
                 const setPart = `combat_manage set_part {encounterId: '${parsed.encounterId}', participantId: '${targetNow.id}', part: '${parsed.atPart ?? '<part>'}', state: 'crippled' | 'dead' | 'breached'}`;
                 resultRec.consequenceDue = { ...due, setPart };
-                ruleLines.push(`CONSEQUENCE DUE (${due.rule}): ${due.reason}. GM names it: ${due.options.join(' / ')}; record it with ${setPart} (or add_condition)`);
+                ruleLines.push(`CONSEQUENCE DUE (${due.rule}${due.direction === 'down' ? ', from above' : ''}): ${due.reason}. GM names it: ${due.options.join(' / ')}; record it with ${setPart} (or add_condition)`);
             }
         }
         if (preparedRule) {

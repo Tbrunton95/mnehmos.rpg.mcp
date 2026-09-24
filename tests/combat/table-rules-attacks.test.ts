@@ -67,6 +67,24 @@ describe('peer consequence', () => {
         expect((await attack({ targetId: 'scion', outcome: 'crit', damage: 12 })).text).not.toMatch(/CONSEQUENCE DUE/);
     });
 
+    it("under direction 'both' (the day-366 preset) a higher band maims a lower one", async () => {
+        await setup({ luciel: 'Monster/Lord', karanak: 'Astartes Elite' });
+        const { text, data } = await attack({ outcome: 'hit', damage: 40 });
+        expect(text).toMatch(/CONSEQUENCE DUE \(peer-consequence, from above\): 40 damage/);
+        expect(JSON.stringify(data)).toMatch(/"direction":"down"/);
+    });
+
+    it("direction 'up' keeps a higher band's hits unflagged", async () => {
+        await setup({ luciel: 'Monster/Lord', karanak: 'Astartes Elite' });
+        await handleTableRules({ action: 'define', worldId: W, kind: 'peer_consequence', name: 'peer-consequence', spec: { direction: 'up' } }, ctx as any);
+        expect((await attack({ outcome: 'crit', damage: 40 })).text).not.toMatch(/CONSEQUENCE DUE/);
+    });
+
+    it('a hit that kills flags nothing, either way', async () => {
+        await setup({ luciel: 'Astartes', karanak: 'Astartes' });
+        expect((await attack({ outcome: 'crit', damage: 160 })).text).not.toMatch(/CONSEQUENCE DUE/);
+    });
+
     it('says so when a band is unset, and does nothing without rules', async () => {
         await setup({ luciel: 'Astartes' });
         expect((await attack({ outcome: 'crit', damage: 10 })).text).toMatch(/RULE skipped: .*band unset for Karanak/);

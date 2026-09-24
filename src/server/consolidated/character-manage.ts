@@ -106,7 +106,7 @@ const CreateSchema = z.object({
         current: z.number(),
         max: z.number(),
         lastRefilledAt: z.string().optional()
-    })).optional().describe('Named numeric pools written AT CREATE (rads, composure, hunger…) — #93: honored now, was silently dropped'),
+    })).optional().describe('Named numeric pools written AT CREATE (resolve, corruption, fatigue…) — #93: honored now, was silently dropped'),
     conditions: z.array(conditionSchema()).optional().describe('FINDINGS #107: conditions written AT CREATE (wound clocks, THAW states…) — was the #93 anatomy repeated: outer schema accepted, create schema stripped, banner printed a clean card, and a GM could play six sessions off a condition that was never there'),
     worldId: z.string().optional().describe('FINDINGS #93: tag this character to a world — list {worldId} filters by it (nullable #91 pattern; untagged rows show everywhere)'),
     name: z.string().min(1).describe('Character name (required)'),
@@ -219,7 +219,7 @@ const UpdateSchema = z.object({
         current: z.number(),
         max: z.number(),
         lastRefilledAt: z.string().optional()
-    })).optional().describe('Named numeric pools (rads, composure, psi...) — ONE incrementing row per pool via read-modify-write, replacing per-delta effect-ledger rows'),
+    })).optional().describe('Named numeric pools (resolve, corruption, ammo...) — ONE incrementing row per pool via read-modify-write, replacing per-delta effect-ledger rows'),
     // FINDINGS #86: the composure re-spec — per-character charge/repair table.
     // DATA, NOT LOGIC: the engine stores and returns it so every chair charges
     // the same number; no resolver evaluates it (Register B stays Register B).
@@ -229,7 +229,7 @@ const UpdateSchema = z.object({
 const AdjustPoolSchema = z.object({
     action: z.literal('adjust_pool'),
     characterId: z.string(),
-    pool: z.string().describe('Pool name (rads, composure, psi, heat, vodka_uses...) — created if absent'),
+    pool: z.string().describe('Pool name (resolve, corruption, souls, ammo...) — created if absent'),
     delta: z.number().optional().default(0).describe('Amount to add (negative to subtract). Result clamps to 0..max. RETRY-UNSAFE by construction — prefer value for reconciliation'),
     // #67-F: retry ghost-writes (Tom's diagnosis) — deltas re-apply when a
     // retried generation re-executes tool calls from a discarded branch.
@@ -1828,7 +1828,7 @@ const definitions: Record<CharacterAction, ActionDefinition> = {
         schema: AdjustPoolSchema,
         handler: handleAdjustPool,
         aliases: ['pool', 'pool_delta'],
-        description: 'Adjust a named resource pool by a delta (rads, composure, heat...) with 0..max clamping'
+        description: 'Adjust a named resource pool by a delta (resolve, corruption, souls...) with 0..max clamping'
     },
     schedule_change: {
         schema: ScheduleChangeSchema,
@@ -1945,7 +1945,7 @@ const definitions: Record<CharacterAction, ActionDefinition> = {
         schema: GetStatusBlockSchema,
         handler: handleGetStatusBlock,
         aliases: ['status_block', 'status', 'sostoyanie'],
-        description: 'FINDINGS #64: the 00-schema status block from reads — HP, dosimeter, composure, weapon condition, wounds, effects, RU, world clock. Psi structurally absent.'
+        description: 'The status block from reads: HP, named pools, weapon condition, wounds, effects, currency, world clock. With a status_block table rule: the tiny block (HP, core pool, location, objective, two conditions). Hidden pools never print.'
     },
     add_xp: {
         schema: AddXpSchema,

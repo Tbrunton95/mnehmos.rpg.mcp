@@ -694,7 +694,7 @@ const definitions: Record<NarrativeAction, ActionDefinition> = {
         schema: AppendSchema,
         handler: handleAppend,
         aliases: ['grow', 'add_section', 'log_entry'],
-        description: 'FINDINGS #96: append a dated section to a note — bestiary pages, anomaly files, field notes GROW instead of being rewritten. {noteId, content, day?}'
+        description: 'FINDINGS #96: append a dated section to a note — bestiary pages, case files, field notes GROW instead of being rewritten. {noteId, content, day?}'
     },
     get: {
         schema: GetSchema,

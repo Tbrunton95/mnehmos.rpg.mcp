@@ -19,7 +19,9 @@ export const RuleSpecSchemas = {
     peer_consequence: z.object({
         thresholdFraction: z.number().gt(0).max(1).default(0.25),
         onCrit: z.boolean().default(true),
-        options: z.array(z.string()).default(['crippled joint', 'breached plate', 'thrown out of position'])
+        options: z.array(z.string()).default(['crippled joint', 'breached plate', 'thrown out of position']),
+        /** 'up': hits on the same band or higher. 'both': a higher band's hits on a lower one too. */
+        direction: z.enum(['up', 'both']).default('up')
     }).passthrough(),
     called_strike: z.object({
         requirePeer: z.boolean().default(true),

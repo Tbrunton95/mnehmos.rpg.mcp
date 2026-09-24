@@ -37,7 +37,7 @@ Luciel fights An'ggrath (Monster/Lord) on the mountain. Every fight follows this
 2. **Resolve the player's declaration.** A strike at the joint of An'ggrath's sword arm is a called strike on a peer:
    `combat_action attack {encounterId, actorId: 'luciel', targetId: 'angrath', atPart: 'sword arm', calledStrike: 'arm', attackBonus: 14, damage: '3d10+9', opId: 'r4-luciel-joint'}`.
    If the table rolled physical dice, post the result instead: `outcome: 'hit'` (or `'crit'` / `'miss'`) with `damage: 27`. Never inflate `attackBonus` to force a hit.
-3. **Read the lines under the result.** `RULE ... crippled until repaired` is already applied. `CONSEQUENCE DUE ...` asks you to name one: pick what the fiction earns from where the blow landed, then record it with `combat_manage set_part {encounterId, participantId: 'angrath', part: 'breastplate', state: 'breached', opId: 'r4-consequence'}`.
+3. **Read the lines under the result.** `RULE ... crippled until repaired` is already applied. `CONSEQUENCE DUE ...` asks you to name one (`from above` means a higher band maimed a lower one; a killing blow and a hit on a unit never flag): pick what the fiction earns from where the blow landed, then record it with `combat_manage set_part {encounterId, participantId: 'angrath', part: 'breastplate', state: 'breached', opId: 'r4-consequence'}`.
 4. **Record any ruling:** `precedent_manage record {worldId, kind: 'ruling', statement: 'A crippled daemon limb drops what it holds', scope: 'called strikes'}`.
 5. **Record who learned something:** `knowledge_manage record {worldId, key: 'angrath-wounded', statement: "Luciel crippled An'ggrath's sword arm", knowers: [{id: 'inquisitor', how: 'witnessed', day: 367}]}`.
 6. **Advance the turn:** `combat_manage advance {encounterId, opId: 'r4-advance'}`.
@@ -53,6 +53,7 @@ When several steps must land together, send them as one `batch_manage execute_se
 - **Never remove and re-add a condition to change its text.** Use `editConditions`, or `feature_from_condition`.
 - **Never let an NPC state a fact without a road to it.** Ask `knowledge_manage can_know` first.
 - **Never rule on something twice from memory.** `precedent_manage search` first.
+- **Never batch a call that carries an array.** Precedents with `tags` and knowledge records with `knowers` go as direct calls; inside `batch_manage` they are refused, and an atomic batch then undoes its earlier steps.
 - **Never narrate Luciel's choices, thoughts or words.**
 - **Never work around a refusal.** It is a rule; say so in the fiction.
 - **Never read whole sheets when you need two numbers.** Add `fields: ['hp', 'conditions']` or `output_mode: 'summary'`.
@@ -75,6 +76,8 @@ When several steps must land together, send them as one `batch_manage execute_se
 | A ruling or an invention | `precedent_manage record` / `search` |
 | Who knows a secret | `knowledge_manage record` / `learn` / `can_know` |
 | Debts and deferred prices | `ledger_manage create` |
+| Souls taken or spent | `character_manage adjust_pool {characterId, pool: 'souls', delta, reason}` |
+| Souls owed to a god | `ledger_manage create {worldId, debtor, creditor, amount, currency: 'souls', dueDay, consequence}` |
 | Time passes | `world_manage update {worldId, environment}` |
 | Did a timed-out call apply? | `session_manage op_status {forOpId}` |
 | Check a past roll | `session_manage rolls {forId \| encounterId \| forOpId}` |
