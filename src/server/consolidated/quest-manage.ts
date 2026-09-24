@@ -11,6 +11,7 @@ import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/a
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 import { getDb } from '../../storage/index.js';
+import { characterLexicon } from '../../engine/table-rules.js';
 import { QuestRepository } from '../../storage/repos/quest.repo.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
@@ -164,10 +165,11 @@ async function handleFail(args: z.infer<typeof FailSchema>): Promise<object> {
     if (!log.failedQuests.includes(args.questId)) log.failedQuests.push(args.questId);
     questRepo.updateLog(log);
     questRepo.update(args.questId, { status: 'failed' } as never);
+    const failLine = characterLexicon(getDb(), args.characterId).questFailLine;
     return {
         success: true, actionType: 'fail', questId: args.questId, questName: quest.name,
         characterId: args.characterId, reason: args.reason,
-        message: `"${quest.name}" FAILED for ${character.name}${args.reason ? ` — ${args.reason}` : ''}. No rewards. The Zone doesn't wait.`
+        message: `"${quest.name}" FAILED for ${character.name}${args.reason ? ` — ${args.reason}` : ''}. No rewards.${failLine ? ` ${failLine}` : ''}`
     };
 }
 
@@ -527,7 +529,8 @@ async function handleComplete(args: z.infer<typeof CompleteSchema>): Promise<obj
         characterId: args.characterId,
         characterName: character.name,
         rewards: rewardsGranted,
-        message: `${character.name} completed "${quest.name}"! Rewards credited: ${rewardsGranted.xp} XP, ${rewardsGranted.gold} RU`
+        currencyLabel: characterLexicon(getDb(), args.characterId).currency,
+        message: `${character.name} completed "${quest.name}"! Rewards credited: ${rewardsGranted.xp} XP, ${rewardsGranted.gold} ${characterLexicon(getDb(), args.characterId).currency}`
     };
 }
 
@@ -790,7 +793,7 @@ export async function handleQuestManage(args: unknown, _ctx: SessionContext): Pr
                 output += '\n**Rewards:**\n';
                 output += RichFormatter.keyValue({
                     'XP': parsed.rewards?.xp || 0,
-                    'RU': parsed.rewards?.gold || 0
+                    [parsed.currencyLabel ?? 'RU']: parsed.rewards?.gold || 0
                 });
                 if (parsed.rewards?.items?.length > 0) {
                     output += '**Items:** ' + parsed.rewards.items.join(', ') + '\n';

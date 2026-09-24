@@ -343,13 +343,15 @@ export function refuseFromPayload(p: { message?: string; hint?: string; writes?:
 // ── THE STRIP — scene-block chrome; the dosimeter is always visible ────
 // The 8-cell bar maps the 01 §2 band table — load-bearing, not decor.
 // ПДА is the one Cyrillic residue (Tom's language ruling).
-export function renderStrip(ctx: { callsign?: string; day?: number | string; time?: string; rads?: number }): string {
+export function renderStrip(ctx: { callsign?: string; day?: number | string; time?: string; rads?: number; badge?: string }): string {
     const g = G();
     const cs = (ctx.callsign ?? '???').toUpperCase();
     const clock = ctx.day !== undefined && ctx.time ? ` ─ D${ctx.day} ${g.sep} ${ctx.time} ─` : ' ─';
     const dosim = typeof ctx.rads === 'number' ? ` ${g.rad} ${bar(ctx.rads, 8, 1000)} ${ctx.rads} ─` : ' ─';
-    if (plain()) return `+- ${g.badge} - ${cs} -${clock.replace(/─/g, '-')}${dosim.replace(/─/g, '-')}-+\n`;
-    return `╓─ ${g.badge} ─── ${cs} ──${clock}─${dosim}──╖\n`;
+    const badge = ctx.badge === undefined ? g.badge : ctx.badge;
+    const head = badge ? `${badge} ─── ` : '';
+    if (plain()) return `+- ${head.replace(/─/g, '-')}${cs} -${clock.replace(/─/g, '-')}${dosim.replace(/─/g, '-')}-+\n`;
+    return `╓─ ${head}${cs} ──${clock}─${dosim}──╖\n`;
 }
 
 // ── СОСТОЯНИЕ / STATUS BLOCK — the 00-schema block from reads (#64) ───
@@ -361,7 +363,7 @@ export interface StatusInput {
     weaponName?: string; weaponCondition?: number; weaponCeiling?: number;
     weaponAttachments?: Array<{ slot: string; name: string }>;
     conditions?: Array<{ name?: string; duration?: number } | string>;
-    effects?: string[]; gold?: number;
+    effects?: string[]; gold?: number; currencyLabel?: string; badge?: string;
     day?: number | string; time?: string; weather?: string;
     // Table rules status_block: the tiny block.
     compact?: boolean;
@@ -380,10 +382,10 @@ export function renderStatusBlock(d: StatusInput): string {
         if (d.objective) rows.push([L('OBJ '), V(d.objective)]);
         const conds = (d.conditions ?? []).map(c => typeof c === 'string' ? c : `${c.name}${c.duration ? ` (${c.duration}d)` : ''}`);
         if (conds.length) rows.push([L('COND '), V(conds.join(` ${g.sep} `) + (d.moreConditions ? ` +${d.moreConditions}` : ''))]);
-        return renderStrip({ callsign: callsign(d.characterName ?? '???') }) + emit(rows)
+        return renderStrip({ callsign: callsign(d.characterName ?? '???'), badge: d.badge }) + emit(rows)
             + (plain() ? `+${'-'.repeat(50)}+\n` : `╙${'─'.repeat(50)}╜\n`);
     }
-    let out = renderStrip({ callsign: callsign(d.characterName ?? '???'), day: d.day, time: d.time, rads: d.rads });
+    let out = renderStrip({ callsign: callsign(d.characterName ?? '???'), day: d.day, time: d.time, rads: d.rads, badge: d.badge });
     const rows: Cell[][] = [];
     rows.push([L('HP '), V(`${d.hp ?? '?'}/${d.maxHp ?? '?'}`)]);
     if (typeof d.rads === 'number')
@@ -410,7 +412,7 @@ export function renderStatusBlock(d: StatusInput): string {
     rows.push([L('WOUNDS: '), conds.length ? V(conds.join(` ${g.sep} `)) : L('none')]);
     if (d.effects?.length) rows.push([L('EFFECTS: '), V(d.effects.join(` ${g.sep} `))]);
     const tail: Cell[] = [];
-    if (typeof d.gold === 'number') tail.push(L('RU '), V(d.gold));
+    if (typeof d.gold === 'number') tail.push(L(`${d.currencyLabel ?? 'RU'} `), V(d.gold));
     if (d.weather) tail.push(L(tail.length ? `   ${g.sep} ` : ''), L('WEATHER '), V(d.weather));
     if (tail.length) rows.push(tail);
     out += emit(rows);

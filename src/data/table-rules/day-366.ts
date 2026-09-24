@@ -52,6 +52,7 @@ export const DAY_366_PRESET: RulePresetEntry[] = [
     { kind: 'prepared_asset', name: 'prepared-anti-armour', spec: { catastrophicMargin: 10, missOptions: ['breach', 'displacement', 'forced into cover'], hitEffect: 'crippled system', catastrophicEffect: 'catastrophic' } },
     { kind: 'progression', name: 'milestone-xp', spec: { mode: 'milestone' } },
     { kind: 'status_block', name: 'tiny-status', spec: { compact: true, maxConditions: 2 } },
+    { kind: 'lexicon', name: 'lexicon', spec: { currency: 'Thrones', badge: '+++', questFailLine: '' } },
     ...principles.map(([name, text]) => ({ kind: 'principle' as const, name, spec: { text } })),
 ];
 

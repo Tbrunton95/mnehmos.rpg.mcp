@@ -49,6 +49,18 @@ export const RuleSpecSchemas = {
     }).passthrough(),
     principle: z.object({
         text: z.string().min(1)
+    }).passthrough(),
+    /**
+     * The world's words for the engine's fixed labels. Without a lexicon
+     * rule a world reads the STALKER defaults the engine grew up with.
+     */
+    lexicon: z.object({
+        /** Label on the gold field: 'Thrones', 'crowns', 'RU'. */
+        currency: z.string().min(1).default('gold'),
+        /** Badge on the status block's header strip. Empty for none. */
+        badge: z.string().default(''),
+        /** Line appended when a quest fails. Empty for none. */
+        questFailLine: z.string().default('')
     }).passthrough()
 } as const;
 
@@ -164,6 +176,22 @@ export function findPool<P>(pools: Record<string, P> | undefined | null, name: s
     if (pools[name] !== undefined) return { key: name, pool: pools[name] };
     const key = Object.keys(pools).find(k => k.toLowerCase() === name.toLowerCase());
     return key ? { key, pool: pools[key] } : undefined;
+}
+
+export interface Lexicon { currency: string; badge: string; questFailLine: string }
+
+/** What a world without a lexicon rule reads: the STALKER campaign's words. */
+export const DEFAULT_LEXICON: Lexicon = { currency: 'RU', badge: 'ПДА', questFailLine: "The Zone doesn't wait." };
+
+/** The world's lexicon, or the defaults when it has none. */
+export function worldLexicon(db: Database.Database, worldId: string | null | undefined): Lexicon {
+    const spec = loadRule(db, worldId, 'lexicon')?.spec;
+    return spec ? { currency: spec.currency, badge: spec.badge, questFailLine: spec.questFailLine } : DEFAULT_LEXICON;
+}
+
+/** The lexicon for a character's world. */
+export function characterLexicon(db: Database.Database, characterId: string): Lexicon {
+    return worldLexicon(db, resolveWorldId(db, { characterIds: [characterId] }));
 }
 
 /** The world's band order, or the Day 366 default when no band rule exists. */

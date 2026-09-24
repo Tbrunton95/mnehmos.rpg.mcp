@@ -12,7 +12,7 @@
  * - level_up -> action: 'level_up'
  */
 
-import { loadRule, resolveWorldId, findPool } from '../../engine/table-rules.js';
+import { loadRule, resolveWorldId, findPool, worldLexicon } from '../../engine/table-rules.js';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { SessionContext } from '../types.js';
@@ -214,7 +214,7 @@ const UpdateSchema = z.object({
     regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
     saveProficiencies: z.array(z.string()).optional().describe('Saving throw proficiencies (str/dex/con/int/wis/cha)'),
     expertise: z.array(z.string()).optional().describe('Skills with double proficiency'),
-    startingGold: z.number().int().min(0).optional().describe('Set currency to this exact RU amount (absolute set; for deltas use inventory_manage add_currency)'),
+    startingGold: z.number().int().min(0).optional().describe('Set currency to this exact amount (the world lexicon names it; RU by default) (absolute set; for deltas use inventory_manage add_currency)'),
     resourcePools: z.record(z.object({
         current: z.number(),
         max: z.number(),
@@ -380,6 +380,7 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
     // Table rules: a world's status_block rule asks for the tiny block: HP,
     // core pool, location, objective, one or two conditions.
     const worldId = resolveWorldId(db, { characterIds: [args.characterId] });
+    const lex = worldLexicon(db, worldId);
     const tiny = loadRule(db, worldId, 'status_block');
     if (tiny?.spec.compact) {
         const core = findPool(pools, tiny.spec.corePool);
@@ -400,6 +401,7 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
             actionType: 'get_status_block',
             compact: true,
             rule: tiny.name,
+            badge: lex.badge,
             characterId: args.characterId,
             characterName: char.name,
             hp: char.hp,
@@ -432,6 +434,8 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
         conditions: char.conditions || [],
         effects,
         gold,
+        currencyLabel: lex.currency,
+        badge: lex.badge,
         day, time, weather,
         message: `${char.name}: HP ${char.hp}/${char.maxHp}`
     };
@@ -872,7 +876,8 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
         }).filter(Boolean) as Array<Record<string, unknown>>;
         if (found.length) liveEncounters = found;
     } catch { /* no encounters table */ }
-    return { ...character, worldId, currency, currencyNote: currency ? `RU ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec, ...(liveEncounters ? { liveEncounters } : {}) };
+    const currencyLabel = worldLexicon(db, resolveWorldId(db, { characterIds: [args.characterId] })).currency;
+    return { ...character, worldId, currency, currencyLabel, currencyNote: currency ? `${currencyLabel} ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec, ...(liveEncounters ? { liveEncounters } : {}) };
 }
 
 async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object> {
@@ -2214,7 +2219,7 @@ export async function handleCharacterManage(args: unknown, _ctx: SessionContext)
                 'HP': `${data.hp}/${data.maxHp}`,
                 'AC': data.ac || 10,
                 // Findings #35: banner AND JSON, always.
-                ...(data.currency ? { 'RU': data.currency.gold ?? 0 } : {})
+                ...(data.currency ? { [data.currencyLabel ?? 'RU']: data.currency.gold ?? 0 } : {})
             });
             if (data.conditions?.length) {
                 output += RichFormatter.section('Conditions');

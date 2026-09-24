@@ -8,6 +8,7 @@ import { randomUUID } from 'crypto';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { CorpseRepository } from '../../storage/repos/corpse.repo.js';
 import { getDb } from '../../storage/index.js';
+import { characterLexicon } from '../../engine/table-rules.js';
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 
@@ -59,7 +60,7 @@ const CreateSchema = z.object({
         gold: z.number().min(0).optional(),
         silver: z.number().int().min(0).optional(),
         copper: z.number().int().min(0).optional()
-    }).optional()).describe('RU on the body at creation (persists to the corpse; looted via loot lootAll)')
+    }).optional()).describe('Currency on the body at creation (persists to the corpse; looted via loot lootAll)')
 });
 
 const GetSchema = z.object({
@@ -327,6 +328,7 @@ const definitions: Record<CorpseAction, ActionDefinition> = {
                     totalItems: looted.length,
                     currency: cur.success ? cur.currency : { gold: 0, silver: 0, copper: 0 },
                     currencyTransferred: cur.success,
+                    currencyLabel: characterLexicon(getDb(), params.characterId).currency,
                     lootAll: true
                 };
             }
@@ -694,7 +696,7 @@ export async function handleCorpseManage(args: unknown, _ctx: SessionContext): P
             });
         }
         if (parsed.currency && parsed.currency.gold > 0) {
-            output += `\n**RU:** ${parsed.currency.gold}${parsed.currencyTransferred ? ' (transferred)' : ''}\n`;
+            output += `\n**${parsed.currencyLabel ?? 'RU'}:** ${parsed.currency.gold}${parsed.currencyTransferred ? ' (transferred)' : ''}\n`;
         }
         output += RichFormatter.success('Items looted successfully');
     } else if (parsed.harvestedBy) {
