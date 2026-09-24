@@ -20,7 +20,8 @@ import {
     handleExecuteLairAction,
     getOrLoadEngine,
     syncParticipantHpFromDb,
-    saveEncounterState
+    saveEncounterState,
+    mirrorConditionToRow
 } from '../handlers/combat-handlers.js';
 import { expandCreatureTemplate, listAllTemplates } from '../../data/creature-presets.js';
 import { getDomainServices } from '../domain-services.js';
@@ -358,19 +359,6 @@ function stageGateCheck(characterId: string): string | null {
  * sheet ({name, duration?, source?}; names match case-insensitively). Returns
  * false when the participant has no character row.
  */
-function mirrorConditionToRow(characterId: string, op: 'add' | 'remove', name: string, duration?: number, source?: string): boolean {
-    const repo = new CharacterRepository(getDb());
-    const row = repo.findById(characterId);
-    if (!row) return false;
-    const key = name.toLowerCase();
-    const others = (row.conditions ?? []).filter((c: { name: string }) => c.name.toLowerCase() !== key);
-    const next = op === 'add'
-        ? [...others, { name, ...(duration !== undefined ? { duration } : {}), ...(source !== undefined ? { source } : {}) }]
-        : others;
-    repo.update(characterId, { conditions: next } as never);
-    return true;
-}
-
 function logConditionChange(encounterId: string, state: { round: number; currentTurnIndex: number }, actionType: string, targetId: string, summary: string, reason?: string): void {
     getDomainServices().combatActionLog.log({
         encounterId, round: state.round, turnIndex: state.currentTurnIndex,

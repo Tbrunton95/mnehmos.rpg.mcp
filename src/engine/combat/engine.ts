@@ -651,7 +651,10 @@ export class CombatEngine {
         // An attack the GM resolved at the table: no d20 is rolled, so no
         // natural 1 or 20 can override it, and a posted damage number lands
         // exactly as posted (field report: a nat 20 doubled a posted 111).
-        resolved?: 'hit' | 'crit' | 'miss'
+        resolved?: 'hit' | 'crit' | 'miss',
+        // The attack is made with a limb no crippling condition touches
+        // (e.g. the good arm), so condition attack disadvantage is skipped.
+        unaffectedLimb?: boolean
     ): CombatActionResult {
         if (!this.state) throw new Error('No active combat');
 
@@ -672,6 +675,13 @@ export class CombatEngine {
             const helper = this.state.participants.find(p => p.id === actor.helpedBy);
             situational.push(`helped by ${helper?.name ?? actor.helpedBy} (advantage)`);
             actor.helpedBy = undefined;
+        }
+        // Conditions can carry mechanics in metadata (a called strike's
+        // crippled arm). The GM passes unaffectedLimb for the good arm.
+        const hampering = actor.conditions.filter(c => c.metadata?.attackDisadvantage);
+        if (hampering.length && !unaffectedLimb) {
+            disadvantage = true;
+            situational.push(`${hampering.map(c => c.type).join(', ')} (disadvantage)`);
         }
 
         // Roll with full transparency — 5e semantics (Findings #32):
@@ -1127,7 +1137,20 @@ export class CombatEngine {
         participant.actionUsed = false;
         participant.bonusActionUsed = false;
         participant.spellsCast = {};
-        participant.movementRemaining = participant.movementSpeed ?? 30;
+        participant.movementRemaining = this.effectiveSpeed(participant);
+    }
+
+    /**
+     * Base speed after conditions whose metadata carries a speedFactor (a
+     * crippled leg halves it).
+     */
+    effectiveSpeed(participant: CombatParticipant): number {
+        const base = participant.movementSpeed ?? 30;
+        const factor = participant.conditions.reduce((f, c) => {
+            const sf = c.metadata?.speedFactor;
+            return typeof sf === 'number' ? f * sf : f;
+        }, 1);
+        return Math.floor(base * factor);
     }
 
     /**
@@ -1183,7 +1206,7 @@ export class CombatEngine {
             return { ok: false, error: econ.error || 'Action already used this turn' };
         }
 
-        const baseSpeed = participant.movementSpeed ?? 30;
+        const baseSpeed = this.effectiveSpeed(participant);
         const currentRemaining = participant.movementRemaining ?? baseSpeed;
         participant.movementRemaining = currentRemaining + baseSpeed;
         participant.hasDashed = true;
