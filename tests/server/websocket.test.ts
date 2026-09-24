@@ -1,3 +1,4 @@
+import { connect } from 'node:net';
 import { WebSocket } from 'ws';
 import { WebSocketServerTransport } from '../../src/server/transport/websocket';
 import { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
@@ -181,5 +182,51 @@ describe('WebSocket Transport', () => {
 
         expect(unexpectedMessages).toEqual([]);
         client2.close();
+    });
+});
+
+describe('WebSocket Transport close()', () => {
+    const PORT = 3014;
+
+    it('refuses new connections as soon as it starts, while a client still lingers', async () => {
+        // Loopback, so the bind works on any host: this is about shutdown, not
+        // the IPv6 fallback.
+        const transport = new WebSocketServerTransport(PORT, { host: '127.0.0.1' });
+        await transport.start();
+
+        // A client that completes the upgrade but never answers the close
+        // frame, so close() cannot finish until this socket goes away.
+        const lingering = connect(PORT, '127.0.0.1');
+        const handshake = await new Promise<string>((resolve, reject) => {
+            lingering.once('connect', () => lingering.write(
+                'GET / HTTP/1.1\r\n' +
+                `Host: 127.0.0.1:${PORT}\r\n` +
+                'Upgrade: websocket\r\n' +
+                'Connection: Upgrade\r\n' +
+                'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n' +
+                'Sec-WebSocket-Version: 13\r\n\r\n'
+            ));
+            lingering.once('data', data => resolve(data.toString()));
+            lingering.once('error', reject);
+        });
+        expect(handshake).toMatch(/^HTTP\/1\.1 101 /);
+
+        let closed = false;
+        const closing = transport.close().then(() => { closed = true; });
+        try {
+            const attempt = await new Promise<string>((resolve) => {
+                const socket = connect(PORT, '127.0.0.1');
+                socket.once('connect', () => {
+                    socket.destroy();
+                    resolve('connected');
+                });
+                socket.once('error', (error: NodeJS.ErrnoException) => resolve(error.code ?? error.message));
+            });
+            expect(closed).toBe(false);
+            expect(attempt).toBe('ECONNREFUSED');
+        } finally {
+            lingering.destroy();
+            await closing;
+        }
     });
 });

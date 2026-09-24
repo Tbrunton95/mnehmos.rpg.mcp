@@ -153,21 +153,27 @@ export class WebSocketServerTransport implements Transport {
         }
         this.clients.clear();
 
-        // Close the WebSocket server, then the HTTP server under it: ws does
-        // not close a server it was handed. Like ws closing its own server,
-        // ignore the "not running" error left by a bind that never succeeded.
-        return new Promise((resolve, reject) => {
+        // Close the WebSocket server and the HTTP server under it together. ws
+        // does not close a server it was handed, and only calls back once its
+        // clients are gone, so closing the HTTP server here (not in that
+        // callback) refuses new connections straight away, as ws does with a
+        // server it creates itself. Like ws, ignore the "not running" error
+        // left by a bind that never succeeded.
+        const wssClosed = new Promise<void>((resolve, reject) => {
             this.wss.close((error) => {
-                if (error) {
-                    reject(error);
-                    return;
-                }
-                this.httpServer.close(() => {
-                    this.onclose?.();
-                    resolve();
-                });
+                if (error) reject(error);
+                else resolve();
             });
         });
+        const httpClosed = new Promise<void>((resolve, reject) => {
+            this.httpServer.close((error?: NodeJS.ErrnoException) => {
+                if (error && error.code !== 'ERR_SERVER_NOT_RUNNING') reject(error);
+                else resolve();
+            });
+        });
+
+        await Promise.all([wssClosed, httpClosed]);
+        this.onclose?.();
     }
 
     // Broadcast to all connected clients (useful for notifications)
