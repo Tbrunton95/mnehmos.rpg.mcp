@@ -357,6 +357,9 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                     message: result.error
                 };
             }
+            // Save it: a reload used to lose the doubled movement and the spent action.
+            const dashState = engine.getState();
+            if (dashState) getDomainServices().encounter.saveState(params.encounterId, dashState);
             return {
                 success: true,
                 actionType: 'dash',
@@ -373,7 +376,14 @@ const definitions: Record<CombatAction, ActionDefinition> = {
         schema: DodgeSchema,
         handler: async (params: z.infer<typeof DodgeSchema>, ctx?: SessionContext) => {
             if (!ctx) throw new Error('No session context');
-            // Dodge grants advantage on DEX saves, attackers have disadvantage
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            if (!engine) return { error: true, actionType: 'dodge', message: `Encounter ${params.encounterId} not found.` };
+            const applied = engine.applyDodge(params.actorId);
+            if (!applied.ok) return { error: true, actionType: 'dodge', actorId: params.actorId, message: applied.error };
+            const dodgeState = engine.getState();
+            if (dodgeState) new EncounterRepository(getDb()).saveState(params.encounterId, dodgeState);
+            // Attack disadvantage is applied by the engine; the DEX-save
+            // advantage is on the GM, since saves are rolled outside it.
             return {
                 success: true,
                 actionType: 'dodge',
@@ -389,13 +399,20 @@ const definitions: Record<CombatAction, ActionDefinition> = {
         schema: HelpSchema,
         handler: async (params: z.infer<typeof HelpSchema>, ctx?: SessionContext) => {
             if (!ctx) throw new Error('No session context');
-            // Help grants advantage to an ally's next attack/check
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            if (!engine) return { error: true, actionType: 'help', message: `Encounter ${params.encounterId} not found.` };
+            const applied = engine.applyHelp(params.actorId, params.targetId);
+            if (!applied.ok) return { error: true, actionType: 'help', actorId: params.actorId, message: applied.error };
+            const helpState = engine.getState();
+            if (helpState) new EncounterRepository(getDb()).saveState(params.encounterId, helpState);
+            // The engine applies the advantage to the ally's next attack; an
+            // ability check it helps is on the GM.
             return {
                 success: true,
                 actionType: 'help',
                 actorId: params.actorId,
                 targetId: params.targetId,
-                effect: `${params.targetId} gains advantage on their next attack roll or ability check.`,
+                effect: `${params.targetId} gains advantage on its next attack roll before ${params.actorId}'s next turn (applied by the engine), or on one ability check (GM).`,
                 message: `${params.actorId} helps ${params.targetId}.`
             };
         },
@@ -484,7 +501,7 @@ Validates spell, rolls damage, applies effects, handles saves - all automatic.
 
 💚 SUPPORT:
 - heal - Restore HP to a target
-- help - Grant advantage to an ally
+- help - The ally's next attack before your next turn rolls with advantage (engine-applied)
 
 🏃 MOVEMENT:
 - move - Move to a position (use available movement)
@@ -492,7 +509,7 @@ Validates spell, rolls damage, applies effects, handles saves - all automatic.
 - disengage - Move without provoking opportunity attacks
 
 🛡️ DEFENSIVE:
-- dodge - Disadvantage on attacks against you, advantage on DEX saves
+- dodge - Attacks against you roll at disadvantage until your next turn (engine-applied; DEX-save advantage is on the GM)
 - ready - Prepare an action with a trigger
 
 Aliases: hit/strike→attack, cast/spell→cast_spell, sprint→dash, evade→dodge.

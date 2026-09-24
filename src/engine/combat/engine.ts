@@ -34,6 +34,8 @@ export interface CombatParticipant {
     movementRemaining?: number;   // Remaining movement this turn (in feet)
     size?: SizeCategory;          // Creature size for footprint calculation
     hasDashed?: boolean;          // Whether dash action was used this turn
+    isDodging?: boolean;          // Dodge: attacks against it roll at disadvantage until its next turn
+    helpedBy?: string;            // Help: advantage on its next attack, granted by this participant
     // HIGH-002: Damage modifiers
     resistances?: string[];    // Damage types that deal half damage
     vulnerabilities?: string[]; // Damage types that deal double damage
@@ -659,6 +661,17 @@ export class CombatEngine {
 
         const hpBefore = target.hp;
 
+        // Dodge and Help feed the roll. Help is spent by the attack even when
+        // the GM posts the result.
+        const situational: string[] = [];
+        if (target.isDodging) { disadvantage = true; situational.push(`${target.name} is dodging (disadvantage)`); }
+        if (actor.helpedBy) {
+            advantage = true;
+            const helper = this.state.participants.find(p => p.id === actor.helpedBy);
+            situational.push(`helped by ${helper?.name ?? actor.helpedBy} (advantage)`);
+            actor.helpedBy = undefined;
+        }
+
         // Roll with full transparency — 5e semantics (Findings #32):
         // crit reads the natural die, never the margin.
         const attackRoll: CheckResult & { allRolls: number[]; resolved?: 'hit' | 'crit' | 'miss' } = resolved
@@ -734,6 +747,8 @@ export class CombatEngine {
                 breakdown += ` [DEFEATED]`;
             }
         }
+
+        if (situational.length) breakdown += `\n   ⚖️ ${situational.join('; ')}`;
 
         // Build simple message
         let message = '';
@@ -1098,6 +1113,12 @@ export class CombatEngine {
      * HIGH-003: Reset reaction and disengage status at start of turn
      */
     private resetTurnResources(participant: CombatParticipant): void {
+        // Dodge lasts until the dodger's next turn; unused Help lapses when
+        // the helper's next turn starts.
+        participant.isDodging = false;
+        for (const p of this.state?.participants ?? []) {
+            if (p.helpedBy === participant.id) p.helpedBy = undefined;
+        }
         participant.reactionUsed = false;
         participant.hasDisengaged = false;
         participant.hasDashed = false;
@@ -1105,6 +1126,39 @@ export class CombatEngine {
         participant.bonusActionUsed = false;
         participant.spellsCast = {};
         participant.movementRemaining = participant.movementSpeed ?? 30;
+    }
+
+    /**
+     * The Dodge action: until the start of its next turn, attacks against the
+     * participant roll at disadvantage. Consumes the main action.
+     */
+    applyDodge(participantId: string): { ok: true } | { ok: false; error: string } {
+        if (!this.state) return { ok: false, error: 'No active combat' };
+        const participant = this.state.participants.find((p) => p.id === participantId);
+        if (!participant) return { ok: false, error: `Participant ${participantId} not found` };
+        const econ = this.validateActionEconomy(participantId, 'action');
+        if (!econ.valid) return { ok: false, error: econ.error || 'Action already used this turn' };
+        participant.isDodging = true;
+        participant.actionUsed = true;
+        return { ok: true };
+    }
+
+    /**
+     * The Help action: the ally's next attack before the helper's next turn
+     * rolls with advantage. Consumes the helper's main action.
+     */
+    applyHelp(helperId: string, allyId: string): { ok: true } | { ok: false; error: string } {
+        if (!this.state) return { ok: false, error: 'No active combat' };
+        const helper = this.state.participants.find((p) => p.id === helperId);
+        if (!helper) return { ok: false, error: `Participant ${helperId} not found` };
+        const ally = this.state.participants.find((p) => p.id === allyId);
+        if (!ally) return { ok: false, error: `Participant ${allyId} not found` };
+        if (helperId === allyId) return { ok: false, error: 'A participant cannot Help itself' };
+        const econ = this.validateActionEconomy(helperId, 'action');
+        if (!econ.valid) return { ok: false, error: econ.error || 'Action already used this turn' };
+        ally.helpedBy = helperId;
+        helper.actionUsed = true;
+        return { ok: true };
     }
 
     /**
