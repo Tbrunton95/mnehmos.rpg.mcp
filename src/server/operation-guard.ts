@@ -18,6 +18,32 @@ import type Database from 'better-sqlite3';
 import { getDb } from '../storage/index.js';
 import { getCombatManager } from './state/combat-manager.js';
 import { getTenant } from '../storage/tenant-context.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { recordRolls } from '../storage/roll-log.js';
+
+const opContext = new AsyncLocalStorage<{ opId?: string; tool: string }>();
+
+/** The operation this code runs inside (for roll_log), if any. */
+export function currentOperation(): { opId?: string; tool: string } | undefined {
+    return opContext.getStore();
+}
+
+/** Write the session's combat dice since the last drain to roll_log. */
+function flushCombatRolls(db: Database.Database, sessionId: string, op: { opId?: string; tool: string }): void {
+    const manager = getCombatManager();
+    for (const key of manager.list()) {
+        if (!key.startsWith(`${sessionId}:`)) continue;
+        const engine = manager.get(key);
+        const records = engine?.drainRollRecords?.() ?? [];
+        if (!records.length) continue;
+        const encounterId = key.slice(sessionId.length + 1);
+        recordRolls(db, records.map(r => ({
+            purpose: r.purpose, forId: r.forId, targetId: r.targetId, encounterId,
+            dice: r.dice, result: r.dice.reduce((a, d) => a + d.value, 0),
+            replay: r.origin !== null ? `${r.origin}@${r.startDraw}` : null
+        })), op);
+    }
+}
 
 type ToolReply = { content?: Array<{ type: string; text: string }> };
 type Handler = (args: Record<string, unknown>, extra: unknown) => Promise<ToolReply>;
@@ -107,8 +133,9 @@ export function withOperation(toolName: string, handler: Handler): Handler {
             const sp = `op_${++savepointSeq}`;
             db.exec(`SAVEPOINT ${sp}`);
             let res: ToolReply;
+            const op = { opId, tool: toolName };
             try {
-                res = await handler(args, extra);
+                res = await opContext.run(op, () => handler(args, extra));
             } catch (e) {
                 db.exec(`ROLLBACK TO ${sp}`); db.exec(`RELEASE ${sp}`);
                 evictSessionEngines(sessionKey());
@@ -120,6 +147,7 @@ export function withOperation(toolName: string, handler: Handler): Handler {
                 evictSessionEngines(sessionKey());
                 return res;
             }
+            flushCombatRolls(db, sessionKey(), op);
             if (opId) {
                 db.prepare('INSERT INTO op_log (op_id, tool, args_hash, response, created_at) VALUES (?, ?, ?, ?, ?)')
                     .run(opId, toolName, argsHash, res?.content?.[0]?.text ?? '', new Date().toISOString());

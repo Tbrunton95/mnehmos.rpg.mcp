@@ -2867,7 +2867,7 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
             // Handle saving throw if specified
             if (parsed.savingThrow) {
                 // Roll saving throw on the encounter's seeded stream
-                saveRoll = engine.rollD20();
+                saveRoll = engine.rollD20({ purpose: `lair save (${parsed.savingThrow.ability})`, forId: targetId });
                 const abilityScore = target.abilityScores?.[parsed.savingThrow.ability] ?? 10;
                 const modifier = Math.floor((abilityScore - 10) / 2);
                 saveTotal = saveRoll + modifier;

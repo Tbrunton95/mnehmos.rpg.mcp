@@ -18,6 +18,7 @@ import { listRules } from '../../engine/table-rules.js';
 import { CHANGELOG, type ChangelogEntry } from '../../data/changelog.js';
 import { getMeta, setMeta } from '../../storage/data-migrations.js';
 import { lookupOperation } from '../operation-guard.js';
+import { queryRolls } from '../../storage/roll-log.js';
 
 /** Engine changes this database has not been shown yet. */
 function unseenChangelog(): ChangelogEntry[] {
@@ -59,7 +60,7 @@ export interface McpResponse {
     content: Array<{ type: 'text'; text: string }>;
 }
 
-const ACTIONS = ['initialize', 'get_context', 'capabilities', 'find', 'journal', 'revert', 'changelog', 'op_status'] as const;
+const ACTIONS = ['initialize', 'get_context', 'capabilities', 'find', 'journal', 'revert', 'changelog', 'op_status', 'rolls'] as const;
 
 type SessionAction = typeof ACTIONS[number];
 
@@ -89,7 +90,7 @@ function ensureDb() {
 
 // Input schema
 const SessionManageInputSchema = z.object({
-    action: z.string().describe('Action: initialize, get_context, capabilities, find, journal, revert, changelog, op_status'),
+    action: z.string().describe('Action: initialize, get_context, capabilities, find, journal, revert, changelog, op_status, rolls'),
 
     // FINDINGS #88 (mirror law): find / journal / revert params — the shared
     // schema IS the outer schema here, so one addition covers both sides.
@@ -99,7 +100,9 @@ const SessionManageInputSchema = z.object({
     entityId: z.string().optional().describe('journal: filter by row id'),
     writeId: z.number().int().optional().describe('revert: journal entry id to restore'),
     all: z.boolean().optional().describe('changelog: every entry, not only the ones this database has not seen'),
-    forOpId: z.string().optional().describe('op_status: the opId a timed-out call carried'),
+    forOpId: z.string().optional().describe('op_status / rolls: the opId a call carried'),
+    forId: z.string().optional().describe('rolls: whose rolls (character or token id)'),
+    encounterId: z.string().optional().describe('rolls: rolls in this encounter'),
 
     // initialize fields
     worldId: z.string().optional().describe('World ID to load'),
@@ -144,6 +147,11 @@ const SessionManageActionSchemas = {
         schema: SessionManageInputSchema.extend({ action: z.literal('journal'), entityTable: z.string().optional(), entityId: z.string().optional(), limit: z.number().int().min(1).max(50).optional().default(10) }),
         aliases: ['write_journal', 'history', 'writes'],
         description: 'FINDINGS #88: list journaled writes (items, instances, notes…) — newest first, filterable by table/entity. Each row is revertable by id'
+    },
+    rolls: {
+        schema: SessionManageInputSchema.extend({ action: z.literal('rolls') }),
+        aliases: ['roll_log', 'dice_log', 'audit_rolls'],
+        description: 'The roll log, newest first: who each roll was for, why, the dice, and how to replay it (a seed, or an encounter stream origin@draw). Filter by forId, encounterId or forOpId'
     },
     op_status: {
         schema: SessionManageInputSchema.extend({ action: z.literal('op_status'), forOpId: z.string() }),
@@ -665,6 +673,18 @@ export async function handleSessionManage(args: unknown, ctx: SessionContext): P
                 : { success: true, actionType: 'op_status', opId: input.forOpId, applied: false, message: 'No call with this opId applied. Retrying it is safe.' };
             let output = RichFormatter.header('Operation', '🧾');
             output += found ? `op ${input.forOpId} applied: ${found.tool} at ${found.createdAt}\n` : `op ${input.forOpId} did not apply. Retry it with the same opId.\n`;
+            output += RichFormatter.embedJson(payload, 'SESSION_MANAGE');
+            return { content: [{ type: 'text', text: output }] };
+        }
+        case 'rolls': {
+            const rows = queryRolls(getDb(), { forId: input.forId, encounterId: input.encounterId, opId: input.forOpId, limit: input.limit });
+            const payload = { success: true, actionType: 'rolls', count: rows.length, rolls: rows };
+            let output = RichFormatter.header('Roll Log', '🎲');
+            for (const r of rows) {
+                const dice = (r.dice as Array<{ sides: number; value: number }>).map(d => `d${d.sides}:${d.value}`).join(' ');
+                output += `• ${r.created_at} ${r.purpose}${r.for_id ? ` for ${r.for_id}` : ''}${r.target_id ? ` → ${r.target_id}` : ''}: [${dice}]${r.result !== null ? ` = ${r.result}` : ''}${r.replay ? ` (replay ${r.replay})` : ''}${r.op_id ? ` op ${r.op_id}` : ''}\n`;
+            }
+            if (!rows.length) output += 'No rolls logged for that filter.\n';
             output += RichFormatter.embedJson(payload, 'SESSION_MANAGE');
             return { content: [{ type: 'text', text: output }] };
         }
