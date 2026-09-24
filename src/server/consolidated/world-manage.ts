@@ -393,7 +393,7 @@ function auditPartySeats(db: ReturnType<typeof getDb>, worldId?: string): unknow
 // migration queue), the check runs global and SAYS SO in its name, so the
 // reader always knows which patient each row belongs to.
 async function handleAudit(args: { worldId?: string }): Promise<object> {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const db = getDb();
     const W = args.worldId;
     const checks: Array<{ check: string; status: 'ok' | 'contradictions' | 'skipped'; scope?: string; items: unknown[] }> = [];
     // Scoped-first with honest fallback: when W is given and a scoped query

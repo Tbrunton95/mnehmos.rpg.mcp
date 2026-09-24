@@ -40,7 +40,7 @@ type VehicleRow = {
 };
 
 function vdb() {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const db = getDb();
     db.exec(`CREATE TABLE IF NOT EXISTS vehicles (
         id TEXT PRIMARY KEY, world_id TEXT NOT NULL, name TEXT NOT NULL,
         make TEXT, plate TEXT, registered_to TEXT, owner_character_id TEXT,

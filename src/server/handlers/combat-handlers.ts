@@ -1121,7 +1121,7 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
         // (the soft-AC trap). Explicit ac still wins below; ad-hoc tokens with
         // no row keep the heuristic.
         if (p.ac === undefined && extraStats.ac === undefined && p.id) {
-            const acDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+            const acDb = getDb();
             const row = new CharacterRepository(acDb).findById(p.id);
             if (row?.ac !== undefined) {
                 extraStats.ac = row.ac;
@@ -1385,7 +1385,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
 
         // RESOLVER v1 (Findings #19): consume autoApply-flagged trait mechanics.
         // Bare/prose-conditional mechanics stay GM-declared by design.
-        const resolverDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+        const resolverDb = getDb();
         const autoApplied: import('../../engine/effects-resolver.js').AutoApplication[] = [];
         const actorMechs = loadAutoMechanics(resolverDb, parsed.actorId);
         attackBonus += autoAttackBonus(actorMechs, autoApplied);
@@ -1530,7 +1530,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
 
             if (targetChar && concentrationRepo.isConcentrating(parsed.targetId)) {
                 // RESOLVER v1: autoApply saving_throw_bonus (con-filtered) feeds the hold.
-                const conMechs = loadAutoMechanics(getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db'), parsed.targetId);
+                const conMechs = loadAutoMechanics(getDb(), parsed.targetId);
                 const conBonus = conMechs.filter(m => m.type === 'saving_throw_bonus' && (!m.condition || 'constitution'.includes(m.condition.toLowerCase()) || m.condition.toLowerCase().includes('con'))).reduce((s, m) => s + m.value, 0);
                 const concentrationCheck = checkConcentration(targetChar, result.damage, concentrationRepo, conBonus);
                 if (concentrationCheck.broken) {
@@ -1567,7 +1567,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         try {
             const natDie = (result.attackRoll as { roll?: number } | undefined)?.roll;
             if (typeof natDie === 'number' && natDie <= 3) {
-                const jamDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+                const jamDb = getDb();
                 const mh = jamDb.prepare(`
                     SELECT i.name AS name, i.id AS templateId FROM inventory_items inv
                     JOIN items i ON i.id = inv.item_id
@@ -2336,7 +2336,7 @@ export async function handleEndEncounter(args: unknown, ctx: SessionContext) {
         // corpse. The store's answer drives the report: changes=0 means there
         // was nothing to close, and THAT stays a loud not-found.
         try {
-            const ghostDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+            const ghostDb = getDb();
             const r = ghostDb.prepare(`UPDATE encounters SET status = 'completed', updated_at = ? WHERE id = ? AND status = 'active'`)
                 .run(new Date().toISOString(), parsed.encounterId);
             if (r.changes > 0) {
@@ -2401,7 +2401,7 @@ export async function handleEndEncounter(args: unknown, ctx: SessionContext) {
     // 03 §9 "cosmetic" pointer was a banner-lie (#67-A class) with a documented
     // excuse. The store now agrees with the message.
     try {
-        const endDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+        const endDb = getDb();
         endDb.prepare(`UPDATE encounters SET status = 'completed', updated_at = ? WHERE id = ?`)
             .run(new Date().toISOString(), parsed.encounterId);
     } catch { /* encounters table absent (tests) — memory delete already done */ }

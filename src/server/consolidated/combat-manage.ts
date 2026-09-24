@@ -195,7 +195,7 @@ const ListEncountersSchema = z.object({
 // FINDINGS #34 HELPERS — party inclusion, threat readout, participant append
 
 function fetchPartyParticipants(partyId?: string): { participants: Record<string, unknown>[]; partyName?: string; error?: string } {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+    const db = getDb();
     let pid = partyId;
     if (!pid) {
         const parties = db.prepare(`SELECT id, name FROM parties WHERE status = 'active'`).all() as Array<{ id: string; name: string }>;
@@ -238,7 +238,7 @@ function threatReadout(participants: Array<Record<string, unknown>>, presetCr?: 
     const allies = participants.filter(p => !p.isEnemy);
     const dpr = enemies.reduce((s, e) => s + avgDice(e.attackDamage as string | number | undefined), 0);
     const crTotal = presetCr !== undefined && enemyCount !== undefined ? presetCr * enemyCount : undefined;
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+    const db = getDb();
     let levelSum = 0, levelKnown = 0;
     for (const a of allies) {
         const row = db.prepare('SELECT level FROM characters WHERE id = ?').get(a.id as string) as { level: number } | undefined;
@@ -260,7 +260,7 @@ async function appendToEncounter(ctx: SessionContext, encounterId: string, newPa
     const sessionKey = `${ctx.sessionId}:${encounterId}`;
     let engine = getCombatManager().get(sessionKey);
     if (!engine) {
-        const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+        const db = getDb();
         const repo = new EncounterRepository(db);
         const persisted = repo.loadState(encounterId);
         if (!persisted) return { ok: false, message: `Encounter ${encounterId} not found (memory or DB)` };
@@ -271,7 +271,7 @@ async function appendToEncounter(ctx: SessionContext, encounterId: string, newPa
     const beforeIds = new Set(engine.getState()?.participants.map((p) => p.id) ?? []);
     const state = engine.addParticipants(newParticipants as unknown as Parameters<typeof engine.addParticipants>[0]);
     try {
-        const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+        const db = getDb();
         new EncounterRepository(db).saveState(encounterId, state);
     } catch (err) {
         const live = engine.getState();
@@ -299,7 +299,7 @@ async function appendToEncounter(ctx: SessionContext, encounterId: string, newPa
 const NON_ACTIONABLE_STAGES = new Set(['stage:ovomorph', 'stage:facehugger_dormant', 'stage:implanted', 'stage:gestating']);
 function stageGateCheck(characterId: string): string | null {
     try {
-        const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+        const db = getDb();
         const row = new CharacterRepository(db).findById(characterId);
         const conds = ((row as { conditions?: Array<{ name?: string }> } | null)?.conditions ?? []);
         for (const c of conds) {
@@ -371,7 +371,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             // Fully unclaimed → row stays NULL and shows as untagged in list.
             if (!data.error && data.encounterId) {
                 try {
-                    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+                    const db = getDb();
                     try { db.exec('ALTER TABLE encounters ADD COLUMN world_id TEXT'); } catch { /* exists */ }
                     let w: string | null = (params as { worldId?: string }).worldId ?? null;
                     if (!w) {
@@ -408,7 +408,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             // T4.17: capture pc participants BEFORE ending (state clears after)
             let xpTargets: string[] = params.xpRecipients ?? [];
             if (params.xpAward && xpTargets.length === 0) {
-                const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+                const db = getDb();
                 try {
                     const persisted = new EncounterRepository(db).loadState(params.encounterId)
                         ?? getCombatManager().get(`${ctx.sessionId}:${params.encounterId}`)?.getState();
@@ -422,7 +422,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             const result = await handleEndEncounter({ encounterId: params.encounterId }, ctx);
             const data = extractResultData(result, 'end') as Record<string, unknown>;
             if (params.xpAward && xpTargets.length > 0 && !data.error) {
-                const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+                const db = getDb();
                 const charRepo = new CharacterRepository(db);
                 const each = Math.floor(params.xpAward / xpTargets.length);
                 const credited: Array<{ id: string; name: string; xp: number }> = [];
@@ -743,7 +743,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 if (gated) {
                     return { error: true, actionType: 'add_participant', message: `STAGE GATE: character ${params.characterId} carries ${gated} — a specimen at this stage cannot act in an encounter. It can be a TARGET (attack it, move it, sample it), but it takes no turns. NOT added.` };
                 }
-                const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+                const db = getDb();
                 const row = new CharacterRepository(db).findById(params.characterId);
                 if (!row) return { error: true, actionType: 'add_participant', message: `Character ${params.characterId} not found` };
                 const stats = row.stats as Record<string, number>;
@@ -794,7 +794,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             const sessionKey = `${ctx.sessionId}:${params.encounterId}`;
             let engine = getCombatManager().get(sessionKey);
             if (!engine) {
-                const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+                const db = getDb();
                 const persisted = new EncounterRepository(db).loadState(params.encounterId);
                 if (!persisted) return { error: true, actionType: 'remove_participant', message: `Encounter ${params.encounterId} not found (memory or DB)`, writes: 'none' };
                 engine = new CombatEngine(params.encounterId);
@@ -814,7 +814,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             if (state.turnOrder.length === 0) return { error: true, actionType: 'remove_participant', message: 'Refused: removal would empty the encounter — use end instead', writes: 'none' };
             const reIdx = state.turnOrder.indexOf(currentActorId);
             state.currentTurnIndex = reIdx >= 0 ? reIdx : state.currentTurnIndex % state.turnOrder.length;
-            const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+            const db = getDb();
             new EncounterRepository(db).saveState(params.encounterId, state);
             return {
                 success: true, actionType: 'remove_participant', encounterId: params.encounterId,
@@ -877,7 +877,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         schema: ListEncountersSchema,
         handler: async (params: z.infer<typeof ListEncountersSchema>, ctx?: SessionContext) => {
             if (!ctx) throw new Error('No session context');
-            const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+            const db = getDb();
             let rows: Array<{ id: string; status: string; round: number; updated_at: string; world_id?: string | null }> = [];
             let untaggedExcluded = 0;
             try {

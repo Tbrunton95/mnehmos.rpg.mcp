@@ -319,7 +319,7 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
     const { characterRepo } = ensureDb();
     const char = characterRepo.findById(args.characterId) as unknown as { name?: string; hp?: number; maxHp?: number; resourcePools?: Record<string, { current: number; max: number }>; currency?: { gold?: number } | string; conditions?: Array<{ name?: string; duration?: number }> } | undefined;
     if (!char) throw new Error(`Character ${args.characterId} not found`);
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+    const db = getDb();
 
     const pools = char.resourcePools || {};
     const rads = pools['rads']?.current;
@@ -770,7 +770,7 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
 
     // FINDINGS #34 T2.5: currency belongs on the sheet read — the RU is
     // provable the same way the rads are.
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+    const db = getDb();
     let currency: Record<string, number> | undefined;
     try {
         // Currency lives on characters.currency as JSON (Findings #35 — the

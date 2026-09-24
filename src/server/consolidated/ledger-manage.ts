@@ -39,7 +39,7 @@ type DebtRow = {
 };
 
 function ldb() {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const db = getDb();
     db.exec(`CREATE TABLE IF NOT EXISTS ledger_debts (
         id TEXT PRIMARY KEY, world_id TEXT NOT NULL,
         debtor TEXT NOT NULL, creditor TEXT NOT NULL,

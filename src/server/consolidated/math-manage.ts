@@ -126,8 +126,7 @@ async function handleCharacterRoll(
     kind: 'skill' | 'ability' | 'save',
     args: { characterId: string; skill?: string; ability?: string; dc?: number; advantage?: boolean; disadvantage?: boolean; modifier?: number }
 ): Promise<object> {
-    const dbPath = process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db';
-    const db = getDb(dbPath);
+    const db = getDb();
     const charRepo = new CharacterRepository(db);
     const char = charRepo.findById(args.characterId);
     if (!char) return { error: true, message: `Character ${args.characterId} not found` };

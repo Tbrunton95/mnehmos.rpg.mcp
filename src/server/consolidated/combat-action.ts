@@ -136,8 +136,7 @@ const definitions: Record<CombatAction, ActionDefinition> = {
             const ammoCount = params.ammoCount ?? 1;
             if (params.ammoItemId) {
                 const { getDb } = await import('../../storage/index.js');
-                const dbPath = process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db';
-                adb = getDb(dbPath);
+                adb = getDb();
                 ammoRow = adb.prepare('SELECT ii.quantity, i.name FROM inventory_items ii JOIN items i ON i.id = ii.item_id WHERE ii.character_id = ? AND ii.item_id = ?').get(params.actorId, params.ammoItemId) as { quantity: number; name: string } | undefined;
                 if (!ammoRow || ammoRow.quantity < ammoCount) {
                     return {
@@ -157,7 +156,7 @@ const definitions: Record<CombatAction, ActionDefinition> = {
             let coatingRead: { instanceId: string; label: string; bonus: number; remainingHits: number; name: string } | null = null;
             let coatDb: ReturnType<typeof getDb> | null = null;
             try {
-                coatDb = adb ?? getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+                coatDb = adb ?? getDb();
                 const mh = coatDb.prepare('SELECT item_id FROM inventory_items WHERE character_id = ? AND equipped = 1 AND slot = ?').get(params.actorId, params.hand ?? 'mainhand') as { item_id: string } | undefined;
                 if (mh) {
                     const inst = coatDb.prepare('SELECT id, attachments FROM item_instances WHERE owner_character_id = ? AND (template_id = ? OR id = ?)').get(params.actorId, mh.item_id, mh.item_id) as { id: string; attachments: string } | undefined;
@@ -557,7 +556,7 @@ function grappleResolve(args: Record<string, unknown>): Record<string, unknown> 
     if (!move) return { error: true, writes: 'none', message: `grapple needs move: ${GRAPPLE_MOVES.join(' | ')}` };
     if (!actorId || !targetId) return { error: true, writes: 'none', message: 'grapple needs actorId + targetId' };
 
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const db = getDb();
     const repo = new CharacterRepository(db);
     type CRow = { id: string; name: string; level?: number; stats?: { str?: number; dex?: number }; skillProficiencies?: string[]; conditions?: Array<{ name: string; duration?: number; source?: string }> };
     const actor = repo.findById(actorId) as unknown as CRow | null;

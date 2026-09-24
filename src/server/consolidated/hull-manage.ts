@@ -50,7 +50,7 @@ type HullInput = z.infer<typeof HullInputSchema>;
 export type { HullInput };
 
 function hullDb() {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const db = getDb();
     db.exec(`CREATE TABLE IF NOT EXISTS hull_sections (
         room_id TEXT PRIMARY KEY, world_id TEXT NOT NULL,
         pressure INTEGER NOT NULL DEFAULT 100, atmosphere TEXT NOT NULL DEFAULT 'breathable',

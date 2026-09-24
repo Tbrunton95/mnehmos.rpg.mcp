@@ -43,7 +43,7 @@ const HordeInputSchema = z.object({
 });
 
 function hdb() {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const db = getDb();
     db.exec(`CREATE TABLE IF NOT EXISTS hordes (
         id TEXT PRIMARY KEY, world_id TEXT NOT NULL, name TEXT NOT NULL,
         size INTEGER NOT NULL, x REAL NOT NULL, y REAL NOT NULL,
