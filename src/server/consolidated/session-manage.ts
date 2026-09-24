@@ -17,6 +17,7 @@ import { SessionContext } from '../types.js';
 import { listRules } from '../../engine/table-rules.js';
 import { CHANGELOG, type ChangelogEntry } from '../../data/changelog.js';
 import { getMeta, setMeta } from '../../storage/data-migrations.js';
+import { lookupOperation } from '../operation-guard.js';
 
 /** Engine changes this database has not been shown yet. */
 function unseenChangelog(): ChangelogEntry[] {
@@ -58,7 +59,7 @@ export interface McpResponse {
     content: Array<{ type: 'text'; text: string }>;
 }
 
-const ACTIONS = ['initialize', 'get_context', 'capabilities', 'find', 'journal', 'revert', 'changelog'] as const;
+const ACTIONS = ['initialize', 'get_context', 'capabilities', 'find', 'journal', 'revert', 'changelog', 'op_status'] as const;
 
 type SessionAction = typeof ACTIONS[number];
 
@@ -88,7 +89,7 @@ function ensureDb() {
 
 // Input schema
 const SessionManageInputSchema = z.object({
-    action: z.string().describe('Action: initialize, get_context, capabilities, find, journal, revert, changelog'),
+    action: z.string().describe('Action: initialize, get_context, capabilities, find, journal, revert, changelog, op_status'),
 
     // FINDINGS #88 (mirror law): find / journal / revert params — the shared
     // schema IS the outer schema here, so one addition covers both sides.
@@ -98,6 +99,7 @@ const SessionManageInputSchema = z.object({
     entityId: z.string().optional().describe('journal: filter by row id'),
     writeId: z.number().int().optional().describe('revert: journal entry id to restore'),
     all: z.boolean().optional().describe('changelog: every entry, not only the ones this database has not seen'),
+    forOpId: z.string().optional().describe('op_status: the opId a timed-out call carried'),
 
     // initialize fields
     worldId: z.string().optional().describe('World ID to load'),
@@ -142,6 +144,11 @@ const SessionManageActionSchemas = {
         schema: SessionManageInputSchema.extend({ action: z.literal('journal'), entityTable: z.string().optional(), entityId: z.string().optional(), limit: z.number().int().min(1).max(50).optional().default(10) }),
         aliases: ['write_journal', 'history', 'writes'],
         description: 'FINDINGS #88: list journaled writes (items, instances, notes…) — newest first, filterable by table/entity. Each row is revertable by id'
+    },
+    op_status: {
+        schema: SessionManageInputSchema.extend({ action: z.literal('op_status'), forOpId: z.string() }),
+        aliases: ['operation', 'did_it_apply'],
+        description: 'Did the call carrying this opId apply? After a timeout, check before retrying (a retry with the same opId is also safe)'
     },
     changelog: {
         schema: SessionManageInputSchema.extend({ action: z.literal('changelog') }),
@@ -651,6 +658,16 @@ export async function handleSessionManage(args: unknown, ctx: SessionContext): P
             return handleJournal(input as SessionManageInput & { entityTable?: string; entityId?: string; limit?: number }, ctx);
         case 'revert':
             return handleRevert(input as SessionManageInput & { writeId?: number }, ctx);
+        case 'op_status': {
+            const found = input.forOpId ? lookupOperation(getDb(), input.forOpId) : null;
+            const payload = found
+                ? { success: true, actionType: 'op_status', opId: input.forOpId, applied: true, tool: found.tool, appliedAt: found.createdAt, reply: found.response.slice(0, 600) }
+                : { success: true, actionType: 'op_status', opId: input.forOpId, applied: false, message: 'No call with this opId applied. Retrying it is safe.' };
+            let output = RichFormatter.header('Operation', '🧾');
+            output += found ? `op ${input.forOpId} applied: ${found.tool} at ${found.createdAt}\n` : `op ${input.forOpId} did not apply. Retry it with the same opId.\n`;
+            output += RichFormatter.embedJson(payload, 'SESSION_MANAGE');
+            return { content: [{ type: 'text', text: output }] };
+        }
         case 'changelog': {
             const entries = input.all ? CHANGELOG : unseenChangelog();
             markChangelogSeen();

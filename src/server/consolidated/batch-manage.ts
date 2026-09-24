@@ -161,7 +161,8 @@ const BatchManageInputSchema = z.object({
         args: z.record(z.any()).describe('Tool arguments'),
         id: z.string().optional().describe('Step ID for referencing results in later steps')
     })).max(10).optional().describe('Sequence of tools to execute (1-10)'),
-    stopOnError: z.boolean().optional().default(true).describe('Stop execution if a step fails')
+    stopOnError: z.boolean().optional().default(true).describe('Stop execution if a step fails'),
+    atomic: z.boolean().optional().describe('execute_sequence: all steps apply together or none do; any failed step rolls back every step (implies stopOnError)')
 });
 
 type BatchManageInput = z.infer<typeof BatchManageInputSchema>;
@@ -722,7 +723,7 @@ async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContex
     // batch_manage needs the registry only from this runtime path.
     const { buildConsolidatedRegistry } = await import('../consolidated-registry.js');
     const registry = buildConsolidatedRegistry();
-    const stopOnError = input.stopOnError ?? true;
+    const stopOnError = input.atomic ? true : (input.stopOnError ?? true);
 
     const stepResults = new Map<string, unknown>();
     const executedSteps: Array<{
@@ -918,8 +919,12 @@ async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContex
         ...(ambiguousCount ? { 'Ambiguous ⚠': ambiguousCount } : {})
     });
 
+    // atomic: an error reply makes the operation guard roll back every step.
+    const atomicFailure = input.atomic && failureCount > 0;
+    if (atomicFailure) output += `\n⛔ atomic: a step failed, so every step in this sequence was rolled back.\n`;
     const resultPayload = {
         success: failureCount === 0,
+        ...(atomicFailure ? { error: true, message: 'atomic sequence: a step failed; every step was rolled back', writes: 'none' } : {}),
         actionType: 'execute_sequence',
         totalSteps: input.steps.length,
         executedSteps: executedSteps.length,
