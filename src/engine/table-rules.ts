@@ -43,7 +43,9 @@ export const RuleSpecSchemas = {
     }).passthrough(),
     status_block: z.object({
         compact: z.boolean().default(true),
-        maxConditions: z.number().int().min(0).max(10).default(2)
+        maxConditions: z.number().int().min(0).max(10).default(2),
+        /** The one resource pool the tiny block shows (e.g. 'corruption'). Only a named pool is ever shown. */
+        corePool: z.string().optional()
     }).passthrough(),
     principle: z.object({
         text: z.string().min(1)

@@ -12,6 +12,7 @@
  * - level_up -> action: 'level_up'
  */
 
+import { loadRule, resolveWorldId } from '../../engine/table-rules.js';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { SessionContext } from '../types.js';
@@ -368,6 +369,42 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
             day = env.day; time = env.time; weather = env.weather;
         }
     } catch { /* clock degrades to absent */ }
+
+    // Table rules: a world's status_block rule asks for the tiny block: HP,
+    // core pool, location, objective, one or two conditions.
+    const worldId = resolveWorldId(db, { characterIds: [args.characterId] });
+    const tiny = loadRule(db, worldId, 'status_block');
+    if (tiny?.spec.compact) {
+        const pool = tiny.spec.corePool ? pools[tiny.spec.corePool] : undefined;
+        let location: string | undefined;
+        let objective: string | undefined;
+        try {
+            const roomId = (char as { currentRoomId?: string }).currentRoomId;
+            if (roomId) location = (db.prepare('SELECT name FROM rooms WHERE id = ?').get(roomId) as { name?: string } | undefined)?.name;
+        } catch { /* no rooms table */ }
+        try {
+            const log = db.prepare('SELECT active_quests FROM quest_logs WHERE character_id = ?').get(args.characterId) as { active_quests?: string } | undefined;
+            const firstId = (JSON.parse(log?.active_quests || '[]') as string[])[0];
+            if (firstId) objective = (db.prepare('SELECT name FROM quests WHERE id = ?').get(firstId) as { name?: string } | undefined)?.name;
+        } catch { /* no quest log */ }
+        const conditions = (char.conditions || []).slice(0, tiny.spec.maxConditions);
+        return {
+            success: true,
+            actionType: 'get_status_block',
+            compact: true,
+            rule: tiny.name,
+            characterId: args.characterId,
+            characterName: char.name,
+            hp: char.hp,
+            maxHp: char.maxHp,
+            corePool: pool && tiny.spec.corePool ? { name: tiny.spec.corePool, current: pool.current, max: pool.max } : undefined,
+            location,
+            objective,
+            conditions,
+            moreConditions: Math.max(0, (char.conditions || []).length - conditions.length),
+            message: `${char.name}: HP ${char.hp}/${char.maxHp}`
+        };
+    }
 
     // #65-V: the repo's currency mapping drops the column — read it raw.
     let gold: number | undefined;
@@ -1528,6 +1565,12 @@ async function handleCancelScheduled(args: z.infer<typeof CancelScheduledSchema>
     return { success: true, actionType: 'cancel_scheduled', scheduleId: args.scheduleId, note: row.note, firesAtDay: row.fires_at_day, message: `Cancelled scheduled change ${args.scheduleId}${row.note ? ` (${row.note})` : ''} — was due Day ${row.fires_at_day}` };
 }
 
+/** The character's world uses milestone progression (table_rules progression). */
+function isMilestone(characterId: string): boolean {
+    const db = getDb();
+    return loadRule(db, resolveWorldId(db, { characterIds: [characterId] }), 'progression')?.spec.mode === 'milestone';
+}
+
 async function handleAddXp(args: z.infer<typeof AddXpSchema>): Promise<object> {
     const { characterRepo } = ensureDb();
     const char = characterRepo.findById(args.characterId);
@@ -1540,7 +1583,9 @@ async function handleAddXp(args: z.infer<typeof AddXpSchema>): Promise<object> {
     const newXp = Math.max(0, currentXp + args.amount);   // Findings #43: corrections floor at 0
     const currentLevel = char.level;
     const nextLevelXp = XP_TABLE[currentLevel + 1];
-    const canLevelUp = nextLevelXp !== undefined && newXp >= nextLevelXp;
+    // Table rules: milestone progression never offers a level-up for XP.
+    const milestone = isMilestone(char.id);
+    const canLevelUp = !milestone && nextLevelXp !== undefined && newXp >= nextLevelXp;
 
     characterRepo.update(char.id, { xp: newXp });
 
@@ -1551,10 +1596,11 @@ async function handleAddXp(args: z.infer<typeof AddXpSchema>): Promise<object> {
         newXp,
         level: currentLevel,
         canLevelUp,
+        ...(milestone ? { progression: 'milestone' } : {}),
         nextLevelXp: nextLevelXp || null,
         message: canLevelUp
             ? `Added ${args.amount} XP. Total: ${newXp}. LEVEL UP AVAILABLE for Level ${currentLevel + 1}!`
-            : `Added ${args.amount} XP. Total: ${newXp}.`
+            : `Added ${args.amount} XP. Total: ${newXp}.${milestone ? ' Milestone progression: levels come on the GM\'s call, not from XP.' : ''}`
     };
 }
 
@@ -1575,7 +1621,8 @@ async function handleGetProgression(args: z.infer<typeof GetProgressionSchema>):
             xp,
             xpForNextLevel: nextXp,
             xpToNext: nextXp === null ? null : Math.max(0, nextXp - xp),
-            readyToLevel: nextXp !== null && xp >= nextXp
+            readyToLevel: !isMilestone(char.id) && nextXp !== null && xp >= nextXp,
+            ...(isMilestone(char.id) ? { progression: 'milestone' } : {})
         };
     }
     if (args.level === undefined) {

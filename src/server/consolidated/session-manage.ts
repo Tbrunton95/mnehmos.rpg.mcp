@@ -14,6 +14,28 @@ import { PartyRepository } from '../../storage/repos/party.repo.js';
 import { QuestRepository } from '../../storage/repos/quest.repo.js';
 import { WorldRepository } from '../../storage/repos/world.repo.js';
 import { SessionContext } from '../types.js';
+import { listRules } from '../../engine/table-rules.js';
+
+/**
+ * A world's table rules for session boot: the enforced rules by name and
+ * kind, and the principles as text (reference only, never enforced).
+ */
+function tableRulesAtBoot(worldId: string | undefined | null): { enforced: Array<{ name: string; kind: string }>; principles: string[] } | undefined {
+    if (!worldId) return undefined;
+    const rules = listRules(getDb(), worldId).filter(r => r.enabled);
+    if (!rules.length) return undefined;
+    return {
+        enforced: rules.filter(r => r.kind !== 'principle').map(r => ({ name: r.name, kind: r.kind })),
+        principles: rules.filter(r => r.kind === 'principle').map(r => String((r.spec as { text?: string }).text ?? ''))
+    };
+}
+
+function renderTableRules(t: { enforced: Array<{ name: string; kind: string }>; principles: string[] }): string {
+    let out = RichFormatter.section('📜 Table Rules');
+    if (t.enforced.length) out += `Enforced: ${t.enforced.map(r => `${r.name} [${r.kind}]`).join(', ')}\n`;
+    for (const p of t.principles) out += `• ${p}\n`;
+    return out;
+}
 
 export interface McpResponse {
     content: Array<{ type: 'text'; text: string }>;
@@ -322,9 +344,13 @@ async function handleInitialize(input: SessionManageInput, ctx: SessionContext):
         output += RichFormatter.table(['Name', 'Class', 'HP', 'Leader'], rows);
     }
 
+    const bootRules = tableRulesAtBoot(worldId);
+    if (bootRules) output += renderTableRules(bootRules);
+
     const result = {
         success: true,
         actionType: 'initialize',
+        ...(bootRules ? { tableRules: bootRules } : {}),
         sessionId: ctx.sessionId,
         worldId,
         worldName: world?.name,
@@ -350,6 +376,8 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
     const { partyRepo, questRepo, worldRepo, db } = ensureDb();
 
     const context: Record<string, any> = {};
+    const bootRules = tableRulesAtBoot(input.worldId);
+    if (bootRules) context.tableRules = bootRules;
 
     // Get party context
     if (input.includeParty && input.partyId) {
@@ -539,6 +567,8 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
         if (!context.scheduled.due.length) output += `${context.scheduled.pendingTotal} pending, none due${context.scheduled.day === null ? ' (world day unknown)' : ''}\n`;
         else if (context.scheduled.pendingTotal > context.scheduled.due.length) output += `(+${context.scheduled.pendingTotal - context.scheduled.due.length} more pending, not yet due)\n`;
     }
+
+    if (context.tableRules) output += renderTableRules(context.tableRules);
 
     if (context.activeCombat) {
         output += RichFormatter.section('Active Combat');

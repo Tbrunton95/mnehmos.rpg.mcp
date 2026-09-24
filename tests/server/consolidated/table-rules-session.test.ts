@@ -1,0 +1,62 @@
+import { handleCharacterManage } from '../../../src/server/consolidated/character-manage.js';
+import { handleSessionManage } from '../../../src/server/consolidated/session-manage.js';
+import { handleTableRules } from '../../../src/server/consolidated/table-rules.js';
+import { CharacterRepository } from '../../../src/storage/repos/character.repo.js';
+import { WorldRepository } from '../../../src/storage/repos/world.repo.js';
+import { closeDb, getDb } from '../../../src/storage/index.js';
+
+const ctx = { sessionId: 'rules-session' };
+const W = 'world-40k';
+const tagJson = (text: string, tag: string) => JSON.parse(text.match(new RegExp(`<!-- ${tag}_JSON\\n([\\s\\S]*?)\\n${tag}_JSON -->`))![1]);
+
+describe('milestone XP, tiny status, principles at boot', () => {
+    beforeEach(async () => {
+        closeDb();
+        const db = getDb(':memory:');
+        const now = new Date().toISOString();
+        new WorldRepository(db).create({ id: W, name: 'Vorago', seed: 's', width: 10, height: 10, createdAt: now, updatedAt: now } as any);
+        new CharacterRepository(db).create({
+            id: 'luciel', name: 'Luciel', stats: { str: 24, dex: 14, con: 20, int: 12, wis: 12, cha: 16 },
+            hp: 150, maxHp: 200, ac: 20, level: 1, xp: 0,
+            resourcePools: { corruption: { current: 7, max: 100 }, warp: { current: 3, max: 10 } },
+            conditions: [{ name: 'bleeding' }, { name: 'shaken' }, { name: 'marked' }],
+            createdAt: now, updatedAt: now
+        } as any);
+        try { db.exec('ALTER TABLE characters ADD COLUMN world_id TEXT'); } catch { /* exists */ }
+        db.prepare("UPDATE characters SET world_id = ? WHERE id = 'luciel'").run(W);
+    });
+    afterEach(() => closeDb());
+
+    const importDay366 = () => handleTableRules({ action: 'import', worldId: W, preset: 'day-366' }, ctx as any);
+
+    it('XP offers a level-up without the rule, and never under milestone progression', async () => {
+        const plain = tagJson((await handleCharacterManage({ action: 'add_xp', characterId: 'luciel', amount: 1000 }, ctx as any)).content[0].text, 'CHARACTER_MANAGE');
+        expect(plain.canLevelUp).toBe(true);
+        await importDay366();
+        const milestone = tagJson((await handleCharacterManage({ action: 'add_xp', characterId: 'luciel', amount: 1000 }, ctx as any)).content[0].text, 'CHARACTER_MANAGE');
+        expect(milestone.canLevelUp).toBe(false);
+        expect(milestone.message).toMatch(/Milestone progression/);
+    });
+
+    it('the tiny status block shows HP, the named core pool and two conditions', async () => {
+        await importDay366();
+        await handleTableRules({ action: 'define', worldId: W, kind: 'status_block', name: 'tiny-status', spec: { corePool: 'corruption' } }, ctx as any);
+        const res = (await handleCharacterManage({ action: 'get_status_block', characterId: 'luciel' }, ctx as any)).content[0].text;
+        expect(res).toMatch(/150\/200/);
+        expect(res).toMatch(/CORRUPTION/);
+        expect(res).toMatch(/7\/100/);
+        expect(res).toMatch(/bleeding/);
+        expect(res).toMatch(/\+1/);
+        expect(res).not.toMatch(/marked/);
+        // Only the named pool is shown.
+        expect(res).not.toMatch(/WARP/i);
+    });
+
+    it('get_context lists the enforced rules and the principles', async () => {
+        await importDay366();
+        const text = (await handleSessionManage({ action: 'get_context', worldId: W }, ctx as any)).content[0].text;
+        expect(text).toMatch(/Table Rules/);
+        expect(text).toMatch(/measure-of-a-body \[called_strike\]/);
+        expect(text).toMatch(/Chaos pays first/);
+    });
+});
