@@ -75,6 +75,7 @@ export interface CombatParticipant {
      */
     ac?: number;
     attackDamage?: string;     // Default attack damage (e.g., "1d6+2")
+    attackDamageType?: string; // Damage type of the default attack (resistances on opportunity attacks)
     attackBonus?: number;      // Default attack bonus used if none provided
 }
 
@@ -606,6 +607,25 @@ export class CombatEngine {
     }
 
     /**
+     * Roll an attack's damage. 5e crit: a dice expression rolls its dice twice
+     * and counts the modifier once; a plain number has no dice and lands as
+     * given, crit or not.
+     */
+    private rollAttackDamage(damage: number | string, crit: boolean): { total: number; rolls?: number[]; breakdown: string } {
+        if (typeof damage !== 'string') return { total: damage, breakdown: '' };
+        const first = this.rng.rollDamageDetailed(damage);
+        let diceTotal = first.diceTotal;
+        let rolls = first.rolls;
+        if (crit) {
+            const extra = this.rng.rollDamageDetailed(damage);
+            diceTotal += extra.diceTotal;
+            rolls = [...rolls, ...extra.rolls];
+        }
+        const mod = first.modifier;
+        return { total: diceTotal + mod, rolls, breakdown: ` (${rolls.join('+')}${mod >= 0 ? '+' + mod : mod})` };
+    }
+
+    /**
      * Execute an attack with full transparency
      * Returns detailed breakdown of what happened
      */
@@ -659,24 +679,10 @@ export class CombatEngine {
         let baseDamageVal = 0;
         let damageBreakdownStr = '';
 
-        let capturedDamageRolls: number[] | undefined;
-        if (typeof damage === 'string') {
-            const dmgResult = this.rng.rollDamageDetailed(damage);
-            let diceTotal = dmgResult.diceTotal;
-            let rolls = dmgResult.rolls;
-            // 5e crit: roll the damage dice twice; the modifier counts once.
-            if (attackRoll.isHit && attackRoll.isCrit) {
-                const extra = this.rng.rollDamageDetailed(damage);
-                diceTotal += extra.diceTotal;
-                rolls = [...rolls, ...extra.rolls];
-            }
-            baseDamageVal = diceTotal + dmgResult.modifier;
-            capturedDamageRolls = rolls;
-            damageBreakdownStr = ` (${rolls.join('+')}${dmgResult.modifier >= 0 ? '+' + dmgResult.modifier : dmgResult.modifier})`;
-        } else {
-            // A number has no dice to double: it lands as given, crit or not.
-            baseDamageVal = damage;
-        }
+        const rolled = this.rollAttackDamage(damage, attackRoll.isHit && attackRoll.isCrit);
+        baseDamageVal = rolled.total;
+        const capturedDamageRolls = rolled.rolls;
+        damageBreakdownStr = rolled.breakdown;
 
         if (attackRoll.isHit) {
             // FINDINGS #70: the damage lane lands here — outside the crit
@@ -1467,20 +1473,28 @@ export class CombatEngine {
         // Mark reaction as used
         attacker.reactionUsed = true;
 
-        // Simple attack calculation: use initiative bonus as attack modifier
-        // AC approximation: 10 + initiative bonus (simple heuristic)
-        const attackBonus = attacker.initiativeBonus + 2; // Add a small bonus
-        const targetAC = 10 + (target.initiativeBonus > 0 ? Math.floor(target.initiativeBonus / 2) : 0);
-
-        // Fixed damage for opportunity attacks: 1d6 + 2
-        const baseDamage = this.rng.roll('1d6') + 2;
+        // The attacker's own default attack and the target's AC, falling back
+        // to ability scores, then to the old heuristics for bare tokens.
+        const mod = (score?: number) => Math.floor(((score ?? 10) - 10) / 2);
+        const attackBonus = attacker.attackBonus
+            ?? (attacker.abilityScores
+                ? Math.max(mod(attacker.abilityScores.strength), mod(attacker.abilityScores.dexterity)) + 2
+                : attacker.initiativeBonus + 2);
+        const targetAC = target.ac
+            ?? (target.abilityScores ? 10 + mod(target.abilityScores.dexterity)
+                : 10 + (target.initiativeBonus > 0 ? Math.floor(target.initiativeBonus / 2) : 0));
 
         const hpBefore = target.hp;
-        const attackRoll = this.rng.checkDegreeDetailed(attackBonus, targetAC);
+        // 5e: crit on the natural 20 only, never on the margin.
+        const attackRoll = this.rng.rollAttackD20(attackBonus, targetAC);
 
         let damageDealt = 0;
+        let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
         if (attackRoll.isHit) {
-            damageDealt = attackRoll.isCrit ? baseDamage * 2 : baseDamage;
+            const rolled = this.rollAttackDamage(attacker.attackDamage ?? '1d6+2', attackRoll.isCrit);
+            const modResult = this.calculateDamageWithModifiers(rolled.total, attacker.attackDamageType, target);
+            damageDealt = modResult.finalDamage;
+            damageModifier = modResult.modifier;
             target.hp = Math.max(0, target.hp - damageDealt);
         }
 
@@ -1532,6 +1546,8 @@ export class CombatEngine {
             target: { id: target.id, name: target.name, hpBefore, hpAfter: target.hp, maxHp: target.maxHp },
             attackRoll,
             damage: damageDealt,
+            damageType: attacker.attackDamageType,
+            damageModifier: damageModifier === 'normal' ? undefined : damageModifier,
             success: attackRoll.isHit,
             defeated,
             message,
