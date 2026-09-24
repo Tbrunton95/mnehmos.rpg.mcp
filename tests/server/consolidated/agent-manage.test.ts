@@ -208,6 +208,37 @@ describe('agent_manage tool', () => {
             expect(parsed.characterName).toBe('Kara');
         });
 
+        // FINDINGS #98: a pre-gate row carrying a -pro override must load, name
+        // its problem, and be clearable in place; new -pro writes stay refused.
+        it('loads a legacy -pro override row, surfaces overrideError, and lets update clear it', async () => {
+            const characterId = createCharacter('Kara');
+            const created = extractJson(await handleAgentManage(
+                { action: 'create', characterId, provider: 'openai', model: 'gpt-5.5' },
+                ctx
+            ));
+            getDb(':memory:').prepare('UPDATE agents SET competency_override = ? WHERE id = ?')
+                .run(JSON.stringify({ model: 'gpt-5.5-pro' }), created.agent.id);
+
+            const loaded = extractJson(await handleAgentManage({ action: 'get', characterId }, ctx));
+            expect(loaded.error).toBeUndefined();
+            expect(loaded.resolvedCompetency).toMatchObject({ model: 'gpt-5.5', source: 'stat_derived' });
+            expect(loaded.resolvedCompetency.overrideError).toMatch(/gpt-5\.5-pro/);
+
+            const refused = extractJson(await handleAgentManage(
+                { action: 'update', characterId, competencyOverride: { model: 'gpt-5.4-pro' } },
+                ctx
+            ));
+            expect(refused.error).toBe(true);
+            expect(refused.writes).toBe('none');
+
+            const cleared = extractJson(await handleAgentManage(
+                { action: 'update', characterId, competencyOverride: null },
+                ctx
+            ));
+            expect(cleared.success).toBe(true);
+            expect(cleared.agent.competencyOverride).toBeNull();
+        });
+
         it('lists agents with status filter', async () => {
             const c1 = createCharacter('A');
             const c2 = createCharacter('B');

@@ -379,8 +379,13 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
         agent,
         characterName: character?.name ?? null,
         storedModel: agent.model,
+        // FINDINGS #98: a stored override that fails the model rule loads
+        // leniently and degrades to the ladder — say so where the DM looks.
         resolvedCompetency: resolved
-            ? { model: resolved.model, reasoningEffort: resolved.reasoningEffort, tier: resolved.tier, int: resolved.int, source: resolved.source }
+            ? {
+                model: resolved.model, reasoningEffort: resolved.reasoningEffort, tier: resolved.tier, int: resolved.int, source: resolved.source,
+                ...(resolved.overrideError ? { overrideError: resolved.overrideError } : {})
+            }
             : null,
         modelAdvisory: resolved && !agent.competencyOverride?.model && agent.model !== resolved.model
             ? `stored model '${agent.model}' is advisory — invokes serve '${resolved.model}' (INT ladder). Set competencyOverride to change that.`
@@ -897,6 +902,7 @@ export async function handleAgentManage(args: unknown, ctx: SessionContext): Pro
                         'Slices': parsed.sliceCount,
                         'Tokens used': parsed.agent?.tokensUsed
                     });
+                    if (parsed.resolvedCompetency?.overrideError) output += RichFormatter.alert(parsed.resolvedCompetency.overrideError, 'warning');
                     if (parsed.modelAdvisory) output += RichFormatter.alert(parsed.modelAdvisory, 'warning');
                     break;
                 case 'list':
