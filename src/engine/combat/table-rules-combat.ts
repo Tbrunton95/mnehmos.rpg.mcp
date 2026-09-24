@@ -14,6 +14,8 @@ export interface ConsequenceDue {
     rule: string;
     reason: string;
     options: string[];
+    /** 'up': a hit on the same band or higher. 'down': a higher band maiming a lower one. */
+    direction: 'up' | 'down';
 }
 
 export interface PreparedOutcome {
@@ -39,7 +41,12 @@ export function isPeer(order: string[], actor: CombatParticipant, target: Combat
     return cmp === null ? null : cmp >= 0;
 }
 
-/** A significant hit on a peer: a crit, or damage at or above the threshold. */
+/**
+ * A significant hit on a peer: a crit, or damage at or above the threshold.
+ * Under direction 'both' a higher band's hit on a lower one counts too. A
+ * hit that kills never flags: there is no body left to mark. Unit tokens
+ * never flag either; casualties are their consequence.
+ */
 export function peerConsequence(
     rule: TableRule<'peer_consequence'>,
     order: string[],
@@ -49,16 +56,17 @@ export function peerConsequence(
 ): ConsequenceDue | { skipped: string } | null {
     const r = roll(result);
     if (!r.isHit) return null;
+    if (target.hp <= 0 || (target as { unit?: unknown }).unit) return null;
     const peer = isPeer(order, actor, target);
     if (peer === null) return { skipped: `${rule.name}: band unset for ${!actor.band ? actor.name : target.name}` };
-    if (!peer) return null;
     const spec = rule.spec as RuleSpec<'peer_consequence'>;
+    if (!peer && spec.direction !== 'both') return null;
     const threshold = Math.ceil(target.maxHp * spec.thresholdFraction);
     const damage = result.damage ?? 0;
     let reason: string | null = null;
     if (spec.onCrit && r.isCrit) reason = 'critical hit';
     else if (damage >= threshold) reason = `${damage} damage ≥ ${Math.round(spec.thresholdFraction * 100)}% of max HP (${threshold})`;
-    return reason ? { rule: rule.name, reason, options: spec.options } : null;
+    return reason ? { rule: rule.name, reason, options: spec.options, direction: peer ? 'up' : 'down' } : null;
 }
 
 /** Refuses a called strike on a target below the attacker's band. */

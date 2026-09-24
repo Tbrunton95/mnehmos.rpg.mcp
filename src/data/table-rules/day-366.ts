@@ -39,7 +39,7 @@ const principles: Array<[string, string]> = [
 
 export const DAY_366_PRESET: RulePresetEntry[] = [
     { kind: 'band', name: 'bands', spec: { order: ['Mortal', 'Elite Mortal', 'Astartes', 'Astartes Elite', 'Monster/Lord', 'Primarch-class'] } },
-    { kind: 'peer_consequence', name: 'peer-consequence', spec: { thresholdFraction: 0.25, onCrit: true, options: ['crippled joint', 'breached plate', 'thrown out of position'] } },
+    { kind: 'peer_consequence', name: 'peer-consequence', spec: { thresholdFraction: 0.25, onCrit: true, options: ['crippled joint', 'breached plate', 'thrown out of position'], direction: 'both' } },
     {
         kind: 'called_strike', name: 'measure-of-a-body', spec: {
             requirePeer: true,

@@ -73,7 +73,7 @@ const CreateSchema = z.object({
     scrollDC: z.number().int().min(10).optional().describe('Spell save DC (default: 13 + spell level)'),
     scrollAttackBonus: z.number().int().optional().describe('Spell attack bonus (default: 5 + spell level)'),
     spellClass: SpellcastingClassEnum.optional().describe('Class list the spell is on'),
-    value: z.number().int().min(0).optional().describe('Value in RU (roubles)'),
+    value: z.number().int().min(0).optional().describe('Value in the world currency'),
     description: z.string().optional().describe('Custom description')
 });
 
