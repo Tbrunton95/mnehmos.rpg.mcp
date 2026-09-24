@@ -73,6 +73,17 @@ describe('OpenRouterProvider', () => {
         expect(result.costSource).toBe('provider');
     });
 
+    it('reports the model OpenRouter says it served (FINDINGS #69)', async () => {
+        const mock = mockFetch({
+            body: JSON.stringify({ model: 'openai/gpt-5.5', choices: [{ message: { content: 'x' } }] })
+        });
+        const provider = new OpenRouterProvider({ apiKey: 'or-test', fetchImpl: mock.fn });
+
+        const result = await provider.call({ model: 'openai/gpt-5.5', messages: [{ role: 'user', content: 'hi' }] });
+
+        expect(result.model).toBe('openai/gpt-5.5');
+    });
+
     it('sends attribution headers when configured', async () => {
         const mock = mockFetch({
             body: JSON.stringify({ choices: [{ message: { content: 'x' } }] })
@@ -134,6 +145,24 @@ describe('OpenRouterProvider', () => {
         expect(body.max_tokens).toBeUndefined();
         expect(body.temperature).toBeUndefined();
         expect(body.reasoning_effort).toBe('medium');
+    });
+
+    it('maps effort "none" to OpenRouter\'s reasoning off-switch, not an effort string', async () => {
+        const mock = mockFetch({
+            body: JSON.stringify({ choices: [{ message: { content: 'x' } }] })
+        });
+        const provider = new OpenRouterProvider({ apiKey: 'or-test', fetchImpl: mock.fn });
+
+        await provider.call({
+            model: 'openai/gpt-5.5',
+            messages: [{ role: 'user', content: 'hi' }],
+            maxTokens: 300,
+            reasoningEffort: 'none'
+        });
+
+        const body = JSON.parse(mock.lastRequest.init?.body as string);
+        expect(body.reasoning).toEqual({ enabled: false });
+        expect(body.reasoning_effort).toBeUndefined();
     });
 
     it('explains an empty reasoning response caused by a completion ceiling', async () => {

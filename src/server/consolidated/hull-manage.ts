@@ -50,7 +50,7 @@ type HullInput = z.infer<typeof HullInputSchema>;
 export type { HullInput };
 
 function hullDb() {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const db = getDb();
     db.exec(`CREATE TABLE IF NOT EXISTS hull_sections (
         room_id TEXT PRIMARY KEY, world_id TEXT NOT NULL,
         pressure INTEGER NOT NULL DEFAULT 100, atmosphere TEXT NOT NULL DEFAULT 'breathable',
@@ -257,7 +257,9 @@ Aliases: state→get_state, power/budget→allocate_power, decompress→vent, pa
 🫁 LIFE SUPPORT: station pool, decays per hour + per breached section; repairs consume parts from the acquisition loop. At 0 the engine states the failure and the GM runs the suffocation.
 
 worldId is REQUIRED on every call — hull state is world-scoped and PSAR has none.`,
-    inputSchema: HullInputSchema
+    inputSchema: HullInputSchema,
+    // Every action shares the one input schema; the switch dispatcher validates per action.
+    actionSchemas: Object.fromEntries(ACTIONS.map(a => [a, { schema: HullInputSchema, aliases: [] as string[] }]))
 };
 
 // FINDINGS #93: SIEGE ALIAS — the same machinery, addressed in the genre's
@@ -273,5 +275,7 @@ export const SiegeManageTool = {
 Actions: get_state, set_section, allocate_power, vent, seal, damage, repair, process_life_support
 READ IT AS: section = ZONE of the compound · pressure 100→0 = intact→BREACHED-OPEN · atmosphere = habitability (breathable=held, toxic=overrun-adjacent, vacuum=lost) · power = generator budget, off = dark zone (things move in dark zones) · vent = deliberately sacrificing a zone — occupants enumerated with their traits, deaths are the GM's via character_manage kill · seal = barricaded (no adjacency damage) · damage/repair = barrier integrity, 0 = OPEN · process_life_support = the supply pool: food, water, meds — decays per hour + per breached zone, repaired by consuming scavenged parts.
 Zones ride spatial_manage rooms (one call each — a compound IS a room graph, no world map needed beyond a small grid). worldId REQUIRED — the multi-campaign db demands it (#91).`,
-    inputSchema: HullInputSchema
+    inputSchema: HullInputSchema,
+    // Every action shares the one input schema; the switch dispatcher validates per action.
+    actionSchemas: Object.fromEntries(ACTIONS.map(a => [a, { schema: HullInputSchema, aliases: [] as string[] }]))
 };

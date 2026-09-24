@@ -12,7 +12,7 @@ export interface ChatMessage {
     content: string;
 }
 
-export type ReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh';
+export type ReasoningEffort = 'none' | 'low' | 'medium' | 'high' | 'xhigh';
 export type ProviderCostSource = 'provider' | 'provider_upstream' | 'estimated';
 
 export interface ProviderCallOpts {

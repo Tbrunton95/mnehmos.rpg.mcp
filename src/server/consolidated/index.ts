@@ -57,6 +57,12 @@ export { PerceptionManageTool, handlePerceptionManage } from './perception-manag
 
 // Batch 9 - Scene (DM-committed shared narrative state, auto-injected into agent prompts)
 export { SceneManageTool, handleSceneManage } from './scene-manage.js';
+export { HullManageTool, SiegeManageTool, handleHullManage, handleSiegeManage } from './hull-manage.js';
+export { ContainerManageTool, handleContainerManage } from './container-manage.js';
+export { VehicleManageTool, handleVehicleManage } from './vehicle-manage.js';
+export { LedgerManageTool, handleLedgerManage } from './ledger-manage.js';
+export { CommsManageTool, handleCommsManage } from './comms-manage.js';
+export { HordeManageTool, handleHordeManage } from './horde-manage.js';
 
 /**
  * Array of all consolidated tool definitions for easy iteration
@@ -92,6 +98,12 @@ import { BatchManageTool, handleBatchManage } from './batch-manage.js';
 import { AgentManageTool, handleAgentManage } from './agent-manage.js';
 import { PerceptionManageTool, handlePerceptionManage } from './perception-manage.js';
 import { SceneManageTool, handleSceneManage } from './scene-manage.js';
+import { HullManageTool, SiegeManageTool, handleHullManage, handleSiegeManage } from './hull-manage.js';
+import { ContainerManageTool, handleContainerManage } from './container-manage.js';
+import { VehicleManageTool, handleVehicleManage } from './vehicle-manage.js';
+import { LedgerManageTool, handleLedgerManage } from './ledger-manage.js';
+import { CommsManageTool, handleCommsManage } from './comms-manage.js';
+import { HordeManageTool, handleHordeManage } from './horde-manage.js';
 import { defineToolContract } from './contracts.js';
 import type { ToolContract } from '../tool-metadata.js';
 
@@ -127,4 +139,11 @@ export const ConsolidatedTools: ToolContract[] = [
     defineToolContract(AgentManageTool, handleAgentManage),
     defineToolContract(PerceptionManageTool, handlePerceptionManage),
     defineToolContract(SceneManageTool, handleSceneManage),
+    defineToolContract(HullManageTool, handleHullManage),
+    defineToolContract(SiegeManageTool, handleSiegeManage),
+    defineToolContract(ContainerManageTool, handleContainerManage),
+    defineToolContract(VehicleManageTool, handleVehicleManage),
+    defineToolContract(LedgerManageTool, handleLedgerManage),
+    defineToolContract(CommsManageTool, handleCommsManage),
+    defineToolContract(HordeManageTool, handleHordeManage),
 ];

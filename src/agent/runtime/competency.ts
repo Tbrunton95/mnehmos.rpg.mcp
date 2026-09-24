@@ -1,8 +1,13 @@
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { z } from 'zod';
+import { effortForModel, supportsReasoningEffort } from '../provider/reasoning.js';
 
-export const ReasoningEffortSchema = z.enum(['low', 'medium', 'high', 'xhigh']);
+// 'none' is the active ladder's INT 1–6 rung (docs/bastion/07): reasoning
+// explicitly OFF on a reasoning model. Distinct from null, which means "send
+// no effort" (OpenAI then applies its own per-model default). Keep in lockstep
+// with src/schema/agent.ts — stored call rows parse through that copy.
+export const ReasoningEffortSchema = z.enum(['none', 'low', 'medium', 'high', 'xhigh']);
 export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
 
 export const CompetencySourceSchema = z.enum(['stat_derived', 'override']);
@@ -90,15 +95,37 @@ export function resolveCompetency(
         };
     }
 
+    // The active ladder's 'none' (INT 1–6) and 'xhigh' (INT 19–20) are gpt-5.5
+    // efforts. A model-only override inherits them, and an older reasoning
+    // model (o-series, gpt-5/-mini/-nano) answers HTTP 400 to each — every
+    // invoke, until the circuit opens. Request the nearest effort the model
+    // takes, so the provider call, preflight floor and audit row all agree.
+    const requestedEffort = override?.reasoningEffort !== undefined
+        ? override.reasoningEffort
+        : entry.reasoningEffort;
+    const reasoningEffort = effortForModel(model, requestedEffort);
+    // FINDINGS #98 again: an explicit stored pair that validateOverride now
+    // refuses still loads, requests what the model takes, and says so.
+    const effortError = override?.reasoningEffort !== undefined && reasoningEffort !== requestedEffort
+        ? `stored override reasoningEffort "${requestedEffort}" is not accepted by "${model}" — requesting ${reasoningEffort === null ? 'the model default' : `"${reasoningEffort}"`}; fix via agent_manage update {competencyOverride}`
+        : null;
+
     return {
         ...entry,
         int,
         model,
-        reasoningEffort: override?.reasoningEffort !== undefined
-            ? override.reasoningEffort
-            : entry.reasoningEffort,
-        source: hasOverride ? 'override' : 'stat_derived'
+        reasoningEffort,
+        source: hasOverride ? 'override' : 'stat_derived',
+        ...(effortError ? { overrideError: effortError } : {})
     };
+}
+
+// The ladder names OpenAI-native ids ('gpt-5.5'); OpenRouter routes by
+// namespaced id ('openai/gpt-5.5'). A bare id headed to OpenRouter gets the
+// openai/ namespace; an id that already names one (an override such as
+// 'openai/gpt-5.6-luna') is sent as-is — never double-prefixed.
+export function providerModelId(provider: 'openai' | 'openrouter', model: string): string {
+    return provider === 'openrouter' && !model.includes('/') ? `openai/${model}` : model;
 }
 
 // FINDINGS #98: the WRITE-SIDE gate — call BEFORE persisting an override.
@@ -109,9 +136,13 @@ export function validateOverride(override?: CompetencyOverride | null): string |
     if (!override || override.model === undefined) return null;
     try {
         assertNoProModel(override.model);
-        return null;
     } catch {
         const known = [...new Set(loadCompetencyLadder().map(e => e.model))].join(', ');
         return `Model "${override.model}" is refused (rule: no -pro model variants). Known-good ladder models: ${known}. Test any other string on a disposable agent before a live one.`;
     }
+    const effort = override.reasoningEffort;
+    if (effort && !supportsReasoningEffort(override.model, effort)) {
+        return `reasoningEffort "${effort}" is refused for "${override.model}": the model does not accept it (HTTP 400 on every invoke). Pick another effort, or omit reasoningEffort to inherit the INT ladder's, stepped to one the model takes.`;
+    }
+    return null;
 }

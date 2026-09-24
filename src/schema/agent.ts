@@ -13,17 +13,27 @@ export type AgentStatus = z.infer<typeof AgentStatusSchema>;
 export const AgentCircuitStateSchema = z.enum(['closed', 'open', 'half_open']);
 export type AgentCircuitState = z.infer<typeof AgentCircuitStateSchema>;
 
-export const ReasoningEffortSchema = z.enum(['low', 'medium', 'high', 'xhigh']);
+// 'none' = reasoning explicitly off (active ladder INT 1–6); null = no effort
+// sent. Keep in lockstep with src/agent/runtime/competency.ts.
+export const ReasoningEffortSchema = z.enum(['none', 'low', 'medium', 'high', 'xhigh']);
 export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
 
 export const CompetencySourceSchema = z.enum(['stat_derived', 'override']);
 export type CompetencySource = z.infer<typeof CompetencySourceSchema>;
 
-export const CompetencyOverrideSchema = z.object({
+// FINDINGS #98: STRICT ON WRITE, LENIENT ON READ. The stored shape carries no
+// model rule, so a row persisted before the write gate still loads (and
+// resolveCompetency degrades it with overrideError) instead of bricking every
+// read of the agent. Input schemas use the strict CompetencyOverrideSchema.
+const StoredCompetencyOverrideSchema = z.object({
+    model: z.string().min(1).optional(),
+    reasoningEffort: ReasoningEffortSchema.nullable().optional()
+});
+
+export const CompetencyOverrideSchema = StoredCompetencyOverrideSchema.extend({
     model: z.string().min(1).refine((model) => !/-pro\b/i.test(model), {
         message: 'Pro model variants are not allowed'
-    }).optional(),
-    reasoningEffort: ReasoningEffortSchema.nullable().optional()
+    }).optional()
 });
 export type CompetencyOverride = z.infer<typeof CompetencyOverrideSchema>;
 
@@ -41,7 +51,7 @@ export const AgentSchema = z.object({
     timeoutMs: z.number().int().positive().default(25000),
     consecutiveFailures: z.number().int().nonnegative().default(0),
     circuitState: AgentCircuitStateSchema.default('closed'),
-    competencyOverride: CompetencyOverrideSchema.nullable().default(null),
+    competencyOverride: StoredCompetencyOverrideSchema.nullable().default(null),
     createdAt: z.string(),
     updatedAt: z.string()
 });
@@ -181,5 +191,7 @@ export const AgentUpdateInputSchema = AgentSchema.omit({
     characterId: true,
     createdAt: true,
     updatedAt: true
+}).extend({
+    competencyOverride: CompetencyOverrideSchema.nullable()
 }).partial();
 export type AgentUpdateInput = z.infer<typeof AgentUpdateInputSchema>;

@@ -41,6 +41,20 @@ describe('DiceEngine', () => {
         expect(result.result).toBeGreaterThanOrEqual(10);
     });
 
+    it('rejects exploding dice with fewer than two sides', () => {
+        // A d1 always rolls its maximum, so "1d1!" used to explode forever
+        // and hang the (single-threaded) server.
+        const engine = new DiceEngine();
+        expect(() => engine.parse('1d1!')).toThrow(/at least 2 sides/);
+        expect(() => engine.roll('3d1!')).toThrow(/at least 2 sides/);
+    });
+
+    it('caps an explosion chain when handed a pre-parsed d1 expression', () => {
+        const engine = new DiceEngine('cap');
+        const result = engine.roll({ count: 1, sides: 1, modifier: 0, explode: true });
+        expect(result.result).toBeLessThanOrEqual(1 + DiceEngine.MAX_EXPLOSIONS);
+    });
+
     it('should handle advantage', () => {
         const engine = new DiceEngine();
         const result = engine.roll({ count: 1, sides: 20, modifier: 0, advantage: true });

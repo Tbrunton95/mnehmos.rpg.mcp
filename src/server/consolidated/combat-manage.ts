@@ -21,8 +21,12 @@ import {
 } from '../handlers/combat-handlers.js';
 import { expandCreatureTemplate, listAllTemplates } from '../../data/creature-presets.js';
 import { getDomainServices } from '../domain-services.js';
+import { getDb } from '../../storage/index.js';
+import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { CombatEngine } from '../../engine/combat/engine.js';
+import { ConditionInputSchema } from '../../schema/encounter.js';
 import { getCombatManager } from '../state/combat-manager.js';
+import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { getAgentRuntime, buildAgentRuntime } from '../../agent/runtime/deps.js';
 import { invokeAgent } from '../../agent/runtime/invoke.js';
 import { ProviderFactory } from '../../agent/provider/factory.js';
@@ -31,7 +35,7 @@ import { ProviderFactory } from '../../agent/provider/factory.js';
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'get_history'] as const;
+const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'get_history', 'list'] as const;
 type CombatManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -41,7 +45,7 @@ type CombatManageAction = typeof ACTIONS[number];
 const ParticipantSchema = z.object({
     id: z.string(),
     name: z.string(),
-    initiativeBonus: z.number().int().default(0),
+    initiativeBonus: z.number().int().default(0).describe('FINDINGS #103: DEFAULTS TO 0 — was silently mandatory and undocumented, costing every fresh client a refused round trip'),
     initiative: z.number().int().optional().describe('Optional pre-rolled initiative; otherwise the engine rolls it'),
     hp: z.number().int().nonnegative(), // Allow 0 HP for dying characters
     maxHp: z.number().int().positive(),
@@ -54,7 +58,8 @@ const ParticipantSchema = z.object({
      * If both `side` and `isEnemy` are provided, `isEnemy` wins.
      */
     side: z.enum(['party', 'enemy', 'hostile', 'ally', 'friendly', 'neutral']).optional(),
-    conditions: z.array(z.string()).default([]),
+    conditions: z.array(ConditionInputSchema).default([])
+        .describe('Names ("prone") or {name|type, duration?, source?} objects — normalized by create'),
     position: z.object({
         x: z.number(),
         y: z.number(),
@@ -96,7 +101,10 @@ const CreateSchema = z.object({
     action: z.literal('create'),
     seed: z.string().default('combat').describe('Seed for deterministic combat resolution'),
     participants: z.array(ParticipantSchema).min(1),
-    terrain: TerrainSchema
+    terrain: TerrainSchema,
+    includeParty: z.boolean().optional().describe('T1.2 (Findings #34): prepend the active party as PC-side participants'),
+    partyId: z.string().optional().describe('Party to include (defaults to the only active party)'),
+    worldId: z.string().optional().describe('FINDINGS #105: stamp the encounter to this world; omitted → derived from the first participant whose character row is claimed')
 });
 
 const GetSchema = z.object({
@@ -106,7 +114,9 @@ const GetSchema = z.object({
 
 const EndSchema = z.object({
     action: z.literal('end'),
-    encounterId: z.string().describe('The ID of the encounter')
+    encounterId: z.string().describe('The ID of the encounter'),
+    xpAward: z.number().int().optional().describe('FINDINGS #34 T4.17: XP credited on end — split evenly among pc-type participants unless xpRecipients given'),
+    xpRecipients: z.array(z.string()).optional().describe('Character IDs to receive xpAward (overrides the pc-participant default)')
 });
 
 const LoadSchema = z.object({
@@ -145,7 +155,22 @@ const SpawnQuickEnemySchema = z.object({
     count: z.number().int().min(1).max(10).default(1).describe('Number of enemies to spawn'),
     position: z.object({ x: z.number(), y: z.number() }).optional().describe('Starting position (defaults to random)'),
     encounterId: z.string().optional().describe('Add to existing encounter (creates new if omitted)'),
-    seed: z.string().optional().describe('Seed for deterministic combat (auto-generated if omitted)')
+    seed: z.string().optional().describe('Seed for deterministic combat (auto-generated if omitted)'),
+    includeParty: z.boolean().optional().describe('T1.2 (Findings #34): include the active party as PC-side participants in the NEW encounter'),
+    partyId: z.string().optional().describe('Party to include (defaults to the only party if exactly one exists)')
+});
+
+const AddParticipantSchema = z.object({
+    action: z.literal('add_participant'),
+    encounterId: z.string().describe('Encounter to add to'),
+    characterId: z.string().optional().describe('Character row to hydrate from (name/hp/ac/initiative from the sheet)'),
+    name: z.string().optional().describe('Name (required for ad-hoc tokens without characterId)'),
+    hp: z.number().int().optional(),
+    maxHp: z.number().int().optional(),
+    ac: z.number().int().optional(),
+    initiativeBonus: z.number().int().optional(),
+    isEnemy: z.boolean().optional().default(false),
+    position: z.object({ x: z.number(), y: z.number() }).optional()
 });
 
 const GetHistorySchema = z.object({
@@ -155,13 +180,137 @@ const GetHistorySchema = z.object({
     limit: z.number().int().min(1).max(100).default(20).describe('Max actions to return (default 20)')
 });
 
+// FINDINGS #80: the ghost hunt gets a verb — encounters could previously only
+// be found one at a time through get_context's LIMIT 1. list shows every row
+// by status with a liveness column, so a persisted corpse never masquerades
+// as a running fight and multiple ghosts surface in one call.
+const ListEncountersSchema = z.object({
+    action: z.literal('list'),
+    status: z.enum(['active', 'completed', 'all']).default('active').describe('Row status filter — default active (the ghost hunt)'),
+    limit: z.number().int().min(1).max(50).default(20),
+    buryGhosts: z.boolean().optional().describe('FINDINGS #80-B: mark every listed ghost (active row, no engine) completed IN THIS CALL — the bulk burial. Count reported from the store\'s changes. #102 GUARD: on a fresh process EVERY active row looks like a ghost (memory is empty) — burial refuses then unless confirmBury:true'),
+    confirmBury: z.boolean().optional().describe('FINDINGS #102: override the cold-boot guard — confirms burial when NO encounter is in memory (fresh process), where live cross-campaign fights are indistinguishable from ghosts'),
+    worldId: z.string().optional().describe('FINDINGS #105: STRICT filter — only encounters stamped to this world; untagged legacy rows are counted and EXCLUDED (claim by re-creating or direct update). Scopes the ghost sweep')
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
+// FINDINGS #34 HELPERS — party inclusion, threat readout, participant append
+
+function fetchPartyParticipants(partyId?: string): { participants: Record<string, unknown>[]; partyName?: string; error?: string } {
+    const db = getDb();
+    let pid = partyId;
+    if (!pid) {
+        const parties = db.prepare(`SELECT id, name FROM parties WHERE status = 'active'`).all() as Array<{ id: string; name: string }>;
+        if (parties.length !== 1) {
+            return { participants: [], error: `includeParty needs a partyId when ${parties.length} active parties exist` };
+        }
+        pid = parties[0].id;
+    }
+    const rows = db.prepare(
+        `SELECT pm.role, ch.id, ch.name, ch.hp, ch.max_hp AS maxHp, ch.ac, ch.stats
+         FROM party_members pm JOIN characters ch ON ch.id = pm.character_id
+         WHERE pm.party_id = ?`
+    ).all(pid) as Array<{ role: string; id: string; name: string; hp: number; maxHp: number; ac: number; stats: string }>;
+    const partyName = (db.prepare('SELECT name FROM parties WHERE id = ?').get(pid) as { name: string } | undefined)?.name;
+    const participants = rows.filter(r => r.role !== 'prisoner').map((r, i) => {
+        let dexMod = 0;
+        try { dexMod = Math.floor(((JSON.parse(r.stats || '{}').dex ?? 10) - 10) / 2); } catch { /* default 0 */ }
+        return {
+            id: r.id, name: r.name, hp: r.hp, maxHp: r.maxHp, ac: r.ac,
+            initiativeBonus: dexMod, isEnemy: false, conditions: [],
+            position: { x: (i % 3), y: Math.floor(i / 3) },
+            resistances: [], vulnerabilities: [], immunities: []
+        };
+    });
+    return { participants, partyName };
+}
+
+function avgDice(expr?: string | number): number {
+    if (expr === undefined) return 0;
+    if (typeof expr === 'number') return expr;
+    let total = 0;
+    for (const m of expr.matchAll(/(\d+)d(\d+)/g)) total += parseInt(m[1]) * (parseInt(m[2]) + 1) / 2;
+    for (const m of expr.matchAll(/(?<![d\d])([+-]\d+)(?!d)/g)) total += parseInt(m[1]);
+    return Math.round(total * 10) / 10;
+}
+
+/** T1.3 (Findings #34): surface the wall before the party hits it. */
+function threatReadout(participants: Array<Record<string, unknown>>, presetCr?: number, enemyCount?: number): string {
+    const enemies = participants.filter(p => p.isEnemy);
+    const allies = participants.filter(p => !p.isEnemy);
+    const dpr = enemies.reduce((s, e) => s + avgDice(e.attackDamage as string | number | undefined), 0);
+    const crTotal = presetCr !== undefined && enemyCount !== undefined ? presetCr * enemyCount : undefined;
+    const db = getDb();
+    let levelSum = 0, levelKnown = 0;
+    for (const a of allies) {
+        const row = db.prepare('SELECT level FROM characters WHERE id = ?').get(a.id as string) as { level: number } | undefined;
+        if (row) { levelSum += row.level; levelKnown++; }
+    }
+    const allyHp = allies.reduce((s, a) => s + ((a.maxHp as number) || 0), 0);
+    let line = `⚔️ THREAT: ${enemies.length} hostile${enemies.length === 1 ? '' : 's'}`;
+    if (crTotal !== undefined) line += ` (~CR ${crTotal} total)`;
+    if (dpr > 0) line += ` — est ${dpr} dmg/round`;
+    line += ` vs ${allies.length} allied (${allyHp} HP pooled${levelKnown ? `, levels ${levelSum}` : ''})`;
+    if ((crTotal !== undefined && levelKnown && crTotal > levelSum * 0.75) || (dpr > 0 && allyHp > 0 && dpr * 3 >= allyHp)) {
+        line += `\n   ⚠️ HEAVY: this can drop the allied side in ~${dpr > 0 ? Math.max(1, Math.ceil(allyHp / dpr)) : '?'} rounds of average dice.`;
+    }
+    return line;
+}
+
+/** Shared append-with-persist (extracted from the spawn_quick_enemy append branch pattern). */
+async function appendToEncounter(ctx: SessionContext, encounterId: string, newParticipants: Record<string, unknown>[]): Promise<{ ok: boolean; message: string; state?: unknown }> {
+    const sessionKey = `${ctx.sessionId}:${encounterId}`;
+    let engine = getCombatManager().get(sessionKey);
+    if (!engine) {
+        const db = getDb();
+        const repo = new EncounterRepository(db);
+        const persisted = repo.loadState(encounterId);
+        if (!persisted) return { ok: false, message: `Encounter ${encounterId} not found (memory or DB)` };
+        engine = new CombatEngine(encounterId);
+        engine.loadState(persisted);
+        getCombatManager().create(sessionKey, engine);
+    }
+    const beforeIds = new Set(engine.getState()?.participants.map((p) => p.id) ?? []);
+    const state = engine.addParticipants(newParticipants as unknown as Parameters<typeof engine.addParticipants>[0]);
+    try {
+        const db = getDb();
+        new EncounterRepository(db).saveState(encounterId, state);
+    } catch (err) {
+        const live = engine.getState();
+        if (live) {
+            live.participants = live.participants.filter((p) => beforeIds.has(p.id));
+            live.turnOrder = live.turnOrder.filter((id) => id === 'LAIR' || beforeIds.has(id));
+        }
+        return { ok: false, message: `Persist failed, in-memory append rolled back: ${(err as Error).message}` };
+    }
+    return { ok: true, message: 'appended', state };
+}
+
 // CONTEXT HOLDER (for passing session context to handlers)
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ACTION DEFINITIONS
 // ═══════════════════════════════════════════════════════════════════════════
+
+// FINDINGS #92: THE STAGE GATE — KEEPER spec §3.2. A specimen at a
+// non-actionable stage (egg, dormant hugger, implanted, gestating) can be a
+// TARGET, moved, sampled, sold or destroyed — it cannot take a turn. The
+// gate is a wall, not a discipline (#58 reasoning). PSAR impact: zero — no
+// STALKER character carries a stage: condition.
+const NON_ACTIONABLE_STAGES = new Set(['stage:ovomorph', 'stage:facehugger_dormant', 'stage:implanted', 'stage:gestating']);
+function stageGateCheck(characterId: string): string | null {
+    try {
+        const db = getDb();
+        const row = new CharacterRepository(db).findById(characterId);
+        const conds = ((row as { conditions?: Array<{ name?: string }> } | null)?.conditions ?? []);
+        for (const c of conds) {
+            const n = (c?.name ?? '').toLowerCase();
+            if (NON_ACTIONABLE_STAGES.has(n)) return n;
+        }
+    } catch { /* character unreadable — no gate, downstream lookup will refuse */ }
+    return null;
+}
 
 const definitions: Record<CombatManageAction, ActionDefinition> = {
     create: {
@@ -175,13 +324,71 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 const derived = deriveIsEnemy(p);
                 return derived === undefined ? rest : { ...rest, isEnemy: derived };
             });
+            // T1.2 (Findings #34): includeParty pulls the active party in.
+            let finalParticipants = normalizedParticipants as Array<Record<string, unknown>>;
+            const gateSkipped: string[] = [];
+            // FINDINGS #92: the stage gate — second door. participants[] with a
+            // character UUID id get the same wall as add_participant; gate one
+            // door and the fence has a hole.
+            for (const p of finalParticipants) {
+                const pid = typeof p.id === 'string' ? p.id : undefined;
+                if (pid && pid.length >= 32) {
+                    const gated = stageGateCheck(pid);
+                    if (gated) {
+                        return { error: true, actionType: 'create', message: `STAGE GATE: participant ${p.name ?? pid} carries ${gated} — a specimen at this stage cannot act in an encounter. Remove it from participants[]; it can still be attacked as a target. Encounter NOT created.` };
+                    }
+                }
+            }
+            if (params.includeParty) {
+                const party = fetchPartyParticipants(params.partyId);
+                if (party.error) return { error: true, actionType: 'create', message: party.error };
+                const existing = new Set(finalParticipants.map(p => p.id as string));
+                finalParticipants = [
+                    ...party.participants.filter(pp => !existing.has(pp.id as string)),
+                    ...finalParticipants
+                ];
+            }
             const originalParams = {
                 seed: params.seed,
-                participants: normalizedParticipants,
+                participants: finalParticipants.filter(p => {
+                    // FINDINGS #92: third path — party-pulled members (includeParty)
+                    // arrive automatically, so a gated one is SKIPPED with a note
+                    // rather than refusing the whole encounter (an implanted
+                    // prisoner in the party must not veto the fight).
+                    const pid = typeof p.id === 'string' && p.id.length >= 32 ? p.id : undefined;
+                    if (!pid) return true;
+                    const gated = stageGateCheck(pid);
+                    if (gated) { gateSkipped.push(`${p.name ?? pid} (${gated})`); return false; }
+                    return true;
+                }),
                 terrain: params.terrain
             };
             const result = await handleCreateEncounter(originalParams, ctx);
-            return extractResultData(result, 'create');
+            const data = extractResultData(result, 'create') as Record<string, unknown>;
+            // T1.3 (Findings #34): print the wall before the party hits it.
+            if (!data.error) data.threat = threatReadout(originalParams.participants);
+            if (!data.error && gateSkipped.length) data.stageGateSkipped = gateSkipped;
+            // FINDINGS #105: stamp the encounter's world — explicit worldId, else
+            // derived from the first participant whose character row is claimed.
+            // Fully unclaimed → row stays NULL and shows as untagged in list.
+            if (!data.error && data.encounterId) {
+                try {
+                    const db = getDb();
+                    try { db.exec('ALTER TABLE encounters ADD COLUMN world_id TEXT'); } catch { /* exists */ }
+                    let w: string | null = (params as { worldId?: string }).worldId ?? null;
+                    if (!w) {
+                        for (const p of originalParams.participants as Array<{ id?: string }>) {
+                            if (!p.id) continue;
+                            try {
+                                const r = db.prepare('SELECT world_id FROM characters WHERE id = ?').get(p.id) as { world_id?: string | null } | undefined;
+                                if (r?.world_id) { w = r.world_id; break; }
+                            } catch { break; }
+                        }
+                    }
+                    if (w) { db.prepare('UPDATE encounters SET world_id = ? WHERE id = ?').run(w, data.encounterId); data.worldId = w; }
+                } catch { /* stamping is best-effort — the fight matters more */ }
+            }
+            return data;
         },
         aliases: ['start', 'new', 'begin', 'init']
     },
@@ -200,8 +407,37 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         schema: EndSchema,
         handler: async (params: z.infer<typeof EndSchema>, ctx?: SessionContext) => {
             if (!ctx) throw new Error('No session context');
+            // T4.17: capture pc participants BEFORE ending (state clears after)
+            let xpTargets: string[] = params.xpRecipients ?? [];
+            if (params.xpAward && xpTargets.length === 0) {
+                const db = getDb();
+                try {
+                    const persisted = new EncounterRepository(db).loadState(params.encounterId)
+                        ?? getCombatManager().get(`${ctx.sessionId}:${params.encounterId}`)?.getState();
+                    const charRepo = new CharacterRepository(db);
+                    for (const p of persisted?.participants ?? []) {
+                        const row = charRepo.findById(p.id);
+                        if (row && (row as { characterType?: string }).characterType === 'pc') xpTargets.push(p.id);
+                    }
+                } catch { /* fall through — no targets, no award */ }
+            }
             const result = await handleEndEncounter({ encounterId: params.encounterId }, ctx);
-            return extractResultData(result, 'end');
+            const data = extractResultData(result, 'end') as Record<string, unknown>;
+            if (params.xpAward && xpTargets.length > 0 && !data.error) {
+                const db = getDb();
+                const charRepo = new CharacterRepository(db);
+                const each = Math.floor(params.xpAward / xpTargets.length);
+                const credited: Array<{ id: string; name: string; xp: number }> = [];
+                for (const id of xpTargets) {
+                    const row = charRepo.findById(id);
+                    if (!row) continue;
+                    charRepo.update(id, { xp: ((row as { xp?: number }).xp ?? 0) + each } as Partial<import('../../schema/character.js').Character>);
+                    credited.push({ id, name: row.name, xp: each });
+                }
+                data.xpAwarded = credited;
+                data.xpNote = `${params.xpAward} XP split ${each} each among ${credited.map(cr => cr.name).join(', ')}`;
+            }
+            return data;
         },
         aliases: ['finish', 'complete', 'stop', 'close']
     },
@@ -442,6 +678,22 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             }
 
             // Create encounter with these participants
+            // Findings #35: freeze the spawned-enemy list BEFORE includeParty
+            // mutates participants — the banner listed a party member under
+            // Enemies Spawned wearing the creature's AC and Bite.
+            const spawnedEnemies = [...participants];
+            // T1.2 (Findings #34): includeParty pulls the active party in as
+            // PC-side participants — quick spawns stop excluding the table.
+            if (params.includeParty) {
+                const party = fetchPartyParticipants(params.partyId);
+                if (party.error) {
+                    return { error: true, actionType: 'spawn_quick_enemy', message: party.error };
+                }
+                const existing = new Set(participants.map(p => p.id));
+                for (const pp of party.participants) {
+                    if (!existing.has(pp.id as string)) participants.unshift(pp as typeof participants[number]);
+                }
+            }
             const seed = params.seed || `quick-${Date.now()}`;
             const createParams = {
                 seed,
@@ -458,7 +710,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 actionType: 'spawn_quick_enemy',
                 creature: params.creature,
                 spawnedCount: count,
-                enemies: participants.map(p => ({
+                enemies: spawnedEnemies.map(p => ({
                     id: p.id,
                     name: p.name,
                     hp: p.hp,
@@ -474,6 +726,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     cr: preset.cr,
                     traits: preset.traits
                 },
+                threat: threatReadout(participants as unknown as Array<Record<string, unknown>>, preset.cr, count),
                 readyForCombat: true,
                 hint: 'Use combat_action to attack, combat_map to render grid'
             };
@@ -481,6 +734,107 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         aliases: ['quick', 'spawn', 'summon', 'add_enemy']
     },
 
+    add_participant: {
+        schema: AddParticipantSchema,
+        handler: async (params: z.infer<typeof AddParticipantSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            let participant: Record<string, unknown>;
+            if (params.characterId) {
+                // FINDINGS #92: the stage gate — first door.
+                const gated = stageGateCheck(params.characterId);
+                if (gated) {
+                    return { error: true, actionType: 'add_participant', message: `STAGE GATE: character ${params.characterId} carries ${gated} — a specimen at this stage cannot act in an encounter. It can be a TARGET (attack it, move it, sample it), but it takes no turns. NOT added.` };
+                }
+                const db = getDb();
+                const row = new CharacterRepository(db).findById(params.characterId);
+                if (!row) return { error: true, actionType: 'add_participant', message: `Character ${params.characterId} not found` };
+                const stats = row.stats as Record<string, number>;
+                participant = {
+                    id: row.id, name: params.name ?? row.name,
+                    hp: params.hp ?? row.hp, maxHp: params.maxHp ?? row.maxHp,
+                    ac: params.ac ?? row.ac,
+                    initiativeBonus: params.initiativeBonus ?? Math.floor(((stats?.dex ?? 10) - 10) / 2),
+                    isEnemy: params.isEnemy ?? false,
+                    // Sheet conditions stay off the engine token: nothing syncs
+                    // conditions between character rows and a live encounter,
+                    // and no tool removes an engine condition, so a copied
+                    // durationless condition would stick for the whole fight.
+                    // Pass conditions explicitly on create until that sync exists.
+                    conditions: [],
+                    position: params.position ?? { x: 0, y: 0 },
+                    resistances: (row as { resistances?: string[] }).resistances || [],
+                    vulnerabilities: (row as { vulnerabilities?: string[] }).vulnerabilities || [],
+                    immunities: (row as { immunities?: string[] }).immunities || []
+                };
+            } else {
+                if (!params.name || params.hp === undefined || params.maxHp === undefined) {
+                    return { error: true, actionType: 'add_participant', message: 'Ad-hoc participant needs name, hp, maxHp (or pass characterId)' };
+                }
+                participant = {
+                    id: `token-${randomUUID().slice(0, 8)}`, name: params.name,
+                    hp: params.hp, maxHp: params.maxHp, ac: params.ac ?? 10,
+                    initiativeBonus: params.initiativeBonus ?? 0,
+                    isEnemy: params.isEnemy ?? false, conditions: [],
+                    position: params.position ?? { x: 0, y: 0 },
+                    resistances: [], vulnerabilities: [], immunities: []
+                };
+            }
+            const res = await appendToEncounter(ctx, params.encounterId, [participant]);
+            if (!res.ok) return { error: true, actionType: 'add_participant', message: res.message };
+            return {
+                success: true, actionType: 'add_participant', encounterId: params.encounterId,
+                participant: { id: participant.id, name: participant.name, hp: participant.hp, ac: participant.ac, isEnemy: participant.isEnemy },
+                message: `${participant.name} joins the encounter (${participant.isEnemy ? 'HOSTILE' : 'allied'}) — initiative rolled, state persisted.`
+            };
+        },
+        aliases: ['reinforce', 'join_combat'],
+        description: 'Add a character or ad-hoc token to a RUNNING encounter — reinforcements, late arrivals, the PC joining a quick-spawned fight'
+    },
+    remove_participant: {
+        schema: z.object({
+            action: z.literal('remove_participant'),
+            encounterId: z.string(),
+            participantId: z.string().describe('Participant/token id to remove (fled, banished, despawned — NOT killed; the dead use character_manage kill or drop at 0 HP)')
+        }),
+        handler: async (params: { encounterId: string; participantId: string }, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            // #67-D: the inverse of add_participant — same engine access pattern.
+            const sessionKey = `${ctx.sessionId}:${params.encounterId}`;
+            let engine = getCombatManager().get(sessionKey);
+            if (!engine) {
+                const db = getDb();
+                const persisted = new EncounterRepository(db).loadState(params.encounterId);
+                if (!persisted) return { error: true, actionType: 'remove_participant', message: `Encounter ${params.encounterId} not found (memory or DB)`, writes: 'none' };
+                engine = new CombatEngine(params.encounterId);
+                engine.loadState(persisted);
+                getCombatManager().create(sessionKey, engine);
+            }
+            const state = engine.getState();
+            if (!state) return { error: true, actionType: 'remove_participant', message: 'No live state', writes: 'none' };
+            const gone = state.participants.find((p) => p.id === params.participantId);
+            if (!gone) return { error: true, actionType: 'remove_participant', message: `Participant ${params.participantId} not in this encounter`, writes: 'none' };
+            // Turn-pointer safety: currentTurnIndex indexes turnOrder — re-anchor
+            // on the current actor's id after the filter so removal of an
+            // earlier slot never skips or repeats a turn.
+            const currentActorId = state.turnOrder[state.currentTurnIndex];
+            state.participants = state.participants.filter((p) => p.id !== params.participantId);
+            state.turnOrder = state.turnOrder.filter((id) => id !== params.participantId);
+            if (state.turnOrder.length === 0) return { error: true, actionType: 'remove_participant', message: 'Refused: removal would empty the encounter — use end instead', writes: 'none' };
+            const reIdx = state.turnOrder.indexOf(currentActorId);
+            state.currentTurnIndex = reIdx >= 0 ? reIdx : state.currentTurnIndex % state.turnOrder.length;
+            const db = getDb();
+            new EncounterRepository(db).saveState(params.encounterId, state);
+            return {
+                success: true, actionType: 'remove_participant', encounterId: params.encounterId,
+                removed: { id: gone.id, name: gone.name },
+                remaining: state.participants.length,
+                currentTurn: state.turnOrder[state.currentTurnIndex],
+                message: `${gone.name} is out of the fight — removed from initiative. ${state.participants.length} remain.`
+            };
+        },
+        aliases: ['flee', 'banish', 'despawn'],
+        description: '#67-D: Remove a participant from a running encounter (fled/banished/despawned) — turn pointer re-anchored, state persisted. The dead don\'t use this; they drop at 0 HP'
+    },
     get_history: {
         schema: GetHistorySchema,
         handler: async (params: z.infer<typeof GetHistorySchema>) => {
@@ -526,6 +880,84 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             };
         },
         aliases: ['history', 'log', 'replay', 'actions']
+    },
+    list: {
+        schema: ListEncountersSchema,
+        handler: async (params: z.infer<typeof ListEncountersSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const db = getDb();
+            let rows: Array<{ id: string; status: string; round: number; updated_at: string; world_id?: string | null }> = [];
+            let untaggedExcluded = 0;
+            try {
+                const whereClause = params.status === 'all' ? '' : (params.status === 'active' ? `WHERE status = 'active'` : `WHERE status = 'completed'`);
+                rows = db.prepare(`SELECT id, status, round, updated_at FROM encounters ${whereClause} ORDER BY updated_at DESC LIMIT ?`)
+                    .all(params.limit) as typeof rows;
+                // FINDINGS #105: STRICT world filter (the #94 semantics — nulls are
+                // legacy, not wildcards). Untagged rows counted and excluded.
+                if (params.worldId !== undefined) {
+                    try {
+                        // FINDINGS #105b: the list lane ensures the column too — before
+                        // the first post-migration create, a missing column made the
+                        // filter silently pass EVERYTHING with excluded:0 (a lie of the
+                        // #103 class). With the column ensured, legacy rows read NULL
+                        // and the strict filter excludes them honestly.
+                        try { db.exec('ALTER TABLE encounters ADD COLUMN world_id TEXT'); } catch { /* exists */ }
+                        const tagged = new Map((db.prepare('SELECT id, world_id FROM encounters').all() as Array<{ id: string; world_id: string | null }>).map(r => [r.id, r.world_id]));
+                        const before = rows.length;
+                        rows = rows.filter(r => tagged.get(r.id) === params.worldId);
+                        untaggedExcluded = before - rows.length;
+                    } catch { /* pre-migration db — no column, no filter */ }
+                }
+            } catch {
+                return { success: true, actionType: 'list', count: 0, encounters: [], summary: 'No encounters table — nothing has ever fought here.' };
+            }
+            const encounters = rows.map(r => ({
+                encounterId: r.id,
+                status: r.status,
+                round: r.round,
+                updatedAt: r.updated_at,
+                // FINDINGS #80 liveness: an 'active' row with no engine in memory
+                // is a ghost (pre-#79 residue) or a crash-survivor — named either way.
+                inMemory: getCombatManager().get(`${ctx.sessionId}:${r.id}`) !== null
+            }));
+            const ghosts = encounters.filter(e => e.status === 'active' && !e.inMemory);
+            // FINDINGS #80-B: bulk burial — the census found 58+ ghosts spanning
+            // the campaign's whole life; one-per-call burial doesn't scale.
+            // Buried count comes from the store's changes, never the input.
+            let buried = 0;
+            // FINDINGS #102-B: the cold-boot nuke. Liveness is "in THIS session's
+            // memory" — on a fresh process memory is empty, so every campaign's
+            // genuinely-active fight reads as a ghost and buryGhosts would
+            // force-complete them all. When NOTHING is in memory, burial needs
+            // explicit confirmation.
+            const anyInMemory = encounters.some(e => e.inMemory);
+            if (params.buryGhosts && ghosts.length && !anyInMemory && !params.confirmBury) {
+                return {
+                success: true, actionType: 'list', count: encounters.length, encounters,
+                ...(params.worldId !== undefined ? { worldId: params.worldId, untaggedOrOtherWorldExcluded: untaggedExcluded } : {}),
+                    ghosts: ghosts.map(g => g.encounterId), buried: 0,
+                    guardRefused: true,
+                    summary: `⚠ COLD-BOOT GUARD (#102): ${ghosts.length} active row(s) look like ghosts, but ZERO encounters are in this process's memory — a fresh process cannot tell a ghost from another campaign's live fight. Re-open yours with 'load' first, or pass confirmBury:true to bury all listed anyway.`
+                };
+            }
+            if (params.buryGhosts && ghosts.length) {
+                const mark = db.prepare(`UPDATE encounters SET status = 'completed', updated_at = ? WHERE id = ? AND status = 'active'`);
+                const nowIso = new Date().toISOString();
+                for (const g of ghosts) buried += mark.run(nowIso, g.encounterId).changes;
+                for (const e of encounters) { if (ghosts.includes(e)) e.status = 'completed'; }
+            }
+            return {
+                success: true,
+                actionType: 'list',
+                count: encounters.length,
+                encounters,
+                ...(params.worldId !== undefined ? { worldId: params.worldId, untaggedOrOtherWorldExcluded: untaggedExcluded } : {}),
+                ...(params.buryGhosts ? { buried } : {}),
+                ...(ghosts.length && !params.buryGhosts ? { ghosts: ghosts.map(g => g.encounterId), hint: `${ghosts.length} active row(s) with no running engine — combat_manage end closes each, or list with buryGhosts:true closes all (#80-B)` } : {}),
+                summary: encounters.length === 0 ? `No ${params.status === 'all' ? '' : params.status + ' '}encounters.` : `${encounters.length} encounter(s)${params.buryGhosts ? ` — ${buried} ghost(s) BURIED` : (ghosts.length ? ` — ${ghosts.length} GHOST(s) needing burial` : '')}`
+            };
+        },
+        aliases: ['encounters', 'ls', 'ghosts']
     }
 };
 
@@ -595,9 +1027,27 @@ For CORPSES after combat, use corpse_manage tool.`,
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
         encounterId: z.string().optional().describe('Encounter ID (required for most actions)'),
         seed: z.string().optional().describe('Seed for new encounter (create only)'),
-        participants: z.array(z.any()).optional().describe('Array of participants (create only)'),
+        participants: z.array(z.any()).optional().describe("Array of participants (create only). Shape per entry: { id: <character UUID — always the UUID>, name, hp, maxHp, initiativeBonus?: number (default 0, #103), ac?: number (falls back to attacker-side derivation), isEnemy?: boolean, position?: {x,y} }"),
         terrain: z.any().optional().describe('Terrain configuration (create only)'),
-        characterId: z.string().optional().describe('Character ID (death_save only)'),
+        characterId: z.string().optional().describe('Character ID (death_save, add_participant)'),
+        // FINDINGS #34 mirror block — add_participant + includeParty params
+        includeParty: z.boolean().optional().describe('Include the active party in the new encounter (create / spawn_quick_enemy)'),
+        partyId: z.string().optional().describe('Party to include (defaults to the only active party)'),
+        name: z.string().optional().describe('Ad-hoc participant name (add_participant)'),
+        hp: z.number().optional().describe('Participant HP (add_participant)'),
+        maxHp: z.number().optional().describe('Participant max HP (add_participant)'),
+        ac: z.number().optional().describe('Participant AC (add_participant)'),
+        initiativeBonus: z.number().optional().describe('Initiative bonus (add_participant)'),
+        participantId: z.string().optional().describe('#67-D remove_participant: participant/token id to remove'),
+        isEnemy: z.boolean().optional().describe('Hostile flag (add_participant)'),
+        xpAward: z.number().optional().describe('XP credited on end'),
+        xpRecipients: z.array(z.string()).optional().describe('XP recipient character IDs'),
+        round: z.number().optional().describe('Round filter (get_history)'),
+        limit: z.number().optional().describe('Max actions returned (get_history) / max rows (list)'),
+        status: z.string().optional().describe('FINDINGS #80 (mirror): list filter — active | completed | all (default active, the ghost hunt)'),
+        buryGhosts: z.boolean().optional().describe('FINDINGS #80-B (mirror): list — mark every listed ghost completed in this call'),
+        confirmBury: z.boolean().optional().describe('FINDINGS #102 (mirror): override the cold-boot guard — required to bury when nothing is in process memory'),
+        worldId: z.string().optional().describe('FINDINGS #105 (mirror): create — stamp the encounter to a world (else derived from first claimed participant); list — STRICT world filter, scopes the ghost sweep'),
         actionDescription: z.string().optional().describe('Lair action description'),
         targetIds: z.array(z.string()).optional().describe('Target IDs for lair action'),
         damage: z.number().optional().describe('Lair action damage'),
@@ -674,6 +1124,16 @@ export async function handleCombatManage(args: unknown, ctx: SessionContext): Pr
                     break;
                 case 'end':
                     output = RichFormatter.header('Combat Ended', '🏁');
+                    if (parsed.xpNote) output += `\n⭐ ${parsed.xpNote}\n`;
+                    break;
+                case 'list':
+                    output = RichFormatter.header('Encounters', '📋');
+                    if (parsed.encounters?.length > 0) {
+                        const rows = parsed.encounters.map((e: { encounterId: string; status: string; round: number; inMemory: boolean; updatedAt: string }) =>
+                            [e.encounterId, e.status + (e.status === 'active' && !e.inMemory ? ' 👻 GHOST' : ''), String(e.round), e.inMemory ? 'running' : 'persisted', e.updatedAt]
+                        );
+                        output += RichFormatter.table(['Encounter', 'Status', 'Round', 'Engine', 'Updated'], rows);
+                    }
                     break;
                 case 'load':
                     output = RichFormatter.header('Encounter Loaded', '📂');

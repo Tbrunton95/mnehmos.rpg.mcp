@@ -6,10 +6,12 @@ dist/
 build/
 *.tsbuildinfo
 
-# SQLite databases
+# SQLite databases (including renamed snapshots like rpg.db.keeper-day35)
 *.db
 *.db-shm
 *.db-wal
+*.db.*
+rpg.db*
 *.sqlite
 *.sqlite3
 
@@ -24,6 +26,10 @@ coverage/
 .env
 .env.local
 .env.*.local
+
+# Personal Claude Code settings (machine-local permissions) and agent worktrees
+.claude/settings.local.json
+.claude/worktrees/
 
 # IDE
 .vscode/

@@ -27,15 +27,16 @@ export class InventoryRepository {
         return InventorySchema.parse({
             characterId,
             items,
-            capacity: this.carryCapacity(characterId), // #95 R1c: pool-derived, 100 only when absent
+            capacity: this.carryCapacity(characterId), // #95 R1c: pool-derived, STR x 15 when absent
             currency
         });
     }
 
     // FINDINGS #95 (RULING R1c): capacity reads the character's carry_capacity
-    // pool when present; hardcoded 100 is only the ABSENT-pool default. Pool
-    // max < 0 encodes the "unlimited" sentinel (0 is a real state — a man who
-    // can carry nothing; null is indistinguishable from unset — Tom's ruling).
+    // pool when present; the 5e STR x 15 rule (getCapacity) is only the
+    // ABSENT-pool default. Pool max < 0 encodes the "unlimited" sentinel (0 is
+    // a real state — a man who can carry nothing; null is indistinguishable
+    // from unset — Tom's ruling).
     private carryCapacity(characterId: string): number | 'unlimited' {
         try {
             const row = this.db.prepare('SELECT resource_pools FROM characters WHERE id = ?').get(characterId) as { resource_pools?: string | null } | undefined;
@@ -45,7 +46,7 @@ export class InventoryRepository {
                 if (cc && typeof cc.max === 'number') return cc.max < 0 ? 'unlimited' : cc.max;
             }
         } catch { /* column shape unexpected — default */ }
-        return 100;
+        return this.getCapacity(characterId);
     }
 
     addItem(characterId: string, itemId: string, quantity: number = 1): void {
@@ -170,6 +171,19 @@ export class InventoryRepository {
             capacity: this.carryCapacity(characterId), // #95 R1c
             currency
         };
+    }
+
+    /** D&D 5e carrying capacity: Strength score multiplied by 15 pounds. */
+    private getCapacity(characterId: string): number {
+        const row = this.db.prepare('SELECT stats FROM characters WHERE id = ?').get(characterId) as { stats: string } | undefined;
+        if (!row?.stats) return 0;
+
+        try {
+            const stats = JSON.parse(row.stats) as { str?: number };
+            return Math.max(0, Math.trunc(stats.str ?? 0) * 15);
+        } catch {
+            return 0;
+        }
     }
 
     // ============================================================

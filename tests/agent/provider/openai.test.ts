@@ -1,4 +1,5 @@
 import { OpenAIProvider, isReasoningModel, REASONING_COMPLETION_FLOOR } from '../../../src/agent/provider/openai.js';
+import { supportsReasoningEffort } from '../../../src/agent/provider/reasoning.js';
 import { ProviderError } from '../../../src/agent/provider/types.js';
 
 /**
@@ -48,6 +49,17 @@ describe('OpenAIProvider', () => {
         expect(result.finishReason).toBe('stop');
         expect(result.raw.length).toBeGreaterThan(0);
         expect(result.durationMs).toBeGreaterThanOrEqual(0);
+    });
+
+    it('reports the model OpenAI says it served (FINDINGS #69)', async () => {
+        const mock = mockFetch({
+            body: JSON.stringify({ model: 'gpt-5.5-2026-04-23', choices: [{ message: { content: 'x' } }] })
+        });
+        const provider = new OpenAIProvider({ apiKey: 'sk', fetchImpl: mock.fn });
+
+        const result = await provider.call({ model: 'gpt-5.5', messages: [{ role: 'user', content: 'hi' }] });
+
+        expect(result.model).toBe('gpt-5.5-2026-04-23');
     });
 
     it('sends the expected request shape', async () => {
@@ -179,6 +191,22 @@ describe('OpenAIProvider', () => {
             expect(body.reasoning_effort).toBe('xhigh');
         });
 
+        it('sends reasoning_effort "none" explicitly (active ladder INT 1–6) rather than the API default', async () => {
+            const mock = mockFetch({
+                body: JSON.stringify({ choices: [{ message: { content: 'x' } }] })
+            });
+            const provider = new OpenAIProvider({ apiKey: 'sk', fetchImpl: mock.fn });
+
+            await provider.call({
+                model: 'gpt-5.5',
+                messages: [{ role: 'user', content: 'hi' }],
+                reasoningEffort: 'none'
+            });
+
+            const body = JSON.parse(mock.lastRequest.init?.body as string);
+            expect(body.reasoning_effort).toBe('none');
+        });
+
         it('omits reasoning_effort for non-reasoning models', async () => {
             const mock = mockFetch({
                 body: JSON.stringify({ choices: [{ message: { content: 'x' } }] })
@@ -216,6 +244,17 @@ describe('OpenAIProvider', () => {
             await provider.call({ model: 'o3', messages: [{ role: 'user', content: 'hi' }], maxTokens: 800 });
             const body = JSON.parse(mock.lastRequest.init?.body as string);
             expect(body.max_completion_tokens).toBe(REASONING_COMPLETION_FLOOR.medium);
+        });
+
+        it('does not floor effort "none" — no hidden reasoning to fund', async () => {
+            const mock = mockFetch({ body: JSON.stringify({ choices: [{ message: { content: 'x' } }] }) });
+            const provider = new OpenAIProvider({ apiKey: 'sk', fetchImpl: mock.fn });
+            await provider.call({
+                model: 'gpt-5.5', messages: [{ role: 'user', content: 'hi' }], maxTokens: 800, reasoningEffort: 'none'
+            });
+            const body = JSON.parse(mock.lastRequest.init?.body as string);
+            expect(body.max_completion_tokens).toBe(800);
+            expect(body.max_tokens).toBeUndefined();
         });
 
         it('never lowers a caller budget already above the floor', async () => {
@@ -262,6 +301,42 @@ describe('OpenAIProvider', () => {
         it('is case-insensitive', () => {
             expect(isReasoningModel('GPT-5')).toBe(true);
             expect(isReasoningModel('O1-Mini')).toBe(true);
+        });
+    });
+
+    // OpenAI API reference: models before gpt-5.1 do not support 'none';
+    // 'xhigh' arrives after gpt-5.1-codex-max. Either one sent to a model that
+    // lacks it is an HTTP 400.
+    describe('supportsReasoningEffort', () => {
+        it.each(['gpt-5.1', 'gpt-5.2', 'gpt-5.4-nano', 'gpt-5.5', 'gpt-5.5-2026-04-23', 'openai/gpt-5.6-luna', 'gpt-6'])(
+            '"%s" accepts none',
+            (m) => expect(supportsReasoningEffort(m, 'none')).toBe(true)
+        );
+
+        it.each(['o1', 'o3', 'o3-mini', 'o4-mini', 'gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5-2025-08-07', 'openai/o3'])(
+            '"%s" rejects none',
+            (m) => expect(supportsReasoningEffort(m, 'none')).toBe(false)
+        );
+
+        it('accepts xhigh only from gpt-5.2 on', () => {
+            expect(supportsReasoningEffort('gpt-5.2', 'xhigh')).toBe(true);
+            expect(supportsReasoningEffort('gpt-5.5', 'xhigh')).toBe(true);
+            expect(supportsReasoningEffort('gpt-5.1', 'xhigh')).toBe(false);
+            expect(supportsReasoningEffort('gpt-5-mini', 'xhigh')).toBe(false);
+            expect(supportsReasoningEffort('o3', 'xhigh')).toBe(false);
+        });
+
+        it('accepts low/medium/high on every reasoning model', () => {
+            for (const m of ['o1', 'o3', 'o4-mini', 'gpt-5-nano', 'gpt-5.5']) {
+                for (const e of ['low', 'medium', 'high'] as const) {
+                    expect(supportsReasoningEffort(m, e)).toBe(true);
+                }
+            }
+        });
+
+        it('places no restriction on non-reasoning models (the field is never sent)', () => {
+            expect(supportsReasoningEffort('gpt-4.1', 'none')).toBe(true);
+            expect(supportsReasoningEffort('gpt-4o', 'xhigh')).toBe(true);
         });
     });
 

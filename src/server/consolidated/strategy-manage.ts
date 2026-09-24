@@ -282,7 +282,7 @@ async function handleClaimRegion(args: z.infer<typeof ClaimRegionSchema>): Promi
     diplomacyRepo.createClaim({
         id: randomUUID(),
         nationId: args.nationId,
-        regionId: args.regionId,
+        regionId: region.id, // not args.regionId — a legacy id resolves to this row
         claimStrength: 100,
         justification: args.justification,
         createdAt: new Date().toISOString()

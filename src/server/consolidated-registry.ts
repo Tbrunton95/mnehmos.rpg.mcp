@@ -23,8 +23,38 @@ export function buildConsolidatedRegistry(): ToolRegistry {
         };
     }
 
+    runBootMirrorAudit(cachedRegistry);
     return cachedRegistry;
 }
+
+/**
+ * FINDINGS #34 T4.19 (interim form): the mirror law has six casualties.
+ * Until outer schemas are auto-generated, audit them at every boot and
+ * shout about drift where it cannot be missed.
+ */
+function runBootMirrorAudit(registry: ToolRegistry): void {
+    for (const [name, entry] of Object.entries(registry)) {
+        const outerShape = (entry.schema as { shape?: Record<string, unknown> }).shape;
+        const actionSchemas = entry.actionSchemas as Record<string, { schema?: { shape?: Record<string, unknown> } }> | undefined;
+        if (!outerShape || !actionSchemas) continue;
+        const outerKeys = new Set(Object.keys(outerShape));
+        const missing = new Set<string>();
+        for (const def of Object.values(actionSchemas)) {
+            const innerShape = def?.schema?.shape;
+            if (!innerShape) continue;
+            for (const k of Object.keys(innerShape)) {
+                if (k !== 'action' && !outerKeys.has(k)) missing.add(k);
+            }
+        }
+        if (missing.size > 0) {
+            console.error(`[MIRROR AUDIT] ${name}: outer inputSchema missing inner params: ${[...missing].sort().join(', ')} — clients WILL strip these (Findings #14/#27/#33)`);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// METADATA ACCESS FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
 
 export function getAllConsolidatedToolMetadata(): ToolMetadata[] {
     return Object.values(buildConsolidatedRegistry()).map(entry => entry.metadata);

@@ -41,7 +41,8 @@ describe('travel_manage consolidated tool', () => {
         const db = getDb(':memory:');
         const now = new Date().toISOString();
 
-        // Create pois table with snake_case column names (matching implementation)
+        // Mirrors the camelCase pois table migrate() creates (a no-op when it
+        // already exists); PoiRepository adapts to either column naming.
         db.exec(`
             CREATE TABLE IF NOT EXISTS pois (
                 id TEXT PRIMARY KEY,
@@ -53,8 +54,8 @@ describe('travel_manage consolidated tool', () => {
                 discoveryState TEXT DEFAULT 'unknown',
                 discoveryDc INTEGER DEFAULT 15,
                 networkId TEXT,
-                created_at TEXT,
-                updated_at TEXT
+                createdAt TEXT,
+                updatedAt TEXT
             )
         `);
 
@@ -147,7 +148,7 @@ describe('travel_manage consolidated tool', () => {
         // Create test POI
         testPoiId = randomUUID();
         db.prepare(`
-            INSERT INTO pois (id, worldId, name, type, x, y, discoveryState, discoveryDc, created_at, updated_at)
+            INSERT INTO pois (id, worldId, name, type, x, y, discoveryState, discoveryDc, createdAt, updatedAt)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(testPoiId, 'world-1', 'Ancient Temple', 'dungeon', 50, 75, 'discovered', 15, now, now);
 

@@ -7,6 +7,9 @@ import { handleAgentManage, AgentManageTool } from '../../../src/server/consolid
 import { AgentRepository } from '../../../src/storage/repos/agent.repo.js';
 import { getDb, closeDb } from '../../../src/storage/index.js';
 import { CharacterRepository } from '../../../src/storage/repos/character.repo.js';
+import { ProviderFactory } from '../../../src/agent/provider/factory.js';
+import { LLMProvider, ProviderError } from '../../../src/agent/provider/types.js';
+import { buildAgentRuntime, setAgentRuntime, clearAgentRuntime } from '../../../src/agent/runtime/deps.js';
 import { randomUUID } from 'crypto';
 
 process.env.NODE_ENV = 'test';
@@ -155,6 +158,21 @@ describe('agent_manage tool', () => {
             });
         });
 
+        it('reports the namespaced ladder id an OpenRouter agent will request', async () => {
+            const characterId = createCharacter('Kara');
+
+            const created = extractJson(await handleAgentManage(
+                { action: 'create', characterId, provider: 'openrouter', model: 'openai/gpt-5.5' },
+                ctx
+            ));
+            expect(created.resolvedCompetency.model).toBe('openai/gpt-5.5');
+            expect(created.modelAdvisory).toBeUndefined();
+
+            const loaded = extractJson(await handleAgentManage({ action: 'get', characterId }, ctx));
+            expect(loaded.resolvedCompetency.model).toBe('openai/gpt-5.5');
+            expect(loaded.modelAdvisory).toBeNull();
+        });
+
         it('refuses duplicate agents for the same character', async () => {
             const characterId = createCharacter('Kara');
             await handleAgentManage(
@@ -191,6 +209,66 @@ describe('agent_manage tool', () => {
             expect(parsed.actionType).toBe('get');
             expect(parsed.agent.characterId).toBe(characterId);
             expect(parsed.characterName).toBe('Kara');
+        });
+
+        // FINDINGS #98: a pre-gate row carrying a -pro override must load, name
+        // its problem, and be clearable in place; new -pro writes stay refused.
+        it('loads a legacy -pro override row, surfaces overrideError, and lets update clear it', async () => {
+            const characterId = createCharacter('Kara');
+            const created = extractJson(await handleAgentManage(
+                { action: 'create', characterId, provider: 'openai', model: 'gpt-5.5' },
+                ctx
+            ));
+            getDb(':memory:').prepare('UPDATE agents SET competency_override = ? WHERE id = ?')
+                .run(JSON.stringify({ model: 'gpt-5.5-pro' }), created.agent.id);
+
+            const loaded = extractJson(await handleAgentManage({ action: 'get', characterId }, ctx));
+            expect(loaded.error).toBeUndefined();
+            expect(loaded.resolvedCompetency).toMatchObject({ model: 'gpt-5.5', source: 'stat_derived' });
+            expect(loaded.resolvedCompetency.overrideError).toMatch(/gpt-5\.5-pro/);
+
+            const refused = extractJson(await handleAgentManage(
+                { action: 'update', characterId, competencyOverride: { model: 'gpt-5.4-pro' } },
+                ctx
+            ));
+            expect(refused.error).toBe(true);
+            expect(refused.writes).toBe('none');
+
+            const cleared = extractJson(await handleAgentManage(
+                { action: 'update', characterId, competencyOverride: null },
+                ctx
+            ));
+            expect(cleared.success).toBe(true);
+            expect(cleared.agent.competencyOverride).toBeNull();
+        });
+
+        // Reasoning models before gpt-5.1 reject 'none', and before gpt-5.2
+        // reject 'xhigh': an explicit pair the model cannot take is refused
+        // before the write, like a -pro model.
+        it('refuses an explicit override effort the override model cannot take', async () => {
+            const characterId = createCharacter('Kara');
+            const refused = extractJson(await handleAgentManage(
+                { action: 'create', characterId, provider: 'openai', model: 'o3', competencyOverride: { model: 'o3', reasoningEffort: 'none' } },
+                ctx
+            ));
+            expect(refused.error).toBe(true);
+            expect(refused.writes).toBe('none');
+            expect(refused.message).toMatch(/"none"[\s\S]*"o3"/);
+
+            const created = extractJson(await handleAgentManage(
+                { action: 'create', characterId, provider: 'openai', model: 'o3', competencyOverride: { model: 'o3' } },
+                ctx
+            ));
+            expect(created.error).toBeUndefined();
+
+            const updateRefused = extractJson(await handleAgentManage(
+                { action: 'update', characterId, competencyOverride: { model: 'gpt-5-mini', reasoningEffort: 'xhigh' } },
+                ctx
+            ));
+            expect(updateRefused.error).toBe(true);
+            expect(updateRefused.writes).toBe('none');
+            const loaded = extractJson(await handleAgentManage({ action: 'get', characterId }, ctx));
+            expect(loaded.agent.competencyOverride).toEqual({ model: 'o3' });
         });
 
         it('lists agents with status filter', async () => {
@@ -517,6 +595,47 @@ describe('agent_manage tool', () => {
                 expect(replay.original).toBeDefined();
                 expect(replay.callId).toBe(invokeResult.callId);
             }
+        });
+
+        describe('model line (FINDINGS #69: requested vs served)', () => {
+            afterEach(() => clearAgentRuntime());
+
+            function wireOpenAI(call: LLMProvider['call']) {
+                const factory = new ProviderFactory();
+                factory.register('openai', { name: 'openai', call });
+                setAgentRuntime(buildAgentRuntime(getDb(':memory:'), factory));
+            }
+
+            async function invokeText(characterId: string): Promise<string> {
+                const result = await handleAgentManage({ action: 'invoke', characterId, situation: 'go' }, ctx);
+                return result.content[0].text;
+            }
+
+            it('flags a served model that differs from the requested one', async () => {
+                const characterId = createCharacter('Kara');
+                await handleAgentManage({ action: 'create', characterId, provider: 'openai', model: 'gpt-5.5' }, ctx);
+                wireOpenAI(async () => ({ text: 'hi', raw: '{}', durationMs: 1, model: 'gpt-4o-mini' }));
+
+                expect(await invokeText(characterId)).toContain('gpt-4o-mini ⚠ (requested gpt-5.5)');
+            });
+
+            it('names the requested model when the provider reported no served model', async () => {
+                const characterId = createCharacter('Kara');
+                await handleAgentManage({ action: 'create', characterId, provider: 'openai', model: 'gpt-5.5' }, ctx);
+                wireOpenAI(async () => ({ text: 'hi', raw: '{}', durationMs: 1 }));
+
+                expect(await invokeText(characterId)).toMatch(/gpt-5\.5 \[stat_derived\] \(served model not reported\)/);
+            });
+
+            it('names the requested model on a failed invoke', async () => {
+                const characterId = createCharacter('Kara');
+                await handleAgentManage({ action: 'create', characterId, provider: 'openai', model: 'gpt-5.5' }, ctx);
+                wireOpenAI(async () => { throw new ProviderError('timed out', 'timeout'); });
+
+                const text = await invokeText(characterId);
+                expect(text).toContain('timeout');
+                expect(text).toMatch(/gpt-5\.5 \[stat_derived\] \(served model not reported\)/);
+            });
         });
 
         it('replay errors when callId not found', async () => {

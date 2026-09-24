@@ -32,14 +32,29 @@
  *     and skips if already present. Re-running this script will not produce
  *     38 duplicate NPCs.
  *
- * Run:
- *   npx tsx scripts/seed-bastion.ts
+ * Run (from the repo root, devDependencies installed):
+ *   npm run seed:bastion -- --db-path /path/to/rpg.db
+ * which is shorthand for:
+ *   node --loader ts-node/esm scripts/seed-bastion.ts --db-path /path/to/rpg.db
+ * --db-path=/path/to/rpg.db works too. Through npm the "--" is required;
+ * without it npm keeps the flag for itself and the script refuses to run.
  *
- * The DB path resolves through getDb() — uses RPG_MCP_DB_PATH or the
- * platform AppData default (Windows: %APPDATA%/rpg-mcp/rpg.db).
+ * The package is "type": "module" and imports name .ts sources by their .js
+ * specifiers, which only ts-node's ESM loader resolves; `ts-node` and
+ * `ts-node --esm` fail with ERR_MODULE_NOT_FOUND, and tsx is not a
+ * dependency. Node's ExperimentalWarning about --loader is harmless.
+ *
+ * The database is selected the way the server's local transports select
+ * theirs (useSingleUserDatabase in src/storage/index.ts): --db-path, else
+ * RPG_MCP_DB_PATH, else $RPG_DATA_DIR/rpg.db, else the platform app-data
+ * default — Windows %APPDATA%\rpg-mcp\rpg.db, macOS ~/Library/Application
+ * Support/rpg-mcp/rpg.db, Linux $XDG_DATA_HOME (or ~/.local/share)/rpg-mcp/rpg.db.
+ * That file must already exist and hold the Sebastopyr world. If it does not
+ * exist the script stops without creating it; if the world is missing it
+ * stops before seeding. The resolved path is logged before anything is seeded.
  */
 
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -48,7 +63,7 @@ import { handleNarrativeManage } from '../src/server/consolidated/narrative-mana
 import { handleCreate as handleCharacterCreate } from '../src/server/consolidated/character-manage.js';
 import { handleCreate as handleAgentCreate, handleAddSecret as handleAgentAddSecret } from '../src/server/consolidated/agent-manage.js';
 import type { SessionContext } from '../src/server/types.js';
-import { getDb } from '../src/storage/index.js';
+import { getDb, getDbPath, useSingleUserDatabase } from '../src/storage/index.js';
 import { CharacterRepository } from '../src/storage/repos/character.repo.js';
 import { NpcMemoryRepository, type Familiarity, type Disposition, type Importance } from '../src/storage/repos/npc-memory.repo.js';
 
@@ -1483,14 +1498,75 @@ async function seedNestedNarrativeSeeds(boot: Bootstrap, worldId: string): Promi
 // MAIN
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * The --db-path value (`--db-path X` or `--db-path=X`), or undefined when the
+ * flag is absent (the storage layer then falls back to RPG_MCP_DB_PATH,
+ * RPG_DATA_DIR, then the app-data default). Anything else on the command line
+ * is refused rather than ignored: silently falling back would seed whatever
+ * database the environment happens to point at.
+ */
+function dbPathArg(): string | undefined {
+    // `npm run seed:bastion --db-path X` (no `--`) keeps the flag for npm, which
+    // exports it as npm_config_db_path and hands the script only `X`, or
+    // nothing at all for the `=` form.
+    if (process.env.npm_config_db_path !== undefined) {
+        throw new Error('npm took --db-path for itself. Put it after "--": npm run seed:bastion -- --db-path /path/to/rpg.db');
+    }
+    const args = process.argv.slice(2);
+    let value: string | undefined;
+    for (let i = 0; i < args.length; i++) {
+        let next: string | undefined;
+        if (args[i] === '--db-path') next = args[++i];
+        else if (args[i].startsWith('--db-path=')) next = args[i].slice('--db-path='.length);
+        else throw new Error(`Unexpected argument "${args[i]}". The only option is --db-path /path/to/rpg.db`);
+        if (!next || next.startsWith('--')) {
+            throw new Error('--db-path needs a value, e.g. --db-path /path/to/rpg.db');
+        }
+        if (value !== undefined) throw new Error('--db-path was given more than once.');
+        value = next;
+    }
+    return value;
+}
+
 async function main(): Promise<void> {
     log(`Loading bootstrap from ${BOOTSTRAP_PATH}`);
     const boot = JSON.parse(readFileSync(BOOTSTRAP_PATH, 'utf-8')) as Bootstrap;
     log(`Loaded: ${boot.locations.length} locations, ${boot.factions.length} factions, ${boot.npcs.length} npcs, ${boot.plot_threads.length} plots, ${boot.bestiary.length} beasts`);
     log(`Seeding into existing world: ${SEBASTOPYR_WORLD_ID}`);
 
-    // Touch the DB once up front so migrations run before any handler call.
-    getDb();
+    // Select the database explicitly, before any handler call. Since the
+    // per-campaign split, getDb() with nothing selected looks for a verified
+    // tenant and throws "No tenant context in scope", which says nothing about
+    // which file was meant. This is the single-user selection the server's
+    // local transports make (src/server/index.ts), so the path resolves the
+    // same way; it also runs migrations.
+    //
+    // Opening creates a missing file, so check first. A new file cannot hold
+    // the world this seeder adds to, and the one the fallback creates,
+    // <RPG_DATA_DIR or app-data>/rpg.db, is a legacy name the HTTP server's
+    // assertNoLegacyDatabase() refuses to boot beside.
+    const requested = dbPathArg();
+    const target = getDbPath(requested);
+    if (!existsSync(target)) {
+        throw new Error(
+            `No database at ${target}. None was created and nothing was seeded. ` +
+            `Select the database that holds world ${SEBASTOPYR_WORLD_ID} (Sebastopyr) with --db-path or RPG_MCP_DB_PATH.`
+        );
+    }
+    const db = useSingleUserDatabase(requested);
+    log(`Database: ${db.name}`);
+
+    // This seeder only adds to the existing world, so its absence means the
+    // wrong database was selected. Carrying on is not harmless: the character,
+    // agent, memory and room phases still write rows (orphaned, with no world
+    // and no room placement), while every narrative_manage call returns
+    // WORLD_NOT_FOUND and is counted as a zero-note success. Refuse first.
+    if (!db.prepare('SELECT id FROM worlds WHERE id = ?').get(SEBASTOPYR_WORLD_ID)) {
+        throw new Error(
+            `World ${SEBASTOPYR_WORLD_ID} (Sebastopyr) is not in ${db.name}. ` +
+            'Nothing was seeded. Select the database that holds it with --db-path or RPG_MCP_DB_PATH.'
+        );
+    }
 
     const worldId = SEBASTOPYR_WORLD_ID;
     const totals = newCounters();

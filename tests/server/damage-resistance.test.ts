@@ -193,5 +193,46 @@ describe('HIGH-002: Damage Resistance', () => {
             expect(attackText).not.toMatch(/resist/i);
             expect(attackText).toContain('10'); // Full damage
         });
+
+        // The tests above can match a participant name ("Fire-Resistant
+        // Hero") or the encounter id ("immune-test-1"). This one reads the
+        // PDA damage line and the actionResult envelope, which must agree.
+        // One `it` per case so beforeEach gives each a fresh DB: the
+        // encounter id is seed + Date.now(), which can repeat within a
+        // millisecond and fail the INSERT if the cases share a DB.
+        it.each([
+            { key: 'resistances', damage: 40, dealt: 20, modifier: 'resistant', shown: /RESISTANT/ },
+            { key: 'vulnerabilities', damage: 10, dealt: 20, modifier: 'vulnerable', shown: /VULNERABLE/ },
+            { key: 'immunities', damage: 30, dealt: 0, modifier: 'immune', shown: /IMMUNE/ }
+        ])('should print the $modifier modifier on the damage line and in actionResult', async (c) => {
+            const createResult = await handleCreateEncounter({
+                seed: 'modifier-line-1',
+                participants: [
+                    { id: 'hero-1', name: 'Hero', initiativeBonus: 10, hp: 30, maxHp: 30 },
+                    { id: 'orc-1', name: 'Orc', initiativeBonus: 1, hp: 50, maxHp: 50, isEnemy: true, [c.key]: ['fire'] }
+                ]
+            }, mockCtx);
+            const createData = JSON.parse(createResult.content[0].text.match(/<!-- STATE_JSON\n([\s\S]*?)\nSTATE_JSON -->/)?.[1] || '{}');
+
+            const attackResult = await handleExecuteCombatAction({
+                encounterId: createData.encounterId,
+                action: 'attack',
+                actorId: 'hero-1',
+                targetId: 'orc-1',
+                attackBonus: 10,
+                dc: 10,
+                damage: c.damage,
+                damageType: 'fire'
+            }, mockCtx);
+
+            const attackText = attackResult.content[0].text;
+            const state = JSON.parse(attackText.match(/<!-- STATE_JSON\n([\s\S]*?)\nSTATE_JSON -->/)?.[1] || '{}');
+            expect(state.actionResult.roll.hit).toBe(true);
+            expect(state.actionResult.damage).toMatchObject({ total: c.dealt, type: 'fire', modifier: c.modifier });
+
+            const damageLine = attackText.split('\n').find((l: string) => l.includes('⌁'));
+            expect(damageLine).toMatch(c.shown);
+            expect(damageLine).toContain(`${c.dealt} fire`);
+        });
     });
 });

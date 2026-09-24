@@ -326,6 +326,37 @@ describe('strategy_manage consolidated tool', () => {
             expect(data.error).toBe(true);
         });
 
+        it('stores the canonical region id when claimed by its legacy id', async () => {
+            // Campaign notes written before region ids were unified name the
+            // legacy `${worldId}:<n>` form; the claim must land on the real row.
+            const db = getDb();
+            const now = new Date().toISOString();
+            new RegionRepository(db).create({
+                id: `${testWorldId}:region:5`,
+                worldId: testWorldId,
+                name: 'Rostok',
+                type: 'wilderness',
+                centerX: 0,
+                centerY: 0,
+                color: '#888888',
+                createdAt: now,
+                updatedAt: now
+            });
+
+            const data = parseResult(await handleStrategyManage({
+                action: 'claim_region',
+                nationId: testNationId,
+                regionId: `${testWorldId}:5`,
+                justification: 'Duty holds Rostok'
+            }, ctx));
+
+            expect(data.success).toBe(true);
+            expect(data.region).toBe('Rostok');
+            const stored = db.prepare('SELECT region_id AS regionId FROM territorial_claims WHERE nation_id = ?')
+                .all(testNationId) as Array<{ regionId: string }>;
+            expect(stored).toEqual([{ regionId: `${testWorldId}:region:5` }]);
+        });
+
         it('should accept "claim" alias', async () => {
             const result = await handleStrategyManage({
                 action: 'claim',

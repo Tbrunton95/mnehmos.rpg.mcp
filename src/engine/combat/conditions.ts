@@ -100,6 +100,96 @@ export interface Condition {
     metadata?: Record<string, any>;
 }
 
+const ABILITY_ABBREVIATIONS: Record<string, Ability> = {
+    str: Ability.STRENGTH,
+    dex: Ability.DEXTERITY,
+    con: Ability.CONSTITUTION,
+    int: Ability.INTELLIGENCE,
+    wis: Ability.WISDOM,
+    cha: Ability.CHARISMA
+};
+
+/**
+ * Resolve a caller's durationType ("SAVE_ENDS", "save ends", "end-of-turn")
+ * to DurationType, or undefined when it names none.
+ */
+export function parseDurationType(value: string | undefined): DurationType | undefined {
+    const key = (value ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+    return (Object.values(DurationType) as string[]).includes(key) ? key as DurationType : undefined;
+}
+
+/**
+ * Resolve a caller's saveAbility — full name or three-letter abbreviation,
+ * any case — to Ability, or undefined when it names none.
+ */
+export function parseAbility(value: string | undefined): Ability | undefined {
+    const key = (value ?? '').trim().toLowerCase();
+    if ((Object.values(Ability) as string[]).includes(key)) return key as Ability;
+    return Object.hasOwn(ABILITY_ABBREVIATIONS, key) ? ABILITY_ABBREVIATIONS[key] : undefined;
+}
+
+/**
+ * A condition as callers hand it to encounter create / add_participant:
+ * a bare name ("prone"), a character-row entry ({name, duration?, source?}),
+ * or the same object with the engine's duration/save fields
+ * ({type, durationType?, sourceId?, saveDC?, saveAbility?}).
+ */
+export type ConditionInput = string | {
+    id?: string;
+    type?: string;
+    name?: string;
+    durationType?: string;
+    duration?: number;
+    source?: string;
+    sourceId?: string;
+    saveDC?: number;
+    saveAbility?: string;
+};
+
+/**
+ * Normalize a caller-supplied condition into the engine's Condition shape.
+ * Known names map case-insensitively onto ConditionType; anything else is
+ * kept verbatim as a custom condition with no mechanical effect. durationType
+ * and saveAbility resolve like the name does (any case; "con" for
+ * constitution). With no durationType, a duration means rounds (the
+ * character-row convention) and none means permanent. Returns null when
+ * there is no name to go on.
+ *
+ * Lenient by design, for character-row data. Caller input goes through
+ * ConditionInputSchema (schema/encounter.ts) first, which rejects anything
+ * this would have to drop or guess at.
+ */
+export function normalizeCondition(input: ConditionInput, participantId: string): Condition | null {
+    const raw = typeof input === 'string' ? { name: input } : input;
+    const label = String(raw.type || raw.name || '').trim();
+    if (!label) return null;
+
+    const type = (Object.values(ConditionType) as string[]).includes(label.toLowerCase())
+        ? label.toLowerCase() as ConditionType
+        : label as ConditionType;
+    const durationType = parseDurationType(raw.durationType)
+        ?? (raw.duration !== undefined ? DurationType.ROUNDS : DurationType.PERMANENT);
+    const sourceId = raw.sourceId ?? raw.source;
+    const saveAbility = parseAbility(raw.saveAbility);
+
+    return {
+        // Same instance-id scheme as CombatEngine.applyCondition
+        id: raw.id ?? `${participantId}-${type}-${Date.now()}-${Math.random()}`,
+        type,
+        durationType,
+        ...(raw.duration !== undefined ? { duration: raw.duration } : {}),
+        ...(sourceId !== undefined ? { sourceId } : {}),
+        ...(raw.saveDC !== undefined ? { saveDC: raw.saveDC } : {}),
+        ...(saveAbility ? { saveAbility } : {})
+    };
+}
+
+export function normalizeConditions(inputs: ConditionInput[] | undefined, participantId: string): Condition[] {
+    return (inputs ?? [])
+        .map(c => normalizeCondition(c, participantId))
+        .filter((c): c is Condition => c !== null);
+}
+
 /**
  * Condition effect modifiers
  * Defines mechanical effects of each condition type

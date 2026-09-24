@@ -1,4 +1,6 @@
 import { ToolContract, ToolCategory, ToolMetadata } from '../tool-metadata.js';
+import { SessionContext } from '../types.js';
+import { setToolContext } from '../tool-context.js';
 
 interface ToolDescriptor {
     category: ToolCategory;
@@ -45,6 +47,16 @@ const TOOL_DESCRIPTORS: Readonly<Record<string, ToolDescriptor>> = {
     agent_manage: { category: 'agent', keywords: ['agent', 'llm', 'npc', 'ai', 'persona', 'invoke', 'prompt', 'memory', 'autonomous'], capabilities: ['LLM-driven NPC minds', 'Modular prompt slices', 'Plain-text intent declarations', 'Auto-invoke on initiative'] },
     perception_manage: { category: 'meta', keywords: ['perception', 'hazard', 'control', 'safety', 'sight', 'blind-spot', 'attention', 'operator'], capabilities: ['Hierarchy-of-Controls hazard scanning', 'Attentional-capacity metering', 'Blind-spot detection (§3.5)', 'Disposition discipline'] },
     scene_manage: { category: 'narrative', keywords: ['scene', 'set_scene', 'frame', 'dm', 'narration', 'shared', 'state', 'context'], capabilities: ['DM-committed shared scenes', 'Auto-injected into agent prompts', 'Engine-side source of truth for "what is happening now"'] },
+    // Campaign-layer tools (FINDINGS #92/#93/#99). Hull/siege/container/horde
+    // metadata is carried over from the pre-contract registry; vehicle, ledger
+    // and comms had none there and are described from their tool text.
+    hull_manage: { category: 'world', keywords: ['hull', 'station', 'pressure', 'vent', 'power', 'atmosphere', 'life-support', 'section', 'keeper'], capabilities: ['Station sections: pressure/atmosphere/integrity/power', 'Power budget sum-vs-generation', 'Venting with Register-B occupant resolution', 'Life-support decay clock'] },
+    siege_manage: { category: 'world', keywords: ['siege', 'compound', 'zone', 'barricade', 'wall', 'supplies', 'fortify', 'survival', 'zombie'], capabilities: ['Fortified-compound zones (hull_manage alias)', 'Generator budget and dark zones', 'Zone sacrifice with occupant enumeration', 'Supply pool decay'] },
+    container_manage: { category: 'inventory', keywords: ['container', 'stash', 'cache', 'safe', 'backpack', 'boot', 'storage', 'put', 'take'], capabilities: ['Things inside things: stashes, safes, caches, boots', 'put/take moves real inventory rows', 'Locked/hidden/trapped flags', 'Capacity or unlimited'] },
+    horde_manage: { category: 'world', keywords: ['horde', 'zombie', 'mass', 'noise', 'swarm', 'press', 'attraction', 'drift', 'walker'], capabilities: ['Mass entities: one object, not N combatants', 'Noise as a place-owned decaying value', 'Drift toward the loudest pull', 'resolve_press: how many reach the wall'] },
+    vehicle_manage: { category: 'inventory', keywords: ['vehicle', 'car', 'plate', 'registration', 'defect', 'known', 'crime'], capabilities: ['Vehicles as rows: plate, registeredTo, status', 'Defects that can draw a lawful stop', 'Who can identify the vehicle and why', 'Cavities via container_manage'] },
+    ledger_manage: { category: 'meta', keywords: ['ledger', 'debt', 'loan', 'due', 'settle', 'default', 'counterparty', 'crime'], capabilities: ['Debts with due dates and counterparties', 'Clock-driven status: pending → due → lapsed', 'process_due walks the in-fiction clock', 'settle/default as GM verbs'] },
+    comms_manage: { category: 'npc', keywords: ['comms', 'phone', 'sim', 'contact', 'burner', 'reachable', 'handset', 'crime'], capabilities: ['Handset and SIM rows', 'Directional contact graph', 'Burn/swap/split SIMs', 'reachable(A→B) attribution checks'] },
 };
 
 type ToolShape = {
@@ -75,12 +87,21 @@ export function defineToolContract(tool: ToolShape, handler: ToolHandler): ToolC
         deferLoading: descriptor.deferLoading ?? true,
     };
 
+    const name = tool.name;
+    const dispatch = handler as (args: unknown, ctx: SessionContext) => Promise<unknown>;
+
     return {
         ...tool,
         metadata,
         schema: tool.inputSchema,
         actionSchemas: tool.actionSchemas,
-        handler,
+        handler: (async (args: unknown, ctx: SessionContext) => {
+            // FINDINGS #34 T1.4: stamp every dispatch so state-writing
+            // repos can attribute their writes. Ghost writes end here.
+            const action = (args as { action?: string })?.action;
+            setToolContext(action ? `${name}.${action}` : name);
+            return dispatch(args, ctx);
+        }) as ToolContract['handler'],
     };
 }
 

@@ -45,7 +45,7 @@ const ContainerInputSchema = z.object({
 });
 
 function cdb() {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const db = getDb();
     db.exec(`CREATE TABLE IF NOT EXISTS containers (
         id TEXT PRIMARY KEY, world_id TEXT NOT NULL, name TEXT NOT NULL,
         owner_type TEXT NOT NULL DEFAULT 'none', owner_id TEXT,
@@ -173,5 +173,7 @@ Actions: create, get, list, put, take, move, destroy
 - locked refuses put/take until the fiction opens it (ignoreLock:true = GM override). hidden hides from list. trapped is a flag; the trap is fiction.
 - capacityLbs omitted = unlimited. destroy refuses while loaded unless force (spill named in full).
 worldId REQUIRED on every call.`,
-    inputSchema: ContainerInputSchema
+    inputSchema: ContainerInputSchema,
+    // Every action shares the one input schema; the switch dispatcher validates per action.
+    actionSchemas: Object.fromEntries(ACTIONS.map(a => [a, { schema: ContainerInputSchema, aliases: [] as string[] }]))
 };

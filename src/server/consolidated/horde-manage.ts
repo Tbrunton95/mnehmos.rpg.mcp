@@ -43,7 +43,7 @@ const HordeInputSchema = z.object({
 });
 
 function hdb() {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const db = getDb();
     db.exec(`CREATE TABLE IF NOT EXISTS hordes (
         id TEXT PRIMARY KEY, world_id TEXT NOT NULL, name TEXT NOT NULL,
         size INTEGER NOT NULL, x REAL NOT NULL, y REAL NOT NULL,
@@ -184,5 +184,7 @@ Actions: create, get, list, set, add_noise, list_noise, tick, resolve_press, des
 - tick {hours}: hordes drift toward the loudest pull (formula printed); silence decays attraction; noise fades.
 - resolve_press {x, y}: "how many reach the wall this turn" — printed formula, Register B resolution (spawn the closest N, damage the barrier, narrate the surge). Book kills with {losses:N}.
 worldId REQUIRED on every call.`,
-    inputSchema: HordeInputSchema
+    inputSchema: HordeInputSchema,
+    // Every action shares the one input schema; the switch dispatcher validates per action.
+    actionSchemas: Object.fromEntries(ACTIONS.map(a => [a, { schema: HordeInputSchema, aliases: [] as string[] }]))
 };

@@ -2,6 +2,7 @@ import { Server, Socket } from 'net';
 
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
+import { listenWithIpv4Fallback } from './listen.js';
 
 /**
  * A TCP transport for the MCP server.
@@ -92,12 +93,8 @@ export class TCPServerTransport implements Transport {
     }
 
     async start(): Promise<void> {
-        return new Promise((resolve) => {
-            this.server.listen(this.port, this.host, () => {
-                console.error(`TCP Server listening on ${this.host}:${this.port}`);
-                resolve();
-            });
-        });
+        const host = await listenWithIpv4Fallback(this.server, this.port, this.host, '[TCP]');
+        console.error(`TCP Server listening on ${host}:${this.port}`);
     }
 
     async close(): Promise<void> {

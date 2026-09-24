@@ -215,18 +215,21 @@ function resolveQueuedActions(
     for (const batch of queued) {
         for (const [index, action] of batch.actions.entries()) {
             switch (action.type) {
-                case 'claim_region':
-                    if (!action.regionId || !repos.regionRepo.findById(action.regionId)) break;
+                case 'claim_region': {
+                    // Claim the row found, not action.regionId — a legacy id resolves to it.
+                    const region = action.regionId ? repos.regionRepo.findById(action.regionId) : null;
+                    if (!region) break;
                     repos.diplomacyRepo.createClaim({
                         id: `turn-action-${batch.id}-${index}`,
                         nationId: batch.nationId,
-                        regionId: action.regionId,
+                        regionId: region.id,
                         claimStrength: 100,
                         justification: action.justification,
                         createdAt: new Date().toISOString()
                     });
-                    processed.push(`Claimed region ${action.regionId}`);
+                    processed.push(`Claimed region ${region.id}`);
                     break;
+                }
 
                 case 'propose_alliance':
                     if (!action.toNationId) break;

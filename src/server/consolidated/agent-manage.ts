@@ -24,13 +24,12 @@ import {
     AgentStatusSchema,
     AgentSliceKindSchema,
     AgentSecretImportanceSchema,
-    AgentJournalKindSchema,
-    CompetencyOverrideSchema
+    AgentJournalKindSchema
 } from '../../schema/agent.js';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { RichFormatter } from '../utils/formatter.js';
 import { getAgentRuntime, buildAgentRuntime } from '../../agent/runtime/deps.js';
-import { CompetencyOverrideSchema, resolveCompetency, validateOverride } from '../../agent/runtime/competency.js';
+import { CompetencyOverrideSchema, resolveCompetency, validateOverride, providerModelId } from '../../agent/runtime/competency.js';
 import { invokeAgent } from '../../agent/runtime/invoke.js';
 import { composePrompt } from '../../agent/prompt/compose.js';
 import { replayCall } from '../../agent/audit/replay.js';
@@ -102,7 +101,6 @@ const CreateSchema = z.object({
     characterId: z.string().describe('Character to bind this agent to (1:1)'),
     provider: AgentProviderSchema.describe('LLM provider: openai or openrouter'),
     model: z.string().min(1).describe('Provider model identifier (e.g. gpt-4o-mini, openai/gpt-5.6-luna)'),
-    competencyOverride: CompetencyOverrideSchema.nullable().optional().describe('Optional fixed model/reasoning policy; when set it overrides INT-based competency selection'),
     status: AgentStatusSchema.optional(),
     autoOnTurn: z.boolean().optional().describe('Auto-invoke when this character\'s turn comes up in combat'),
     temperature: z.number().min(0).max(2).optional(),
@@ -130,7 +128,6 @@ const UpdateSchema = z.object({
     characterId: z.string().optional(),
     provider: AgentProviderSchema.optional(),
     model: z.string().min(1).optional(),
-    competencyOverride: CompetencyOverrideSchema.nullable().optional().describe('Optional fixed model/reasoning policy; null restores INT-based competency selection'),
     status: AgentStatusSchema.optional(),
     autoOnTurn: z.boolean().optional(),
     temperature: z.number().min(0).max(2).optional(),
@@ -329,7 +326,6 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         characterId: args.characterId,
         provider: args.provider,
         model: args.model,
-        competencyOverride: args.competencyOverride,
         status: args.status,
         autoOnTurn: args.autoOnTurn ?? false,
         temperature: args.temperature,
@@ -341,8 +337,10 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
 
     // FINDINGS #69: the INT ladder resolves the served model; agents.model is
     // advisory unless an override is set. Say so AT CREATE TIME, not on the
-    // billing page three sessions later.
-    const resolved = resolveCompetency(character.stats.int, agent.competencyOverride);
+    // billing page three sessions later. Report the id exactly as invoke will
+    // request it (openai/-namespaced on OpenRouter).
+    const ladder = resolveCompetency(character.stats.int, agent.competencyOverride);
+    const resolved = { ...ladder, model: providerModelId(agent.provider, ladder.model) };
     const modelAdvisory = !agent.competencyOverride?.model && args.model !== resolved.model
         ? `⚠ agents.model ('${args.model}') is ADVISORY — INT ${character.stats.int} resolves to '${resolved.model}' via the competency ladder. Set competencyOverride to pin a model for this agent.`
         : null;
@@ -367,9 +365,13 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
     const character = characterRepo.findById(agent.characterId);
 
     // FINDINGS #69: report the model that will actually be SERVED, not just the
-    // stored advisory one. resolveCompetency is exactly what invoke runs.
-    const resolved = character
+    // stored advisory one. resolveCompetency + providerModelId is exactly what
+    // invoke runs.
+    const ladder = character
         ? resolveCompetency(character.stats.int, agent.competencyOverride)
+        : null;
+    const resolved = ladder
+        ? { ...ladder, model: providerModelId(agent.provider, ladder.model) }
         : null;
 
     return {
@@ -377,8 +379,13 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
         agent,
         characterName: character?.name ?? null,
         storedModel: agent.model,
+        // FINDINGS #98: a stored override that fails the model rule loads
+        // leniently and degrades to the ladder — say so where the DM looks.
         resolvedCompetency: resolved
-            ? { model: resolved.model, reasoningEffort: resolved.reasoningEffort, tier: resolved.tier, int: resolved.int, source: resolved.source }
+            ? {
+                model: resolved.model, reasoningEffort: resolved.reasoningEffort, tier: resolved.tier, int: resolved.int, source: resolved.source,
+                ...(resolved.overrideError ? { overrideError: resolved.overrideError } : {})
+            }
             : null,
         modelAdvisory: resolved && !agent.competencyOverride?.model && agent.model !== resolved.model
             ? `stored model '${agent.model}' is advisory — invokes serve '${resolved.model}' (INT ladder). Set competencyOverride to change that.`
@@ -822,7 +829,6 @@ Actions: create, get, list, update, delete, resume, health, budget, set_slice, r
         // create/update
         provider: AgentProviderSchema.optional(),
         model: z.string().optional(),
-        competencyOverride: CompetencyOverrideSchema.nullable().optional(),
         status: AgentStatusSchema.optional(),
         autoOnTurn: z.boolean().optional(),
         temperature: z.number().optional(),
@@ -896,6 +902,7 @@ export async function handleAgentManage(args: unknown, ctx: SessionContext): Pro
                         'Slices': parsed.sliceCount,
                         'Tokens used': parsed.agent?.tokensUsed
                     });
+                    if (parsed.resolvedCompetency?.overrideError) output += RichFormatter.alert(parsed.resolvedCompetency.overrideError, 'warning');
                     if (parsed.modelAdvisory) output += RichFormatter.alert(parsed.modelAdvisory, 'warning');
                     break;
                 case 'list':
@@ -925,13 +932,17 @@ export async function handleAgentManage(args: unknown, ctx: SessionContext): Pro
                     break;
                 case 'invoke': {
                     const name = parsed.characterName || parsed.characterId || 'agent';
+                    // FINDINGS #69: requested vs served. When the provider
+                    // reported no served model, say so — never assume it.
+                    const modelLine = parsed.servedModel
+                        ? (parsed.requestedModel && parsed.servedModel !== parsed.requestedModel
+                            ? `${parsed.servedModel} ⚠ (requested ${parsed.requestedModel})`
+                            : `${parsed.servedModel} [${parsed.competencySource ?? '?'}]`)
+                        : parsed.requestedModel
+                            ? `${parsed.requestedModel} [${parsed.competencySource ?? '?'}] (served model not reported)`
+                            : '—';
                     if (parsed.status === 'ok') {
                         output = RichFormatter.header(`${name} speaks`, '');
-                        const modelLine = parsed.servedModel
-                            ? (parsed.requestedModel && parsed.servedModel !== parsed.requestedModel
-                                ? `${parsed.servedModel} ⚠ (requested ${parsed.requestedModel})`
-                                : `${parsed.servedModel} [${parsed.competencySource ?? '?'}]`)
-                            : '—';
                         output += RichFormatter.keyValue({
                             'Status': parsed.status,
                             'Model': modelLine,
@@ -950,7 +961,8 @@ export async function handleAgentManage(args: unknown, ctx: SessionContext): Pro
                             output += RichFormatter.keyValue({
                                 'Agent': name,
                                 'Call ID': parsed.callId,
-                                'Status': parsed.status
+                                'Status': parsed.status,
+                                ...(parsed.requestedModel ? { 'Model': modelLine } : {})
                             });
                         }
                     }

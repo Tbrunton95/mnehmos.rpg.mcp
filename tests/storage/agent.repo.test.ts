@@ -4,6 +4,11 @@ import { migrate } from '../../src/storage/migrations';
 import { CharacterRepository } from '../../src/storage/repos/character.repo';
 import { AgentRepository } from '../../src/storage/repos/agent.repo';
 import { Character } from '../../src/schema/character';
+import {
+    AgentCreateInputSchema,
+    AgentUpdateInputSchema,
+    CompetencyOverrideSchema
+} from '../../src/schema/agent';
 import { FIXED_TIMESTAMP } from '../fixtures.js';
 
 const TEST_DB_PATH = 'test-agent-repo.db';
@@ -135,6 +140,32 @@ describe('AgentRepository', () => {
             expect(updated?.autoOnTurn).toBe(true);
             expect(updated?.provider).toBe('openai'); // unchanged
             expect((updated as any).competencyOverride).toEqual({ reasoningEffort: 'medium' });
+        });
+
+        // FINDINGS #98: strict on write, lenient on read. A row written before
+        // the write gate existed must still load so it can be seen and fixed.
+        it('reads back a stored -pro override instead of throwing (lenient read)', () => {
+            chars.create(makeCharacter('char-1'));
+            const agent = repo.create({ characterId: 'char-1', provider: 'openai', model: 'gpt-4o-mini' });
+            db.prepare('UPDATE agents SET competency_override = ? WHERE id = ?')
+                .run(JSON.stringify({ model: 'gpt-5.5-pro', reasoningEffort: 'xhigh' }), agent.id);
+
+            expect(repo.findById(agent.id)?.competencyOverride).toEqual({ model: 'gpt-5.5-pro', reasoningEffort: 'xhigh' });
+            expect(repo.findByCharacterId('char-1')?.id).toBe(agent.id);
+            expect(repo.list().map(a => a.id)).toEqual([agent.id]);
+
+            const cleared = repo.update(agent.id, { competencyOverride: null });
+            expect(cleared?.competencyOverride).toBeNull();
+        });
+
+        it('keeps the write-side override schemas strict about -pro', () => {
+            const pro = { model: 'gpt-5.5-pro' };
+            expect(CompetencyOverrideSchema.safeParse(pro).success).toBe(false);
+            expect(AgentCreateInputSchema.safeParse({
+                characterId: 'c', provider: 'openai', model: 'gpt-5.5', competencyOverride: pro
+            }).success).toBe(false);
+            expect(AgentUpdateInputSchema.safeParse({ competencyOverride: pro }).success).toBe(false);
+            expect(AgentUpdateInputSchema.safeParse({ competencyOverride: { model: 'gpt-5.5' } }).success).toBe(true);
         });
 
         it('returns null when updating a missing agent', () => {

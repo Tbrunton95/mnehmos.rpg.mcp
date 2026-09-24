@@ -417,6 +417,7 @@ export interface ContactInput {
     die?: number; allRolls?: number[]; bonus?: number; total?: number;
     targetAc?: number; hit?: boolean; crit?: boolean;
     damageTotal?: number; damageType?: string; damageRolls?: number[];
+    damageModifier?: 'immune' | 'resistant' | 'vulnerable';
     jamCheckOwed?: { weapon?: string; condition?: number; jamsOn?: string };
     hpBefore?: number; hpAfter?: number; defeated?: boolean;
 }
@@ -451,6 +452,11 @@ export function renderContact(c: ContactInput): string {
         if (Array.isArray(c.damageRolls) && c.damageRolls.length)
             dmg.push(L(' ['), V(c.damageRolls.join(', ')), L(']'));
         dmg.push(L(' '), V(c.damageType ?? ''));
+        // HIGH-002: the total is already halved/doubled/zeroed — say so, or
+        // the dice above it do not add up on the glass.
+        if (c.damageModifier)
+            dmg.push(L(` ${g.sep} `), V(c.damageModifier === 'immune' ? 'IMMUNE (no damage)'
+                : c.damageModifier === 'resistant' ? 'RESISTANT (halved)' : 'VULNERABLE (doubled)'));
         if (typeof c.hpBefore === 'number' && typeof c.hpAfter === 'number')
             dmg.push(L('         '), V(callsign(c.targetName ?? '???')), L(' '), V(c.hpBefore), L(` ${g.to} `), V(c.hpAfter));
         rows.push(dmg);

@@ -1,121 +1,121 @@
 [
   {
     "int": 1,
-    "tier": "bare_pattern",
-    "model": "babbage-002",
-    "reasoningEffort": null
+    "tier": "mindless_dull",
+    "model": "gpt-5.5",
+    "reasoningEffort": "none"
   },
   {
     "int": 2,
-    "tier": "bare_pattern",
-    "model": "babbage-002",
-    "reasoningEffort": null
+    "tier": "mindless_dull",
+    "model": "gpt-5.5",
+    "reasoningEffort": "none"
   },
   {
     "int": 3,
-    "tier": "primitive_reasoning",
-    "model": "davinci-002",
-    "reasoningEffort": null
+    "tier": "mindless_dull",
+    "model": "gpt-5.5",
+    "reasoningEffort": "none"
   },
   {
     "int": 4,
-    "tier": "simple_language",
-    "model": "gpt-4",
-    "reasoningEffort": null
+    "tier": "mindless_dull",
+    "model": "gpt-5.5",
+    "reasoningEffort": "none"
   },
   {
     "int": 5,
-    "tier": "low_cognition",
-    "model": "gpt-oss-20b",
-    "reasoningEffort": null
+    "tier": "mindless_dull",
+    "model": "gpt-5.5",
+    "reasoningEffort": "none"
   },
   {
     "int": 6,
-    "tier": "low_cognition",
-    "model": "gpt-oss-20b",
-    "reasoningEffort": null
+    "tier": "mindless_dull",
+    "model": "gpt-5.5",
+    "reasoningEffort": "none"
   },
   {
     "int": 7,
-    "tier": "basic_adventurer",
-    "model": "gpt-4o-mini",
-    "reasoningEffort": null
+    "tier": "below_average",
+    "model": "gpt-5.5",
+    "reasoningEffort": "low"
   },
   {
     "int": 8,
-    "tier": "broad_context",
-    "model": "gpt-oss-120b",
-    "reasoningEffort": null
+    "tier": "below_average",
+    "model": "gpt-5.5",
+    "reasoningEffort": "low"
   },
   {
     "int": 9,
-    "tier": "trained",
-    "model": "gpt-4.1-mini",
-    "reasoningEffort": null
+    "tier": "average",
+    "model": "gpt-5.5",
+    "reasoningEffort": "low"
   },
   {
     "int": 10,
-    "tier": "baseline_human",
-    "model": "gpt-4.1",
-    "reasoningEffort": null
+    "tier": "average",
+    "model": "gpt-5.5",
+    "reasoningEffort": "low"
   },
   {
     "int": 11,
-    "tier": "above_average",
-    "model": "o3",
+    "tier": "clever_scholar",
+    "model": "gpt-5.5",
     "reasoningEffort": "medium"
   },
   {
     "int": 12,
-    "tier": "sharp",
-    "model": "o3",
-    "reasoningEffort": "high"
+    "tier": "clever_scholar",
+    "model": "gpt-5.5",
+    "reasoningEffort": "medium"
   },
   {
     "int": 13,
-    "tier": "gifted",
-    "model": "gpt-5-nano",
+    "tier": "gifted_expert",
+    "model": "gpt-5.5",
     "reasoningEffort": "medium"
   },
   {
     "int": 14,
-    "tier": "expert",
-    "model": "gpt-5-mini",
-    "reasoningEffort": "high"
+    "tier": "gifted_expert",
+    "model": "gpt-5.5",
+    "reasoningEffort": "medium"
   },
   {
     "int": 15,
-    "tier": "master",
-    "model": "gpt-5.4-nano",
-    "reasoningEffort": "medium"
-  },
-  {
-    "int": 16,
-    "tier": "master_plus",
-    "model": "gpt-5.4-mini",
-    "reasoningEffort": "high"
-  },
-  {
-    "int": 17,
-    "tier": "genius",
-    "model": "gpt-5.4",
-    "reasoningEffort": "medium"
-  },
-  {
-    "int": 18,
-    "tier": "strategic_genius",
-    "model": "gpt-5.4",
-    "reasoningEffort": "high"
-  },
-  {
-    "int": 19,
-    "tier": "near_superhuman",
+    "tier": "genius_master",
     "model": "gpt-5.5",
     "reasoningEffort": "high"
   },
   {
+    "int": 16,
+    "tier": "genius_master",
+    "model": "gpt-5.5",
+    "reasoningEffort": "high"
+  },
+  {
+    "int": 17,
+    "tier": "archmage",
+    "model": "gpt-5.5",
+    "reasoningEffort": "high"
+  },
+  {
+    "int": 18,
+    "tier": "archmage",
+    "model": "gpt-5.5",
+    "reasoningEffort": "high"
+  },
+  {
+    "int": 19,
+    "tier": "godlike_oracle",
+    "model": "gpt-5.5",
+    "reasoningEffort": "xhigh"
+  },
+  {
     "int": 20,
-    "tier": "superhuman",
+    "tier": "godlike_oracle",
     "model": "gpt-5.5",
     "reasoningEffort": "xhigh"
   }

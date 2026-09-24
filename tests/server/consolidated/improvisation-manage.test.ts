@@ -799,9 +799,17 @@ describe('improvisation_manage consolidated tool', () => {
                 dc: 15
             }, ctx);
 
+            // FINDINGS #63: stunts render in the PDA check grammar, replacing
+            // the old 'Improvised Stunt' header. The banner still carries the
+            // skill, verdict, total vs DC and the d20 arithmetic.
             const text = result.content[0].text;
-            // Header uses uppercase format
-            expect(text.toUpperCase()).toContain('IMPROVISED STUNT');
+            const data = parseResult(result);
+            const banner = text.split('<!-- IMPROVISATION_MANAGE_JSON')[0];
+            expect(banner).toContain(`ATHLETICS STUNT · ${data.total} vs DC 15`);
+            expect(banner).toContain(data.success ? 'SUCCESS' : 'FAILED');
+            expect(banner).not.toContain(data.success ? 'FAILED' : 'SUCCESS');
+            const sign = data.bonus >= 0 ? '+' : '';
+            expect(banner).toContain(`d20[${data.natural}] ${sign}${data.bonus} → ${data.total}`);
         });
 
         it('should include rich text formatting for synthesis', async () => {

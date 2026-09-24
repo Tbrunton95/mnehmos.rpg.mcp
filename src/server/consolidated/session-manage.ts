@@ -178,7 +178,7 @@ async function handleCapabilities(_input: SessionManageInput, _ctx: SessionConte
 // (a missing table is a skipped lane, never a crash); journal/revert ride
 // the shared write-journal module.
 async function handleFind(input: SessionManageInput & { query?: string; limit?: number }, _ctx: SessionContext): Promise<McpResponse> {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const db = getDb();
     const q = `%${input.query ?? ''}%`;
     const limit = input.limit ?? 8;
     // FINDINGS #111: worldId is a STRICT filter on every lane that carries one
@@ -221,7 +221,7 @@ async function handleFind(input: SessionManageInput & { query?: string; limit?: 
 }
 
 async function handleJournal(input: SessionManageInput & { entityTable?: string; entityId?: string; limit?: number }, _ctx: SessionContext): Promise<McpResponse> {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const db = getDb();
     const rows = readJournal(db, { table: input.entityTable, entityId: input.entityId, limit: input.limit });
     const payload = { success: true, actionType: 'journal', count: rows.length, writes: rows };
     let output = RichFormatter.header('Write Journal', '📜');
@@ -232,7 +232,7 @@ async function handleJournal(input: SessionManageInput & { entityTable?: string;
 }
 
 async function handleRevert(input: SessionManageInput & { writeId?: number }, _ctx: SessionContext): Promise<McpResponse> {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const db = getDb();
     if (input.writeId === undefined) {
         const payload = { error: true, message: 'revert requires writeId — session_manage journal to list entries' };
         return { content: [{ type: 'text', text: RichFormatter.error(payload.message) + RichFormatter.embedJson(payload, 'SESSION_MANAGE') }] };

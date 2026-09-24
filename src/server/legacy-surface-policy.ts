@@ -17,5 +17,8 @@ export const LEGACY_SURFACE_POLICY = Object.freeze({
         { legacyTool: 'preview_map_patch', consolidatedAction: 'preview' },
         { legacyTool: 'find_valid_poi_location', consolidatedAction: 'find_poi' },
         { legacyTool: 'suggest_poi_locations', consolidatedAction: 'suggest_poi' },
-    ])
+    ]),
+    // world_map actions implemented directly in the consolidated handler,
+    // with no legacy adapter behind them.
+    nativeActions: Object.freeze(['list_pois'])
 } as const);

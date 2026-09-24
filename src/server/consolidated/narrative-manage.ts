@@ -20,7 +20,7 @@ import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/a
 // CONSTANTS & ENUMS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['add', 'batch_add', 'search', 'update', 'get', 'delete', 'get_context'] as const;
+const ACTIONS = ['add', 'batch_add', 'search', 'update', 'get', 'delete', 'get_context', 'append'] as const;
 type NarrativeAction = typeof ACTIONS[number];
 
 const NOTE_TYPE_VALUES = [
@@ -28,7 +28,10 @@ const NOTE_TYPE_VALUES = [
     'canonical_moment',
     'npc_voice',
     'foreshadowing',
-    'session_log'
+    'session_log',
+    // FINDINGS #96 (GAP 4): the growing-file type — bestiary pages, anomaly
+    // files, field notes. Pairs with the append action: entries GROW.
+    'bestiary'
  ] as const;
 const noteTypeSchema = () => z.enum(NOTE_TYPE_VALUES);
 
@@ -86,7 +89,39 @@ const SessionLogMetadata = z.object({
 // ═══════════════════════════════════════════════════════════════════════════
 
 function ensureDb() {
-    return getDb();
+    const db = getDb();
+    migrateBestiaryCheck(db);
+    return db;
+}
+
+// FINDINGS #96-C (BUG B): the Zod layer took 'bestiary'; the narrative_notes
+// CHECK constraint (baked into the table DDL) did not — schema migrated, DB
+// wasn't. SQLite cannot ALTER a CHECK: guarded one-time table rebuild inside
+// a transaction — copy, drop, rename, reindex. Runs once per database handle
+// (each campaign has its own file); every later call sees 'bestiary' in the
+// stored DDL and skips.
+const bestiaryMigrated = new WeakSet<object>();
+function migrateBestiaryCheck(db: ReturnType<typeof getDb>): void {
+    if (bestiaryMigrated.has(db)) return;
+    try {
+        const row = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='narrative_notes'").get() as { sql?: string } | undefined;
+        if (!row?.sql) { bestiaryMigrated.add(db); return; }
+        if (/bestiary/.test(row.sql) || !/CHECK/i.test(row.sql)) { bestiaryMigrated.add(db); return; }
+        const newSql = row.sql
+            .replace(/CREATE TABLE ("?)narrative_notes("?)/i, 'CREATE TABLE $1narrative_notes_new$2')
+            .replace(/'session_log'/g, "'session_log', 'bestiary'");
+        if (!/bestiary/.test(newSql)) { bestiaryMigrated.add(db); return; } // enum literal not found — leave untouched, refuse-not-corrupt
+        const indexes = db.prepare("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='narrative_notes' AND sql IS NOT NULL").all() as Array<{ sql: string }>;
+        const migrate = db.transaction(() => {
+            db.exec(newSql);
+            db.exec('INSERT INTO narrative_notes_new SELECT * FROM narrative_notes');
+            db.exec('DROP TABLE narrative_notes');
+            db.exec('ALTER TABLE narrative_notes_new RENAME TO narrative_notes');
+            for (const ix of indexes) { try { db.exec(ix.sql); } catch { /* index name survives rename on some builds */ } }
+        });
+        migrate();
+        bestiaryMigrated.add(db);
+    } catch { /* migration failed — adds of type bestiary keep refusing at the CHECK, loudly, until fixed; nothing corrupted */ }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -96,7 +131,7 @@ function ensureDb() {
 const AddSchema = z.object({
     action: z.literal('add'),
     worldId: z.string().describe('World/campaign ID'),
-    type: noteTypeSchema().describe('Note type: plot_thread, canonical_moment, npc_voice, foreshadowing, session_log'),
+    type: noteTypeSchema().describe('Note type: plot_thread, canonical_moment, npc_voice, foreshadowing, session_log, bestiary'),
     content: z.string().min(1).describe('Main text content'),
     metadata: z.record(z.any()).optional().default({}).describe('Type-specific structured data'),
     visibility: visibilitySchema().optional().default('dm_only'),
@@ -127,6 +162,11 @@ const SearchSchema = z.object({
     query: z.string().optional().describe('Text search in content'),
     type: noteTypeSchema().optional().describe('Filter by note type'),
     status: noteStatusSchema().optional().describe('Filter by status'),
+    // FINDINGS #61: the outer schema advertised these but the inner stripped them
+    // — the mirror family inverted. No defaults: absent = unfiltered (search must
+    // not silently narrow; that is get_context's job).
+    includeTypes: z.array(noteTypeSchema()).optional().describe('Filter by multiple note types (IN)'),
+    statusFilter: z.array(noteStatusSchema()).optional().describe('Filter by multiple statuses (IN)'),
     tags: z.array(z.string()).optional().describe('Filter by tags (AND logic)'),
     entityId: z.string().optional().describe('Filter by linked entity'),
     visibility: visibilitySchema().optional().describe('Filter by visibility'),
@@ -138,6 +178,7 @@ const UpdateSchema = z.object({
     action: z.literal('update'),
     noteId: z.string().describe('ID of the note to update'),
     content: z.string().optional().describe('New content'),
+    type: noteTypeSchema().optional().describe('FINDINGS #96-C: re-type a note (e.g. plot_thread → bestiary) — the migration lane for pages that grew into a different kind'),
     metadata: z.record(z.any()).optional().describe('Merge into existing metadata'),
     status: noteStatusSchema().optional().describe('Change status'),
     visibility: visibilitySchema().optional(),
@@ -304,6 +345,18 @@ async function handleSearch(args: z.infer<typeof SearchSchema>): Promise<object>
         params.push(args.status);
     }
 
+    // FINDINGS #61: plural filters now actually filter (IN clauses); they AND
+    // with the singular forms when both are passed.
+    if (args.includeTypes && args.includeTypes.length > 0) {
+        sql += ` AND type IN (${args.includeTypes.map(() => '?').join(',')})`;
+        params.push(...args.includeTypes);
+    }
+
+    if (args.statusFilter && args.statusFilter.length > 0) {
+        sql += ` AND status IN (${args.statusFilter.map(() => '?').join(',')})`;
+        params.push(...args.statusFilter);
+    }
+
     if (args.visibility) {
         sql += ` AND visibility = ?`;
         params.push(args.visibility);
@@ -349,7 +402,58 @@ async function handleSearch(args: z.infer<typeof SearchSchema>): Promise<object>
 
     return {
         count: results.length,
+        // FINDINGS #87: FILTER ECHO — the #61 filters ARE honored server-side,
+        // but a stale client schema strips array params before they arrive, and
+        // the server cannot refuse what it never received. Echoing what was
+        // ACTUALLY applied makes the strip visible: you passed includeTypes,
+        // the echo says none — your schema is stale; reopen the client or
+        // route raw args via batch (03 §9). session_manage capabilities
+        // confirms the server side in one call.
+        appliedFilters: {
+            query: args.query ?? null,
+            type: args.type ?? null,
+            includeTypes: args.includeTypes ?? null,
+            status: args.status ?? null,
+            statusFilter: args.statusFilter ?? null,
+            tags: args.tags ?? null,
+            entityId: args.entityId ?? null,
+            visibility: args.visibility ?? null
+        },
         notes: results
+    };
+}
+
+// FINDINGS #96 (GAP 4): APPEND — the growing-file verb. A bestiary page
+// (rumor → tracks → class guess → weakness CONFIRMED) grows by dated
+// sections instead of wholesale rewrites; the file's history IS the
+// investigation. Serves witcher bestiaries, KEEPER anomaly files, SCP
+// documents, PSAR field notes alike.
+const AppendSchema = z.object({
+    action: z.literal('append'),
+    noteId: z.string().describe('Note to grow'),
+    content: z.string().min(1).describe('The new section — appended, never replacing'),
+    day: z.union([z.number(), z.string()]).optional().describe('In-fiction date stamp for the section header, e.g. 12 or "Day 12, dusk"')
+});
+
+async function handleAppend(args: z.infer<typeof AppendSchema>): Promise<object> {
+    const db = ensureDb();
+    const existing = db.prepare('SELECT * FROM narrative_notes WHERE id = ?').get(args.noteId) as NarrativeNoteRow | undefined;
+    if (!existing) return { error: true, message: `Note ${args.noteId} not found — nothing appended` };
+    const stamp = args.day !== undefined
+        ? (/^\d+(\.\d+)?$/.test(String(args.day)) ? `Day ${args.day}` : String(args.day))
+        : new Date().toISOString().slice(0, 10);
+    const section = `\n\n── [${stamp}] ──\n${args.content}`;
+    const newContent = existing.content + section;
+    db.prepare('UPDATE narrative_notes SET content = ?, updated_at = ? WHERE id = ?').run(newContent, new Date().toISOString(), args.noteId);
+    return {
+        success: true,
+        actionType: 'append',
+        noteId: args.noteId,
+        type: existing.type,
+        stamp,
+        appendedChars: args.content.length,
+        totalChars: newContent.length,
+        message: `Section [${stamp}] appended — the file grows (${newContent.length} chars total)`
     };
 }
 
@@ -370,6 +474,12 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     if (args.content !== undefined) {
         updates.push('content = ?');
         params.push(args.content);
+    }
+
+    // FINDINGS #96-C: type is updatable — the plot_thread→bestiary migration lane.
+    if (args.type !== undefined) {
+        updates.push('type = ?');
+        params.push(args.type);
     }
 
     if (args.status !== undefined) {
@@ -410,7 +520,9 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     return {
         success: true,
         noteId: args.noteId,
-        message: `Updated note. Changes: ${updates.slice(0, -1).join(', ')}`
+        // FINDINGS #61: was joining raw SQL fragments ("status = ?") — unbound
+        // placeholders leaking into user-facing text. Field names only.
+        message: `Updated note. Changed: ${updates.slice(0, -1).map(u => u.split(' =')[0]).join(', ')}`
     };
 }
 
@@ -578,6 +690,12 @@ const definitions: Record<NarrativeAction, ActionDefinition> = {
         aliases: ['edit', 'modify'],
         description: 'Update an existing note'
     },
+    append: {
+        schema: AppendSchema,
+        handler: handleAppend,
+        aliases: ['grow', 'add_section', 'log_entry'],
+        description: 'FINDINGS #96: append a dated section to a note — bestiary pages, anomaly files, field notes GROW instead of being rewritten. {noteId, content, day?}'
+    },
     get: {
         schema: GetSchema,
         handler: handleGet,
@@ -641,11 +759,12 @@ Actions: add, batch_add, search, update, get, delete, get_context
 Aliases: add_many/bulk_add/log_session→batch_add, create→add, find→search, context→get_context`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
-        action: z.string().describe('Action: add, batch_add, search, update, get, delete, get_context'),
+        action: z.string().describe('Action: add, batch_add, search, update, get, delete, get_context, append (#96)'),
         worldId: z.string().optional().describe('World ID (required for add, search, get_context)'),
-        noteId: z.string().optional().describe('Note ID (required for get, update, delete)'),
-        type: noteTypeSchema().optional().describe('Note type: plot_thread, canonical_moment, npc_voice, foreshadowing, session_log'),
-        content: z.string().optional().describe('Note content (required for add)'),
+        noteId: z.string().optional().describe('Note ID (required for get, update, delete, append)'),
+        day: z.union([z.number(), z.string()]).optional().describe('append: in-fiction date stamp for the section header (#96)'),
+        type: noteTypeSchema().optional().describe('Note type: plot_thread, canonical_moment, npc_voice, foreshadowing, session_log, bestiary (#96)'),
+        content: z.string().optional().describe('Note content (required for add; the appended section for append)'),
         metadata: z.record(z.any()).optional().describe('Type-specific metadata'),
         visibility: visibilitySchema().optional(),
         tags: z.array(z.string()).optional(),

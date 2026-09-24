@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { getToolContext } from '../../server/tool-context.js';
 import { Character, CharacterSchema, NPC, NPCSchema } from '../../schema/character.js';
 import { CharacterType } from '../../schema/party.js';
 
@@ -95,7 +96,17 @@ export class CharacterRepository {
         const stmt = this.db.prepare('SELECT * FROM characters WHERE id = ?');
         const row = stmt.get(id) as CharacterRow | undefined;
 
-        if (!row) return null;
+        if (!row) {
+            // FINDINGS #70: truncated-UUID rescue — exact miss falls through to
+            // a prefix match, ≥6 chars, resolving ONLY on exactly one hit.
+            // Unique-or-nothing makes this safe on the write paths too: an
+            // ambiguous prefix stays not-found, never a guess.
+            if (id.length >= 6 && id.length < 36) {
+                const hits = this.db.prepare('SELECT * FROM characters WHERE id LIKE ? LIMIT 2').all(`${id}%`) as CharacterRow[];
+                if (hits.length === 1) return this.rowToCharacter(hits[0]);
+            }
+            return null;
+        }
         return this.rowToCharacter(row);
     }
 
@@ -122,12 +133,55 @@ export class CharacterRepository {
     update(id: string, updates: Partial<Character | NPC>): Character | NPC | null {
         const existing = this.findById(id);
         if (!existing) return null;
+        // FINDINGS #77: existing.id from here down — the resolve must propagate.
+        // The raw argument previously fed BOTH the audit rows and the UPDATE's
+        // WHERE: a prefix call wrote an audit trail for a transition that never
+        // happened, then matched zero rows and returned the merged object as if
+        // written. The audit logging the lie is the worst family variant found.
+        const canonicalId = existing.id;
 
         const updated = {
             ...existing,
             ...updates,
             updatedAt: new Date().toISOString()
         };
+
+        // FINDINGS #34 T1.4: attribute every HP / pool write to its tool.
+        try {
+            const auditStmt = this.db.prepare(
+                `INSERT INTO write_audit (character_id, field, old_value, new_value, source, created_at) VALUES (?, ?, ?, ?, ?, ?)`
+            );
+            const src = getToolContext();
+            const now = new Date().toISOString();
+            if (updates.hp !== undefined && updates.hp !== existing.hp) {
+                auditStmt.run(canonicalId, 'hp', String(existing.hp), String(updates.hp), src, now);
+            }
+            if (updates.maxHp !== undefined && updates.maxHp !== existing.maxHp) {
+                auditStmt.run(canonicalId, 'maxHp', String(existing.maxHp), String(updates.maxHp), src, now);
+            }
+            // Findings #35: XP and level join the audited set — XP has drifted before.
+            const updXp = (updates as { xp?: number }).xp;
+            const exXp = (existing as { xp?: number }).xp ?? 0;
+            if (updXp !== undefined && updXp !== exXp) {
+                auditStmt.run(canonicalId, 'xp', String(exXp), String(updXp), src, now);
+            }
+            if (updates.level !== undefined && updates.level !== existing.level) {
+                auditStmt.run(canonicalId, 'level', String(existing.level), String(updates.level), src, now);
+            }
+            const newPools = (updates as { resourcePools?: Record<string, { current: number; max: number }> }).resourcePools;
+            const oldPools = (existing as { resourcePools?: Record<string, { current: number; max: number }> }).resourcePools || {};
+            if (newPools) {
+                for (const [pool, val] of Object.entries(newPools)) {
+                    const before = oldPools[pool];
+                    if (!before || before.current !== val.current || before.max !== val.max) {
+                        auditStmt.run(canonicalId, `pool:${pool}`, before ? `${before.current}/${before.max}` : 'absent', `${val.current}/${val.max}`, src, now);
+                    }
+                }
+                for (const pool of Object.keys(oldPools)) {
+                    if (!(pool in newPools)) auditStmt.run(canonicalId, `pool:${pool}`, `${oldPools[pool].current}/${oldPools[pool].max}`, 'DELETED', src, now);
+                }
+            }
+        } catch { /* audit must never block the write (table may predate migration) */ }
 
         // Validate
         const isNPC = 'factionId' in updated || 'behavior' in updated;
@@ -204,15 +258,25 @@ export class CharacterRepository {
             validChar.alignment ?? null,
             validChar.origin ? JSON.stringify(validChar.origin) : null,
             validChar.updatedAt,
-            id
+            canonicalId
         );
 
         return validChar;
     }
 
     delete(id: string): boolean {
+        // FINDINGS #77: resolve before deleting — the raw id no-opped both the
+        // instance cleanup and the delete on a prefix call.
+        const existing = this.findById(id);
+        if (!existing) return false;
+        // FINDINGS #59: instance rows are per-owner state and die with the row.
+        // Corpse/loot flows re-home instances BEFORE anyone deletes; a straight
+        // admin delete otherwise strands orphans (the #59 probe did exactly this).
+        try {
+            this.db.prepare('DELETE FROM item_instances WHERE owner_character_id = ?').run(existing.id);
+        } catch { /* instances table absent pre-migration — nothing to clean */ }
         const stmt = this.db.prepare('DELETE FROM characters WHERE id = ?');
-        const result = stmt.run(id);
+        const result = stmt.run(existing.id);
         return result.changes > 0;
     }
 

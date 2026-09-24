@@ -40,7 +40,7 @@ type VehicleRow = {
 };
 
 function vdb() {
-    const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : process.env.RPG_DATA_DIR ? `${process.env.RPG_DATA_DIR}/rpg.db` : 'rpg.db');
+    const db = getDb();
     db.exec(`CREATE TABLE IF NOT EXISTS vehicles (
         id TEXT PRIMARY KEY, world_id TEXT NOT NULL, name TEXT NOT NULL,
         make TEXT, plate TEXT, registered_to TEXT, owner_character_id TEXT,
@@ -178,5 +178,7 @@ Actions: create, get, list, update, add_defect, clear_defect, note_known, delete
 - Cavities/boot are container_manage rows with ownerType:'vehicle' — create returns the exact call; get JOINs them in.
 - expectName guards update/delete. delete refuses while containers are attached.
 worldId REQUIRED on every call.`,
-    inputSchema: VehicleInputSchema
+    inputSchema: VehicleInputSchema,
+    // Every action shares the one input schema; the switch dispatcher validates per action.
+    actionSchemas: Object.fromEntries(ACTIONS.map(a => [a, { schema: VehicleInputSchema, aliases: [] as string[] }]))
 };

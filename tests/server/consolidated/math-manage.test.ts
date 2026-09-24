@@ -385,8 +385,18 @@ describe('math_manage consolidated tool', () => {
                 expression: '2d6'
             }, ctx);
 
+            // FINDINGS #62/#66: the old 'Dice Roll' header became the PDA
+            // raw-roll banner. It must say no DC was evaluated and still show
+            // the expression, total, every roll step and the seed.
             const text = result.content[0].text;
-            expect(text.toUpperCase()).toContain('DICE ROLL');
+            const data = parseResult(result);
+            const banner = text.split('<!-- MATH_MANAGE_JSON')[0];
+            expect(banner).toContain('NO TARGET SET');
+            expect(banner).toContain(`2d6 RAW ROLL · total ${data.total}`);
+            expect(banner).toContain('no DC passed');
+            expect(data.rolls.length).toBeGreaterThan(0);
+            for (const step of data.rolls) expect(banner).toContain(step);
+            expect(banner).toContain(`seed ${data.seed}`);
         });
 
         it('should include rich text formatting for probability', async () => {

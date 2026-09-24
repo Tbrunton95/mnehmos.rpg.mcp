@@ -387,9 +387,12 @@ describe('npc_manage consolidated tool', () => {
             }, ctx);
 
             const data = parseResult(result);
-            // Will error because character not in room, but action should be recognized
-            expect(data.error).toBe(true);
-            expect(data.message).toContain('not in any room');
+            expect(data.actionType).toBe('interact');
+            // FINDINGS #81: a speaker with no room no longer errors — interact
+            // runs non-spatially and says so.
+            expect(data.success).toBe(true);
+            expect(data.spatial).toBe(false);
+            expect(data.speaker.id).toBe(testCharacterId);
         });
     });
 

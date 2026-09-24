@@ -3,6 +3,8 @@ import { loadAutoMechanics, autoAttackBonus, autoAcBonus, autoDamageBonus, apply
 import * as pda from '../../render/pda.js';
 import { randomUUID } from 'crypto';
 import { CombatEngine, CombatParticipant, CombatState, CombatActionResult } from '../../engine/combat/engine.js';
+import { normalizeConditions } from '../../engine/combat/conditions.js';
+import { ConditionInputSchema } from '../../schema/encounter.js';
 import { SpatialEngine } from '../../engine/spatial/engine.js';
 
 import { PubSub } from '../../engine/pubsub.js';
@@ -13,7 +15,7 @@ import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { SessionContext } from '../types.js';
 
 // CRIT-006: Import spellcasting validation and resolution
-import { validateSpellCast, consumeSpellSlot } from '../../engine/magic/spell-validator.js';
+import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
@@ -69,6 +71,33 @@ function syncParticipantHpFromDb(state: CombatState): CombatState {
     }
 
     return state;
+}
+
+/**
+ * Write participant HP back to the character database (the reverse of
+ * syncParticipantHpFromDb). Lair damage, damage-over-time, opportunity
+ * attacks and death-save crits change HP only in the engine; without this
+ * the next DB→memory sync reverted them and the characters row never saw
+ * them. Only participants backed by a characters row are written.
+ */
+function persistParticipantHpToDb(state: CombatState): void {
+    const charRepo = new CharacterRepository(getDb());
+    for (const participant of state.participants) {
+        const character = charRepo.findById(participant.id);
+        if (character && (character.hp !== participant.hp || character.maxHp !== participant.maxHp)) {
+            charRepo.update(participant.id, { hp: participant.hp, maxHp: participant.maxHp });
+        }
+    }
+}
+
+/**
+ * Save encounter state from a handler that can change HP. Such handlers must
+ * call syncParticipantHpFromDb first, so an HP change made through
+ * character_manage between calls is read before this writes memory back.
+ */
+function saveEncounterState(repo: EncounterRepository, encounterId: string, state: CombatState): void {
+    persistParticipantHpToDb(state);
+    repo.saveState(encounterId, state);
 }
 
 // ============================================================
@@ -222,6 +251,7 @@ function formatAttackResult(result: CombatActionResult): string {
         crit: ar?.isCrit,
         damageTotal: result.damage,
         damageType: rr.damageType,
+        damageModifier: result.damageModifier,
         damageRolls: (result as CombatActionResult & { damageRolls?: number[] }).damageRolls,
         hpBefore: result.target?.hpBefore,
         hpAfter: result.target?.hpAfter,
@@ -603,7 +633,8 @@ Example (use real UUID from context for player character!):
                     .describe('Adds a LAIR slot at initiative 20 to the turn order'),
                 ac: z.number().int().min(0).optional()
                     .describe('Armor Class (used by attack resolution; defaults to attacker-side derivation if omitted)'),
-                conditions: z.array(z.string()).default([]),
+                conditions: z.array(ConditionInputSchema).default([])
+                    .describe('Names ("prone") or {name|type, duration?, source?} objects; unknown names are kept as custom conditions with no mechanical effect'),
                 position: z.object({ x: z.number(), y: z.number(), z: z.number().optional() }).optional()
                     .describe('CRIT-003: Spatial position for movement (x, y coordinates)'),
                 // HIGH-002: Damage modifiers
@@ -1121,16 +1152,17 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
         // (the soft-AC trap). Explicit ac still wins below; ad-hoc tokens with
         // no row keep the heuristic.
         if (p.ac === undefined && extraStats.ac === undefined && p.id) {
-            const acDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+            const acDb = getDb();
             const row = new CharacterRepository(acDb).findById(p.id);
             if (row?.ac !== undefined) {
                 extraStats.ac = row.ac;
             }
         }
 
+        const id = p.id || randomUUID();
         const participant = {
             // CRITICAL FIX: Auto-generate ID if not provided to prevent React key collisions
-            id: p.id || randomUUID(),
+            id,
             name: preset ? preset.name : p.name,
             hp: p.hp,
             maxHp: p.maxHp,
@@ -1138,7 +1170,9 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             initiativeBonus: p.initiativeBonus ?? 0,
             isEnemy: p.isEnemy ?? false,
             hasLairActions: p.hasLairActions ?? false,
-            conditions: p.conditions || [],
+            // Callers send names or character-row {name, ...} entries; the
+            // engine and the encounter token schema need Condition objects.
+            conditions: normalizeConditions(p.conditions, id),
             position: p.position,
             resistances: p.resistances,
             vulnerabilities: p.vulnerabilities,
@@ -1298,6 +1332,10 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         getCombatManager().create(`${ctx.sessionId}:${parsed.encounterId}`, engine);
     }
 
+    // Read character_manage HP changes before this action writes HP back.
+    const syncState = engine.getState();
+    if (syncState) syncParticipantHpFromDb(syncState);
+
     // Turn-identity advisory (issue #49). Every action routed through this
     // handler (attack / cast_spell / move / dash / dodge / help / heal /
     // disengage / ready) is an on-turn action. If actorId doesn't match the
@@ -1385,7 +1423,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
 
         // RESOLVER v1 (Findings #19): consume autoApply-flagged trait mechanics.
         // Bare/prose-conditional mechanics stay GM-declared by design.
-        const resolverDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+        const resolverDb = getDb();
         const autoApplied: import('../../engine/effects-resolver.js').AutoApplication[] = [];
         const actorMechs = loadAutoMechanics(resolverDb, parsed.actorId);
         attackBonus += autoAttackBonus(actorMechs, autoApplied);
@@ -1530,7 +1568,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
 
             if (targetChar && concentrationRepo.isConcentrating(parsed.targetId)) {
                 // RESOLVER v1: autoApply saving_throw_bonus (con-filtered) feeds the hold.
-                const conMechs = loadAutoMechanics(getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db'), parsed.targetId);
+                const conMechs = loadAutoMechanics(getDb(), parsed.targetId);
                 const conBonus = conMechs.filter(m => m.type === 'saving_throw_bonus' && (!m.condition || 'constitution'.includes(m.condition.toLowerCase()) || m.condition.toLowerCase().includes('con'))).reduce((s, m) => s + m.value, 0);
                 const concentrationCheck = checkConcentration(targetChar, result.damage, concentrationRepo, conBonus);
                 if (concentrationCheck.broken) {
@@ -1567,7 +1605,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         try {
             const natDie = (result.attackRoll as { roll?: number } | undefined)?.roll;
             if (typeof natDie === 'number' && natDie <= 3) {
-                const jamDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+                const jamDb = getDb();
                 const mh = jamDb.prepare(`
                     SELECT i.name AS name, i.id AS templateId FROM inventory_items inv
                     JOIN items i ON i.id = inv.item_id
@@ -1957,10 +1995,16 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         const saveType = damageEffect?.saveType;
         const saveEffect = damageEffect?.saveEffect;
         const requiresSave = saveType && saveType !== 'none';
-        const spellSaveDC = casterChar.spellSaveDC || (8 + 2 + Math.floor((casterChar.stats?.int ?? 10) - 10) / 2);
+        const spellSaveDC = casterChar.spellSaveDC || calculateSpellSaveDC(casterChar);
+        // Each target rolls its own save below, so a save spell starts from the
+        // full roll. resolution.damage already carries the resolver's single
+        // unmodified save; using it would halve (or zero) the damage twice.
+        const baseDamage = requiresSave
+            ? (resolution.damageRolled ?? resolution.damage ?? 0)
+            : (resolution.damage ?? 0);
 
         // Apply damage/healing to ALL targets
-        if (resolution.damage && resolution.damage > 0 && allTargetIds.length > 0) {
+        if (baseDamage > 0 && allTargetIds.length > 0) {
             const db = getDb();
             const concentrationRepo = new ConcentrationRepository(db);
 
@@ -1969,7 +2013,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 if (!targetParticipant) continue;
 
                 const hpBefore = targetParticipant.hp;
-                let damageDealt = resolution.damage;
+                let damageDealt = baseDamage;
                 let saveRoll: number | undefined;
                 let saveTotal: number | undefined;
                 let saved = false;
@@ -1996,7 +2040,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
 
                     if (saved) {
                         if (saveEffect === 'half') {
-                            damageDealt = Math.floor(resolution.damage / 2);
+                            damageDealt = Math.floor(baseDamage / 2);
                         } else {
                             damageDealt = 0; // No damage on successful save (saveEffect: 'none')
                         }
@@ -2113,7 +2157,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             output += `│ ✨ ${spell.name.toUpperCase()} (AoE)\n`;
             output += `└─────────────────────────────────────────┘\n\n`;
             output += `${actor.name} casts ${spell.name}!\n\n`;
-            output += `💥 Base Damage: ${resolution.damage} ${damageType}\n`;
+            output += `💥 Base Damage: ${baseDamage} ${damageType}\n`;
             if (requiresSave) {
                 output += `🎯 Save: ${saveType!.toUpperCase()} DC ${spellSaveDC}\n`;
             }
@@ -2129,14 +2173,27 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 }
             }
         } else if (damageResults.length === 1) {
-            output = formatSpellCastResult(actor.name, resolution, primaryTarget, targetHpBefore);
+            // Show the target's own save and the damage it actually took,
+            // not the resolver's single unmodified save.
+            const only = damageResults[0];
+            const shown = requiresSave
+                ? { ...resolution, damage: only.damageDealt ?? baseDamage, saveResult: (only.saved ? 'passed' : 'failed') as 'passed' | 'failed', saveDC: spellSaveDC }
+                : resolution;
+            output = formatSpellCastResult(actor.name, shown, primaryTarget, targetHpBefore);
         } else {
             output = `\n✨ ${actor.name} casts ${spell.name}!\n`;
             if (resolution.healing && resolution.healing > 0) {
                 output += `💚 Healing: ${resolution.healing}\n`;
             }
         }
-        output += `\n[SPELL: ${spell.name}, SLOT: ${effectiveSlotLevel > 0 ? effectiveSlotLevel : 'cantrip'}, DMG: ${resolution.damage || 0}, HEAL: ${resolution.healing || 0}]`;
+        // Save spells report what targets took; with no participant targets
+        // (a point-targeted AoE) the full roll is the spell's damage.
+        const reportedDamage = requiresSave
+            ? (damageResults.length > 0
+                ? damageResults.reduce((sum, dr) => sum + (dr.damageDealt ?? 0), 0)
+                : baseDamage)
+            : (resolution.damage || 0);
+        output += `\n[SPELL: ${spell.name}, SLOT: ${effectiveSlotLevel > 0 ? effectiveSlotLevel : 'cantrip'}, DMG: ${reportedDamage}, HEAL: ${resolution.healing || 0}]`;
 
         // Commit Action Economy
         engine.commitAction(parsed.actorId, actionType, effectiveSlotLevel);
@@ -2157,7 +2214,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             defeated: firstTargetResult?.defeated || false,
             message: `${actor.name} cast ${spell.name}`,
             // CRIT-006: Include spell damage/healing in result for testing and frontend
-            damage: resolution.damage,
+            damage: requiresSave ? (firstTargetResult?.damageDealt ?? baseDamage) : resolution.damage,
             healAmount: resolution.healing,
             detailedBreakdown: output
         };
@@ -2170,7 +2227,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
     if (state) {
         const db = getDb();
         const repo = new EncounterRepository(db);
-        repo.saveState(parsed.encounterId, state);
+        saveEncounterState(repo, parsed.encounterId, state);
 
         // PLAYTEST-FIX: Log action to combat history for context compaction resilience
         if (result) {
@@ -2241,7 +2298,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 hit: r.attackRoll.isHit,
                 crit: r.attackRoll.isCrit
             } : undefined,
-            damage: r.damage !== undefined ? { total: r.damage, rolls: r.damageRolls, type: (r as { damageType?: string }).damageType } : undefined,
+            // HIGH-002: modifier rides with the total the banner explains.
+            damage: r.damage !== undefined ? { total: r.damage, rolls: r.damageRolls, type: (r as { damageType?: string }).damageType, modifier: r.damageModifier } : undefined,
             healAmount: r.healAmount,
             success: r.success,
             defeated: r.defeated,
@@ -2287,6 +2345,9 @@ export async function handleAdvanceTurn(args: unknown, ctx: SessionContext) {
     }
 
     const previousParticipant = engine.getCurrentParticipant();
+    // Read character_manage HP changes before this turn writes HP back.
+    const preTurnState = engine.getState();
+    if (preTurnState) syncParticipantHpFromDb(preTurnState);
     engine.nextTurnWithConditions();
     const state = engine.getState();
 
@@ -2294,7 +2355,7 @@ export async function handleAdvanceTurn(args: unknown, ctx: SessionContext) {
     if (state) {
         const db = getDb();
         const repo = new EncounterRepository(db);
-        repo.saveState(parsed.encounterId, state);
+        saveEncounterState(repo, parsed.encounterId, state);
     }
 
     // PLAYTEST-FIX: Sync HP from character database before display
@@ -2336,7 +2397,7 @@ export async function handleEndEncounter(args: unknown, ctx: SessionContext) {
         // corpse. The store's answer drives the report: changes=0 means there
         // was nothing to close, and THAT stays a loud not-found.
         try {
-            const ghostDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+            const ghostDb = getDb();
             const r = ghostDb.prepare(`UPDATE encounters SET status = 'completed', updated_at = ? WHERE id = ? AND status = 'active'`)
                 .run(new Date().toISOString(), parsed.encounterId);
             if (r.changes > 0) {
@@ -2401,7 +2462,7 @@ export async function handleEndEncounter(args: unknown, ctx: SessionContext) {
     // 03 §9 "cosmetic" pointer was a banner-lie (#67-A class) with a documented
     // excuse. The store now agrees with the message.
     try {
-        const endDb = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+        const endDb = getDb();
         endDb.prepare(`UPDATE encounters SET status = 'completed', updated_at = ? WHERE id = ?`)
             .run(new Date().toISOString(), parsed.encounterId);
     } catch { /* encounters table absent (tests) — memory delete already done */ }
@@ -2486,6 +2547,8 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
     if (!state) {
         throw new Error('Encounter has no active state');
     }
+    // Read character_manage HP changes before the save writes HP back.
+    syncParticipantHpFromDb(state);
 
     const participant = state.participants.find(p => p.id === parsed.characterId);
     if (!participant) {
@@ -2534,7 +2597,7 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
     // Save state
     const db = getDb();
     const repo = new EncounterRepository(db);
-    repo.saveState(parsed.encounterId, engine.getState()!);
+    saveEncounterState(repo, parsed.encounterId, engine.getState()!);
 
     output += `\n<!-- STATE_JSON\n${JSON.stringify({ deathSave: { characterId: parsed.characterId, characterName: participant.name, roll: result.roll, isNat20: result.isNat20, isNat1: result.isNat1, success: result.success, successes: result.successes, failures: result.failures, stabilized: result.isStabilized, dead: result.isDead } })}\nSTATE_JSON -->`;
 
@@ -2561,6 +2624,8 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
     if (!state) {
         throw new Error('Encounter has no active state');
     }
+    // Read character_manage HP changes before the lair damage writes HP back.
+    syncParticipantHpFromDb(state);
 
     // Validate it's the lair's turn
     if (!engine.isLairActionPending()) {
@@ -2663,7 +2728,7 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
     // Save state
     const db = getDb();
     const repo = new EncounterRepository(db);
-    repo.saveState(parsed.encounterId, engine.getState()!);
+    saveEncounterState(repo, parsed.encounterId, engine.getState()!);
 
     return {
         content: [{

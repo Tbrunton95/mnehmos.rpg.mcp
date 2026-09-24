@@ -50,10 +50,11 @@ type SpatialAction = typeof ACTIONS[number];
 // SCHEMAS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const BiomeEnum = z.enum([
+const BIOME_VALUES = [
     'forest', 'mountain', 'urban', 'dungeon',
     'coastal', 'cavern', 'divine', 'arcane'
-]);
+ ] as const;
+const biomeSchema = () => z.enum(BIOME_VALUES);
 
 const AtmosphericEnum = z.enum([
     'DARKNESS', 'FOG', 'ANTIMAGIC', 'SILENCE', 'BRIGHT', 'MAGICAL'
@@ -82,7 +83,7 @@ const GenerateSchema = z.object({
     action: z.literal('generate'),
     name: z.string().min(1).max(100).describe('Room name'),
     baseDescription: z.string().min(10).max(2000).describe('Detailed description'),
-    biomeContext: BiomeEnum.describe('Biome/environment type'),
+    biomeContext: biomeSchema().describe('Biome/environment type'),
     atmospherics: z.array(AtmosphericEnum).default([]).describe('Environmental effects'),
     previousNodeId: z.string().uuid().optional().describe('Link from this room'),
     direction: DirectionEnum.optional().describe('Direction of exit from previous room'),
@@ -97,7 +98,7 @@ const UpdateSchema = z.object({
     roomId: z.string().uuid().describe('Room ID'),
     name: z.string().min(1).max(100).optional().describe('Room name'),
     baseDescription: z.string().min(10).max(2000).optional().describe('Detailed description'),
-    biomeContext: BiomeEnum.optional().describe('Biome/environment type'),
+    biomeContext: biomeSchema().optional().describe('Biome/environment type'),
     atmospherics: z.array(AtmosphericEnum).optional().describe('Environmental effects')
 });
 
@@ -109,10 +110,14 @@ const GetExitsSchema = z.object({
 const MoveSchema = z.object({
     action: z.literal('move'),
     characterId: z.string().uuid().describe('Character ID'),
-    roomId: z.string().uuid().describe('Destination room ID'),
+    roomId: z.string().uuid().optional().describe('Destination room ID; omit to follow an exit'),
+    direction: DirectionEnum.optional().describe('Exit direction to follow from the character\'s current room'),
     networkId: z.string().uuid().optional().describe('Optional node network ID to assign to the room'),
     localX: z.number().int().optional().describe('Optional local X coordinate within node network'),
     localY: z.number().int().optional().describe('Optional local Y coordinate within node network')
+}).refine(args => Boolean(args.roomId || args.direction), {
+    message: 'move requires either roomId or direction',
+    path: ['roomId']
 });
 
 const DeleteRoomSchema = z.object({
@@ -123,7 +128,7 @@ const DeleteRoomSchema = z.object({
 
 const ListSchema = z.object({
     action: z.literal('list'),
-    biome: BiomeEnum.optional().describe('Filter by biome'),
+    biome: biomeSchema().optional().describe('Filter by biome'),
     // FINDINGS #106: these two were the ROOT of the unscoped-list report — the
     // schema never declared them, so zod stripped the caller's scope BEFORE the
     // handler ever saw it. The handler filter (#106-A) is the second half.
@@ -273,6 +278,7 @@ async function handleMove(args: z.infer<typeof MoveSchema>, ctx?: SessionContext
     const result = await handleMoveCharacterToRoom({
         characterId: args.characterId,
         roomId: args.roomId,
+        direction: args.direction,
         networkId: args.networkId,
         localX: args.localX,
         localY: args.localY
@@ -617,12 +623,12 @@ Biomes: forest, mountain, urban, dungeon, coastal, cavern, divine, arcane`,
         force: z.boolean().optional().describe('delete_room: unseat occupants and delete anyway'),
         name: z.string().optional().describe('Room or network name'),
         baseDescription: z.string().optional().describe('Room description (for generate/update)'),
-        biomeContext: BiomeEnum.optional().describe('Biome type'),
+        biomeContext: biomeSchema().optional().describe('Biome type'),
         atmospherics: z.array(AtmosphericEnum).optional(),
         previousNodeId: z.string().optional(),
         autoLink: z.boolean().optional().describe('#96 generate: linear networks auto-link to the previous room; false suppresses'),
         direction: DirectionEnum.optional(),
-        biome: BiomeEnum.optional().describe('Filter biome (for list)'),
+        biome: biomeSchema().optional().describe('Filter biome (for list)'),
         networkId: z.string().optional().describe('Node network ID'),
         networkType: NetworkTypeEnum.optional().describe('Network shape'),
         worldId: z.string().optional().describe('World ID'),
@@ -646,8 +652,8 @@ export async function handleSpatialManage(args: unknown, ctx: SessionContext): P
             output += RichFormatter.alert(parsed.message || parsed.error || 'Unknown error', 'error');
             if (parsed.suggestions) {
                 output += '\n**Did you mean:**\n';
-                parsed.suggestions.forEach((s: { action: string; similarity: number }) => {
-                    output += `  • ${s.action} (${s.similarity}% match)\n`;
+                parsed.suggestions.forEach((s: { value: string; similarity: number }) => {
+                    output += `  • ${s.value} (${s.similarity}% match)\n`;
                 });
             }
         } else {

@@ -123,6 +123,7 @@ export interface CombatActionResult {
     damage?: number;
     damageRolls?: number[];  // Individual damage dice
     damageType?: string;     // Findings #40: auditable against resistances
+    damageModifier?: 'immune' | 'resistant' | 'vulnerable';  // HIGH-002: set only when one applied
     
     // Heal specifics (if type === 'heal')
     healAmount?: number;
@@ -728,6 +729,7 @@ export class CombatEngine {
             damage: damageDealt,
             damageRolls: capturedDamageRolls,
             damageType,   // Findings #40: the AP-vs-expanding lane and every resistance list key off it
+            damageModifier: damageModifier === 'normal' ? undefined : damageModifier,
             success: attackRoll.isHit,
             defeated,
             message,
@@ -1246,10 +1248,12 @@ export class CombatEngine {
         const participant = this.state.participants.find(p => p.id === participantId);
         if (!participant || participant.hp <= 0) return false;
 
-        // Check for incapacitating conditions
+        // Check for incapacitating conditions. Custom conditions (names outside
+        // ConditionType, kept verbatim by normalizeCondition) have no entry in
+        // CONDITION_EFFECTS and no mechanical effect — never a crash.
         return !participant.conditions.some(c => {
             const effects = CONDITION_EFFECTS[c.type];
-            return effects.canTakeActions === false;
+            return effects?.canTakeActions === false;
         });
     }
 
@@ -1264,7 +1268,7 @@ export class CombatEngine {
 
         return !participant.conditions.some(c => {
             const effects = CONDITION_EFFECTS[c.type];
-            return effects.canTakeReactions === false;
+            return effects?.canTakeReactions === false;
         });
     }
 
@@ -1526,7 +1530,7 @@ export class CombatEngine {
 
         return participant.conditions.some(c => {
             const effects = CONDITION_EFFECTS[c.type];
-            return effects.attacksAgainstAdvantage === true;
+            return effects?.attacksAgainstAdvantage === true;
         });
     }
 
@@ -1541,7 +1545,7 @@ export class CombatEngine {
 
         return participant.conditions.some(c => {
             const effects = CONDITION_EFFECTS[c.type];
-            return effects.attackDisadvantage === true;
+            return effects?.attackDisadvantage === true;
         });
     }
 }

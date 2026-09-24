@@ -17,7 +17,9 @@ describe('legacy tool surface policy', () => {
             Tools.FIND_VALID_POI_LOCATION.name,
             Tools.SUGGEST_POI_LOCATIONS.name,
         ];
-        const worldMapActions = Object.keys(WorldMapTool.actionSchemas ?? {});
+        const nativeActions: readonly string[] = LEGACY_SURFACE_POLICY.nativeActions;
+        const worldMapActions = Object.keys(WorldMapTool.actionSchemas ?? {})
+            .filter(action => !nativeActions.includes(action));
 
         expect(LEGACY_SURFACE_POLICY.supportedAdapters.map(entry => entry.legacyTool))
             .toEqual(legacyNames);

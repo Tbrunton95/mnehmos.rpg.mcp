@@ -22,7 +22,7 @@ import { shouldTripCircuit } from './circuit.js';
 import { checkSceneScope, composeRemoteContactSituation, RemoteContact } from './scope.js';
 import { composePrompt } from '../prompt/compose.js';
 import { ProviderError, ChatMessage } from '../provider/types.js';
-import { ResolvedCompetency, resolveCompetency } from './competency.js';
+import { ResolvedCompetency, resolveCompetency, providerModelId } from './competency.js';
 
 export interface InvokeInput {
     agentId?: string;
@@ -55,6 +55,13 @@ export interface InvokeResult {
     costSource: 'provider' | 'provider_upstream' | 'estimated' | null;
     durationMs: number | null;
     finishReason?: string;
+    /** FINDINGS #69: model the runtime RESOLVED and requested (ladder or override — agents.model is advisory). */
+    requestedModel?: string | null;
+    /** FINDINGS #69: model the provider reports having SERVED. Mismatch vs requestedModel = substitution, visible. */
+    servedModel?: string | null;
+    /** FINDINGS #69: where the resolved model came from — 'stat_derived' (INT ladder) or 'override'. */
+    competencySource?: string | null;
+    reasoningEffort?: string | null;
 }
 
 function notFound(reason: string): InvokeResult {
@@ -103,6 +110,19 @@ function estimateTokens(value: unknown): number {
     return Math.max(1, Math.ceil(text.length / 4));
 }
 
+/** FINDINGS #69: the model a provider body says it served, if it says one. A
+ * provider error on a 200 (empty content, finish_reason=length) still names
+ * it; an HTTP error body or a timeout does not, and that stays null. */
+function reportedModel(raw: string | null | undefined): string | null {
+    if (!raw) return null;
+    try {
+        const model = (JSON.parse(raw) as { model?: unknown }).model;
+        return typeof model === 'string' && model ? model : null;
+    } catch {
+        return null;
+    }
+}
+
 function resolveAgent(deps: AgentRuntimeDeps, input: InvokeInput): Agent | null {
     if (input.agentId) return deps.agentRepo.findById(input.agentId);
     if (input.characterId) return deps.agentRepo.findByCharacterId(input.characterId);
@@ -121,7 +141,8 @@ export async function invokeAgent(input: InvokeInput, deps: AgentRuntimeDeps): P
 
     const character = deps.characterRepo.findById(agent.characterId);
     const competency = resolveInvocationCompetency(agent, character);
-    const resolvedModel = competency?.model ?? agent.model;
+    // Provider-shaped: this exact id is sent, audited and reported as requested.
+    const resolvedModel = providerModelId(agent.provider, competency?.model ?? agent.model);
 
     // 2. Preflight gates
     const pre = preflight({
@@ -300,7 +321,11 @@ export async function invokeAgent(input: InvokeInput, deps: AgentRuntimeDeps): P
                 costUsd: result.costUsd ?? null,
                 costSource: result.costSource ?? 'estimated',
                 durationMs: result.durationMs,
-                finishReason: result.finishReason
+                finishReason: result.finishReason,
+                requestedModel: resolvedModel,
+                servedModel: result.model ?? null,
+                competencySource: competency?.source ?? null,
+                reasoningEffort: competency?.reasoningEffort ?? null
             };
         }
 
@@ -356,7 +381,13 @@ export async function invokeAgent(input: InvokeInput, deps: AgentRuntimeDeps): P
             costUsd: result.costUsd ?? null,
             costSource: result.costSource ?? 'estimated',
             durationMs: result.durationMs,
-            finishReason: result.finishReason
+            finishReason: result.finishReason,
+            requestedModel: resolvedModel,
+            // Only what the provider REPORTS — defaulting to the request would
+            // hide the very substitution this field exists to expose.
+            servedModel: result.model ?? null,
+            competencySource: competency?.source ?? null,
+            reasoningEffort: competency?.reasoningEffort ?? null
         };
     } catch (err) {
         clearTimeout(timeout);
@@ -402,7 +433,11 @@ export async function invokeAgent(input: InvokeInput, deps: AgentRuntimeDeps): P
             reasoningTokens: null,
             costUsd: null,
             costSource: null,
-            durationMs: null
+            durationMs: null,
+            requestedModel: resolvedModel,
+            servedModel: reportedModel(providerErr?.raw),
+            competencySource: competency?.source ?? null,
+            reasoningEffort: competency?.reasoningEffort ?? null
         };
     }
 }

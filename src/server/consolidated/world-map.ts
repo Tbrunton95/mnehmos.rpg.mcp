@@ -216,7 +216,7 @@ const definitions: Record<WorldMapAction, ActionDefinition> = {
         schema: ListPoisSchema,
         handler: async (args: z.infer<typeof ListPoisSchema>) => {
             // FINDINGS #34 T2.9: the missing POI list — travel-probing ends today.
-            const db = getDb(process.env.NODE_ENV === 'test' ? ':memory:' : 'rpg.db');
+            const db = getDb();
             try {
                 const rows = db.prepare(
                     `SELECT id, name, x, y, discoveryState FROM pois WHERE worldId = ? ORDER BY name`
