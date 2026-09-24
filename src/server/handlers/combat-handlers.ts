@@ -2502,6 +2502,7 @@ export async function handleAdvanceTurn(args: unknown, ctx: SessionContext) {
     }
 
     let output = `\n⏭️ TURN ENDED: ${previousParticipant?.name}\n`;
+    for (const note of engine.turnStartNotes) output += `♻️ ${note}\n`;
     output += state ? formatCombatStateText(state) : 'No combat state';
     
     // Append JSON for frontend

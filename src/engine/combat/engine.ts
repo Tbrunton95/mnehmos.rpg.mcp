@@ -189,6 +189,8 @@ export interface EventEmitter {
  * - Lair Actions (trigger on initiative count 20)
  */
 export class CombatEngine {
+    /** What happened at the start of the new turn (regeneration), for the advance output. */
+    turnStartNotes: string[] = [];
     private rng: CombatRNG;
     private state: CombatState | null = null;
     private emitter?: EventEmitter;
@@ -1225,6 +1227,14 @@ export class CombatEngine {
         // LEGENDARY: Reset legendary actions at start of legendary creature's turn
         this.resetLegendaryActions(participant);
 
+        // Table rules: a regenerating creature heals its stated amount at the
+        // start of each of its turns. Destroyed stays destroyed: not at 0 HP.
+        if (participant.regeneration && participant.hp > 0 && participant.hp < participant.maxHp) {
+            const before = participant.hp;
+            participant.hp = Math.min(participant.maxHp, participant.hp + participant.regeneration);
+            this.turnStartNotes.push(`${participant.name} regenerates ${participant.hp - before} HP (${before} → ${participant.hp}/${participant.maxHp})`);
+        }
+
         for (const condition of [...participant.conditions]) {
             // Process ongoing effects
             if (condition.ongoingEffects) {
@@ -1310,6 +1320,7 @@ export class CombatEngine {
      */
     nextTurnWithConditions(): CombatParticipant | null {
         if (!this.state) return null;
+        this.turnStartNotes = [];
 
         // Process end-of-turn conditions for current participant (if not LAIR)
         const currentParticipant = this.getCurrentParticipant();
