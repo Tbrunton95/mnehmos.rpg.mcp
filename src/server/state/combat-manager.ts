@@ -1,5 +1,14 @@
 import { CombatEngine } from '../../engine/combat/engine.js';
 
+/**
+ * Engines are keyed `${sessionId}:${encounterId}`. With a sessionId, only
+ * that session's engines match, so one table's combat never blocks or
+ * clears another's. Without one, every engine matches (legacy callers).
+ */
+function inSession(key: string, sessionId?: string): boolean {
+    return sessionId === undefined || key.startsWith(`${sessionId}:`);
+}
+
 export class CombatManager {
     private encounters: Map<string, CombatEngine> = new Map();
 
@@ -30,8 +39,9 @@ export class CombatManager {
      * Check if a character is participating in any active encounter
      * Used to prevent resting during combat
      */
-    isCharacterInCombat(characterId: string): boolean {
-        for (const engine of this.encounters.values()) {
+    isCharacterInCombat(characterId: string, sessionId?: string): boolean {
+        for (const [key, engine] of this.encounters.entries()) {
+            if (!inSession(key, sessionId)) continue;
             const state = engine.getState();
             if (state?.participants.some(p => p.id === characterId)) {
                 return true;
@@ -44,9 +54,10 @@ export class CombatManager {
      * Get list of encounter IDs that a character is participating in
      * Useful for error messages
      */
-    getEncountersForCharacter(characterId: string): string[] {
+    getEncountersForCharacter(characterId: string, sessionId?: string): string[] {
         const encounterIds: string[] = [];
         for (const [id, engine] of this.encounters.entries()) {
+            if (!inSession(id, sessionId)) continue;
             const state = engine.getState();
             if (state?.participants.some(p => p.id === characterId)) {
                 encounterIds.push(id);
@@ -60,9 +71,10 @@ export class CombatManager {
      * Used to clean up stale combat state after end_encounter
      * @returns Number of encounters deleted
      */
-    deleteEncountersForCharacter(characterId: string): number {
+    deleteEncountersForCharacter(characterId: string, sessionId?: string): number {
         const toDelete: string[] = [];
         for (const [id, engine] of this.encounters.entries()) {
+            if (!inSession(id, sessionId)) continue;
             const state = engine.getState();
             if (state?.participants.some(p => p.id === characterId)) {
                 toDelete.push(id);

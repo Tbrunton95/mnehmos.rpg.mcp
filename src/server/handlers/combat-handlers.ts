@@ -2520,7 +2520,7 @@ export async function handleEndEncounter(args: unknown, ctx: SessionContext) {
     let staleCleared = 0;
     if (finalState) {
         for (const participant of finalState.participants) {
-            staleCleared += getCombatManager().deleteEncountersForCharacter(participant.id);
+            staleCleared += getCombatManager().deleteEncountersForCharacter(participant.id, ctx.sessionId);
         }
     }
 
