@@ -50,6 +50,17 @@ describe('OpenAIProvider', () => {
         expect(result.durationMs).toBeGreaterThanOrEqual(0);
     });
 
+    it('reports the model OpenAI says it served (FINDINGS #69)', async () => {
+        const mock = mockFetch({
+            body: JSON.stringify({ model: 'gpt-5.5-2026-04-23', choices: [{ message: { content: 'x' } }] })
+        });
+        const provider = new OpenAIProvider({ apiKey: 'sk', fetchImpl: mock.fn });
+
+        const result = await provider.call({ model: 'gpt-5.5', messages: [{ role: 'user', content: 'hi' }] });
+
+        expect(result.model).toBe('gpt-5.5-2026-04-23');
+    });
+
     it('sends the expected request shape', async () => {
         const mock = mockFetch({
             body: JSON.stringify({ choices: [{ message: { content: 'x' } }] })

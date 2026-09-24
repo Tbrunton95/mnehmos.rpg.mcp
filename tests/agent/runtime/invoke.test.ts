@@ -232,6 +232,70 @@ describe('invokeAgent', () => {
         expect(deps.agentRepo.findCallById(result.callId!)!.model).toBe('gpt-5.5');
     });
 
+    // ───────── requested vs served model (FINDINGS #69) ─────────
+
+    it('reports the served model from the provider response alongside the requested one', async () => {
+        const agent = setupAgent({ characterInt: 12 });
+        factory.register('openai', fakeProvider(async () => ({
+            text: 'served', raw: '{}', durationMs: 1, model: 'gpt-5.5-2026-04-23'
+        })));
+
+        const result = await invokeAgent({ agentId: agent.id }, deps);
+
+        expect(result.status).toBe('ok');
+        expect(result.requestedModel).toBe('gpt-5.5');
+        expect(result.servedModel).toBe('gpt-5.5-2026-04-23');
+    });
+
+    it('leaves servedModel null when the provider does not report one (never assumes the request)', async () => {
+        const agent = setupAgent({ characterInt: 12 });
+        factory.register('openai', fakeProvider(async () => ({ text: 'quiet gateway', raw: '{}', durationMs: 1 })));
+
+        const result = await invokeAgent({ agentId: agent.id }, deps);
+
+        expect(result.status).toBe('ok');
+        expect(result.requestedModel).toBe('gpt-5.5');
+        expect(result.servedModel).toBeNull();
+    });
+
+    it('keeps requested/served model and competency on a response that crossed the budget', async () => {
+        const agent = setupAgent({ budgetTokens: 1000, competencyOverride: { model: 'gpt-4.1' } });
+        factory.register('openai', fakeProvider(async () => ({
+            text: 'too expensive', promptTokens: 800, completionTokens: 250, raw: '{}', durationMs: 1, model: 'gpt-4.1-2025-04-14'
+        })));
+
+        const result = await invokeAgent({ agentId: agent.id }, deps);
+
+        expect(result.status).toBe('budget_exhausted');
+        expect(result.requestedModel).toBe('gpt-4.1');
+        expect(result.servedModel).toBe('gpt-4.1-2025-04-14');
+        expect(result.competencySource).toBe('override');
+        expect(result.reasoningEffort).toBe('low');
+    });
+
+    it('reports the requested model on provider failure, and the served one when the error body names it', async () => {
+        const agent = setupAgent({ characterInt: 12 });
+        factory.register('openai', fakeProvider(async () => {
+            throw new ProviderError('empty content', 'malformed', 200, JSON.stringify({
+                model: 'gpt-5.5-2026-04-23',
+                choices: [{ message: { content: '' }, finish_reason: 'length' }]
+            }));
+        }));
+
+        const withBody = await invokeAgent({ agentId: agent.id }, deps);
+        expect(withBody.status).toBe('error');
+        expect(withBody.requestedModel).toBe('gpt-5.5');
+        expect(withBody.servedModel).toBe('gpt-5.5-2026-04-23');
+
+        factory.register('openai', fakeProvider(async () => {
+            throw new ProviderError('timed out', 'timeout');
+        }));
+        const noBody = await invokeAgent({ agentId: agent.id }, deps);
+        expect(noBody.status).toBe('timeout');
+        expect(noBody.requestedModel).toBe('gpt-5.5');
+        expect(noBody.servedModel).toBeNull();
+    });
+
     it('increments tokens_used after a successful call', async () => {
         const agent = setupAgent();
         factory.register('openai', fakeProvider(async () => ({

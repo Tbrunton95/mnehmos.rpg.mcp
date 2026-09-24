@@ -110,6 +110,19 @@ function estimateTokens(value: unknown): number {
     return Math.max(1, Math.ceil(text.length / 4));
 }
 
+/** FINDINGS #69: the model a provider body says it served, if it says one. A
+ * provider error on a 200 (empty content, finish_reason=length) still names
+ * it; an HTTP error body or a timeout does not, and that stays null. */
+function reportedModel(raw: string | null | undefined): string | null {
+    if (!raw) return null;
+    try {
+        const model = (JSON.parse(raw) as { model?: unknown }).model;
+        return typeof model === 'string' && model ? model : null;
+    } catch {
+        return null;
+    }
+}
+
 function resolveAgent(deps: AgentRuntimeDeps, input: InvokeInput): Agent | null {
     if (input.agentId) return deps.agentRepo.findById(input.agentId);
     if (input.characterId) return deps.agentRepo.findByCharacterId(input.characterId);
@@ -308,7 +321,11 @@ export async function invokeAgent(input: InvokeInput, deps: AgentRuntimeDeps): P
                 costUsd: result.costUsd ?? null,
                 costSource: result.costSource ?? 'estimated',
                 durationMs: result.durationMs,
-                finishReason: result.finishReason
+                finishReason: result.finishReason,
+                requestedModel: resolvedModel,
+                servedModel: result.model ?? null,
+                competencySource: competency?.source ?? null,
+                reasoningEffort: competency?.reasoningEffort ?? null
             };
         }
 
@@ -366,7 +383,9 @@ export async function invokeAgent(input: InvokeInput, deps: AgentRuntimeDeps): P
             durationMs: result.durationMs,
             finishReason: result.finishReason,
             requestedModel: resolvedModel,
-            servedModel: result.model ?? resolvedModel,
+            // Only what the provider REPORTS — defaulting to the request would
+            // hide the very substitution this field exists to expose.
+            servedModel: result.model ?? null,
             competencySource: competency?.source ?? null,
             reasoningEffort: competency?.reasoningEffort ?? null
         };
@@ -416,6 +435,7 @@ export async function invokeAgent(input: InvokeInput, deps: AgentRuntimeDeps): P
             costSource: null,
             durationMs: null,
             requestedModel: resolvedModel,
+            servedModel: reportedModel(providerErr?.raw),
             competencySource: competency?.source ?? null,
             reasoningEffort: competency?.reasoningEffort ?? null
         };

@@ -932,13 +932,17 @@ export async function handleAgentManage(args: unknown, ctx: SessionContext): Pro
                     break;
                 case 'invoke': {
                     const name = parsed.characterName || parsed.characterId || 'agent';
+                    // FINDINGS #69: requested vs served. When the provider
+                    // reported no served model, say so — never assume it.
+                    const modelLine = parsed.servedModel
+                        ? (parsed.requestedModel && parsed.servedModel !== parsed.requestedModel
+                            ? `${parsed.servedModel} ⚠ (requested ${parsed.requestedModel})`
+                            : `${parsed.servedModel} [${parsed.competencySource ?? '?'}]`)
+                        : parsed.requestedModel
+                            ? `${parsed.requestedModel} [${parsed.competencySource ?? '?'}] (served model not reported)`
+                            : '—';
                     if (parsed.status === 'ok') {
                         output = RichFormatter.header(`${name} speaks`, '');
-                        const modelLine = parsed.servedModel
-                            ? (parsed.requestedModel && parsed.servedModel !== parsed.requestedModel
-                                ? `${parsed.servedModel} ⚠ (requested ${parsed.requestedModel})`
-                                : `${parsed.servedModel} [${parsed.competencySource ?? '?'}]`)
-                            : '—';
                         output += RichFormatter.keyValue({
                             'Status': parsed.status,
                             'Model': modelLine,
@@ -957,7 +961,8 @@ export async function handleAgentManage(args: unknown, ctx: SessionContext): Pro
                             output += RichFormatter.keyValue({
                                 'Agent': name,
                                 'Call ID': parsed.callId,
-                                'Status': parsed.status
+                                'Status': parsed.status,
+                                ...(parsed.requestedModel ? { 'Model': modelLine } : {})
                             });
                         }
                     }

@@ -7,6 +7,9 @@ import { handleAgentManage, AgentManageTool } from '../../../src/server/consolid
 import { AgentRepository } from '../../../src/storage/repos/agent.repo.js';
 import { getDb, closeDb } from '../../../src/storage/index.js';
 import { CharacterRepository } from '../../../src/storage/repos/character.repo.js';
+import { ProviderFactory } from '../../../src/agent/provider/factory.js';
+import { LLMProvider, ProviderError } from '../../../src/agent/provider/types.js';
+import { buildAgentRuntime, setAgentRuntime, clearAgentRuntime } from '../../../src/agent/runtime/deps.js';
 import { randomUUID } from 'crypto';
 
 process.env.NODE_ENV = 'test';
@@ -563,6 +566,47 @@ describe('agent_manage tool', () => {
                 expect(replay.original).toBeDefined();
                 expect(replay.callId).toBe(invokeResult.callId);
             }
+        });
+
+        describe('model line (FINDINGS #69: requested vs served)', () => {
+            afterEach(() => clearAgentRuntime());
+
+            function wireOpenAI(call: LLMProvider['call']) {
+                const factory = new ProviderFactory();
+                factory.register('openai', { name: 'openai', call });
+                setAgentRuntime(buildAgentRuntime(getDb(':memory:'), factory));
+            }
+
+            async function invokeText(characterId: string): Promise<string> {
+                const result = await handleAgentManage({ action: 'invoke', characterId, situation: 'go' }, ctx);
+                return result.content[0].text;
+            }
+
+            it('flags a served model that differs from the requested one', async () => {
+                const characterId = createCharacter('Kara');
+                await handleAgentManage({ action: 'create', characterId, provider: 'openai', model: 'gpt-5.5' }, ctx);
+                wireOpenAI(async () => ({ text: 'hi', raw: '{}', durationMs: 1, model: 'gpt-4o-mini' }));
+
+                expect(await invokeText(characterId)).toContain('gpt-4o-mini ⚠ (requested gpt-5.5)');
+            });
+
+            it('names the requested model when the provider reported no served model', async () => {
+                const characterId = createCharacter('Kara');
+                await handleAgentManage({ action: 'create', characterId, provider: 'openai', model: 'gpt-5.5' }, ctx);
+                wireOpenAI(async () => ({ text: 'hi', raw: '{}', durationMs: 1 }));
+
+                expect(await invokeText(characterId)).toMatch(/gpt-5\.5 \[stat_derived\] \(served model not reported\)/);
+            });
+
+            it('names the requested model on a failed invoke', async () => {
+                const characterId = createCharacter('Kara');
+                await handleAgentManage({ action: 'create', characterId, provider: 'openai', model: 'gpt-5.5' }, ctx);
+                wireOpenAI(async () => { throw new ProviderError('timed out', 'timeout'); });
+
+                const text = await invokeText(characterId);
+                expect(text).toContain('timeout');
+                expect(text).toMatch(/gpt-5\.5 \[stat_derived\] \(served model not reported\)/);
+            });
         });
 
         it('replay errors when callId not found', async () => {

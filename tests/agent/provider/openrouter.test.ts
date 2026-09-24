@@ -73,6 +73,17 @@ describe('OpenRouterProvider', () => {
         expect(result.costSource).toBe('provider');
     });
 
+    it('reports the model OpenRouter says it served (FINDINGS #69)', async () => {
+        const mock = mockFetch({
+            body: JSON.stringify({ model: 'openai/gpt-5.5', choices: [{ message: { content: 'x' } }] })
+        });
+        const provider = new OpenRouterProvider({ apiKey: 'or-test', fetchImpl: mock.fn });
+
+        const result = await provider.call({ model: 'openai/gpt-5.5', messages: [{ role: 'user', content: 'hi' }] });
+
+        expect(result.model).toBe('openai/gpt-5.5');
+    });
+
     it('sends attribution headers when configured', async () => {
         const mock = mockFetch({
             body: JSON.stringify({ choices: [{ message: { content: 'x' } }] })
