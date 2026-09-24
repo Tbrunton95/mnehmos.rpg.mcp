@@ -398,7 +398,10 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
             const firstId = (JSON.parse(log?.active_quests || '[]') as string[])[0];
             if (firstId) objective = (db.prepare('SELECT name FROM quests WHERE id = ?').get(firstId) as { name?: string } | undefined)?.name;
         } catch { /* no quest log */ }
-        const conditions = conditionsForDisplay(char.conditions || [], tiny.spec.maxConditions);
+        // Names only: a condition's source can run to kilobytes, and the tiny
+        // block is tiny on the wire too. The full text stays on get.
+        const conditions = conditionsForDisplay(char.conditions || [], tiny.spec.maxConditions)
+            .map(c => ({ name: c.name ?? '', ...(c.duration !== undefined ? { duration: c.duration } : {}), ...(c.pinned ? { pinned: true } : {}) }));
         return {
             success: true,
             actionType: 'get_status_block',

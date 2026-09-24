@@ -76,6 +76,11 @@ describe('milestone XP, tiny status, principles at boot', () => {
         await handleCharacterManage({ action: 'update', characterId: 'luciel', editConditions: [{ match: 'bleeding', pinned: true }] }, ctx as any);
         const block = tagJson((await handleCharacterManage({ action: 'get_status_block', characterId: 'luciel' }, ctx as any)).content[0].text, 'CHARACTER_MANAGE');
         expect(block.conditions.map((c: { name: string }) => c.name)).toEqual(['bleeding', 'marked']);
+        // Tiny on the wire too: no condition source text rides the block.
+        await handleCharacterManage({ action: 'update', characterId: 'luciel', editConditions: [{ match: 'marked', source: 'x'.repeat(3000) }] }, ctx as any);
+        const lean = tagJson((await handleCharacterManage({ action: 'get_status_block', characterId: 'luciel' }, ctx as any)).content[0].text, 'CHARACTER_MANAGE');
+        expect(lean.conditions[1]).toEqual({ name: 'marked' });
+        expect(lean.conditions[0]).toEqual({ name: 'bleeding', pinned: true });
         const boot = tagJson((await handleSessionManage({ action: 'boot', worldId: W }, ctx as any)).content[0].text, 'SESSION_MANAGE');
         expect(boot.characters[0].conditions.first).toEqual(['bleeding', 'marked', 'shaken']);
     });
@@ -92,7 +97,7 @@ describe('milestone XP, tiny status, principles at boot', () => {
     it('the header strip has no empty segments without a clock', async () => {
         await importDay366();
         const res = (await handleCharacterManage({ action: 'get_status_block', characterId: 'luciel' }, ctx as any)).content[0].text;
-        expect(res).toMatch(/╓─ \+\+\+ ─── LUCIEL ──╖/);
+        expect(res).toMatch(/╓─ \+\+\+ ─── LUCIEL ─+╖/);
     });
 
     it('get_context lists the enforced rules and the principles', async () => {
