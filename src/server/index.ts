@@ -8,6 +8,7 @@
  * - On-demand schema loading
  */
 
+import { summarizeResult } from './output-mode.js';
 import { config as loadDotenv } from 'dotenv';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -154,7 +155,7 @@ function buildServer(pubsub: PubSub, auditLogger: AuditLogger): McpServer {
   // validation keeps it long enough for withOutputMode to see it.
   const envelopeShape = {
     sessionId: z.string().optional(),
-    output_mode: z.enum(['json', 'banner']).optional()
+    output_mode: z.enum(['json', 'banner', 'summary']).optional()
   };
   const sessionIdSchema = z.object(envelopeShape);
 
@@ -164,13 +165,24 @@ function buildServer(pubsub: PubSub, auditLogger: AuditLogger): McpServer {
   // chairs that want only the data. Banner mode is untouched default.
   const withOutputMode = (handler: (args: Record<string, unknown>, extra: unknown) => Promise<{ content?: Array<{ type: string; text: string }> }>) =>
     async (args: Record<string, unknown>, extra: unknown) => {
-      const wantJson = args?.output_mode === 'json' || args?.outputMode === 'json';
+      const mode = args?.output_mode ?? args?.outputMode;
+      const wantJson = mode === 'json';
+      const wantSummary = mode === 'summary';
       if (args) { delete args.output_mode; delete args.outputMode; }
       const res = await handler(args, extra);
-      if (wantJson && res?.content?.[0]?.text) {
+      if ((wantJson || wantSummary) && res?.content?.[0]?.text) {
         const text = res.content[0].text;
         const m = text.match(/<!--\s*([A-Z_]*JSON)\s*\n?([\s\S]*?)\n?\1\s*-->/);
-        if (m) return { ...res, content: [{ type: 'text', text: m[2].trim() }] };
+        if (m) {
+          if (wantJson) return { ...res, content: [{ type: 'text', text: m[2].trim() }] };
+          // summary: the result's small fields only; big lists become counts.
+          try {
+            const parsed = JSON.parse(m[2].trim());
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              return { ...res, content: [{ type: 'text', text: JSON.stringify(summarizeResult(parsed)) }] };
+            }
+          } catch { /* not JSON: fall through to the full reply */ }
+        }
       }
       return res;
     };

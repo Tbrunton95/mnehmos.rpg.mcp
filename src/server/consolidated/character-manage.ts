@@ -195,6 +195,13 @@ const UpdateSchema = z.object({
     conditions: z.array(conditionSchema()).optional(),
     addConditions: z.array(conditionSchema()).optional(),
     removeConditions: z.array(z.string()).optional(),
+    editConditions: z.array(z.object({
+        match: z.string().min(1).describe('Case-insensitive text found in exactly one condition name'),
+        name: z.string().optional().describe('Replace the whole name'),
+        replace: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the name'),
+        duration: z.number().int().optional(),
+        source: z.string().optional()
+    })).optional().describe('Edit one condition in place without resending its text. Nothing is written if a match finds zero or several conditions'),
     background: z.string().optional(),
     alignment: z.string().optional(),
     origin: CharacterOriginSchema.optional(),
@@ -911,7 +918,7 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
         for (const [k, v] of Object.entries(updateData)) wouldChange[k] = { from: current?.[k], to: v };
         if (args.startingGold !== undefined) wouldChange.currency = { from: current?.currency, to: { gold: args.startingGold } };
         if (args.composureSpec !== undefined) wouldChange.composureSpec = { from: '(stored)', to: args.composureSpec };
-        if (args.conditions !== undefined || args.addConditions !== undefined || args.removeConditions !== undefined) wouldChange.conditions = { from: current?.conditions, to: '(per conditions/addConditions/removeConditions rules)' };
+        if (args.conditions !== undefined || args.addConditions !== undefined || args.removeConditions !== undefined || args.editConditions !== undefined) wouldChange.conditions = { from: current?.conditions, to: '(per conditions/addConditions/removeConditions/editConditions rules)' };
         return {
             success: true,
             preview: true,
@@ -989,13 +996,36 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     // Handle conditions
     if (args.conditions !== undefined) {
         updateData.conditions = args.conditions;
-    } else if (args.addConditions !== undefined || args.removeConditions !== undefined) {
+    } else if (args.addConditions !== undefined || args.removeConditions !== undefined || args.editConditions !== undefined) {
         let currentConditions: Array<{ name: string; duration?: number; source?: string }> =
             (character as any).conditions || [];
 
         if (args.removeConditions?.length) {
             const toRemove = new Set(args.removeConditions.map(n => n.toLowerCase()));
             currentConditions = currentConditions.filter(c => !toRemove.has(c.name.toLowerCase()));
+        }
+
+        // Edit in place: each match must find exactly one condition, or the
+        // whole update is refused before anything is written.
+        if (args.editConditions?.length) {
+            currentConditions = currentConditions.map(c => ({ ...c }));
+            for (const edit of args.editConditions) {
+                const needle = edit.match.toLowerCase();
+                const hits = currentConditions.filter(c => c.name.toLowerCase().includes(needle));
+                if (hits.length !== 1) {
+                    throw new Error(hits.length === 0
+                        ? `editConditions: '${edit.match}' matches no condition. Nothing was written.`
+                        : `editConditions: '${edit.match}' matches ${hits.length} conditions; use more of the text. Nothing was written.`);
+                }
+                const c = hits[0];
+                if (edit.name !== undefined) c.name = edit.name;
+                if (edit.replace) {
+                    if (!c.name.includes(edit.replace.find)) throw new Error(`editConditions: '${edit.replace.find}' is not in the matched condition. Nothing was written.`);
+                    c.name = c.name.split(edit.replace.find).join(edit.replace.with);
+                }
+                if (edit.duration !== undefined) c.duration = edit.duration;
+                if (edit.source !== undefined) c.source = edit.source;
+            }
         }
 
         if (args.addConditions?.length) {
@@ -1022,6 +1052,7 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     return {
         ...updated,
         success: true,
+        changed: Object.keys(updateData).filter(k => k !== 'updatedAt'),
         ...(columnSync && { columnSync }),
         message: `Character updated successfully${columnSync ? ` — column sync: ${Object.entries(columnSync).map(([k, v]) => `${k} ${v.from}→${v.to} (offset ${v.offset >= 0 ? '+' : ''}${v.offset} preserved)`).join(', ')}` : ''}`
     };
@@ -2031,6 +2062,13 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         conditions: z.array(conditionSchema()).optional(),
         addConditions: z.array(conditionSchema()).optional(),
         removeConditions: z.array(z.string()).optional(),
+    editConditions: z.array(z.object({
+        match: z.string().min(1).describe('Case-insensitive text found in exactly one condition name'),
+        name: z.string().optional().describe('Replace the whole name'),
+        replace: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the name'),
+        duration: z.number().int().optional(),
+        source: z.string().optional()
+    })).optional().describe('Edit one condition in place without resending its text. Nothing is written if a match finds zero or several conditions'),
         // Add XP field
         amount: z.number().int().optional(),
         // FINDINGS #60 (mirror law): MEND CLOCK params — absent here means
