@@ -18,6 +18,8 @@ import { SessionContext } from '../types.js';
 // CRIT-006: Import spellcasting validation and resolution
 import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
+import { resolveWorldId, bandOrder, loadRule, loadRules, type TableRule } from '../../engine/table-rules.js';
+import { peerConsequence, calledStrikeProblem, crippleCondition, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { CombatActionLogRepository } from '../../storage/repos/combat-action-log.repo.js';
@@ -99,6 +101,23 @@ function persistParticipantHpToDb(state: CombatState): void {
 export function saveEncounterState(repo: EncounterRepository, encounterId: string, state: CombatState): void {
     persistParticipantHpToDb(state);
     repo.saveState(encounterId, state);
+}
+
+/**
+ * Mirror a token condition onto the character row (add replaces any same-named
+ * entry). False when the token has no character row.
+ */
+export function mirrorConditionToRow(characterId: string, op: 'add' | 'remove', name: string, duration?: number, source?: string): boolean {
+    const repo = new CharacterRepository(getDb());
+    const row = repo.findById(characterId);
+    if (!row) return false;
+    const key = name.toLowerCase();
+    const others = (row.conditions ?? []).filter((c: { name: string }) => c.name.toLowerCase() !== key);
+    const next = op === 'add'
+        ? [...others, { name, ...(duration !== undefined ? { duration } : {}), ...(source !== undefined ? { source } : {}) }]
+        : others;
+    repo.update(characterId, { conditions: next } as never);
+    return true;
 }
 
 /**
@@ -663,7 +682,9 @@ Example (use real UUID from context for player character!):
                 vulnerabilities: z.array(z.string()).optional()
                     .describe('Damage types that deal double damage'),
                 immunities: z.array(z.string()).optional()
-                    .describe('Damage types that deal no damage')
+                    .describe('Damage types that deal no damage'),
+                band: z.string().optional().describe("Table rules: power band (defaults from the character row)"),
+                regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds (defaults from the character row)')
             })).min(1),
             terrain: z.object({
                 obstacles: z.array(z.string()).default([]).describe('Array of "x,y" strings for blocking tiles'),
@@ -734,6 +755,9 @@ Examples:
             outcome: z.enum(['hit', 'crit', 'miss']).optional().describe('A result the GM resolved at the table. The engine rolls no d20 (no nat 1/20 override) and applies damage exactly as posted: a number is never doubled; a dice string with crit doubles its dice only. Resistances, HP write-through and concentration still apply. hit/crit need damage.'),
             advantage: z.boolean().optional().describe('Roll 2d20 keep highest (Findings #31/#32)'),
             disadvantage: z.boolean().optional().describe('Roll 2d20 keep lowest'),
+            calledStrike: z.string().optional().describe("Table rules (called_strike): 'leg' or 'arm'. No roll penalty; a hit cripples that limb. Needs a target of your band or greater"),
+            preparedAsset: z.string().optional().describe('Table rules (prepared_asset): the rule name; reports miss / hit / catastrophic tier and the effect the GM names'),
+            unaffectedLimb: z.boolean().optional().describe('The attacker uses a limb its crippling condition does not touch (skips that disadvantage)'),
             declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit trail: printed in output, never re-applied'),
             declaredEffects: z.array(z.object({ name: z.string(), lane: z.string().optional() })).optional().describe('FINDINGS #60 RESOLVER v2: GM declares the conditional trait by name (+lane for multi-lane rows); engine computes the value (incl. valueFromPool) and APPLIES it to the attack bonus'),
             damageType: z.string().optional()
@@ -1175,13 +1199,13 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
         // silently defaulted to 10 at resolution while output looked correct
         // (the soft-AC trap). Explicit ac still wins below; ad-hoc tokens with
         // no row keep the heuristic.
-        if (p.ac === undefined && extraStats.ac === undefined && p.id) {
-            const acDb = getDb();
-            const row = new CharacterRepository(acDb).findById(p.id);
-            if (row?.ac !== undefined) {
-                extraStats.ac = row.ac;
-            }
+        const row = p.id ? new CharacterRepository(getDb()).findById(p.id) : null;
+        if (p.ac === undefined && extraStats.ac === undefined && row?.ac !== undefined) {
+            extraStats.ac = row.ac;
         }
+        // Table rules: band and regeneration default from the sheet.
+        const band = p.band ?? row?.band;
+        const regeneration = p.regeneration ?? row?.regeneration;
 
         const id = p.id || randomUUID();
         const participant = {
@@ -1201,6 +1225,8 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             resistances: p.resistances,
             vulnerabilities: p.vulnerabilities,
             immunities: p.immunities,
+            ...(band ? { band } : {}),
+            ...(regeneration ? { regeneration } : {}),
             ...extraStats,
             // Caller-supplied AC wins over the preset's default so explicit
             // overrides (e.g., a goblin in chain mail) take effect.
@@ -1257,7 +1283,9 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             // Spatial visualization data
             position: p.position,
             movementSpeed: p.movementSpeed ?? 30,
-            size: p.size ?? 'medium'
+            size: p.size ?? 'medium',
+            band: p.band,
+            regeneration: p.regeneration
         })),
         round: state.round,
         activeTokenId: state.turnOrder[state.currentTurnIndex],
@@ -1566,7 +1594,26 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             throw new Error(validation.error);
         }
 
-        // Use the new detailed attack method with optional damageType for HIGH-002
+        // Table rules: the world's called-strike and prepared-asset rules are
+        // checked before the roll so a refused strike spends nothing.
+        const rulesDb = getDb();
+        const ruleWorld = resolveWorldId(rulesDb, { encounterId: parsed.encounterId, characterIds: [parsed.actorId, parsed.targetId ?? ''] });
+        const ruleBands = bandOrder(rulesDb, ruleWorld);
+        let strikeRule: TableRule<'called_strike'> | undefined;
+        let preparedRule: TableRule<'prepared_asset'> | undefined;
+        if (parsed.calledStrike) {
+            strikeRule = loadRule(rulesDb, ruleWorld, 'called_strike');
+            if (!strikeRule) throw new Error(`calledStrike needs an enabled called_strike rule in this encounter's world${ruleWorld ? '' : ' (the encounter has no world: create it with worldId)'}`);
+            if (actor && target) {
+                const problem = calledStrikeProblem(strikeRule, ruleBands, actor, target, parsed.calledStrike.toLowerCase());
+                if (problem) throw new Error(problem);
+            }
+        }
+        if (parsed.preparedAsset) {
+            preparedRule = loadRule(rulesDb, ruleWorld, 'prepared_asset', parsed.preparedAsset);
+            if (!preparedRule) throw new Error(`No enabled prepared_asset rule named '${parsed.preparedAsset}' in this encounter's world`);
+        }
+
         // Use the new detailed attack method with optional damageType for HIGH-002
         result = engine.executeAttack(
             parsed.actorId,
@@ -1579,7 +1626,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             parsed.disadvantage,
             damageLaneBonus || undefined,  // FINDINGS #70: resolver damage lane
             damageLaneLabel,
-            outcome
+            outcome,
+            parsed.unaffectedLimb
         );
 
         // Sync HP to character database after attack
@@ -1669,7 +1717,47 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             }
         } catch { /* no instance row — template guns carry no jam band */ }
 
+        // Table rules after the hit: called-strike cripples, peer
+        // consequences due, prepared-asset tiers. The engine computes; the
+        // GM names the flavour.
+        const ruleLines: string[] = [];
+        const resultRec = result as unknown as Record<string, unknown>;
+        const afterState = engine.getState();
+        const actorNow = afterState?.participants.find(p => p.id === parsed.actorId);
+        const targetNow = afterState?.participants.find(p => p.id === parsed.targetId);
+        if (strikeRule && parsed.calledStrike && targetNow) {
+            const limb = parsed.calledStrike.toLowerCase();
+            if (result.success) {
+                const cond = crippleCondition(strikeRule, limb, actorNow?.name ?? parsed.actorId);
+                targetNow.conditions = targetNow.conditions.filter(c => c.type.toLowerCase() !== String(cond.type).toLowerCase());
+                engine.applyCondition(targetNow.id, cond);
+                mirrorConditionToRow(targetNow.id, 'add', String(cond.type), undefined, cond.sourceId);
+                resultRec.calledStrike = { rule: strikeRule.name, limb, crippled: true, notes: cond.metadata?.notes };
+                ruleLines.push(`RULE ${strikeRule.name}: ${targetNow.name} ${cond.type} until repaired${(cond.metadata?.notes as string[] | undefined)?.length ? ` (${(cond.metadata!.notes as string[]).join('; ')})` : ''}`);
+            } else {
+                resultRec.calledStrike = { rule: strikeRule.name, limb, crippled: false };
+                ruleLines.push(`RULE ${strikeRule.name}: called strike at the ${limb} missed`);
+            }
+        }
+        if (actorNow && targetNow) {
+            for (const peerRule of loadRules(rulesDb, ruleWorld, 'peer_consequence')) {
+                const due = peerConsequence(peerRule, ruleBands, actorNow, targetNow, result);
+                if (!due) continue;
+                if ('skipped' in due) { ruleLines.push(`RULE skipped: ${due.skipped}`); continue; }
+                resultRec.consequenceDue = due;
+                ruleLines.push(`CONSEQUENCE DUE (${due.rule}): ${due.reason}. GM names it: ${due.options.join(' / ')}; apply with combat_manage add_condition`);
+            }
+        }
+        if (preparedRule) {
+            const prepared = preparedOutcome(preparedRule, result);
+            resultRec.preparedEffectDue = prepared;
+            ruleLines.push(`RULE ${prepared.rule}: ${prepared.tier.toUpperCase()}${prepared.margin !== undefined ? ` (margin ${prepared.margin >= 0 ? '+' : ''}${prepared.margin})` : ''}, ${prepared.note}`);
+        }
+
         output = formatAttackResult(result);
+        // Rule and audit lines start on their own line under the contact block.
+        if ((ruleLines.length || parsed.declaredModifiers?.length || autoApplied.length || resolverProblems.length) && !output.endsWith('\n')) output += '\n';
+        for (const line of ruleLines) output += `▌ ${line}\n`;
         if (parsed.declaredModifiers?.length) {
             output += `▌ ⟨audit⟩ in-bonus: ${parsed.declaredModifiers.map(d => `${d.label} ${d.value >= 0 ? '+' : ''}${d.value}`).join(' · ')}\n`;
             // Findings #35: banner AND JSON, always — audit fields must be greppable in rawData.
@@ -2354,7 +2442,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             declaredModifiers: r.declaredModifiers,
             autoApplied: r.autoApplied,
             // #66: banner and JSON carry the jam flag together — parity law.
-            jamCheckOwed: (r as CombatActionResult & { jamCheckOwed?: unknown }).jamCheckOwed
+            jamCheckOwed: (r as CombatActionResult & { jamCheckOwed?: unknown }).jamCheckOwed,
+            // Table rules: what the engine computed and the GM still names.
+            consequenceDue: (r as { consequenceDue?: unknown }).consequenceDue,
+            calledStrike: (r as { calledStrike?: unknown }).calledStrike,
+            preparedEffectDue: (r as { preparedEffectDue?: unknown }).preparedEffectDue
         } : undefined;
         output += `\n\n<!-- STATE_JSON\n${JSON.stringify({ ...stateJson, actionResult })}\nSTATE_JSON -->`;
     }
@@ -2412,6 +2504,7 @@ export async function handleAdvanceTurn(args: unknown, ctx: SessionContext) {
     }
 
     let output = `\n⏭️ TURN ENDED: ${previousParticipant?.name}\n`;
+    for (const note of engine.turnStartNotes) output += `♻️ ${note}\n`;
     output += state ? formatCombatStateText(state) : 'No combat state';
     
     // Append JSON for frontend

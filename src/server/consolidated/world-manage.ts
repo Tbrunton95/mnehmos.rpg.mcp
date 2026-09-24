@@ -351,7 +351,24 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     const newClock = parseClock(updated.environment as { day?: number; time?: string });
     const elapsedHours = priorClock !== null && newClock !== null ? Math.round((newClock - priorClock) * 24 * 100) / 100 : null;
 
+    // Table rules: regeneration runs out of combat too. A minute is ten
+    // rounds, so any advance of a minute or more restores regenerating
+    // characters in this world who are still standing.
+    let regenerated: Array<{ id: string; name: string; from: number; to: number }> | undefined;
+    if (elapsedHours !== null && elapsedHours >= 1 / 60) {
+        try {
+            const db = getDb();
+            const rows = db.prepare('SELECT id, name, hp, max_hp FROM characters WHERE world_id = ? AND regeneration > 0 AND hp > 0 AND hp < max_hp')
+                .all(args.id) as Array<{ id: string; name: string; hp: number; max_hp: number }>;
+            const heal = db.prepare('UPDATE characters SET hp = max_hp, updated_at = ? WHERE id = ?');
+            const now = new Date().toISOString();
+            for (const r of rows) heal.run(now, r.id);
+            if (rows.length) regenerated = rows.map(r => ({ id: r.id, name: r.name, from: r.hp, to: r.max_hp }));
+        } catch { /* characters.world_id not present on this database */ }
+    }
+
     return {
+        ...(regenerated ? { regenerated } : {}),
         success: true,
         actionType: 'update',
         worldId: args.id,
@@ -362,7 +379,7 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
                 ? `${elapsedHours}h elapsed since the prior clock — pass THIS number to secret_manage check_conditions {type:'time_passed', hoursPassed:${elapsedHours}}`
                 : `clock moved BACKWARDS ${Math.abs(elapsedHours)}h — rewind or correction; no time_passed check applies`
         } : {}),
-        message: `Updated environment for world ${args.id}${elapsedHours !== null && elapsedHours > 0 ? ` — ${elapsedHours}h elapsed` : ''}`
+        message: `Updated environment for world ${args.id}${elapsedHours !== null && elapsedHours > 0 ? ` — ${elapsedHours}h elapsed` : ''}${regenerated ? `; regenerated to full: ${regenerated.map(r => r.name).join(', ')}` : ''}`
     };
 }
 

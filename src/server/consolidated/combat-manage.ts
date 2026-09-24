@@ -20,7 +20,8 @@ import {
     handleExecuteLairAction,
     getOrLoadEngine,
     syncParticipantHpFromDb,
-    saveEncounterState
+    saveEncounterState,
+    mirrorConditionToRow
 } from '../handlers/combat-handlers.js';
 import { expandCreatureTemplate, listAllTemplates } from '../../data/creature-presets.js';
 import { getDomainServices } from '../domain-services.js';
@@ -72,7 +73,9 @@ const ParticipantSchema = z.object({
     }).optional(),
     resistances: z.array(z.string()).optional(),
     vulnerabilities: z.array(z.string()).optional(),
-    immunities: z.array(z.string()).optional()
+    immunities: z.array(z.string()).optional(),
+    band: z.string().optional(),
+    regeneration: z.number().int().min(0).optional()
 });
 
 /**
@@ -187,7 +190,9 @@ const AddParticipantSchema = z.object({
     initiativeBonus: z.number().int().optional(),
     isEnemy: z.boolean().optional().default(false),
     position: z.object({ x: z.number(), y: z.number() }).optional(),
-    importRowConditions: z.boolean().optional().describe('Copy the character sheet\'s conditions onto the new token (remove them later with remove_condition)')
+    importRowConditions: z.boolean().optional().describe('Copy the character sheet\'s conditions onto the new token (remove them later with remove_condition)'),
+    band: z.string().optional().describe('Table rules: power band (defaults from the character row)'),
+    regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds (defaults from the character row)')
 });
 
 const AddConditionSchema = z.object({
@@ -354,19 +359,6 @@ function stageGateCheck(characterId: string): string | null {
  * sheet ({name, duration?, source?}; names match case-insensitively). Returns
  * false when the participant has no character row.
  */
-function mirrorConditionToRow(characterId: string, op: 'add' | 'remove', name: string, duration?: number, source?: string): boolean {
-    const repo = new CharacterRepository(getDb());
-    const row = repo.findById(characterId);
-    if (!row) return false;
-    const key = name.toLowerCase();
-    const others = (row.conditions ?? []).filter((c: { name: string }) => c.name.toLowerCase() !== key);
-    const next = op === 'add'
-        ? [...others, { name, ...(duration !== undefined ? { duration } : {}), ...(source !== undefined ? { source } : {}) }]
-        : others;
-    repo.update(characterId, { conditions: next } as never);
-    return true;
-}
-
 function logConditionChange(encounterId: string, state: { round: number; currentTurnIndex: number }, actionType: string, targetId: string, summary: string, reason?: string): void {
     getDomainServices().combatActionLog.log({
         encounterId, round: state.round, turnIndex: state.currentTurnIndex,
@@ -826,7 +818,9 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     position: params.position ?? { x: 0, y: 0 },
                     resistances: (row as { resistances?: string[] }).resistances || [],
                     vulnerabilities: (row as { vulnerabilities?: string[] }).vulnerabilities || [],
-                    immunities: (row as { immunities?: string[] }).immunities || []
+                    immunities: (row as { immunities?: string[] }).immunities || [],
+                    band: params.band ?? row.band,
+                    regeneration: params.regeneration ?? row.regeneration
                 };
             } else {
                 if (!params.name || params.hp === undefined || params.maxHp === undefined) {
@@ -838,7 +832,8 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     initiativeBonus: params.initiativeBonus ?? 0,
                     isEnemy: params.isEnemy ?? false, conditions: [],
                     position: params.position ?? { x: 0, y: 0 },
-                    resistances: [], vulnerabilities: [], immunities: []
+                    resistances: [], vulnerabilities: [], immunities: [],
+                    band: params.band, regeneration: params.regeneration
                 };
             }
             const res = await appendToEncounter(ctx, params.encounterId, [participant]);
@@ -1235,6 +1230,8 @@ For CORPSES after combat, use corpse_manage tool.`,
         replace: z.boolean().optional().describe('add_condition: drop existing conditions of the same type first'),
         mirrorToCharacter: z.boolean().optional().describe('add_condition / remove_condition: also edit the character sheet'),
         importRowConditions: z.boolean().optional().describe('add_participant: copy the sheet\'s conditions onto the new token'),
+        band: z.string().optional().describe('add_participant: table-rules power band (defaults from the character row)'),
+        regeneration: z.number().int().min(0).optional().describe('add_participant: HP healed at the start of each of its rounds (defaults from the character row)'),
         revive: z.boolean().optional().describe('adjust_hp: allow raising a dead participant'),
         isEnemy: z.boolean().optional().describe('Hostile flag (add_participant)'),
         xpAward: z.number().optional().describe('XP credited on end'),

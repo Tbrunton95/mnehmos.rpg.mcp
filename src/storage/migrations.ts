@@ -1234,6 +1234,33 @@ function runMigrations(db: Database.Database) {
     console.error('[Migration] Adding cost_source column to agent_calls table');
     db.exec(`ALTER TABLE agent_calls ADD COLUMN cost_source TEXT;`);
   }
+
+  // Table rules: a world's house rules as data the engine enforces
+  // (bands, peer consequences, called strikes, prepared assets...).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS table_rules (
+      id TEXT PRIMARY KEY,
+      world_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      name TEXT NOT NULL,
+      spec TEXT NOT NULL DEFAULT '{}',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(world_id, name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_table_rules_world_kind ON table_rules(world_id, kind);
+  `);
+
+  const ruleCharColumns = db.prepare("PRAGMA table_info(characters)").all() as { name: string }[];
+  if (!ruleCharColumns.some(col => col.name === 'band')) {
+    console.error('[Migration] Adding band column to characters table');
+    db.exec(`ALTER TABLE characters ADD COLUMN band TEXT;`);
+  }
+  if (!ruleCharColumns.some(col => col.name === 'regeneration')) {
+    console.error('[Migration] Adding regeneration column to characters table');
+    db.exec(`ALTER TABLE characters ADD COLUMN regeneration INTEGER;`);
+  }
 }
 
 function createPostMigrationIndexes(db: Database.Database) {

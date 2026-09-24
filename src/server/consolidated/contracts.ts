@@ -57,6 +57,7 @@ const TOOL_DESCRIPTORS: Readonly<Record<string, ToolDescriptor>> = {
     vehicle_manage: { category: 'inventory', keywords: ['vehicle', 'car', 'plate', 'registration', 'defect', 'known', 'crime'], capabilities: ['Vehicles as rows: plate, registeredTo, status', 'Defects that can draw a lawful stop', 'Who can identify the vehicle and why', 'Cavities via container_manage'] },
     ledger_manage: { category: 'meta', keywords: ['ledger', 'debt', 'loan', 'due', 'settle', 'default', 'counterparty', 'crime'], capabilities: ['Debts with due dates and counterparties', 'Clock-driven status: pending → due → lapsed', 'process_due walks the in-fiction clock', 'settle/default as GM verbs'] },
     comms_manage: { category: 'npc', keywords: ['comms', 'phone', 'sim', 'contact', 'burner', 'reachable', 'handset', 'crime'], capabilities: ['Handset and SIM rows', 'Directional contact graph', 'Burn/swap/split SIMs', 'reachable(A→B) attribution checks'] },
+    table_rules: { category: 'meta', keywords: ['rules', 'house', 'table', 'band', 'peer', 'called', 'strike', 'prepared', 'milestone', 'principle', 'homebrew'], capabilities: ['World house rules stored as data', 'Bands and peer consequences flagged on hits', 'Called strikes cripple limbs; prepared assets report tiers', 'Milestone XP, tiny status blocks, principles at boot'] },
 };
 
 type ToolShape = {

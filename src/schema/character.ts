@@ -69,6 +69,11 @@ export const CharacterSchema = z.object({
     stealthBonus: z.number().int().optional().default(0)
         .describe('Proficiency bonus for Stealth checks (DEX-based)'),
 
+    // Table rules: power band (named in the world's band rule) and the HP a
+    // regenerating creature heals at the start of each of its rounds.
+    band: z.string().optional(),
+    regeneration: z.number().int().min(0).optional(),
+
     // Spellcasting fields (CRIT-002/006)
     // Flexible character class - allows any string (standard D&D classes or custom like "Chronomancer")
     characterClass: z.string().optional().default('fighter'),

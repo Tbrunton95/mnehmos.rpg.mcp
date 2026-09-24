@@ -182,7 +182,9 @@ export const TokenSchema = z.object({
     // continues to honor immunities/resistances/vulnerabilities.
     resistances: z.array(z.string()).optional().describe('Damage types dealt at half damage'),
     vulnerabilities: z.array(z.string()).optional().describe('Damage types dealt at double damage'),
-    immunities: z.array(z.string()).optional().describe('Damage types ignored entirely')
+    immunities: z.array(z.string()).optional().describe('Damage types ignored entirely'),
+    band: z.string().optional().describe("Table rules: power band"),
+    regeneration: z.number().optional().describe('Table rules: HP healed at the start of each of its rounds')
 });
 
 export type Token = z.infer<typeof TokenSchema>;

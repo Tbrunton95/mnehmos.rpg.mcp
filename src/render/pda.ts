@@ -363,9 +363,26 @@ export interface StatusInput {
     conditions?: Array<{ name?: string; duration?: number } | string>;
     effects?: string[]; gold?: number;
     day?: number | string; time?: string; weather?: string;
+    // Table rules status_block: the tiny block.
+    compact?: boolean;
+    corePool?: { name: string; current: number; max: number };
+    location?: string; objective?: string; moreConditions?: number;
 }
 export function renderStatusBlock(d: StatusInput): string {
     const g = G();
+    if (d.compact) {
+        // HP, core pool, location, objective, one or two conditions.
+        const rows: Cell[][] = [];
+        const top: Cell[] = [L('HP '), V(`${d.hp ?? '?'}/${d.maxHp ?? '?'}`)];
+        if (d.corePool) top.push(L(`   ${g.sep} ${d.corePool.name.toUpperCase()} `), V(`${d.corePool.current}/${d.corePool.max}`));
+        rows.push(top);
+        if (d.location) rows.push([L('AT '), V(d.location)]);
+        if (d.objective) rows.push([L('OBJ '), V(d.objective)]);
+        const conds = (d.conditions ?? []).map(c => typeof c === 'string' ? c : `${c.name}${c.duration ? ` (${c.duration}d)` : ''}`);
+        if (conds.length) rows.push([L('COND '), V(conds.join(` ${g.sep} `) + (d.moreConditions ? ` +${d.moreConditions}` : ''))]);
+        return renderStrip({ callsign: callsign(d.characterName ?? '???') }) + emit(rows)
+            + (plain() ? `+${'-'.repeat(50)}+\n` : `╙${'─'.repeat(50)}╜\n`);
+    }
     let out = renderStrip({ callsign: callsign(d.characterName ?? '???'), day: d.day, time: d.time, rads: d.rads });
     const rows: Cell[][] = [];
     rows.push([L('HP '), V(`${d.hp ?? '?'}/${d.maxHp ?? '?'}`)]);
