@@ -18,8 +18,11 @@ import { SessionContext } from '../types.js';
 // CRIT-006: Import spellcasting validation and resolution
 import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
+import { PartSchema, UnitSchema } from '../../schema/token-extras.js';
 import { resolveWorldId, bandOrder, loadRule, loadRules, type TableRule } from '../../engine/table-rules.js';
-import { peerConsequence, calledStrikeProblem, crippleCondition, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
+import { peerConsequence, calledStrikeProblem, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
+import { volleyTier, describeUnit } from '../../engine/combat/units.js';
+import { compareBands } from '../../engine/table-rules.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { CombatActionLogRepository } from '../../storage/repos/combat-action-log.repo.js';
@@ -103,6 +106,16 @@ export function saveEncounterState(repo: EncounterRepository, encounterId: strin
     repo.saveState(encounterId, state);
 }
 
+function unitView(p: CombatParticipant) {
+    const t = volleyTier(p);
+    return { liveModels: t?.models ?? 0, volley: t?.dice ?? null, volleyReason: t?.reason };
+}
+
+/** True when the id is a character row (tokens without one have nothing to mirror). */
+function charRepoFor(id: string): boolean {
+    return !!new CharacterRepository(getDb()).findById(id);
+}
+
 /**
  * Mirror a token condition onto the character row (add replaces any same-named
  * entry). False when the token has no character row.
@@ -181,7 +194,13 @@ function buildStateJson(state: CombatState, encounterId: string, sessionId?: str
             // Combat stats for frontend/auto-calc
             ac: p.ac,
             attackDamage: p.attackDamage,
-            attackBonus: p.attackBonus
+            attackBonus: p.attackBonus,
+            // Table state the GM reads each round
+            ...(p.band ? { band: p.band } : {}),
+            ...(p.parts?.length ? { parts: p.parts } : {}),
+            ...(p.unit ? { unit: { ...p.unit, ...unitView(p) } } : {}),
+            ...(p.intent ? { intent: p.intent } : {}),
+            ...(p.readied ? { readied: p.readied } : {})
         })),
         // HIGH-006: Lair action status
         isLairActionPending: state.turnOrder[state.currentTurnIndex] === 'LAIR',
@@ -227,6 +246,11 @@ function formatCombatStateText(state: CombatState): string {
         
         // Include ID for LLM targeting
         output += `${marker} ${icon} ${p.name.padEnd(18)} ${hpBar} ${p.hp}/${p.maxHp} HP  [Init: ${p.initiative}] ID: ${p.id} ${status}\n`;
+        if (p.unit) output += `      🪖 ${describeUnit(p)}\n`;
+        const hurt = (p.parts ?? []).filter(pt => pt.state !== 'intact');
+        if (hurt.length) output += `      🦴 ${hurt.map(pt => `${pt.name}: ${pt.state}${pt.latchedTo ? `→${state.participants.find(o => o.id === pt.latchedTo!.participantId)?.name ?? pt.latchedTo.participantId}${pt.latchedTo.part ? ` ${pt.latchedTo.part}` : ''}` : ''}`).join(' · ')}\n`;
+        if (p.intent) output += `      ⚑ intent: ${p.intent}\n`;
+        if (p.readied) output += `      ⏳ readied: ${p.readied.action} when ${p.readied.trigger}\n`;
     });
     
     output += `\n`;
@@ -684,7 +708,10 @@ Example (use real UUID from context for player character!):
                 immunities: z.array(z.string()).optional()
                     .describe('Damage types that deal no damage'),
                 band: z.string().optional().describe("Table rules: power band (defaults from the character row)"),
-                regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds (defaults from the character row)')
+                regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds (defaults from the character row)'),
+                parts: z.array(PartSchema).optional().describe('Named parts with states (defaults from the character row)'),
+                unit: UnitSchema.optional().describe('A mortal unit as one token: models, hpPerModel, packed, attackBonus, tiers'),
+                intent: z.string().optional().describe('Telegraphed intent (clears when its turn ends)')
             })).min(1),
             terrain: z.object({
                 obstacles: z.array(z.string()).default([]).describe('Array of "x,y" strings for blocking tiles'),
@@ -758,6 +785,10 @@ Examples:
             calledStrike: z.string().optional().describe("Table rules (called_strike): 'leg' or 'arm'. No roll penalty; a hit cripples that limb. Needs a target of your band or greater"),
             preparedAsset: z.string().optional().describe('Table rules (prepared_asset): the rule name; reports miss / hit / catastrophic tier and the effect the GM names'),
             unaffectedLimb: z.boolean().optional().describe('The attacker uses a limb its crippling condition does not touch (skips that disadvantage)'),
+            withPart: z.string().optional().describe("The attacker's named part used ('middle head'): crippled = disadvantage; dead or latched = refused"),
+            atPart: z.string().optional().describe('The target part aimed at: breached = advantage; a called strike cripples this part'),
+            cleave: z.boolean().optional().describe('Cleave through a packed unit of a lower band: damage flows through models instead of stopping at one'),
+            volley: z.object({ dice: z.string(), reason: z.string() }).optional().describe('Internal: set by combat_action volley'),
             declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit trail: printed in output, never re-applied'),
             declaredEffects: z.array(z.object({ name: z.string(), lane: z.string().optional() })).optional().describe('FINDINGS #60 RESOLVER v2: GM declares the conditional trait by name (+lane for multi-lane rows); engine computes the value (incl. valueFromPool) and APPLIES it to the attack bonus'),
             damageType: z.string().optional()
@@ -1206,6 +1237,7 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
         // Table rules: band and regeneration default from the sheet.
         const band = p.band ?? row?.band;
         const regeneration = p.regeneration ?? row?.regeneration;
+        const parts = p.parts ?? row?.parts;
 
         const id = p.id || randomUUID();
         const participant = {
@@ -1227,6 +1259,9 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             immunities: p.immunities,
             ...(band ? { band } : {}),
             ...(regeneration ? { regeneration } : {}),
+            ...(parts?.length ? { parts } : {}),
+            ...(p.unit ? { unit: p.unit } : {}),
+            ...(p.intent ? { intent: p.intent } : {}),
             ...extraStats,
             // Caller-supplied AC wins over the preset's default so explicit
             // overrides (e.g., a goblin in chain mail) take effect.
@@ -1285,7 +1320,10 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             movementSpeed: p.movementSpeed ?? 30,
             size: p.size ?? 'medium',
             band: p.band,
-            regeneration: p.regeneration
+            regeneration: p.regeneration,
+            parts: p.parts,
+            unit: p.unit,
+            intent: p.intent
         })),
         round: state.round,
         activeTokenId: state.turnOrder[state.currentTurnIndex],
@@ -1601,6 +1639,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         const ruleBands = bandOrder(rulesDb, ruleWorld);
         let strikeRule: TableRule<'called_strike'> | undefined;
         let preparedRule: TableRule<'prepared_asset'> | undefined;
+        if (parsed.calledStrike && target?.unit) throw new Error(`Called strikes are against a single opponent; ${target.name} is a unit`);
         if (parsed.calledStrike) {
             strikeRule = loadRule(rulesDb, ruleWorld, 'called_strike');
             if (!strikeRule) throw new Error(`calledStrike needs an enabled called_strike rule in this encounter's world${ruleWorld ? '' : ' (the encounter has no world: create it with worldId)'}`);
@@ -1608,6 +1647,13 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 const problem = calledStrikeProblem(strikeRule, ruleBands, actor, target, parsed.calledStrike.toLowerCase());
                 if (problem) throw new Error(problem);
             }
+        }
+        if (parsed.cleave) {
+            if (!target?.unit) throw new Error(`Cleave goes through packed lower-band units; ${target?.name ?? parsed.targetId} is not a unit`);
+            if (!target.unit.packed) throw new Error(`${target.name} is spaced: spacing prevents cleave`);
+            const cmp = actor ? compareBands(ruleBands, actor.band, target.band) : null;
+            if (cmp === null) throw new Error(`Cleave needs both bands set (unset for ${!actor?.band ? actor?.name ?? parsed.actorId : target.name})`);
+            if (cmp <= 0) throw new Error(`Never cleave peers: ${target.name} (${target.band}) is not below ${actor!.name} (${actor!.band})`);
         }
         if (parsed.preparedAsset) {
             preparedRule = loadRule(rulesDb, ruleWorld, 'prepared_asset', parsed.preparedAsset);
@@ -1627,7 +1673,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             damageLaneBonus || undefined,  // FINDINGS #70: resolver damage lane
             damageLaneLabel,
             outcome,
-            parsed.unaffectedLimb
+            parsed.unaffectedLimb,
+            { withPart: parsed.withPart, atPart: parsed.atPart, uncapped: !!(parsed.cleave || parsed.volley) }
         );
 
         // Sync HP to character database after attack
@@ -1728,12 +1775,13 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         if (strikeRule && parsed.calledStrike && targetNow) {
             const limb = parsed.calledStrike.toLowerCase();
             if (result.success) {
-                const cond = crippleCondition(strikeRule, limb, actorNow?.name ?? parsed.actorId);
-                targetNow.conditions = targetNow.conditions.filter(c => c.type.toLowerCase() !== String(cond.type).toLowerCase());
-                engine.applyCondition(targetNow.id, cond);
-                mirrorConditionToRow(targetNow.id, 'add', String(cond.type), undefined, cond.sourceId);
-                resultRec.calledStrike = { rule: strikeRule.name, limb, crippled: true, notes: cond.metadata?.notes };
-                ruleLines.push(`RULE ${strikeRule.name}: ${targetNow.name} ${cond.type} until repaired${(cond.metadata?.notes as string[] | undefined)?.length ? ` (${(cond.metadata!.notes as string[]).join('; ')})` : ''}`);
+                // The cripple lands on a named part (the one aimed at, or the
+                // limb), which the engine reads for speed and attacks.
+                const part = crippledPart(strikeRule, limb, parsed.atPart);
+                targetNow.parts = [...(targetNow.parts ?? []).filter(pt => pt.name.toLowerCase() !== part.name.toLowerCase()), part];
+                if (charRepoFor(targetNow.id)) new CharacterRepository(getDb()).update(targetNow.id, { parts: targetNow.parts } as never);
+                resultRec.calledStrike = { rule: strikeRule.name, limb, crippled: true, part: part.name, notes: part.note };
+                ruleLines.push(`RULE ${strikeRule.name}: ${targetNow.name}'s ${part.name} crippled until repaired${part.note ? ` (${part.note})` : ''}`);
             } else {
                 resultRec.calledStrike = { rule: strikeRule.name, limb, crippled: false };
                 ruleLines.push(`RULE ${strikeRule.name}: called strike at the ${limb} missed`);
@@ -1744,14 +1792,26 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 const due = peerConsequence(peerRule, ruleBands, actorNow, targetNow, result);
                 if (!due) continue;
                 if ('skipped' in due) { ruleLines.push(`RULE skipped: ${due.skipped}`); continue; }
-                resultRec.consequenceDue = due;
-                ruleLines.push(`CONSEQUENCE DUE (${due.rule}): ${due.reason}. GM names it: ${due.options.join(' / ')}; apply with combat_manage add_condition`);
+                const setPart = `combat_manage set_part {encounterId: '${parsed.encounterId}', participantId: '${targetNow.id}', part: '${parsed.atPart ?? '<part>'}', state: 'crippled' | 'dead' | 'breached'}`;
+                resultRec.consequenceDue = { ...due, setPart };
+                ruleLines.push(`CONSEQUENCE DUE (${due.rule}): ${due.reason}. GM names it: ${due.options.join(' / ')}; record it with ${setPart} (or add_condition)`);
             }
         }
         if (preparedRule) {
             const prepared = preparedOutcome(preparedRule, result);
             resultRec.preparedEffectDue = prepared;
             ruleLines.push(`RULE ${prepared.rule}: ${prepared.tier.toUpperCase()}${prepared.margin !== undefined ? ` (margin ${prepared.margin >= 0 ? '+' : ''}${prepared.margin})` : ''}, ${prepared.note}`);
+        }
+
+        for (const note of (result.situational ?? []).slice().reverse()) ruleLines.unshift(`⚖️ ${note}`);
+        if (parsed.volley) {
+            resultRec.volley = parsed.volley;
+            ruleLines.unshift(`VOLLEY ${parsed.volley.dice} (${parsed.volley.reason})`);
+        }
+        if (targetNow?.unit) {
+            const t = volleyTier(targetNow);
+            resultRec.targetUnit = { models: t?.models, maxModels: t?.maxModels, volley: t?.dice ?? null };
+            ruleLines.push(`UNIT ${targetNow.name}: ${describeUnit(targetNow)}`);
         }
 
         output = formatAttackResult(result);
@@ -2446,6 +2506,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             // Table rules: what the engine computed and the GM still names.
             consequenceDue: (r as { consequenceDue?: unknown }).consequenceDue,
             calledStrike: (r as { calledStrike?: unknown }).calledStrike,
+            volley: (r as { volley?: unknown }).volley,
+            situational: r.situational,
+            targetUnit: (r as { targetUnit?: unknown }).targetUnit,
             preparedEffectDue: (r as { preparedEffectDue?: unknown }).preparedEffectDue
         } : undefined;
         output += `\n\n<!-- STATE_JSON\n${JSON.stringify({ ...stateJson, actionResult })}\nSTATE_JSON -->`;

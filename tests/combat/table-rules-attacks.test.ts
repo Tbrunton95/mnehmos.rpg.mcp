@@ -79,11 +79,11 @@ describe('called strikes (Measure of a Body)', () => {
     it('a hit at the leg cripples it: half speed from the next turn, on token and sheet', async () => {
         await setup({ luciel: 'Astartes', karanak: 'Astartes' });
         const { text } = await attack({ outcome: 'hit', damage: 5, calledStrike: 'leg' });
-        expect(text).toMatch(/RULE measure-of-a-body: Karanak crippled:leg until repaired/);
+        expect(text).toMatch(/RULE measure-of-a-body: Karanak's leg crippled until repaired/);
         // A called-strike hit cripples without the 25% threshold.
         expect(text).not.toMatch(/CONSEQUENCE DUE/);
-        expect(token('karanak').conditions.map((c: any) => c.type)).toContain('crippled:leg');
-        expect(new CharacterRepository(getDb()).findById('karanak')!.conditions!.map((c: any) => c.name)).toContain('crippled:leg');
+        expect(token('karanak').parts).toEqual([expect.objectContaining({ name: 'leg', kind: 'leg', state: 'crippled' })]);
+        expect(new CharacterRepository(getDb()).findById('karanak')!.parts).toEqual([expect.objectContaining({ name: 'leg', state: 'crippled' })]);
         await handleCombatManage({ action: 'advance', encounterId }, ctx as any);
         expect(token('karanak').movementRemaining).toBe(15);
     });
@@ -110,7 +110,7 @@ describe('called strikes (Measure of a Body)', () => {
         await setup({ luciel: 'Astartes', karanak: 'Astartes' });
         const { text } = await attack({ outcome: 'miss', calledStrike: 'leg' });
         expect(text).toMatch(/called strike at the leg missed/);
-        expect(token('karanak').conditions).toHaveLength(0);
+        expect(token('karanak').parts ?? []).toHaveLength(0);
     });
 });
 
