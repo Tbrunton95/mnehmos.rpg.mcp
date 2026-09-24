@@ -46,6 +46,7 @@ const AttackSchema = z.object({
     dc: z.number().int().optional(),
     damage: z.union([z.number(), z.string()]).optional(),
     damageType: z.string().optional(),
+    outcome: z.enum(['hit', 'crit', 'miss']).optional().describe('A result the GM resolved at the table. The engine rolls no d20 (no nat 1/20 override) and applies damage exactly as posted: a number is never doubled; a dice string with crit doubles its dice only. Resistances, HP write-through and concentration still apply. hit/crit need damage.'),
     advantage: z.boolean().optional(),
     disadvantage: z.boolean().optional(),
     declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('FINDINGS #34 T4.18: Register-B audit trail — declared conditional traits/cover. Values are ALREADY included in attackBonus by the GM; this array only prints them in the breakdown'),
@@ -181,6 +182,7 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                 dc: params.dc,
                 damage: params.damage,
                 damageType: params.damageType,
+                outcome: params.outcome,
                 advantage: params.advantage,
                 disadvantage: params.disadvantage,
                 declaredModifiers,
@@ -505,6 +507,7 @@ Internal opposed check (Athletics vs better of Athletics/Acrobatics). Win writes
         targetIds: z.array(z.string()).optional().describe('Multiple targets (AoE spells)'),
         targetPosition: z.object({ x: z.number(), y: z.number() }).optional().describe('Target position (move, dash)'),
         attackBonus: z.number().optional().describe('Attack bonus modifier'),
+        outcome: z.enum(['hit', 'crit', 'miss']).optional().describe('attack (mirror): A result the GM resolved at the table. The engine rolls no d20 (no nat 1/20 override) and applies damage exactly as posted: a number is never doubled; a dice string with crit doubles its dice only. Resistances, HP write-through and concentration still apply. hit/crit need damage.'),
         ammoItemId: z.string().optional().describe('FINDINGS #58 (mirror): ammo template id — dry refuses the shot; decrements after the engine resolves'),
         hand: z.enum(['mainhand', 'offhand']).optional().describe('FINDINGS #96-C (mirror): which weapon the attack resolves with — its coating surfaces and debits (default mainhand)'),
         ammoCount: z.number().optional().describe('FINDINGS #58 (mirror): magazines expended (default 1)'),
@@ -634,7 +637,7 @@ function grappleResolve(args: Record<string, unknown>): Record<string, unknown> 
         success: true, actionType: 'grapple', move, hit: true, breakdown, margin,
         ...(applied.length ? { conditionsApplied: applied, onto: target.name } : {}),
         ...(removed.length ? { conditionsRemoved: removed, from: actor.name } : {}),
-        ...(surfaceDamage !== undefined ? { surfaceDamage, damageDetail, applyNote: 'surface damage is ROLLED, not applied — feed it to your damage lane (e.g. attack {damage: N} on the prone target, or the GM adjust verb). The encounter sheet owns mid-combat HP.' } : {}),
+        ...(surfaceDamage !== undefined ? { surfaceDamage, damageDetail, applyNote: 'surface damage is ROLLED, not applied — post it with attack {outcome: \"hit\", damage: N} on the target (no engine d20, no crit doubling), or combat_manage adjust_hp. The encounter sheet owns mid-combat HP.' } : {}),
         message: move === 'break'
             ? `${actor.name} breaks the hold — ${GRAPPLE_CONDITIONS.join('/')} cleared. ${breakdown}`
             : `${actor.name} lands the ${move} on ${target.name}${applied.length ? ` — ${applied.join(' + ')}` : ''}${surfaceDamage !== undefined ? `, ${surfaceDamage} surface damage (${damageDetail})` : ''}. ${breakdown}`

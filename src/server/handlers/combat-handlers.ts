@@ -244,6 +244,7 @@ function formatAttackResult(result: CombatActionResult): string {
         actorName: result.actor?.name,
         targetName: result.target?.name,
         die: ar?.roll,
+        resolved: (ar as { resolved?: 'hit' | 'crit' | 'miss' } | undefined)?.resolved,
         allRolls: ar?.allRolls,
         bonus: ar?.modifier,
         total: ar?.total,
@@ -712,6 +713,7 @@ Examples:
             attackBonus: z.number().int().optional(),
             dc: z.number().int().optional(),
             damage: z.union([z.number(), z.string()]).optional().describe('Damage amount (number) or dice expression (e.g., "1d6+2")'),
+            outcome: z.enum(['hit', 'crit', 'miss']).optional().describe('A result the GM resolved at the table. The engine rolls no d20 (no nat 1/20 override) and applies damage exactly as posted: a number is never doubled; a dice string with crit doubles its dice only. Resistances, HP write-through and concentration still apply. hit/crit need damage.'),
             advantage: z.boolean().optional().describe('Roll 2d20 keep highest (Findings #31/#32)'),
             disadvantage: z.boolean().optional().describe('Roll 2d20 keep lowest'),
             declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit trail: printed in output, never re-applied'),
@@ -1388,6 +1390,18 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         let attackBonus = parsed.attackBonus;
         let dc = parsed.dc;
         let damage: number | string | undefined = parsed.damage;
+        // A GM-resolved attack (outcome) skips every auto-fill below: no d20 is
+        // rolled, so attack bonus and AC are unused, and the posted damage is
+        // the total (0 means 0; no trait damage lane is added on top).
+        const outcome = parsed.outcome;
+        if (outcome && outcome !== 'miss' && damage === undefined) {
+            throw new Error(`outcome '${outcome}' needs the damage you rolled (a number, or dice to roll)`);
+        }
+        if (outcome) {
+            attackBonus = attackBonus ?? 0;
+            dc = dc ?? 0;
+            damage = damage ?? 0;
+        }
 
         const currentState = engine.getState();
         const actor = currentState?.participants.find(p => p.id === parsed.actorId);
@@ -1450,7 +1464,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         }
 
         // 2. Target AC (DC)
-        if (dc === undefined || dc === 0) {
+        if (!outcome && (dc === undefined || dc === 0)) {
             if (target?.ac !== undefined) {
                 dc = target.ac;
             } else {
@@ -1468,10 +1482,10 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             }
         }
         const targetMechs = parsed.targetId ? loadAutoMechanics(resolverDb, parsed.targetId) : [];
-        dc += autoAcBonus(targetMechs, autoApplied);
+        dc = (dc ?? 0) + autoAcBonus(targetMechs, autoApplied);
 
         // 3. Damage - auto-calculate from multiple sources
-        if (damage === undefined || damage === 0) {
+        if (!outcome && (damage === undefined || damage === 0)) {
             // First: try preset on participant
             if (actor?.attackDamage) {
                 damage = actor.attackDamage;
@@ -1506,9 +1520,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // Value sources: fixed, valueFromPool, valueFromProficiency (#70 —
         // Odinets scales with level; hard-coding +2 kills it silently at L5).
         // Applied AFTER crit doubling, BEFORE resistance, inside executeAttack.
-        let damageLaneBonus = autoDamageBonus(actorMechs, autoApplied);
+        let damageLaneBonus = outcome ? 0 : autoDamageBonus(actorMechs, autoApplied);
         let damageLaneProblems: string[] = [];
-        if (declaredEffectRefs.length) {
+        if (!outcome && declaredEffectRefs.length) {
             const ddres = applyDeclaredEffects(resolverDb, parsed.actorId, declaredEffectRefs, 'damage_bonus', autoApplied);
             damageLaneBonus += ddres.total;
             damageLaneProblems = ddres.problems;
@@ -1546,7 +1560,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             parsed.advantage,
             parsed.disadvantage,
             damageLaneBonus || undefined,  // FINDINGS #70: resolver damage lane
-            damageLaneLabel
+            damageLaneLabel,
+            outcome
         );
 
         // Sync HP to character database after attack

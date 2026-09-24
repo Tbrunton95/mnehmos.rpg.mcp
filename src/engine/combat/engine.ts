@@ -623,7 +623,11 @@ export class CombatEngine {
         // (spec ruling pending Tom's ratification; matches 5e dice-double law),
         // and resistance sees the true total.
         flatDamageBonus?: number,
-        flatDamageLabel?: string
+        flatDamageLabel?: string,
+        // An attack the GM resolved at the table: no d20 is rolled, so no
+        // natural 1 or 20 can override it, and a posted damage number lands
+        // exactly as posted (field report: a nat 20 doubled a posted 111).
+        resolved?: 'hit' | 'crit' | 'miss'
     ): CombatActionResult {
         if (!this.state) throw new Error('No active combat');
 
@@ -637,7 +641,16 @@ export class CombatEngine {
 
         // Roll with full transparency — 5e semantics (Findings #32):
         // crit reads the natural die, never the margin.
-        const attackRoll = this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage);
+        const attackRoll: CheckResult & { allRolls: number[]; resolved?: 'hit' | 'crit' | 'miss' } = resolved
+            ? {
+                roll: undefined as unknown as number, modifier: 0, total: undefined as unknown as number,
+                dc: undefined as unknown as number, margin: 0,
+                degree: resolved === 'crit' ? 'critical-success' : resolved === 'hit' ? 'success' : 'failure',
+                isNat20: false, isNat1: false,
+                isHit: resolved !== 'miss', isCrit: resolved === 'crit',
+                allRolls: [], resolved
+            }
+            : this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage);
 
         let damageDealt = 0;
         let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
@@ -649,21 +662,26 @@ export class CombatEngine {
         let capturedDamageRolls: number[] | undefined;
         if (typeof damage === 'string') {
             const dmgResult = this.rng.rollDamageDetailed(damage);
-            baseDamageVal = dmgResult.total;
-            capturedDamageRolls = dmgResult.rolls;
-            damageBreakdownStr = ` (${dmgResult.rolls.join('+')}${dmgResult.modifier >= 0 ? '+' + dmgResult.modifier : dmgResult.modifier})`;
+            let diceTotal = dmgResult.diceTotal;
+            let rolls = dmgResult.rolls;
+            // 5e crit: roll the damage dice twice; the modifier counts once.
+            if (attackRoll.isHit && attackRoll.isCrit) {
+                const extra = this.rng.rollDamageDetailed(damage);
+                diceTotal += extra.diceTotal;
+                rolls = [...rolls, ...extra.rolls];
+            }
+            baseDamageVal = diceTotal + dmgResult.modifier;
+            capturedDamageRolls = rolls;
+            damageBreakdownStr = ` (${rolls.join('+')}${dmgResult.modifier >= 0 ? '+' + dmgResult.modifier : dmgResult.modifier})`;
         } else {
+            // A number has no dice to double: it lands as given, crit or not.
             baseDamageVal = damage;
         }
 
         if (attackRoll.isHit) {
-            // Critical Hit: Double the dice (approx. double the value for now if passing number)
-            // If string was passed, we ideally double the DICE, but for now double the total is consistent with current impl.
-            // TODO(medium): Implement proper crit rules (double dice) using rollDamageDetailed
-            const critBase = attackRoll.isCrit ? baseDamageVal * 2 : baseDamageVal;
             // FINDINGS #70: the damage lane lands here — outside the crit
             // doubling, inside the resistance math.
-            const finalBaseDamage = critBase + (flatDamageBonus ?? 0);
+            const finalBaseDamage = baseDamageVal + (flatDamageBonus ?? 0);
             
             // HIGH-002: Apply resistance/vulnerability/immunity
             const modResult = this.calculateDamageWithModifiers(finalBaseDamage, damageType, target);
@@ -678,7 +696,9 @@ export class CombatEngine {
         const diceShown = attackRoll.allRolls.length > 1
             ? `d20(${attackRoll.allRolls.join(',')}${advantage ? ' adv' : ' dis'}→${attackRoll.roll})`
             : `d20(${attackRoll.roll})`;
-        let breakdown = `🎲 Attack Roll: ${diceShown} + ${attackBonus} = ${attackRoll.total} vs AC ${dc}\n`;
+        let breakdown = resolved
+            ? `🎲 Attack: resolved externally by the GM (${resolved.toUpperCase()})\n`
+            : `🎲 Attack Roll: ${diceShown} + ${attackBonus} = ${attackRoll.total} vs AC ${dc}\n`;
 
         if (attackRoll.isNat20) {
             breakdown += `   ⭐ NATURAL 20!\n`;
