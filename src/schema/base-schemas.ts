@@ -299,7 +299,8 @@ export type ConditionType = z.infer<typeof ConditionTypeEnum>;
  * Standard D&D currency object
  */
 export const CurrencyFields = z.object({
-    gold: z.number().int().min(0).default(0),
+    gold: z.number().min(0).default(0), // decimal, to the cent
+
     silver: z.number().int().min(0).default(0),
     copper: z.number().int().min(0).default(0),
 }).default({});

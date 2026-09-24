@@ -37,7 +37,7 @@ export const CorpseSchema = z.object({
 
     // Currency (from loot generation)
     currency: z.object({
-        gold: z.number().int().min(0).default(0),
+        gold: z.number().min(0).default(0),
         silver: z.number().int().min(0).default(0),
         copper: z.number().int().min(0).default(0)
     }).default({ gold: 0, silver: 0, copper: 0 }),

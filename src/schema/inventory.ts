@@ -35,7 +35,7 @@ export const InventorySchema = z.object({
     items: z.array(InventoryItemSchema),
     capacity: z.union([z.number(), z.literal('unlimited')]).default(100), // #95 R1c: pool-derived weight limit; 'unlimited' is the sentinel (max<0 on the carry_capacity pool)
     currency: z.object({
-        gold: z.number().int().min(0).default(0),
+        gold: z.number().min(0).default(0), // decimal, to the cent
         silver: z.number().int().min(0).default(0),
         copper: z.number().int().min(0).default(0)
     }).default({})

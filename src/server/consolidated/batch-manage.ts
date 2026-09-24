@@ -750,7 +750,9 @@ async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContex
         // corrupting: the refusal names every offending param and the fix.
         const arrayParams = Object.entries(step.args ?? {}).filter(([, v]) => Array.isArray(v)).map(([k]) => k);
         if (arrayParams.length) {
-            const error = `BATCH LAW (#16a): array param(s) [${arrayParams.join(', ')}] would MANGLE in a batched step — refused, nothing executed for this step. Make this call DIRECTLY (arrays are safe outside batch), or restructure without arrays.`;
+            const act = typeof step.args?.action === 'string' ? ` ${step.args.action}` : '';
+            const rolledBack = input.atomic && i > 0 ? ` Atomic: the ${i} earlier step(s) in this batch roll back too.` : '';
+            const error = `BATCH LAW (#16a): ${step.tool}${act} has array param(s) [${arrayParams.join(', ')}], which mangle in a batched step. Refused; nothing executed for this step.${rolledBack} Fix: call ${step.tool} directly (arrays are safe outside batch), or drop the array params from the step.`;
             output += `  ❌ ${error}\n`;
             executedSteps.push({ stepIndex: i, stepId, tool: step.tool, success: false, error });
             if (input.stopOnError !== false) { output += `\n⛔ Sequence stopped (stopOnError).\n`; break; }
