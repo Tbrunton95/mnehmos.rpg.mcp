@@ -577,7 +577,7 @@ export class CombatEngine {
     /**
      * HIGH-002: Calculate damage after applying resistance/vulnerability/immunity
      */
-    private calculateDamageWithModifiers(
+    calculateDamageWithModifiers(
         baseDamage: number,
         damageType: string | undefined,
         target: CombatParticipant

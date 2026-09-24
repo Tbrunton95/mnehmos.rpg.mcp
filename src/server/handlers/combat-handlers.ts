@@ -315,6 +315,7 @@ function formatSpellCastResult(
         attackRoll?: number;
         attackTotal?: number;
         hit?: boolean;
+        critical?: boolean;
     },
     target: { name: string; hp: number; maxHp: number } | undefined,
     targetHpBefore: number
@@ -326,7 +327,7 @@ function formatSpellCastResult(
 
     // Attack Roll details
     if (resolution.attackRoll !== undefined) {
-        const hitStr = resolution.hit ? 'HIT' : 'MISS';
+        const hitStr = resolution.critical ? 'CRITICAL HIT' : resolution.hit ? 'HIT' : resolution.attackRoll === 1 ? 'MISS (natural 1)' : 'MISS';
         const bonus = (resolution.attackTotal || 0) - resolution.attackRoll;
         const sign = bonus >= 0 ? '+' : '';
         output += `⚔️ Attack Roll: ${resolution.attackRoll} (d20) ${sign}${bonus} = ${resolution.attackTotal} → ${hitStr}\n`;
@@ -2025,6 +2026,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             saveTotal?: number;
             saved?: boolean;
             damageDealt?: number;
+            damageModifier?: 'immune' | 'resistant' | 'vulnerable' | 'normal';
         }[] = [];
         const damageType = resolution.damageType || 'force';
 
@@ -2085,6 +2087,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     }
                 }
 
+                // Resistance, immunity and vulnerability apply after the save.
+                const typed = engine.calculateDamageWithModifiers(damageDealt, damageType, targetParticipant);
+                damageDealt = typed.finalDamage;
+                const damageModifier = typed.modifier;
+
                 // Apply damage via engine's applyDamage (direct HP reduction)
                 if (damageDealt > 0) {
                     engine.applyDamage(tid, damageDealt);
@@ -2113,7 +2120,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     saveRoll,
                     saveTotal,
                     saved,
-                    damageDealt
+                    damageDealt,
+                    damageModifier
                 });
 
                 // Check concentration if target is concentrating
@@ -2188,6 +2196,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             );
         }
 
+        const modTag = (m?: string) => (m && m !== 'normal' ? ` (${m})` : '');
         // Format output - now includes all targets hit
         if (damageResults.length > 1) {
             // AoE spell output
@@ -2205,9 +2214,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 if (dr.saveRoll !== undefined) {
                     const saveResult = dr.saved ? '✓ PASS' : '✗ FAIL';
                     output += `  • ${dr.name}: d20(${dr.saveRoll}) + ${(dr.saveTotal || 0) - dr.saveRoll} = ${dr.saveTotal} [${saveResult}]\n`;
-                    output += `    → ${dr.damageDealt} dmg | ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
+                    output += `    → ${dr.damageDealt} dmg${modTag(dr.damageModifier)} | ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
                 } else {
-                    output += `  • ${dr.name}: ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
+                    output += `  • ${dr.name}: ${dr.damageDealt} dmg${modTag(dr.damageModifier)} | ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
                 }
             }
         } else if (damageResults.length === 1) {
@@ -2216,8 +2225,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             const only = damageResults[0];
             const shown = requiresSave
                 ? { ...resolution, damage: only.damageDealt ?? baseDamage, saveResult: (only.saved ? 'passed' : 'failed') as 'passed' | 'failed', saveDC: spellSaveDC }
-                : resolution;
+                : { ...resolution, damage: only.damageDealt ?? resolution.damage };
             output = formatSpellCastResult(actor.name, shown, primaryTarget, targetHpBefore);
+            if (only.damageModifier && only.damageModifier !== 'normal') {
+                output += `\n🛡️ ${only.name} is ${only.damageModifier} to ${damageType}\n`;
+            }
         } else {
             output = `\n✨ ${actor.name} casts ${spell.name}!\n`;
             if (resolution.healing && resolution.healing > 0) {
@@ -2226,11 +2238,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         }
         // Save spells report what targets took; with no participant targets
         // (a point-targeted AoE) the full roll is the spell's damage.
-        const reportedDamage = requiresSave
-            ? (damageResults.length > 0
-                ? damageResults.reduce((sum, dr) => sum + (dr.damageDealt ?? 0), 0)
-                : baseDamage)
-            : (resolution.damage || 0);
+        const reportedDamage = damageResults.length > 0
+            ? damageResults.reduce((sum, dr) => sum + (dr.damageDealt ?? 0), 0)
+            : (requiresSave ? baseDamage : (resolution.damage || 0));
         output += `\n[SPELL: ${spell.name}, SLOT: ${effectiveSlotLevel > 0 ? effectiveSlotLevel : 'cantrip'}, DMG: ${reportedDamage}, HEAL: ${resolution.healing || 0}]`;
 
         // Commit Action Economy
