@@ -2,7 +2,7 @@
 
 ## This Repository
 
-The reference backend game engine. **44 MCP tools** (39 consolidated action-routed + 2 meta + 3 event) for complete RPG mechanics, including LLM-driven NPCs via `agent_manage` and the Operator's constraint-perception lens via `perception_manage`.
+The reference backend game engine. **46 MCP tools** (41 consolidated action-routed + 2 meta + 3 event) for complete RPG mechanics, including LLM-driven NPCs via `agent_manage` and the Operator's constraint-perception lens via `perception_manage`.
 **Philosophy:** "LLM describes, engine validates" - Database is source of truth.
 **Status:** Alpha - 2464 tests passing (7 skipped), 168 test files, MCP Protocol fully integrated
 
@@ -34,7 +34,7 @@ npm run seed:bastion -- --db-path <file>   # Seed Bastion into an existing campa
 ```
 src/
 ├── server/
-│   ├── consolidated/  # 39 action-routed tool handlers (index.ts = registry)
+│   ├── consolidated/  # 41 action-routed tool handlers (index.ts = registry)
 │   ├── handlers/      # Extracted handler implementations (combat, spatial)
 │   ├── index.ts       # MCP server entry + transport setup
 │   └── meta-tools.ts  # search_tools, load_tool_schema
