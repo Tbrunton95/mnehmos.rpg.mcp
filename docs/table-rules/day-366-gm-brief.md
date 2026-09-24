@@ -19,6 +19,9 @@ At the start of every session, call `session_manage get_context {worldId}`. The 
 - Regeneration is automatic at the start of the creature's turn. Out of combat, move time with `world_manage update {worldId, environment: {time}}` and regenerators heal. Nothing regenerates at 0 HP: destroyed stays destroyed.
 - Levels are milestones. XP never offers a level-up. Use `character_manage level_up {characterId}` only when the table calls it.
 - Status blocks stay tiny: `character_manage get_status_block {characterId}`.
+- Keep replies small: add `output_mode: 'summary'` to updates and bookkeeping calls. Big lists come back as counts instead of the full sheet.
+- Change one condition's text in place with `character_manage update {characterId, editConditions: [{match, replace: {find, with}}]}` (or `name` for a full rewrite). Never remove and re-add a condition to edit it.
+- Never pass `seed` to a roll. An explicit seed replays identical dice; leave it out and every roll is fresh.
 
 ## A refusal is a rule, not an error
 If the engine refuses a called strike (the target is below the attacker's band) or reports "band unset", say so plainly and play on. A refused strike spends no action. Don't work around a refusal with a posted result.
