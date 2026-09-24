@@ -350,6 +350,10 @@ export function renderStrip(ctx: { callsign?: string; day?: number | string; tim
     const dosim = typeof ctx.rads === 'number' ? ` ${g.rad} ${bar(ctx.rads, 8, 1000)} ${ctx.rads} ─` : ' ─';
     const badge = ctx.badge === undefined ? g.badge : ctx.badge;
     const head = badge ? `${badge} ─── ` : '';
+    if (ctx.day === undefined && typeof ctx.rads !== 'number') {
+        // Nothing to show after the name: close the strip there.
+        return plain() ? `+- ${head.replace(/─/g, '-')}${cs} --+\n` : `╓─ ${head}${cs} ──╖\n`;
+    }
     if (plain()) return `+- ${head.replace(/─/g, '-')}${cs} -${clock.replace(/─/g, '-')}${dosim.replace(/─/g, '-')}-+\n`;
     return `╓─ ${head}${cs} ──${clock}─${dosim}──╖\n`;
 }

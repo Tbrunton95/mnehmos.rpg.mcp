@@ -196,6 +196,16 @@ export function characterLexicon(db: Database.Database, characterId: string): Le
     return worldLexicon(db, resolveWorldId(db, { characterIds: [characterId] }));
 }
 
+/**
+ * The conditions a short view shows: pinned ones first in sheet order, then
+ * the rest newest first. A sheet's oldest grants never crowd out the fight.
+ */
+export function conditionsForDisplay<C extends { pinned?: boolean }>(conditions: C[], n: number): C[] {
+    const pinned = conditions.filter(c => c.pinned);
+    const rest = conditions.filter(c => !c.pinned).reverse();
+    return [...pinned, ...rest].slice(0, n);
+}
+
 /** The world's band order, or the Day 366 default when no band rule exists. */
 export function bandOrder(db: Database.Database, worldId: string | null | undefined): string[] {
     return loadRule(db, worldId, 'band')?.spec.order ?? DEFAULT_BAND_ORDER;

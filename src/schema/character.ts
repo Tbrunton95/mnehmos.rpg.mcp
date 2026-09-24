@@ -97,7 +97,8 @@ export const CharacterSchema = z.object({
     conditions: z.array(z.object({
         name: z.string().describe('Condition name (e.g., Poisoned, Frightened)'),
         duration: z.number().int().optional().describe('Duration in rounds'),
-        source: z.string().optional().describe('Source of the condition')
+        source: z.string().optional().describe('Source of the condition'),
+        pinned: z.boolean().optional().describe('Shown first in the tiny status block and the boot digest')
     })).optional().default([]),
     position: z.object({
         x: z.number(),
