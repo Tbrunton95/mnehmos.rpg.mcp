@@ -3,7 +3,24 @@ import Database from 'better-sqlite3';
 import { migrateClassProgression } from './migrations.class-progression.js';
 import { migrateLegacyRegionIds } from './migrations.region-ids.js';
 
+/**
+ * Bring a database up to the current schema.
+ *
+ * The whole pass runs in one IMMEDIATE transaction. Claude Desktop starts
+ * two copies of the server at once, and both open the same rpg.db: without
+ * the write lock both read "column missing" and both ALTER, and the loser
+ * dies with "duplicate column name". With it, the second process waits on
+ * busy_timeout, then finds every step already applied.
+ */
 export function migrate(db: Database.Database) {
+  if (db.inTransaction) {
+    migrateSchema(db);
+    return;
+  }
+  db.transaction(() => migrateSchema(db)).immediate();
+}
+
+function migrateSchema(db: Database.Database) {
   // First, create all tables (without indexes that depend on new columns)
   db.exec(`
   CREATE TABLE IF NOT EXISTS worlds(
