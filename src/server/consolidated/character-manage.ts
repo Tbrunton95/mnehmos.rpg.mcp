@@ -12,7 +12,7 @@
  * - level_up -> action: 'level_up'
  */
 
-import { loadRule, resolveWorldId } from '../../engine/table-rules.js';
+import { loadRule, resolveWorldId, findPool } from '../../engine/table-rules.js';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { SessionContext } from '../types.js';
@@ -382,7 +382,7 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
     const worldId = resolveWorldId(db, { characterIds: [args.characterId] });
     const tiny = loadRule(db, worldId, 'status_block');
     if (tiny?.spec.compact) {
-        const pool = tiny.spec.corePool ? pools[tiny.spec.corePool] : undefined;
+        const core = findPool(pools, tiny.spec.corePool);
         let location: string | undefined;
         let objective: string | undefined;
         try {
@@ -404,7 +404,7 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
             characterName: char.name,
             hp: char.hp,
             maxHp: char.maxHp,
-            corePool: pool && tiny.spec.corePool ? { name: tiny.spec.corePool, current: pool.current, max: pool.max } : undefined,
+            corePool: core ? { name: core.key, current: core.pool.current, max: core.pool.max } : undefined,
             location,
             objective,
             conditions,

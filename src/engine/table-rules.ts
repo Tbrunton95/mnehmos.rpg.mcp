@@ -155,6 +155,17 @@ export function compareBands(order: string[], a: string | undefined | null, b: s
     return ia === ib ? 0 : ia < ib ? -1 : 1;
 }
 
+/**
+ * A resource pool by name: the exact key first, then any case. Returns the
+ * stored key so the block shows the name as the sheet spells it.
+ */
+export function findPool<P>(pools: Record<string, P> | undefined | null, name: string | undefined | null): { key: string; pool: P } | undefined {
+    if (!pools || !name) return undefined;
+    if (pools[name] !== undefined) return { key: name, pool: pools[name] };
+    const key = Object.keys(pools).find(k => k.toLowerCase() === name.toLowerCase());
+    return key ? { key, pool: pools[key] } : undefined;
+}
+
 /** The world's band order, or the Day 366 default when no band rule exists. */
 export function bandOrder(db: Database.Database, worldId: string | null | undefined): string[] {
     return loadRule(db, worldId, 'band')?.spec.order ?? DEFAULT_BAND_ORDER;

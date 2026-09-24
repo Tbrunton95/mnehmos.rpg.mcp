@@ -52,6 +52,23 @@ describe('milestone XP, tiny status, principles at boot', () => {
         expect(res).not.toMatch(/WARP/i);
     });
 
+    it('the core pool matches its stored key whatever the case', async () => {
+        await importDay366();
+        await handleTableRules({ action: 'define', worldId: W, kind: 'status_block', name: 'tiny-status', spec: { corePool: 'CORRUPTION' } }, ctx as any);
+        const block = tagJson((await handleCharacterManage({ action: 'get_status_block', characterId: 'luciel' }, ctx as any)).content[0].text, 'CHARACTER_MANAGE');
+        expect(block.corePool).toMatchObject({ name: 'corruption', current: 7, max: 100 });
+        const boot = tagJson((await handleSessionManage({ action: 'boot', worldId: W }, ctx as any)).content[0].text, 'SESSION_MANAGE');
+        expect(boot.characters[0].corruption).toBe('7/100');
+    });
+
+    it('defining a core pool no character has warns and still saves', async () => {
+        const res = tagJson((await handleTableRules({ action: 'define', worldId: W, kind: 'status_block', name: 'tiny-status', spec: { corePool: 'resolve' } }, ctx as any)).content[0].text, 'TABLE_RULES');
+        expect(res.success).toBe(true);
+        expect(res.warning).toMatch(/no character in this world has pool 'resolve'/);
+        const known = tagJson((await handleTableRules({ action: 'define', worldId: W, kind: 'status_block', name: 'tiny-status', spec: { corePool: 'Warp' } }, ctx as any)).content[0].text, 'TABLE_RULES');
+        expect(known.warning).toBeUndefined();
+    });
+
     it('get_context lists the enforced rules and the principles', async () => {
         await importDay366();
         const text = (await handleSessionManage({ action: 'get_context', worldId: W }, ctx as any)).content[0].text;
