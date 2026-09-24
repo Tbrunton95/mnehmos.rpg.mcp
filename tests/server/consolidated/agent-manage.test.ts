@@ -242,6 +242,35 @@ describe('agent_manage tool', () => {
             expect(cleared.agent.competencyOverride).toBeNull();
         });
 
+        // Reasoning models before gpt-5.1 reject 'none', and before gpt-5.2
+        // reject 'xhigh': an explicit pair the model cannot take is refused
+        // before the write, like a -pro model.
+        it('refuses an explicit override effort the override model cannot take', async () => {
+            const characterId = createCharacter('Kara');
+            const refused = extractJson(await handleAgentManage(
+                { action: 'create', characterId, provider: 'openai', model: 'o3', competencyOverride: { model: 'o3', reasoningEffort: 'none' } },
+                ctx
+            ));
+            expect(refused.error).toBe(true);
+            expect(refused.writes).toBe('none');
+            expect(refused.message).toMatch(/"none"[\s\S]*"o3"/);
+
+            const created = extractJson(await handleAgentManage(
+                { action: 'create', characterId, provider: 'openai', model: 'o3', competencyOverride: { model: 'o3' } },
+                ctx
+            ));
+            expect(created.error).toBeUndefined();
+
+            const updateRefused = extractJson(await handleAgentManage(
+                { action: 'update', characterId, competencyOverride: { model: 'gpt-5-mini', reasoningEffort: 'xhigh' } },
+                ctx
+            ));
+            expect(updateRefused.error).toBe(true);
+            expect(updateRefused.writes).toBe('none');
+            const loaded = extractJson(await handleAgentManage({ action: 'get', characterId }, ctx));
+            expect(loaded.agent.competencyOverride).toEqual({ model: 'o3' });
+        });
+
         it('lists agents with status filter', async () => {
             const c1 = createCharacter('A');
             const c2 = createCharacter('B');

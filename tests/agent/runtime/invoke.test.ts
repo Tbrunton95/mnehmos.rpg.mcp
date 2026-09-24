@@ -3,6 +3,7 @@ import { initDB } from '../../../src/storage/db';
 import { migrate } from '../../../src/storage/migrations';
 import { CharacterRepository } from '../../../src/storage/repos/character.repo';
 import { ProviderFactory } from '../../../src/agent/provider/factory';
+import { OpenAIProvider, REASONING_COMPLETION_FLOOR } from '../../../src/agent/provider/openai';
 import { LLMProvider, ProviderCallResult, ProviderError } from '../../../src/agent/provider/types';
 import { invokeAgent } from '../../../src/agent/runtime/invoke';
 import { buildAgentRuntime } from '../../../src/agent/runtime/deps';
@@ -157,6 +158,65 @@ describe('invokeAgent', () => {
         const call = deps.agentRepo.findCallById(result.callId!) as any;
         expect(call.model).toBe('gpt-5.5');
         expect(call.reasoningEffort).toBe('none');
+    });
+
+    // A model-only override inherits the ladder's effort. The active ladder's
+    // 'none' (INT 1–6) and 'xhigh' (INT 19–20) must not reach an older
+    // reasoning model that rejects them: HTTP 400 on every invoke, then an open
+    // circuit. Asserted on the real OpenAI request body.
+    describe('model-only override on an older reasoning model (OpenAI request body)', () => {
+        function captureOpenAIBodies(): Record<string, unknown>[] {
+            const bodies: Record<string, unknown>[] = [];
+            factory.register('openai', new OpenAIProvider({
+                apiKey: 'sk-test',
+                fetchImpl: async (_url, init) => {
+                    bodies.push(JSON.parse(init!.body as string));
+                    return new Response(JSON.stringify({ choices: [{ message: { content: 'Grug see door.' } }] }), {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' }
+                    });
+                }
+            }));
+            return bodies;
+        }
+
+        it.each(['gpt-5-nano', 'gpt-5-mini', 'o3'])(
+            'INT 4 + {model: "%s"} sends no "none" and keeps the default completion floor',
+            async (model) => {
+                const agent = setupAgent({ characterInt: 4, competencyOverride: { model } });
+                const bodies = captureOpenAIBodies();
+
+                const result = await invokeAgent({ agentId: agent.id }, deps);
+
+                expect(result.status).toBe('ok');
+                expect(bodies[0].model).toBe(model);
+                expect(bodies[0]).not.toHaveProperty('reasoning_effort');
+                expect(bodies[0].max_completion_tokens).toBeGreaterThanOrEqual(REASONING_COMPLETION_FLOOR.medium);
+                expect(result.reasoningEffort).toBeNull();
+                expect(deps.agentRepo.findCallById(result.callId!)!.reasoningEffort).toBeNull();
+            }
+        );
+
+        it.each(['o3', 'gpt-5-mini'])('INT 19 + {model: "%s"} sends "high", not "xhigh"', async (model) => {
+            const agent = setupAgent({ characterInt: 19, competencyOverride: { model } });
+            const bodies = captureOpenAIBodies();
+
+            const result = await invokeAgent({ agentId: agent.id }, deps);
+
+            expect(result.status).toBe('ok');
+            expect(bodies[0].reasoning_effort).toBe('high');
+            expect(deps.agentRepo.findCallById(result.callId!)!.reasoningEffort).toBe('high');
+        });
+
+        it('still sends "none" to an override model that accepts it', async () => {
+            const agent = setupAgent({ characterInt: 4, competencyOverride: { model: 'gpt-5.1' } });
+            const bodies = captureOpenAIBodies();
+
+            const result = await invokeAgent({ agentId: agent.id }, deps);
+
+            expect(result.status).toBe('ok');
+            expect(bodies[0].reasoning_effort).toBe('none');
+        });
     });
 
     it('uses per-agent competency override and audits the override source', async () => {

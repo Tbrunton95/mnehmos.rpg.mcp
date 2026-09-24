@@ -1,4 +1,5 @@
 import { OpenAIProvider, isReasoningModel, REASONING_COMPLETION_FLOOR } from '../../../src/agent/provider/openai.js';
+import { supportsReasoningEffort } from '../../../src/agent/provider/reasoning.js';
 import { ProviderError } from '../../../src/agent/provider/types.js';
 
 /**
@@ -300,6 +301,42 @@ describe('OpenAIProvider', () => {
         it('is case-insensitive', () => {
             expect(isReasoningModel('GPT-5')).toBe(true);
             expect(isReasoningModel('O1-Mini')).toBe(true);
+        });
+    });
+
+    // OpenAI API reference: models before gpt-5.1 do not support 'none';
+    // 'xhigh' arrives after gpt-5.1-codex-max. Either one sent to a model that
+    // lacks it is an HTTP 400.
+    describe('supportsReasoningEffort', () => {
+        it.each(['gpt-5.1', 'gpt-5.2', 'gpt-5.4-nano', 'gpt-5.5', 'gpt-5.5-2026-04-23', 'openai/gpt-5.6-luna', 'gpt-6'])(
+            '"%s" accepts none',
+            (m) => expect(supportsReasoningEffort(m, 'none')).toBe(true)
+        );
+
+        it.each(['o1', 'o3', 'o3-mini', 'o4-mini', 'gpt-5', 'gpt-5-mini', 'gpt-5-nano', 'gpt-5-2025-08-07', 'openai/o3'])(
+            '"%s" rejects none',
+            (m) => expect(supportsReasoningEffort(m, 'none')).toBe(false)
+        );
+
+        it('accepts xhigh only from gpt-5.2 on', () => {
+            expect(supportsReasoningEffort('gpt-5.2', 'xhigh')).toBe(true);
+            expect(supportsReasoningEffort('gpt-5.5', 'xhigh')).toBe(true);
+            expect(supportsReasoningEffort('gpt-5.1', 'xhigh')).toBe(false);
+            expect(supportsReasoningEffort('gpt-5-mini', 'xhigh')).toBe(false);
+            expect(supportsReasoningEffort('o3', 'xhigh')).toBe(false);
+        });
+
+        it('accepts low/medium/high on every reasoning model', () => {
+            for (const m of ['o1', 'o3', 'o4-mini', 'gpt-5-nano', 'gpt-5.5']) {
+                for (const e of ['low', 'medium', 'high'] as const) {
+                    expect(supportsReasoningEffort(m, e)).toBe(true);
+                }
+            }
+        });
+
+        it('places no restriction on non-reasoning models (the field is never sent)', () => {
+            expect(supportsReasoningEffort('gpt-4.1', 'none')).toBe(true);
+            expect(supportsReasoningEffort('gpt-4o', 'xhigh')).toBe(true);
         });
     });
 

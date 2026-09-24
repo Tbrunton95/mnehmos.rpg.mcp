@@ -88,6 +88,53 @@ describe('competency mapping', () => {
         expect(resolved.overrideError).toMatch(/no-pro-model/);
     });
 
+    // The active ladder's 'none' (INT 1–6) and 'xhigh' (INT 19–20) are gpt-5.5
+    // efforts. A model-only override inherits them; a reasoning model that
+    // predates them (o-series, gpt-5/-mini/-nano) answers HTTP 400 to each, so
+    // the resolver requests the nearest effort that model accepts.
+    it('does not hand an inherited "none" to a reasoning model older than gpt-5.1', () => {
+        for (const model of ['gpt-5-nano', 'gpt-5-mini', 'gpt-5', 'o3', 'openai/o4-mini']) {
+            const resolved = resolveCompetency(4, { model });
+            expect(resolved).toMatchObject({ model, reasoningEffort: null, source: 'override' });
+            expect(resolved.overrideError).toBeUndefined();
+        }
+        expect(resolveCompetency(4, { model: 'gpt-5.1' }).reasoningEffort).toBe('none');
+        expect(resolveCompetency(4, { model: 'openai/gpt-5.6-luna' }).reasoningEffort).toBe('none');
+    });
+
+    it('steps an inherited "xhigh" down to "high" for a model that lacks it', () => {
+        for (const model of ['o3', 'gpt-5-mini', 'gpt-5.1']) {
+            const resolved = resolveCompetency(19, { model });
+            expect(resolved).toMatchObject({ model, reasoningEffort: 'high', source: 'override' });
+            expect(resolved.overrideError).toBeUndefined();
+        }
+        expect(resolveCompetency(19, { model: 'gpt-5.4' }).reasoningEffort).toBe('xhigh');
+    });
+
+    it('leaves the effort alone for a non-reasoning model (it is never sent)', () => {
+        expect(resolveCompetency(4, { model: 'gpt-4.1' }).reasoningEffort).toBe('none');
+        expect(resolveCompetency(19, { model: 'gpt-4.1' }).reasoningEffort).toBe('xhigh');
+    });
+
+    // FINDINGS #98 again: an explicit pair the model cannot take is refused on
+    // write, and a stored one loads, requests what the model takes, and says so.
+    it('degrades a stored explicit effort the model cannot take, with overrideError', () => {
+        const resolved = resolveCompetency(12, { model: 'o3', reasoningEffort: 'none' });
+        expect(resolved).toMatchObject({ model: 'o3', reasoningEffort: null, source: 'override' });
+        expect(resolved.overrideError).toMatch(/"none"[\s\S]*"o3"/);
+        expect(resolveCompetency(12, { model: 'gpt-5-mini', reasoningEffort: 'xhigh' }))
+            .toMatchObject({ reasoningEffort: 'high', source: 'override' });
+    });
+
+    it('refuses an explicit effort the override model cannot take on write', () => {
+        expect(validateOverride({ model: 'o3', reasoningEffort: 'none' })).toMatch(/"none"[\s\S]*"o3"/);
+        expect(validateOverride({ model: 'gpt-5-nano', reasoningEffort: 'none' })).toMatch(/"none"/);
+        expect(validateOverride({ model: 'gpt-5-mini', reasoningEffort: 'xhigh' })).toMatch(/"xhigh"/);
+        expect(validateOverride({ model: 'gpt-5-nano' })).toBeNull();
+        expect(validateOverride({ model: 'gpt-5.5', reasoningEffort: 'none' })).toBeNull();
+        expect(validateOverride({ model: 'o3', reasoningEffort: null })).toBeNull();
+    });
+
     it('refuses pro model variants on write', () => {
         expect(validateOverride({ model: 'gpt-5.5-pro' })).toMatch(/refused[\s\S]*-pro/);
         expect(validateOverride({ model: 'gpt-5.5' })).toBeNull();

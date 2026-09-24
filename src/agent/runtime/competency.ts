@@ -1,6 +1,7 @@
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { z } from 'zod';
+import { effortForModel, supportsReasoningEffort } from '../provider/reasoning.js';
 
 // 'none' is the active ladder's INT 1–6 rung (docs/bastion/07): reasoning
 // explicitly OFF on a reasoning model. Distinct from null, which means "send
@@ -94,14 +95,28 @@ export function resolveCompetency(
         };
     }
 
+    // The active ladder's 'none' (INT 1–6) and 'xhigh' (INT 19–20) are gpt-5.5
+    // efforts. A model-only override inherits them, and an older reasoning
+    // model (o-series, gpt-5/-mini/-nano) answers HTTP 400 to each — every
+    // invoke, until the circuit opens. Request the nearest effort the model
+    // takes, so the provider call, preflight floor and audit row all agree.
+    const requestedEffort = override?.reasoningEffort !== undefined
+        ? override.reasoningEffort
+        : entry.reasoningEffort;
+    const reasoningEffort = effortForModel(model, requestedEffort);
+    // FINDINGS #98 again: an explicit stored pair that validateOverride now
+    // refuses still loads, requests what the model takes, and says so.
+    const effortError = override?.reasoningEffort !== undefined && reasoningEffort !== requestedEffort
+        ? `stored override reasoningEffort "${requestedEffort}" is not accepted by "${model}" — requesting ${reasoningEffort === null ? 'the model default' : `"${reasoningEffort}"`}; fix via agent_manage update {competencyOverride}`
+        : null;
+
     return {
         ...entry,
         int,
         model,
-        reasoningEffort: override?.reasoningEffort !== undefined
-            ? override.reasoningEffort
-            : entry.reasoningEffort,
-        source: hasOverride ? 'override' : 'stat_derived'
+        reasoningEffort,
+        source: hasOverride ? 'override' : 'stat_derived',
+        ...(effortError ? { overrideError: effortError } : {})
     };
 }
 
@@ -121,9 +136,13 @@ export function validateOverride(override?: CompetencyOverride | null): string |
     if (!override || override.model === undefined) return null;
     try {
         assertNoProModel(override.model);
-        return null;
     } catch {
         const known = [...new Set(loadCompetencyLadder().map(e => e.model))].join(', ');
         return `Model "${override.model}" is refused (rule: no -pro model variants). Known-good ladder models: ${known}. Test any other string on a disposable agent before a live one.`;
     }
+    const effort = override.reasoningEffort;
+    if (effort && !supportsReasoningEffort(override.model, effort)) {
+        return `reasoningEffort "${effort}" is refused for "${override.model}": the model does not accept it (HTTP 400 on every invoke). Pick another effort, or omit reasoningEffort to inherit the INT ladder's, stepped to one the model takes.`;
+    }
+    return null;
 }
