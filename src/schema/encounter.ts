@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DurationType, parseAbility, parseDurationType } from '../engine/combat/conditions.js';
 
 export const ConditionSchema = z.object({
     id: z.string(),
@@ -14,9 +15,18 @@ export const ConditionSchema = z.object({
 
 /**
  * Caller-facing condition at encounter create: a bare name ("prone"), a
- * character-row entry ({name, duration?, source?}), or an engine-shaped
- * object ({type, ...}). Normalized to ConditionSchema by normalizeConditions
+ * character-row entry ({name, duration?, source?}), or the same object with
+ * the engine's duration/save fields ({type, durationType?, saveDC?,
+ * saveAbility?, ...}). Normalized to ConditionSchema by normalizeConditions
  * (engine/combat/conditions.ts) before it reaches the engine.
+ *
+ * The object branch is strict and checked whole: anything normalizeConditions
+ * would have to drop (no name, an unknown key) or read as permanent when the
+ * caller meant otherwise (an unknown durationType or saveAbility, save_ends
+ * without its DC and ability, rounds without a duration) fails the create —
+ * the FINDINGS #93/#107 anatomy was input accepted and then quietly changed.
+ * Checks live in superRefine so they report per field rather than as a bare
+ * union "Invalid input".
  */
 export const ConditionInputSchema = z.union([
     z.string(),
@@ -24,12 +34,48 @@ export const ConditionInputSchema = z.union([
         id: z.string().optional(),
         type: z.string().optional(),
         name: z.string().optional(),
-        durationType: z.string().optional(),
+        durationType: z.string().optional()
+            .describe(`One of ${Object.values(DurationType).join(', ')}; omitted = rounds with a duration, else permanent`),
         duration: z.number().optional().describe('Duration in rounds'),
         source: z.string().optional(),
         sourceId: z.string().optional(),
-        saveDC: z.number().optional(),
-        saveAbility: z.string().optional()
+        saveDC: z.number().optional().describe('Required with durationType save_ends'),
+        saveAbility: z.string().optional().describe('Ability name or abbreviation (con); required with durationType save_ends')
+    }).strict().superRefine((c, ctx) => {
+        if (!(c.type || c.name || '').trim()) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'condition object needs a name or type' });
+        }
+        const durationType = parseDurationType(c.durationType);
+        if (c.durationType !== undefined && !durationType) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom, path: ['durationType'],
+                message: `unknown durationType "${c.durationType}" (one of ${Object.values(DurationType).join(', ')})`
+            });
+        }
+        if (c.saveAbility !== undefined && !parseAbility(c.saveAbility)) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom, path: ['saveAbility'],
+                message: `unknown saveAbility "${c.saveAbility}" (an ability name or str/dex/con/int/wis/cha)`
+            });
+        }
+        if (durationType === DurationType.SAVE_ENDS && !((c.saveDC ?? 0) > 0 && c.saveAbility !== undefined)) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: 'durationType save_ends needs saveDC (1+) and saveAbility, or the save never rolls and the condition never ends'
+            });
+        }
+        if (durationType !== DurationType.SAVE_ENDS && (c.saveDC !== undefined || c.saveAbility !== undefined)) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: 'saveDC/saveAbility only apply with durationType save_ends; without it the save never rolls'
+            });
+        }
+        if (durationType === DurationType.ROUNDS && c.duration === undefined) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom, path: ['duration'],
+                message: 'durationType rounds needs a duration, or the condition never counts down'
+            });
+        }
     })
 ]);
 

@@ -154,6 +154,40 @@ describe('Combat Conditions', () => {
             });
         });
 
+        // A near-miss durationType fell back to PERMANENT and a short ability
+        // name was dropped — either way the save never rolled and a stun
+        // meant "until they save" lasted the whole encounter.
+        it('matches durationType case-insensitively', () => {
+            expect(normalizeCondition({
+                type: 'stunned', durationType: 'SAVE_ENDS', saveDC: 12, saveAbility: 'constitution'
+            }, 'fighter')).toMatchObject({ durationType: DurationType.SAVE_ENDS, saveDC: 12, saveAbility: Ability.CONSTITUTION });
+            expect(normalizeCondition({ type: 'prone', durationType: 'End of Turn' }, 'fighter')!.durationType)
+                .toBe(DurationType.END_OF_TURN);
+        });
+
+        it('takes three-letter ability abbreviations for saveAbility', () => {
+            expect(normalizeCondition({
+                type: 'stunned', durationType: 'save_ends', saveDC: 12, saveAbility: 'CON'
+            }, 'fighter')).toMatchObject({ durationType: DurationType.SAVE_ENDS, saveAbility: Ability.CONSTITUTION });
+            expect(normalizeCondition({ type: 'charmed', durationType: 'save_ends', saveDC: 12, saveAbility: 'wis' }, 'fighter')!.saveAbility)
+                .toBe(Ability.WISDOM);
+        });
+
+        it('lets a normalized save-ends condition end on a successful save', () => {
+            // CON 14 (+2) vs DC 1: only a natural 1 fails, so ten rounds of
+            // end-of-turn saves is plenty. A permanent stun would survive all.
+            const fighter = engine.getState()!.participants.find(p => p.id === 'fighter')!;
+            fighter.conditions.push(normalizeCondition({
+                type: 'Stunned', durationType: 'SAVE_ENDS', saveDC: 1, saveAbility: 'con'
+            }, 'fighter')!);
+
+            for (let turn = 0; turn < 20 && fighter.conditions.length > 0; turn++) {
+                engine.nextTurnWithConditions();
+            }
+
+            expect(fighter.conditions).toEqual([]);
+        });
+
         it('keeps unknown names verbatim and drops nameless entries', () => {
             const list = normalizeConditions(['Clinched', { name: '  ' }, {}], 'fighter');
             expect(list.map(c => c.type)).toEqual(['Clinched']);

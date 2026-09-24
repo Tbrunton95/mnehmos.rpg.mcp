@@ -119,6 +119,74 @@ describe('encounter conditions at create', () => {
         expect(persistedToken(encounterId, 'hero').conditions.map((c: any) => c.type)).toEqual(['Clinched', 'Blessed by Tyr']);
     });
 
+    it('lets a save-ends condition given at create end on a save', async () => {
+        const created = await handleCreateEncounter({
+            seed: 'cond-save-ends',
+            participants: [
+                {
+                    id: 'hero', name: 'Hero', initiative: 20, hp: 30, maxHp: 30, ac: 10, isEnemy: false,
+                    conditions: [{ type: 'Stunned', durationType: 'SAVE_ENDS', saveDC: 1, saveAbility: 'con' }]
+                },
+                { ...foe, conditions: [] }
+            ]
+        }, ctx);
+        const encounterId = encounterIdOf(created);
+
+        expect(persistedToken(encounterId, 'hero').conditions[0]).toMatchObject({
+            type: 'stunned', durationType: 'save_ends', saveDC: 1, saveAbility: 'constitution'
+        });
+
+        // DC 1 with no ability scores: only a natural 1 fails. A condition
+        // that silently went permanent would still be there after ten rounds.
+        for (let turn = 0; turn < 20 && persistedToken(encounterId, 'hero').conditions.length > 0; turn++) {
+            await handleAdvanceTurn({ encounterId }, ctx);
+        }
+        expect(persistedToken(encounterId, 'hero').conditions).toEqual([]);
+    });
+
+    // Each of these used to be accepted and then silently dropped or turned
+    // into a permanent condition (the FINDINGS #93/#107 anatomy). They must
+    // fail the create instead.
+    it.each([
+        ['an object with no name or type', { condition: 'Stunned' }],
+        ['a blank name', { name: '  ' }],
+        ['an unrecognised key', { name: 'Poisoned', rounds: 3 }],
+        ['ongoing effects the create lane does not take', { type: 'burning', ongoingEffects: [{ type: 'damage', dice: '1d6', trigger: 'start_of_turn' }] }],
+        ['an unknown durationType', { type: 'stunned', durationType: 'until_dawn' }],
+        ['an unknown saveAbility', { type: 'stunned', durationType: 'save_ends', saveDC: 12, saveAbility: 'luck' }],
+        ['save_ends with no saveDC', { type: 'stunned', durationType: 'save_ends', saveAbility: 'con' }],
+        ['save_ends with no saveAbility', { type: 'stunned', durationType: 'save_ends', saveDC: 12 }],
+        ['save fields without save_ends', { type: 'stunned', saveDC: 12, saveAbility: 'con' }],
+        ['rounds with no duration', { type: 'stunned', durationType: 'rounds' }]
+    ])('rejects %s', async (_label, condition) => {
+        await expect(handleCreateEncounter({
+            seed: 'cond-reject',
+            participants: [
+                { id: 'hero', name: 'Hero', initiative: 20, hp: 30, maxHp: 30, ac: 10, isEnemy: false, conditions: [condition] },
+                { ...foe, conditions: [] }
+            ]
+        }, ctx)).rejects.toThrow();
+        expect(getDb(':memory:').prepare('SELECT COUNT(*) AS n FROM encounters').get()).toEqual({ n: 0 });
+    });
+
+    it('combat_manage create reports a nameless condition object instead of dropping it', async () => {
+        const data = manageJson(await handleCombatManage({
+            action: 'create',
+            seed: 'cond-manage-reject',
+            participants: [
+                { id: 'hero', name: 'Hero', initiative: 20, hp: 30, maxHp: 30, ac: 10, side: 'party', conditions: [{ condition: 'Stunned' }, { label: 'Prone' }] },
+                { ...foe, conditions: [] }
+            ]
+        }, ctx));
+
+        expect(data.success).not.toBe(true);
+        expect(data.error).toBe('validation_error');
+        expect(data.issues.map((i: { path: string }) => i.path)).toEqual(
+            expect.arrayContaining(['participants.0.conditions.0', 'participants.0.conditions.1'])
+        );
+        expect(getDb(':memory:').prepare('SELECT COUNT(*) AS n FROM encounters').get()).toEqual({ n: 0 });
+    });
+
     it('combat_manage create forwards string and object conditions', async () => {
         const data = manageJson(await handleCombatManage({
             action: 'create',
