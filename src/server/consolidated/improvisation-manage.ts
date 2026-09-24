@@ -24,6 +24,8 @@ import {
 } from '../../schema/improvisation.js';
 import { loadAutoMechanics, autoSkillBonus, applyDeclaredEffects } from '../../engine/effects-resolver.js';
 import { freshSeed } from '../../math/seed.js';
+import { getOrLoadEngine, syncParticipantHpFromDb } from '../handlers/combat-handlers.js';
+import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -97,11 +99,15 @@ function canonicalTargetId(charRepo: CharacterRepository, targetId: string): str
 // DICE HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
 
-function rollDice(notation: string, rng?: seedrandom.PRNG): { total: number; rolls: number[]; notation: string } {
-    const match = notation.match(/^(\d+)d(\d+)([+-]\d+)?$/i);
+function rollDice(notation: string, rng?: seedrandom.PRNG, crit = false): { total: number; rolls: number[]; notation: string } {
+    const trimmed = notation.trim();
+    // A plain number is a posted total: applied as given, never doubled.
+    if (/^\d+$/.test(trimmed)) return { total: parseInt(trimmed, 10), rolls: [], notation: trimmed };
+    const match = trimmed.match(/^(\d+)d(\d+)([+-]\d+)?$/i);
     if (!match) throw new Error(`Invalid dice notation: ${notation}`);
 
-    const count = parseInt(match[1], 10);
+    // A crit rolls the dice twice; the flat modifier is added once.
+    const count = parseInt(match[1], 10) * (crit ? 2 : 1);
     const sides = parseInt(match[2], 10);
     const modifier = match[3] ? parseInt(match[3], 10) : 0;
     const rolls: number[] = [];
@@ -341,7 +347,7 @@ function normalizeMechanics<T extends { type: string }>(mechanics: T[] | undefin
     });
 }
 
-async function handleStunt(args: z.infer<typeof StuntSchema>): Promise<object> {
+async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionContext): Promise<object> {
     const { db, charRepo } = ensureDb();
     const seed = freshSeed(`stunt-${args.encounterId || 'free'}-${args.actorId}`);
     const rng = seedrandom(seed);
@@ -473,8 +479,10 @@ async function handleStunt(args: z.infer<typeof StuntSchema>): Promise<object> {
     const isNat20 = d20Result.roll === 20;
     const isNat1 = d20Result.roll === 1;
     const beatDC = total >= args.dc;
-    const criticalSuccess = isNat20 || (beatDC && total >= args.dc + 10);
-    const criticalFailure = isNat1 || (!beatDC && total <= args.dc - 10);
+    // A crit is the natural 20, nothing else. Beating the DC by 10 used to
+    // crit too, which made any high-modifier character crit on most stunts.
+    const criticalSuccess = isNat20;
+    const criticalFailure = isNat1;
     const success = isNat20 || (beatDC && !isNat1);
 
     // FINDINGS #34 T4.17: stunt XP hook — the attempt is the lesson.
@@ -526,8 +534,9 @@ async function handleStunt(args: z.infer<typeof StuntSchema>): Promise<object> {
     };
 
     if (success && args.successDamage) {
-        const damageRoll = rollDice(args.successDamage, rng);
-        result.damage = criticalSuccess ? damageRoll.total * 2 : damageRoll.total;
+        const damageRoll = rollDice(args.successDamage, rng, criticalSuccess);
+        result.damage = damageRoll.total;
+        result.damageRolls = damageRoll.rolls;
         result.damageType = args.damageType || 'bludgeoning';
 
         if (args.targetIds) {
@@ -535,6 +544,7 @@ async function handleStunt(args: z.infer<typeof StuntSchema>): Promise<object> {
                 id: string;
                 damage: number;
                 saved: boolean;
+                save?: { natural: number; modifier: number; total: number; dc: number };
                 condition?: string;
                 applied: boolean;
                 hpBefore?: number;
@@ -543,10 +553,14 @@ async function handleStunt(args: z.infer<typeof StuntSchema>): Promise<object> {
             for (let i = 0; i < args.targetIds.length; i++) {
                 let targetDamage = result.damage as number;
                 let saved = false;
+                let save: { natural: number; modifier: number; total: number; dc: number } | undefined;
 
                 if (args.savingThrowAbility && args.savingThrowDc) {
+                    const saveStats = (damageTargets[i]?.stats ?? {}) as Record<string, number>;
+                    const saveMod = Math.floor(((saveStats[args.savingThrowAbility] ?? 10) - 10) / 2);
                     const saveRoll = Math.floor(rng() * 20) + 1;
-                    saved = saveRoll >= args.savingThrowDc;
+                    saved = saveRoll + saveMod >= args.savingThrowDc;
+                    save = { natural: saveRoll, modifier: saveMod, total: saveRoll + saveMod, dc: args.savingThrowDc };
                     if (saved && args.halfDamageOnSave) targetDamage = Math.floor(targetDamage / 2);
                     else if (saved) targetDamage = 0;
                 }
@@ -559,6 +573,7 @@ async function handleStunt(args: z.infer<typeof StuntSchema>): Promise<object> {
                     id: args.targetIds[i],
                     damage: targetDamage,
                     saved,
+                    save,
                     condition: !saved && args.applyCondition ? args.applyCondition : undefined,
                     applied: Boolean(target),
                     hpBefore,
@@ -574,6 +589,18 @@ async function handleStunt(args: z.infer<typeof StuntSchema>): Promise<object> {
             });
             commitDamage();
             result.targets = targets;
+
+            // Put the damage on the encounter sheet as well, so the next
+            // combat action doesn't read a stale token.
+            if (args.encounterId && ctx) {
+                const engine = getOrLoadEngine(ctx, args.encounterId);
+                const state = engine?.getState();
+                if (state) {
+                    syncParticipantHpFromDb(state);
+                    new EncounterRepository(db).saveState(args.encounterId, state);
+                    result.encounterTokensUpdated = true;
+                }
+            }
         }
     } else if (!success && criticalFailure && args.failureDamage) {
         const selfDamage = rollDice(args.failureDamage, rng);
@@ -1119,8 +1146,8 @@ ARCANE SYNTHESIS:
     })
 };
 
-export async function handleImprovisationManage(args: unknown, _ctx: SessionContext): Promise<McpResponse> {
-    const result = await router(args as Record<string, unknown>);
+export async function handleImprovisationManage(args: unknown, ctx: SessionContext): Promise<McpResponse> {
+    const result = await router(args as Record<string, unknown>, ctx);
     const parsed = JSON.parse(result.content[0].text);
 
     let output = '';
