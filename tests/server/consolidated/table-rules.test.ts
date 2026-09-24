@@ -1,6 +1,7 @@
 import { handleTableRules } from '../../../src/server/consolidated/table-rules.js';
 import { closeDb, getDb } from '../../../src/storage/index.js';
 import { loadRule, loadRules, compareBands, resolveWorldId, DEFAULT_BAND_ORDER } from '../../../src/engine/table-rules.js';
+import { WorldRepository } from '../../../src/storage/repos/world.repo.js';
 import { DAY_366_PRESET } from '../../../src/data/table-rules/day-366.js';
 
 const ctx = { sessionId: 'rules' };
@@ -93,12 +94,17 @@ describe('world resolution for untagged rows', () => {
     beforeEach(() => { closeDb(); getDb(':memory:'); });
     afterEach(() => closeDb());
 
-    it('uses the only ruled world, and guesses nothing when two worlds have rules', async () => {
+    it('uses the only world in a single-world save, and guesses nothing when there are two', async () => {
         const db = getDb();
         expect(resolveWorldId(db, { characterIds: ['untagged'] })).toBeNull();
+        const now = new Date().toISOString();
+        const worlds = new WorldRepository(db);
+        worlds.create({ id: W, name: 'Vorago', seed: 's', width: 10, height: 10, createdAt: now, updatedAt: now } as any);
         await call({ action: 'define', kind: 'progression', name: 'xp' });
         expect(resolveWorldId(db, { characterIds: ['untagged'] })).toBe(W);
-        await handleTableRules({ action: 'define', worldId: 'other', kind: 'progression', name: 'xp' }, ctx as any);
+        // A second campaign in the same save: its untagged characters must
+        // not pick up this world's rules, even though only this world has any.
+        worlds.create({ id: 'pripyat', name: 'Pripyat', seed: 's', width: 10, height: 10, createdAt: now, updatedAt: now } as any);
         expect(resolveWorldId(db, { characterIds: ['untagged'] })).toBeNull();
     });
 });
