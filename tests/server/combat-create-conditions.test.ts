@@ -5,7 +5,6 @@ import {
     clearCombatState
 } from '../../src/server/handlers/combat-handlers';
 import { handleCombatManage } from '../../src/server/consolidated/combat-manage.js';
-import { CharacterRepository } from '../../src/storage/repos/character.repo.js';
 import { closeDb, getDb } from '../../src/storage';
 
 const ctx = { sessionId: 'test-session-create-conditions' };
@@ -30,7 +29,7 @@ function persistedToken(encounterId: string, id: string): any {
  * 'prone' reached the engine as-is and either failed the encounter token
  * schema on persist or threw on CONDITION_EFFECTS[c.type] once action economy
  * was checked. Character rows carry {name, duration?, source?} — the shape a
- * caller copies off the sheet — and add_participant dropped them entirely.
+ * caller copies off the sheet — so create accepts that shape too.
  */
 describe('encounter conditions at create', () => {
     beforeEach(() => {
@@ -204,41 +203,5 @@ describe('encounter conditions at create', () => {
         await handleExecuteCombatAction({ encounterId: data.encounterId, action: 'attack', actorId: 'hero', targetId: 'foe', attackBonus: 5, dc: 10, damage: 1 }, ctx);
         const adv = manageJson(await handleCombatManage({ action: 'advance', encounterId: data.encounterId }, ctx));
         expect(adv.error).toBeUndefined();
-    });
-
-    it('add_participant hydrates the character row conditions into engine shape', async () => {
-        const now = new Date().toISOString();
-        new CharacterRepository(getDb(':memory:')).create({
-            id: 'row-hero',
-            name: 'Row Hero',
-            stats: { str: 12, dex: 12, con: 12, int: 10, wis: 10, cha: 10 },
-            hp: 25,
-            maxHp: 25,
-            ac: 13,
-            level: 3,
-            conditions: [{ name: 'Prone', source: 'grapple: Foe' }, { name: 'Poisoned', duration: 3 }],
-            createdAt: now,
-            updatedAt: now
-        } as any);
-
-        const created = manageJson(await handleCombatManage({
-            action: 'create',
-            seed: 'cond-hydrate',
-            participants: [{ ...foe, initiative: 1, conditions: [] }]
-        }, ctx));
-        expect(created.success).toBe(true);
-        const encounterId = created.encounterId;
-
-        const added = manageJson(await handleCombatManage({ action: 'add_participant', encounterId, characterId: 'row-hero' }, ctx));
-        expect(added.success).toBe(true);
-
-        const token = persistedToken(encounterId, 'row-hero');
-        expect(token.conditions).toHaveLength(2);
-        expect(token.conditions[0]).toMatchObject({ type: 'prone', durationType: 'permanent', sourceId: 'grapple: Foe' });
-        expect(token.conditions[1]).toMatchObject({ type: 'poisoned', durationType: 'rounds', duration: 3 });
-
-        await handleExecuteCombatAction({ encounterId, action: 'attack', actorId: 'row-hero', targetId: 'foe', attackBonus: 5, dc: 10, damage: 1 }, ctx);
-        await handleAdvanceTurn({ encounterId }, ctx);
-        await handleAdvanceTurn({ encounterId }, ctx);
     });
 });

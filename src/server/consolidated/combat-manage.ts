@@ -24,7 +24,6 @@ import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { CombatEngine } from '../../engine/combat/engine.js';
-import { normalizeConditions } from '../../engine/combat/conditions.js';
 import { ConditionInputSchema } from '../../schema/encounter.js';
 import { getCombatManager } from '../state/combat-manager.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
@@ -755,10 +754,13 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     hp: params.hp ?? row.hp, maxHp: params.maxHp ?? row.maxHp,
                     ac: params.ac ?? row.ac,
                     initiativeBonus: params.initiativeBonus ?? Math.floor(((stats?.dex ?? 10) - 10) / 2),
-                    // The sheet's {name, duration?, source?} conditions join the
-                    // fight in the engine's Condition shape (was dropped to []).
                     isEnemy: params.isEnemy ?? false,
-                    conditions: normalizeConditions(row.conditions, row.id),
+                    // Sheet conditions stay off the engine token: nothing syncs
+                    // conditions between character rows and a live encounter,
+                    // and no tool removes an engine condition, so a copied
+                    // durationless condition would stick for the whole fight.
+                    // Pass conditions explicitly on create until that sync exists.
+                    conditions: [],
                     position: params.position ?? { x: 0, y: 0 },
                     resistances: (row as { resistances?: string[] }).resistances || [],
                     vulnerabilities: (row as { vulnerabilities?: string[] }).vulnerabilities || [],
