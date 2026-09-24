@@ -249,6 +249,7 @@ function formatAttackResult(result: CombatActionResult): string {
         crit: ar?.isCrit,
         damageTotal: result.damage,
         damageType: rr.damageType,
+        damageModifier: result.damageModifier,
         damageRolls: (result as CombatActionResult & { damageRolls?: number[] }).damageRolls,
         hpBefore: result.target?.hpBefore,
         hpAfter: result.target?.hpAfter,
@@ -2291,7 +2292,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 hit: r.attackRoll.isHit,
                 crit: r.attackRoll.isCrit
             } : undefined,
-            damage: r.damage !== undefined ? { total: r.damage, rolls: r.damageRolls, type: (r as { damageType?: string }).damageType } : undefined,
+            // HIGH-002: modifier rides with the total the banner explains.
+            damage: r.damage !== undefined ? { total: r.damage, rolls: r.damageRolls, type: (r as { damageType?: string }).damageType, modifier: r.damageModifier } : undefined,
             healAmount: r.healAmount,
             success: r.success,
             defeated: r.defeated,

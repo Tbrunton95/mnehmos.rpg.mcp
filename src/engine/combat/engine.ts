@@ -123,6 +123,7 @@ export interface CombatActionResult {
     damage?: number;
     damageRolls?: number[];  // Individual damage dice
     damageType?: string;     // Findings #40: auditable against resistances
+    damageModifier?: 'immune' | 'resistant' | 'vulnerable';  // HIGH-002: set only when one applied
     
     // Heal specifics (if type === 'heal')
     healAmount?: number;
@@ -728,6 +729,7 @@ export class CombatEngine {
             damage: damageDealt,
             damageRolls: capturedDamageRolls,
             damageType,   // Findings #40: the AP-vs-expanding lane and every resistance list key off it
+            damageModifier: damageModifier === 'normal' ? undefined : damageModifier,
             success: attackRoll.isHit,
             defeated,
             message,
