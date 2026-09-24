@@ -155,6 +155,21 @@ describe('agent_manage tool', () => {
             });
         });
 
+        it('reports the namespaced ladder id an OpenRouter agent will request', async () => {
+            const characterId = createCharacter('Kara');
+
+            const created = extractJson(await handleAgentManage(
+                { action: 'create', characterId, provider: 'openrouter', model: 'openai/gpt-5.5' },
+                ctx
+            ));
+            expect(created.resolvedCompetency.model).toBe('openai/gpt-5.5');
+            expect(created.modelAdvisory).toBeUndefined();
+
+            const loaded = extractJson(await handleAgentManage({ action: 'get', characterId }, ctx));
+            expect(loaded.resolvedCompetency.model).toBe('openai/gpt-5.5');
+            expect(loaded.modelAdvisory).toBeNull();
+        });
+
         it('refuses duplicate agents for the same character', async () => {
             const characterId = createCharacter('Kara');
             await handleAgentManage(

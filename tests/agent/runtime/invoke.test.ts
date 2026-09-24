@@ -73,6 +73,7 @@ describe('invokeAgent', () => {
         consecutiveFailures: number;
         characterInt: number;
         competencyOverride: { model?: string; reasoningEffort?: string | null };
+        provider: 'openai' | 'openrouter';
     }> = {}) {
         const chars = new CharacterRepository(db);
         chars.create(char('char-1', opts.characterInt === undefined ? {} : {
@@ -80,7 +81,7 @@ describe('invokeAgent', () => {
         }));
         const createInput = {
             characterId: 'char-1',
-            provider: 'openai',
+            provider: opts.provider ?? 'openai',
             model: 'gpt-4o-mini',
             budgetTokens: opts.budgetTokens ?? null,
             competencyOverride: opts.competencyOverride
@@ -178,6 +179,57 @@ describe('invokeAgent', () => {
         expect(observedReasoningEffort).toBe('xhigh');
         const call = deps.agentRepo.findCallById(result.callId!) as any;
         expect(call.competencySource).toBe('override');
+    });
+
+    it('namespaces a bare ladder id for OpenRouter and audits the id actually requested', async () => {
+        const agent = setupAgent({ provider: 'openrouter', characterInt: 12 });
+        let observedModel = '';
+        factory.register('openrouter', fakeProvider(async ({ model }) => {
+            observedModel = model;
+            return { text: 'routed', raw: '{}', durationMs: 1, model: 'openai/gpt-5.5' };
+        }));
+
+        const result = await invokeAgent({ agentId: agent.id }, deps);
+
+        expect(result.status).toBe('ok');
+        expect(observedModel).toBe('openai/gpt-5.5');
+        expect(result.requestedModel).toBe('openai/gpt-5.5');
+        const call = deps.agentRepo.findCallById(result.callId!)!;
+        expect(call.provider).toBe('openrouter');
+        expect(call.model).toBe('openai/gpt-5.5');
+        expect(call.reasoningEffort).toBe('medium');
+    });
+
+    it('does not double-prefix an OpenRouter id that is already namespaced', async () => {
+        const agent = setupAgent({
+            provider: 'openrouter',
+            competencyOverride: { model: 'openai/gpt-5.6-luna', reasoningEffort: 'medium' }
+        });
+        let observedModel = '';
+        factory.register('openrouter', fakeProvider(async ({ model }) => {
+            observedModel = model;
+            return { text: 'routed', raw: '{}', durationMs: 1 };
+        }));
+
+        const result = await invokeAgent({ agentId: agent.id }, deps);
+
+        expect(result.status).toBe('ok');
+        expect(observedModel).toBe('openai/gpt-5.6-luna');
+        expect(deps.agentRepo.findCallById(result.callId!)!.model).toBe('openai/gpt-5.6-luna');
+    });
+
+    it('sends bare ladder ids to OpenAI unchanged', async () => {
+        const agent = setupAgent({ characterInt: 12 });
+        let observedModel = '';
+        factory.register('openai', fakeProvider(async ({ model }) => {
+            observedModel = model;
+            return { text: 'direct', raw: '{}', durationMs: 1 };
+        }));
+
+        const result = await invokeAgent({ agentId: agent.id }, deps);
+
+        expect(observedModel).toBe('gpt-5.5');
+        expect(deps.agentRepo.findCallById(result.callId!)!.model).toBe('gpt-5.5');
     });
 
     it('increments tokens_used after a successful call', async () => {

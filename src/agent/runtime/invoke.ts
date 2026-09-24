@@ -22,7 +22,7 @@ import { shouldTripCircuit } from './circuit.js';
 import { checkSceneScope, composeRemoteContactSituation, RemoteContact } from './scope.js';
 import { composePrompt } from '../prompt/compose.js';
 import { ProviderError, ChatMessage } from '../provider/types.js';
-import { ResolvedCompetency, resolveCompetency } from './competency.js';
+import { ResolvedCompetency, resolveCompetency, providerModelId } from './competency.js';
 
 export interface InvokeInput {
     agentId?: string;
@@ -128,7 +128,8 @@ export async function invokeAgent(input: InvokeInput, deps: AgentRuntimeDeps): P
 
     const character = deps.characterRepo.findById(agent.characterId);
     const competency = resolveInvocationCompetency(agent, character);
-    const resolvedModel = competency?.model ?? agent.model;
+    // Provider-shaped: this exact id is sent, audited and reported as requested.
+    const resolvedModel = providerModelId(agent.provider, competency?.model ?? agent.model);
 
     // 2. Preflight gates
     const pre = preflight({

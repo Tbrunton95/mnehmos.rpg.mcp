@@ -29,7 +29,7 @@ import {
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { RichFormatter } from '../utils/formatter.js';
 import { getAgentRuntime, buildAgentRuntime } from '../../agent/runtime/deps.js';
-import { CompetencyOverrideSchema, resolveCompetency, validateOverride } from '../../agent/runtime/competency.js';
+import { CompetencyOverrideSchema, resolveCompetency, validateOverride, providerModelId } from '../../agent/runtime/competency.js';
 import { invokeAgent } from '../../agent/runtime/invoke.js';
 import { composePrompt } from '../../agent/prompt/compose.js';
 import { replayCall } from '../../agent/audit/replay.js';
@@ -337,8 +337,10 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
 
     // FINDINGS #69: the INT ladder resolves the served model; agents.model is
     // advisory unless an override is set. Say so AT CREATE TIME, not on the
-    // billing page three sessions later.
-    const resolved = resolveCompetency(character.stats.int, agent.competencyOverride);
+    // billing page three sessions later. Report the id exactly as invoke will
+    // request it (openai/-namespaced on OpenRouter).
+    const ladder = resolveCompetency(character.stats.int, agent.competencyOverride);
+    const resolved = { ...ladder, model: providerModelId(agent.provider, ladder.model) };
     const modelAdvisory = !agent.competencyOverride?.model && args.model !== resolved.model
         ? `⚠ agents.model ('${args.model}') is ADVISORY — INT ${character.stats.int} resolves to '${resolved.model}' via the competency ladder. Set competencyOverride to pin a model for this agent.`
         : null;
@@ -363,9 +365,13 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
     const character = characterRepo.findById(agent.characterId);
 
     // FINDINGS #69: report the model that will actually be SERVED, not just the
-    // stored advisory one. resolveCompetency is exactly what invoke runs.
-    const resolved = character
+    // stored advisory one. resolveCompetency + providerModelId is exactly what
+    // invoke runs.
+    const ladder = character
         ? resolveCompetency(character.stats.int, agent.competencyOverride)
+        : null;
+    const resolved = ladder
+        ? { ...ladder, model: providerModelId(agent.provider, ladder.model) }
         : null;
 
     return {

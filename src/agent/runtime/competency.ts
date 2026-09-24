@@ -105,6 +105,14 @@ export function resolveCompetency(
     };
 }
 
+// The ladder names OpenAI-native ids ('gpt-5.5'); OpenRouter routes by
+// namespaced id ('openai/gpt-5.5'). A bare id headed to OpenRouter gets the
+// openai/ namespace; an id that already names one (an override such as
+// 'openai/gpt-5.6-luna') is sent as-is — never double-prefixed.
+export function providerModelId(provider: 'openai' | 'openrouter', model: string): string {
+    return provider === 'openrouter' && !model.includes('/') ? `openai/${model}` : model;
+}
+
 // FINDINGS #98: the WRITE-SIDE gate — call BEFORE persisting an override.
 // Returns null when valid, or an honest error naming the actual rule and the
 // ladder's known-good models (the allowlist was previously discoverable only
