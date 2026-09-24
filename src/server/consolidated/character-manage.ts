@@ -830,6 +830,13 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
         if (row?.currency) currency = JSON.parse(row.currency);
     } catch { /* malformed currency JSON */ }
 
+    // The world tag is a raw column, not on the model: read it so
+    // fields: ['worldId'] can check a row's tag. null means untagged.
+    let worldId: string | null = null;
+    try {
+        worldId = (db.prepare('SELECT world_id FROM characters WHERE id = ?').get(args.characterId) as { world_id?: string | null } | undefined)?.world_id ?? null;
+    } catch { /* column predates world tags */ }
+
     // FINDINGS #34 T1.4: surface the write trail — the last 8 attributed
     // writes to HP and pools, so ghost writes name their authors.
     let lastWrites: Array<Record<string, unknown>> | undefined;
@@ -865,7 +872,7 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
         }).filter(Boolean) as Array<Record<string, unknown>>;
         if (found.length) liveEncounters = found;
     } catch { /* no encounters table */ }
-    return { ...character, currency, currencyNote: currency ? `RU ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec, ...(liveEncounters ? { liveEncounters } : {}) };
+    return { ...character, worldId, currency, currencyNote: currency ? `RU ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec, ...(liveEncounters ? { liveEncounters } : {}) };
 }
 
 async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object> {

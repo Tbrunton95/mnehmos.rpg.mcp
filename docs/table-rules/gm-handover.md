@@ -41,7 +41,7 @@ Luciel fights An'ggrath (Monster/Lord) on the mountain. Every fight follows this
 5. **Record who learned something:** `knowledge_manage record {worldId, key: 'angrath-wounded', statement: "Luciel crippled An'ggrath's sword arm", knowers: [{id: 'inquisitor', how: 'witnessed', day: 367}]}`.
 6. **Advance the turn:** `combat_manage advance {encounterId, opId: 'r4-advance'}`.
 
-When several steps must land together, send them as one `batch_manage execute_sequence {atomic: true, steps}`. If any step fails, none apply.
+When several steps must land together, send them as one `batch_manage execute_sequence {atomic: true, steps}`. If any step fails, none apply. A step with an array param (a precedent's `tags`, a knowledge record's `knowers`) is refused inside a batch, so make those calls directly.
 
 ## Never do these
 

@@ -56,7 +56,7 @@ const CreateSchema = z.object({
     encounterId: z.string().optional(),
     position: z.object({ x: z.number(), y: z.number() }).optional(),
     currency: z.preprocess(jsonIfString, z.object({
-        gold: z.number().int().min(0).optional(),
+        gold: z.number().min(0).optional(),
         silver: z.number().int().min(0).optional(),
         copper: z.number().int().min(0).optional()
     }).optional()).describe('RU on the body at creation (persists to the corpse; looted via loot lootAll)')

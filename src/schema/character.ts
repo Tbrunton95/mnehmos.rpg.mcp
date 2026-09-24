@@ -18,7 +18,8 @@ export const SkillProficiencySchema = z.enum([
 export const SaveProficiencySchema = z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']);
 
 export const CurrencySchema = z.object({
-    gold: z.number().int().min(0).default(0),
+    // Decimal: add_currency rounds to cents (FINDINGS #111).
+    gold: z.number().min(0).default(0),
     silver: z.number().int().min(0).default(0),
     copper: z.number().int().min(0).default(0),
 });

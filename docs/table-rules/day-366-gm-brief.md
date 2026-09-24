@@ -26,7 +26,7 @@ At the start of every session, call `session_manage boot {worldId}` and read all
 - Change one condition's text in place with `character_manage update {characterId, editConditions: [{match, replace: {find, with}}]}` (or `name` for a full rewrite). Never remove and re-add a condition to edit it.
 - Never pass `seed` to a roll. An explicit seed replays identical dice; leave it out and every roll is fresh.
 - Put an `opId` on every write (a short unique label like `r12-orla-melta`). If a call times out, retry it with the same `opId`: it applies once, never twice. Or ask `session_manage op_status {forOpId}` whether it landed.
-- A whole turn that must land together (attack, condition, advance) goes in `batch_manage execute_sequence {atomic: true, steps}`. Any failed call leaves no writes behind.
+- A whole turn that must land together (attack, condition, advance) goes in `batch_manage execute_sequence {atomic: true, steps}`. Any failed call leaves no writes behind. Steps with array params (precedent `tags`, knowledge `knowers`) are refused in a batch; make those calls directly.
 - Check any number with `session_manage rolls {forId | encounterId | forOpId}`. Give `math_manage roll` a `forId` and `purpose` so the log says who it was for.
 - HP lives on the character sheet; the token mirrors it at every combat action. Token conditions, parts and intent are the fight's until you mirror them. `character_manage get` shows both sides.
 - Read the "What's new in the engine" section at session start; it lists anything added since you last looked.
