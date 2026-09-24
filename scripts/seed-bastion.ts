@@ -32,8 +32,15 @@
  *     and skips if already present. Re-running this script will not produce
  *     38 duplicate NPCs.
  *
- * Run:
- *   npx tsx scripts/seed-bastion.ts
+ * Run (from the repo root, devDependencies installed):
+ *   npm run seed:bastion -- --db-path /path/to/rpg.db
+ * which is shorthand for:
+ *   node --loader ts-node/esm scripts/seed-bastion.ts --db-path /path/to/rpg.db
+ *
+ * The package is "type": "module" and imports name .ts sources by their .js
+ * specifiers, which only ts-node's ESM loader resolves; `ts-node` and
+ * `ts-node --esm` fail with ERR_MODULE_NOT_FOUND, and tsx is not a
+ * dependency. Node's ExperimentalWarning about --loader is harmless.
  *
  * The database is selected the way the server's local transports select
  * theirs (useSingleUserDatabase in src/storage/index.ts): --db-path, else
