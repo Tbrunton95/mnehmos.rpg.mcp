@@ -374,20 +374,37 @@ export interface StatusInput {
     corePool?: { name: string; current: number; max: number };
     location?: string; objective?: string; moreConditions?: number;
 }
+/**
+ * Close a strip and its rows into one box: the strip's rule and the bottom
+ * rule both run to the widest line, so the frame never goes ragged.
+ */
+function framed(strip: string, body: string): string {
+    const rows = body.replace(/\n$/, '').split('\n');
+    const top = strip.replace(/\n$/, '');
+    const fill = plain() ? '-' : '─';
+    const open = top.slice(0, -1).replace(new RegExp(`${fill}+$`), '');
+    const close = top.slice(-1);
+    const width = Math.max(open.length + 3, ...rows.map(r => r.length + 1));
+    const bottom = plain() ? `+${'-'.repeat(width - 2)}+` : `╙${'─'.repeat(width - 2)}╜`;
+    return `${open}${fill.repeat(width - open.length - 1)}${close}\n${rows.join('\n')}\n${bottom}\n`;
+}
+
 export function renderStatusBlock(d: StatusInput): string {
     const g = G();
     if (d.compact) {
         // HP, core pool, location, objective, one or two conditions.
         const rows: Cell[][] = [];
         const top: Cell[] = [L('HP '), V(`${d.hp ?? '?'}/${d.maxHp ?? '?'}`)];
-        if (d.corePool) top.push(L(`   ${g.sep} ${d.corePool.name.toUpperCase()} `), V(`${d.corePool.current}/${d.corePool.max}`));
+        if (d.corePool) top.push(L(` ${g.sep} ${d.corePool.name.toUpperCase()} `), V(`${d.corePool.current}/${d.corePool.max}`));
         rows.push(top);
-        if (d.location) rows.push([L('AT '), V(d.location)]);
+        if (d.location) rows.push([L('AT  '), V(d.location)]);
         if (d.objective) rows.push([L('OBJ '), V(d.objective)]);
-        const conds = (d.conditions ?? []).map(c => typeof c === 'string' ? c : `${c.name}${c.duration ? ` (${c.duration}d)` : ''}`);
-        if (conds.length) rows.push([L('COND '), V(conds.join(` ${g.sep} `) + (d.moreConditions ? ` +${d.moreConditions}` : ''))]);
-        return renderStrip({ callsign: callsign(d.characterName ?? '???'), badge: d.badge }) + emit(rows)
-            + (plain() ? `+${'-'.repeat(50)}+\n` : `╙${'─'.repeat(50)}╜\n`);
+        // One condition a row: a long name never runs the frame off the edge.
+        for (const c of d.conditions ?? []) {
+            rows.push([V(typeof c === 'string' ? c : `${c.name}${c.duration ? ` (${c.duration}d)` : ''}`)]);
+        }
+        if (d.moreConditions) rows.push([L(`+${d.moreConditions} more`)]);
+        return framed(renderStrip({ callsign: callsign(d.characterName ?? '???'), badge: d.badge }), emit(rows));
     }
     let out = renderStrip({ callsign: callsign(d.characterName ?? '???'), day: d.day, time: d.time, rads: d.rads, badge: d.badge });
     const rows: Cell[][] = [];
@@ -419,9 +436,7 @@ export function renderStatusBlock(d: StatusInput): string {
     if (typeof d.gold === 'number') tail.push(L(`${d.currencyLabel ?? 'RU'} `), V(d.gold));
     if (d.weather) tail.push(L(tail.length ? `   ${g.sep} ` : ''), L('WEATHER '), V(d.weather));
     if (tail.length) rows.push(tail);
-    out += emit(rows);
-    out += plain() ? `+${'-'.repeat(50)}+\n` : `╙${'─'.repeat(50)}╜\n`;
-    return out;
+    return framed(out, emit(rows));
 }
 
 // ── honest fallback — an unknown actionType can never render empty ───
