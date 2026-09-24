@@ -1261,6 +1261,11 @@ function runMigrations(db: Database.Database) {
     console.error('[Migration] Adding band column to characters table');
     db.exec(`ALTER TABLE characters ADD COLUMN band TEXT;`);
   }
+  const effectColumns = db.prepare("PRAGMA table_info(custom_effects)").all() as { name: string }[];
+  if (effectColumns.length && !effectColumns.some(col => col.name === 'cost')) {
+    console.error('[Migration] Adding cost column to custom_effects table');
+    db.exec(`ALTER TABLE custom_effects ADD COLUMN cost TEXT;`);
+  }
   if (!ruleCharColumns.some(col => col.name === 'parts')) {
     console.error('[Migration] Adding parts column to characters table');
     db.exec(`ALTER TABLE characters ADD COLUMN parts TEXT;`);

@@ -32,7 +32,7 @@ import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 // ═══════════════════════════════════════════════════════════════════════════
 
 const ACTIONS = [
-    'stunt', 'apply_effect', 'get_effects', 'remove_effect', 'replace_effect',
+    'stunt', 'apply_effect', 'get_effects', 'remove_effect', 'replace_effect', 'edit_effect', 'feature_from_condition',
     'process_triggers', 'advance_durations', 'synthesize', 'get_spellbook'
 ] as const;
 type ImprovisationAction = typeof ACTIONS[number];
@@ -243,7 +243,45 @@ const ApplyEffectSchema = z.object({
     triggers: z.array(z.object({
         event: TriggerEventEnum,
         condition: z.string().optional()
-    })).optional().describe('When mechanics fire. Defaults to always_active if omitted')
+    })).optional().describe('When mechanics fire. Defaults to always_active if omitted'),
+    cost: z.string().optional().describe("What using or keeping it costs ('1 RESOLVE per use', 'owes the Mouth a want')")
+});
+
+const FeatureMechanicsSchema = ApplyEffectSchema.shape.mechanics;
+const FeatureTriggersSchema = ApplyEffectSchema.shape.triggers;
+
+const EditEffectSchema = z.object({
+    action: z.literal('edit_effect'),
+    effectId: z.number().int().optional().describe('The effect to edit (or targetId + name)'),
+    targetId: z.string().optional(),
+    targetType: z.enum(['character', 'npc']).optional().default('character'),
+    name: z.string().optional().describe('Find the effect by name on targetId'),
+    rename: z.string().optional(),
+    description: z.string().optional().describe('Replace the whole prose'),
+    descriptionReplace: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Change one clause of the prose in place'),
+    mechanics: FeatureMechanicsSchema.optional(),
+    triggers: FeatureTriggersSchema,
+    cost: z.string().nullable().optional(),
+    durationType: z.enum(['rounds', 'minutes', 'hours', 'days', 'permanent', 'until_removed']).optional(),
+    durationValue: z.number().int().nullable().optional()
+});
+
+const FeatureFromConditionSchema = z.object({
+    action: z.literal('feature_from_condition'),
+    characterId: z.string(),
+    match: z.string().min(1).describe('Text found in exactly one of the character\'s conditions'),
+    name: z.string().optional().describe('Feature name (default: the condition text up to its first colon)'),
+    targetType: z.enum(['character', 'npc']).optional().default('character'),
+    category: z.enum(['boon', 'curse', 'neutral', 'transformative']).optional().default('neutral'),
+    powerLevel: z.number().int().min(1).max(5).optional().default(1),
+    sourceType: z.enum(['divine', 'arcane', 'natural', 'cursed', 'psionic', 'unknown']).optional().default('unknown'),
+    sourceEntityName: z.string().optional(),
+    mechanics: FeatureMechanicsSchema.optional(),
+    triggers: FeatureTriggersSchema,
+    cost: z.string().optional(),
+    durationType: z.enum(['rounds', 'minutes', 'hours', 'days', 'permanent', 'until_removed']).optional().default('until_removed'),
+    durationValue: z.number().int().optional(),
+    keepCondition: z.boolean().optional().describe('Keep the prose condition too (default: it moves into the feature)')
 });
 
 const GetEffectsSchema = z.object({
@@ -628,7 +666,8 @@ async function handleApplyEffect(args: z.infer<typeof ApplyEffectSchema>): Promi
         triggers: args.triggers?.map(t => ({ event: t.event as any, condition: t.condition })) || [],
         removal_conditions: [{ type: 'duration_expires' as const }],
         stackable: false,
-        max_stacks: 1
+        max_stacks: 1,
+        cost: args.cost
     });
 
     // NAME-COLLISION HONESTY: apply() on an existing non-stackable name
@@ -647,6 +686,48 @@ async function handleApplyEffect(args: z.infer<typeof ApplyEffectSchema>): Promi
         message: refreshedExisting
             ? `Existing effect "${args.name}" refreshed (new content discarded)`
             : `Effect "${args.name}" applied to ${args.targetId}`
+    };
+}
+
+async function handleEditEffect(args: z.infer<typeof EditEffectSchema>): Promise<object> {
+    const { effectsRepo, charRepo } = ensureDb();
+    const found = args.effectId !== undefined
+        ? effectsRepo.findById(args.effectId)
+        : args.targetId && args.name ? effectsRepo.findByTargetAndName(canonicalTargetId(charRepo, args.targetId), args.targetType, args.name) : null;
+    if (!found) throw new Error(`No active effect ${args.effectId ?? `'${args.name}' on ${args.targetId}`}. Nothing was written.`);
+    const edited = effectsRepo.editFields(found.id, {
+        name: args.rename, description: args.description, descriptionReplace: args.descriptionReplace,
+        mechanics: args.mechanics ? normalizeMechanics(args.mechanics) as never : undefined,
+        triggers: args.triggers?.map(t => ({ event: t.event as never, condition: t.condition })),
+        cost: args.cost, durationType: args.durationType, durationValue: args.durationValue
+    });
+    const changed = Object.keys(args).filter(k => !['action', 'effectId', 'targetId', 'targetType', 'name'].includes(k) && (args as Record<string, unknown>)[k] !== undefined);
+    return { success: true, actionType: 'edit_effect', effectId: edited.id, changed, effect: edited, message: `${edited.name}: ${changed.join(', ') || 'nothing'} changed` };
+}
+
+async function handleFeatureFromCondition(args: z.infer<typeof FeatureFromConditionSchema>): Promise<object> {
+    const { effectsRepo, charRepo } = ensureDb();
+    const char = charRepo.findById(args.characterId);
+    if (!char) throw new Error(`Character ${args.characterId} not found`);
+    const conds = (char.conditions ?? []) as Array<{ name: string; duration?: number; source?: string }>;
+    const hits = conds.filter(c => c.name.toLowerCase().includes(args.match.toLowerCase()));
+    if (hits.length !== 1) throw new Error(hits.length ? `'${args.match}' matches ${hits.length} conditions; use more of the text. Nothing was written.` : `'${args.match}' matches no condition. Nothing was written.`);
+    const text = hits[0].name;
+    const name = args.name ?? (text.split(':')[0].trim().slice(0, 80) || text.slice(0, 80));
+    const effect = effectsRepo.apply({
+        target_id: char.id, target_type: args.targetType, name, description: text,
+        category: args.category, power_level: args.powerLevel,
+        source: { type: args.sourceType, entity_name: args.sourceEntityName ?? hits[0].source },
+        mechanics: normalizeMechanics(args.mechanics ?? []) as never,
+        duration: { type: args.durationType as never, value: args.durationValue },
+        triggers: args.triggers?.map(t => ({ event: t.event as never, condition: t.condition })) || [],
+        removal_conditions: [{ type: 'duration_expires' as const }], stackable: false, max_stacks: 1, cost: args.cost
+    });
+    if (!args.keepCondition) charRepo.update(char.id, { conditions: conds.filter(c => c !== hits[0]) } as never);
+    return {
+        success: true, actionType: 'feature_from_condition', characterId: char.id, effectId: effect.id, feature: effect,
+        conditionRemoved: !args.keepCondition,
+        message: `${char.name}: '${name}' is now a feature (effect ${effect.id})${args.keepCondition ? '' : '; the prose condition moved into it'}`
     };
 }
 
@@ -1001,6 +1082,18 @@ const definitions: Record<ImprovisationAction, ActionDefinition> = {
         aliases: ['list_effects', 'effects'],
         description: 'Get all effects on a target'
     },
+    edit_effect: {
+        schema: EditEffectSchema,
+        handler: handleEditEffect,
+        aliases: ['edit_feature', 'patch_effect'],
+        description: 'Edit one field of a feature, or one clause of its prose (descriptionReplace), without resending the rest'
+    },
+    feature_from_condition: {
+        schema: FeatureFromConditionSchema,
+        handler: handleFeatureFromCondition,
+        aliases: ['condition_to_feature', 'structure_condition'],
+        description: 'Turn one prose condition into a structured feature: its text becomes the prose, with mechanics, triggers, cost and duration alongside'
+    },
     remove_effect: {
         schema: RemoveEffectSchema,
         handler: handleRemoveEffect,
@@ -1118,6 +1211,11 @@ ARCANE SYNTHESIS:
         durationValue: z.number().optional(),
         triggers: z.array(z.any()).optional().describe('apply_effect: array of {event, condition?}. event is a closed enum (always_active, start_of_turn, end_of_turn, on_attack, on_hit, on_miss, on_damage_taken, on_heal, on_rest, on_spell_cast, on_death)'),
         effectId: z.number().optional(),
+        cost: z.string().nullable().optional().describe('apply_effect / edit_effect / feature_from_condition: what using or keeping it costs'),
+        rename: z.string().optional().describe('edit_effect: new name'),
+        descriptionReplace: z.object({ find: z.string(), with: z.string() }).optional().describe('edit_effect: change one clause of the prose'),
+        match: z.string().optional().describe('feature_from_condition: text found in exactly one condition'),
+        keepCondition: z.boolean().optional().describe('feature_from_condition: keep the prose condition too'),
         effectName: z.string().optional(),
         includeInactive: z.boolean().optional(),
         event: z.string().optional(),
@@ -1142,7 +1240,7 @@ ARCANE SYNTHESIS:
         concentration: z.boolean().optional(),
         duration: z.string().optional(),
         circumstanceModifiers: z.array(z.string()).optional(),
-        characterId: z.string().optional()
+        characterId: z.string().optional().describe('get_spellbook / feature_from_condition: whose')
     })
 };
 

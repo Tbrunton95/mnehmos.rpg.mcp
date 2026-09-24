@@ -39,6 +39,7 @@ export interface CustomEffectRow {
     is_active: number;
     created_at: string;
     expires_at: string | null;
+    cost?: string | null;
 }
 
 export class CustomEffectsRepository {
@@ -137,7 +138,7 @@ export class CustomEffectsRepository {
                 duration_type, duration_value, rounds_remaining,
                 triggers, removal_conditions,
                 stackable, max_stacks, current_stacks,
-                is_active, created_at, expires_at
+                is_active, created_at, expires_at, cost
             ) VALUES (
                 @targetId, @targetType, @name, @description,
                 @sourceType, @sourceEntityId, @sourceEntityName,
@@ -145,7 +146,7 @@ export class CustomEffectsRepository {
                 @durationType, @durationValue, @roundsRemaining,
                 @triggers, @removalConditions,
                 @stackable, @maxStacks, @currentStacks,
-                @isActive, @createdAt, @expiresAt
+                @isActive, @createdAt, @expiresAt, @cost
             )
         `);
 
@@ -170,7 +171,8 @@ export class CustomEffectsRepository {
             currentStacks: 1,
             isActive: 1,
             createdAt: now,
-            expiresAt
+            expiresAt,
+            cost: args.cost ?? null
         };
 
         // Insert and read-back atomically. If the stored row fails to parse on read-back
@@ -494,7 +496,38 @@ export class CustomEffectsRepository {
             current_stacks: row.current_stacks,
             is_active: row.is_active === 1,
             created_at: row.created_at,
-            expires_at: row.expires_at
+            expires_at: row.expires_at,
+            cost: row.cost ?? null
         });
+    }
+
+    /**
+     * Edit one feature in place: any of its fields, or a text replacement
+     * inside its prose, without resending the rest. Validated on read-back
+     * inside a transaction, so a bad patch changes nothing.
+     */
+    editFields(id: number, patch: {
+        name?: string; description?: string; descriptionReplace?: { find: string; with: string };
+        mechanics?: EffectMechanic[]; triggers?: EffectTrigger[]; cost?: string | null;
+        category?: string; powerLevel?: number; durationType?: string; durationValue?: number | null;
+    }): CustomEffect {
+        const current = this.findById(id);
+        if (!current) throw new Error(`No active effect ${id}`);
+        let description = patch.description ?? current.description ?? '';
+        if (patch.descriptionReplace) {
+            if (!description.includes(patch.descriptionReplace.find)) throw new Error(`'${patch.descriptionReplace.find}' is not in the effect's text. Nothing was written.`);
+            description = description.split(patch.descriptionReplace.find).join(patch.descriptionReplace.with);
+        }
+        const run = this.db.transaction(() => {
+            this.db.prepare(`UPDATE custom_effects SET name = ?, description = ?, mechanics = ?, triggers = ?, cost = ?,
+                             category = ?, power_level = ?, duration_type = ?, duration_value = ? WHERE id = ?`).run(
+                patch.name ?? current.name, description,
+                JSON.stringify(patch.mechanics ?? current.mechanics), JSON.stringify(patch.triggers ?? current.triggers),
+                patch.cost !== undefined ? patch.cost : (current.cost ?? null),
+                patch.category ?? current.category, patch.powerLevel ?? current.power_level,
+                patch.durationType ?? current.duration_type, patch.durationValue !== undefined ? patch.durationValue : current.duration_value, id);
+            return this.rowToEffect(this.db.prepare('SELECT * FROM custom_effects WHERE id = ?').get(id) as CustomEffectRow);
+        });
+        return run();
     }
 }

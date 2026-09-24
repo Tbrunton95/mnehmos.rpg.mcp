@@ -28,3 +28,9 @@ export function summarizeResult(result: Record<string, unknown>): Record<string,
     }
     return out;
 }
+
+/** fields: [...] — only the named top-level fields, plus success/error/actionType/message. */
+export function pickFields(result: Record<string, unknown>, fields: string[]): Record<string, unknown> {
+    const keep = new Set([...fields, 'success', 'error', 'actionType', 'message']);
+    return Object.fromEntries(Object.entries(result).filter(([k]) => keep.has(k)));
+}
