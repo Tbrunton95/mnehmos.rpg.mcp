@@ -11,7 +11,7 @@ import { randomUUID } from 'crypto';
 import { RichFormatter } from '../utils/formatter.js';
 import { getDb } from '../../storage/index.js';
 import { SessionContext } from '../types.js';
-import { RULE_KINDS, RuleKind, parseRuleSpec, listRules, TableRule } from '../../engine/table-rules.js';
+import { RULE_KINDS, RuleKind, parseRuleSpec, listRules, TableRule, findPool } from '../../engine/table-rules.js';
 import { RULE_PRESETS } from '../../data/table-rules/day-366.js';
 
 const ACTIONS = ['define', 'get', 'list', 'enable', 'disable', 'delete', 'import'] as const;
@@ -36,6 +36,25 @@ const TableRulesInputSchema = z.object({
 });
 
 type Input = z.infer<typeof TableRulesInputSchema>;
+
+/**
+ * A status block naming a pool nobody carries shows nothing, silently. Say so
+ * at define time. Untagged characters count, as they do everywhere else.
+ */
+function missingPoolWarning(worldId: string, corePool: unknown): string | undefined {
+    if (typeof corePool !== 'string' || !corePool) return undefined;
+    const db = getDb();
+    let rows: Array<{ resource_pools?: string | null }>;
+    try {
+        rows = db.prepare('SELECT resource_pools FROM characters WHERE world_id = ? OR world_id IS NULL').all(worldId) as typeof rows;
+    } catch {
+        try { rows = db.prepare('SELECT resource_pools FROM characters').all() as typeof rows; } catch { return undefined; }
+    }
+    const found = rows.some(r => {
+        try { return !!findPool(JSON.parse(r.resource_pools || '{}'), corePool); } catch { return false; }
+    });
+    return found ? undefined : `no character in this world has pool '${corePool}'; the block will omit it until one does`;
+}
 
 function view(r: TableRule) {
     return { name: r.name, kind: r.kind, enabled: r.enabled, spec: r.spec };
@@ -73,7 +92,8 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
             if (!input.kind || !input.name) return { error: true, message: 'define needs kind and name' };
             const { created } = upsert({ worldId: input.worldId, kind: input.kind, name: input.name, spec: input.spec, enabled: input.enabled });
             const rule = findRule(input.worldId, input.name)!;
-            return { success: true, actionType: 'define', created, rule: view(rule), message: `${created ? 'Defined' : 'Updated'} ${rule.kind} rule '${rule.name}'` };
+            const warning = rule.kind === 'status_block' ? missingPoolWarning(input.worldId, (rule.spec as { corePool?: unknown }).corePool) : undefined;
+            return { success: true, actionType: 'define', created, rule: view(rule), ...(warning ? { warning } : {}), message: `${created ? 'Defined' : 'Updated'} ${rule.kind} rule '${rule.name}'` };
         }
         case 'get': {
             const rule = findRule(input.worldId, input.name);
@@ -128,7 +148,8 @@ export async function handleTableRules(args: unknown, _ctx: SessionContext): Pro
         const result = await route(args);
         let output = result.error
             ? RichFormatter.error(String(result.message))
-            : RichFormatter.header(`Table Rules: ${String(result.actionType)}`, '📜') + (result.message ? RichFormatter.alert(String(result.message), 'info') : '');
+            : RichFormatter.header(`Table Rules: ${String(result.actionType)}`, '📜') + (result.message ? RichFormatter.alert(String(result.message), 'info') : '')
+            + (result.warning ? RichFormatter.alert(String(result.warning), 'warning') : '');
         if (!result.error && Array.isArray(result.rules)) {
             output += RichFormatter.list((result.rules as Array<ReturnType<typeof view>>).map(r =>
                 `${r.enabled ? '●' : '○'} ${r.name} [${r.kind}]${r.kind === 'principle' ? `: ${String((r.spec as { text?: string }).text ?? '')}` : ''}`));
@@ -148,11 +169,11 @@ export const TableRulesTool = {
 Actions: define, get, list, enable, disable, delete, import
 Kinds:
 - band {order}: power bands, lowest first. Characters and combat tokens carry band.
-- peer_consequence {thresholdFraction, onCrit, options}: a hit on a peer (same band or higher) that crits or deals ≥ the fraction of max HP flags CONSEQUENCE DUE; the GM names it and applies it with combat_manage add_condition.
+- peer_consequence {thresholdFraction, onCrit, options}: a hit on a peer (same band or higher) that crits or deals ≥ the fraction of max HP flags CONSEQUENCE DUE; the GM names it and applies it with combat_manage set_part.
 - called_strike {requirePeer, limbs}: combat_action attack calledStrike: 'leg'|'arm' cripples that limb on a hit (no roll penalty, no threshold).
 - prepared_asset {catastrophicMargin, missOptions, hitEffect, catastrophicEffect}: combat_action attack preparedAsset: <rule name> reports the tier (miss / hit / catastrophic); the GM names the effect.
 - progression {mode: 'milestone'}: add_xp stops offering level-ups.
-- status_block {compact, maxConditions}: tiny status blocks.
+- status_block {compact, maxConditions, corePool}: tiny status blocks; corePool names the one resource pool shown (any case).
 - principle {text}: reference text shown at session boot, never enforced.
 import {worldId, preset: 'day-366'} loads the Day 366 table rules. worldId REQUIRED on every call.`,
     inputSchema: TableRulesInputSchema,

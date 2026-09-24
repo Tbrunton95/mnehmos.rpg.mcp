@@ -10,7 +10,7 @@
 import { getDb } from '../storage/index.js';
 import { CustomEffectsRepository } from '../storage/repos/custom-effects.repo.js';
 import { CharacterRepository } from '../storage/repos/character.repo.js';
-import { loadRule } from '../engine/table-rules.js';
+import { loadRule, findPool } from '../engine/table-rules.js';
 import { recentPrecedents } from './consolidated/precedent-manage.js';
 import type { Character } from '../schema/character.js';
 
@@ -34,7 +34,7 @@ function tryAll<T>(fn: () => T[]): T[] {
 function digest(char: Character, worldId: string): Record<string, unknown> {
     const db = getDb();
     const pools = (char.resourcePools ?? {}) as Record<string, { current: number; max: number }>;
-    const corePool = loadRule(db, worldId, 'status_block')?.spec.corePool;
+    const core = findPool(pools, loadRule(db, worldId, 'status_block')?.spec.corePool);
     const effectsRepo = new CustomEffectsRepository(db);
     const effects = [...tryAll(() => effectsRepo.getEffectsOnTarget(char.id, 'character', { is_active: true })),
         ...tryAll(() => effectsRepo.getEffectsOnTarget(char.id, 'npc', { is_active: true }))];
@@ -44,7 +44,7 @@ function digest(char: Character, worldId: string): Record<string, unknown> {
         name: char.name,
         hp: `${char.hp}/${char.maxHp}`,
         ...(char.band ? { band: char.band } : {}),
-        ...(corePool && pools[corePool] ? { [corePool]: `${pools[corePool].current}/${pools[corePool].max}` } : {}),
+        ...(core ? { [core.key]: `${core.pool.current}/${core.pool.max}` } : {}),
         ...(char.parts?.some(p => p.state !== 'intact') ? { parts: char.parts.filter(p => p.state !== 'intact').map(p => `${p.name}: ${p.state}`) } : {}),
         conditions: { count: conditions.length, first: conditions.slice(0, 5).map(c => clip(c.name, 100)) },
         features: effects.map(e => {
