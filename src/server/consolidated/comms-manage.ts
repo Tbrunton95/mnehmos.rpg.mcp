@@ -263,5 +263,7 @@ Actions: create_device, create_sim, insert_sim, eject_sim, add_contact, copy_con
 - copy_contacts (SIM → memory) makes numbers survive the SIM — and survive seizure. burn kills a device; burn {simId, split:true} snaps the card. A burned device still physically contains its SIM until ejected.
 - transfer moves the handset between hands: whoever holds it holds every number in it.
 worldId REQUIRED on every call.`,
-    inputSchema: CommsInputSchema
+    inputSchema: CommsInputSchema,
+    // Every action shares the one input schema; the switch dispatcher validates per action.
+    actionSchemas: Object.fromEntries(ACTIONS.map(a => [a, { schema: CommsInputSchema, aliases: [] as string[] }]))
 };

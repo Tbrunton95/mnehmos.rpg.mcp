@@ -24,8 +24,7 @@ import {
     AgentStatusSchema,
     AgentSliceKindSchema,
     AgentSecretImportanceSchema,
-    AgentJournalKindSchema,
-    CompetencyOverrideSchema
+    AgentJournalKindSchema
 } from '../../schema/agent.js';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { RichFormatter } from '../utils/formatter.js';
@@ -102,7 +101,6 @@ const CreateSchema = z.object({
     characterId: z.string().describe('Character to bind this agent to (1:1)'),
     provider: AgentProviderSchema.describe('LLM provider: openai or openrouter'),
     model: z.string().min(1).describe('Provider model identifier (e.g. gpt-4o-mini, openai/gpt-5.6-luna)'),
-    competencyOverride: CompetencyOverrideSchema.nullable().optional().describe('Optional fixed model/reasoning policy; when set it overrides INT-based competency selection'),
     status: AgentStatusSchema.optional(),
     autoOnTurn: z.boolean().optional().describe('Auto-invoke when this character\'s turn comes up in combat'),
     temperature: z.number().min(0).max(2).optional(),
@@ -130,7 +128,6 @@ const UpdateSchema = z.object({
     characterId: z.string().optional(),
     provider: AgentProviderSchema.optional(),
     model: z.string().min(1).optional(),
-    competencyOverride: CompetencyOverrideSchema.nullable().optional().describe('Optional fixed model/reasoning policy; null restores INT-based competency selection'),
     status: AgentStatusSchema.optional(),
     autoOnTurn: z.boolean().optional(),
     temperature: z.number().min(0).max(2).optional(),
@@ -329,7 +326,6 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         characterId: args.characterId,
         provider: args.provider,
         model: args.model,
-        competencyOverride: args.competencyOverride,
         status: args.status,
         autoOnTurn: args.autoOnTurn ?? false,
         temperature: args.temperature,
@@ -822,7 +818,6 @@ Actions: create, get, list, update, delete, resume, health, budget, set_slice, r
         // create/update
         provider: AgentProviderSchema.optional(),
         model: z.string().optional(),
-        competencyOverride: CompetencyOverrideSchema.nullable().optional(),
         status: AgentStatusSchema.optional(),
         autoOnTurn: z.boolean().optional(),
         temperature: z.number().optional(),

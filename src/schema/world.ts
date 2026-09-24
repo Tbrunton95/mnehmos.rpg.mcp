@@ -2,6 +2,10 @@ import { z } from 'zod';
 
 /** Canonical persisted world-environment contract shared by storage and tools. */
 export const WorldEnvironmentSchema = z.object({
+  // Campaign clock: day number plus HH:MM. world_manage update derives
+  // elapsedHours from these, and session_manage surfaces due schedules by day.
+  day: z.number().optional(),
+  time: z.string().optional(),
   date: z.string().optional(),
   timeOfDay: z.string().optional(),
   season: z.string().optional(),
@@ -25,6 +29,8 @@ export function normalizeWorldEnvironment(value: unknown): WorldEnvironment {
     if (candidate !== undefined) canonical[key] = candidate;
   };
 
+  copy('day', 'currentDay');
+  copy('time');
   copy('date');
   copy('timeOfDay', 'dayNightCycle');
   copy('season');

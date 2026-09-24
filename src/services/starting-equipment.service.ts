@@ -250,8 +250,16 @@ function ensureItemExists(itemRepo: ItemRepository, itemName: string): string {
         return materializeOpen5eItem(itemRepo, catalogValue).item.id;
     }
 
-    // Check if item already exists
+    // Check if item already exists.
+    // FINDINGS #28: findByName is LIKE %name% — 'AKM-74/2' matched BOTH rifles
+    // and granted whichever row was seeded first (the 74/2U), silently
+    // under-arming the kit while the banner printed the intended name.
+    // Exact match wins; fuzzy only as fallback.
     const existing = itemRepo.findByName(itemName);
+    const exact = existing.find(i => i.name.toLowerCase() === itemName.toLowerCase());
+    if (exact) {
+        return exact.id;
+    }
     if (existing.length > 0) {
         return existing[0].id;
     }

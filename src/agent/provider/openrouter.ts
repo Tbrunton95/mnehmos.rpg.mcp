@@ -28,6 +28,7 @@ export interface OpenRouterProviderConfig {
 }
 
 interface OpenRouterChatResponse {
+    model?: string;
     choices?: Array<{
         message?: { content?: string | null };
         finish_reason?: string;
@@ -84,6 +85,17 @@ export class OpenRouterProvider implements LLMProvider {
         }
         if (opts.reasoningEffort !== undefined && opts.reasoningEffort !== null && reasoningModel) {
             body.reasoning_effort = opts.reasoningEffort;
+        }
+        // FINDINGS #69: reasoningEffort was threaded through the whole stack and
+        // dropped here — thinking burned the max_tokens budget on every invoke.
+        // OpenRouter's normalized `reasoning` param: effort string, or
+        // { enabled: false } to disable thinking outright. `null` from the
+        // competency ladder means exactly that — in-character dialogue does not
+        // need chain-of-thought. Unsupported models ignore the parameter.
+        if (opts.reasoningEffort !== undefined) {
+            body.reasoning = opts.reasoningEffort === null
+                ? { enabled: false }
+                : { effort: opts.reasoningEffort === 'xhigh' ? 'high' : opts.reasoningEffort };
         }
 
         let response: Response;
@@ -143,7 +155,8 @@ export class OpenRouterProvider implements LLMProvider {
                     : {}),
             raw: rawText,
             durationMs,
-            finishReason: choice?.finish_reason
+            finishReason: choice?.finish_reason,
+            model: parsed.model
         };
     }
 }

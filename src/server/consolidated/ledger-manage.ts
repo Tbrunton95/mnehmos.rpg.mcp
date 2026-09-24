@@ -193,5 +193,7 @@ Actions: create, get, list, process_due, settle, default, update, delete
 - list returns openExposure — the number a debtor lies awake under.
 - Cash physicality rides container_manage: bundles are items with weight that must live in containers.
 worldId REQUIRED on every call.`,
-    inputSchema: LedgerInputSchema
+    inputSchema: LedgerInputSchema,
+    // Every action shares the one input schema; the switch dispatcher validates per action.
+    actionSchemas: Object.fromEntries(ACTIONS.map(a => [a, { schema: LedgerInputSchema, aliases: [] as string[] }]))
 };

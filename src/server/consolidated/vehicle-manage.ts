@@ -178,5 +178,7 @@ Actions: create, get, list, update, add_defect, clear_defect, note_known, delete
 - Cavities/boot are container_manage rows with ownerType:'vehicle' — create returns the exact call; get JOINs them in.
 - expectName guards update/delete. delete refuses while containers are attached.
 worldId REQUIRED on every call.`,
-    inputSchema: VehicleInputSchema
+    inputSchema: VehicleInputSchema,
+    // Every action shares the one input schema; the switch dispatcher validates per action.
+    actionSchemas: Object.fromEntries(ACTIONS.map(a => [a, { schema: VehicleInputSchema, aliases: [] as string[] }]))
 };

@@ -173,5 +173,7 @@ Actions: create, get, list, put, take, move, destroy
 - locked refuses put/take until the fiction opens it (ignoreLock:true = GM override). hidden hides from list. trapped is a flag; the trap is fiction.
 - capacityLbs omitted = unlimited. destroy refuses while loaded unless force (spill named in full).
 worldId REQUIRED on every call.`,
-    inputSchema: ContainerInputSchema
+    inputSchema: ContainerInputSchema,
+    // Every action shares the one input schema; the switch dispatcher validates per action.
+    actionSchemas: Object.fromEntries(ACTIONS.map(a => [a, { schema: ContainerInputSchema, aliases: [] as string[] }]))
 };

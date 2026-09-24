@@ -984,15 +984,10 @@ function runMigrations(db: Database.Database) {
     db.exec(`ALTER TABLE characters ADD COLUMN origin TEXT;`);
   }
 
-  // PROFICIENCY TRIO: schema carried skillProficiencies/saveProficiencies/
-  // expertise fully enumerated with no columns behind them — the same
-  // silent-drop pattern the background/alignment comment above confesses to.
-  for (const col of ['skill_proficiencies', 'save_proficiencies', 'expertise']) {
-    if (!charColumns.some(c => c.name === col)) {
-      console.error(`[Migration] Adding ${col} column to characters table`);
-      db.exec(`ALTER TABLE characters ADD COLUMN ${col} TEXT DEFAULT '[]';`);
-    }
-  }
+  // PROFICIENCY TRIO (skill/save/expertise) columns are added above with
+  // armor/weapon/tool proficiencies and languages. A second pass here read
+  // the same stale charColumns snapshot and re-ALTERed them — "duplicate
+  // column name" on every database that did not already have them.
 
   // Migration: Rename world_x/world_y to local_x/local_y if needed
   const hasWorldX = roomColumns.some(col => col.name === 'world_x');
