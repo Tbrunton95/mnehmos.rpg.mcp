@@ -1,6 +1,21 @@
 import Database from 'better-sqlite3';
 import { Region, RegionSchema } from '../../schema/region.js';
 
+/**
+ * Row id of generated region `n` in a world — the one format region rows use.
+ * The old seed-restore path wrote `${worldId}:${n}`; migrateLegacyRegionIds
+ * folds those rows into this form and findById still accepts that spelling.
+ */
+export function generatedRegionRowId(worldId: string, regionIndex: number | string): string {
+    return `${worldId}:region:${regionIndex}`;
+}
+
+/** `${worldId}:${n}` → `${worldId}:region:${n}`; null for any other id. */
+function fromLegacyRegionRowId(id: string): string | null {
+    const legacy = /^(.+):(\d+)$/.exec(id);
+    return legacy && !legacy[1].endsWith(':region') ? generatedRegionRowId(legacy[1], legacy[2]) : null;
+}
+
 export class RegionRepository {
     constructor(private db: Database.Database) { }
 
@@ -33,7 +48,11 @@ export class RegionRepository {
 
     findById(id: string): Region | null {
         const stmt = this.db.prepare('SELECT * FROM regions WHERE id = ?');
-        const row = stmt.get(id) as RegionRow | undefined;
+        // Campaign notes and earlier tool output name regions by the legacy
+        // `${worldId}:${n}` id; resolve it to the migrated row. Callers store
+        // the returned region.id, never the id they were handed.
+        const legacyAlias = fromLegacyRegionRowId(id);
+        const row = (stmt.get(id) ?? (legacyAlias ? stmt.get(legacyAlias) : undefined)) as RegionRow | undefined;
 
         if (!row) return null;
 

@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { migrateClassProgression } from './migrations.class-progression.js';
+import { migrateLegacyRegionIds } from './migrations.region-ids.js';
 
 export function migrate(db: Database.Database) {
   // First, create all tables (without indexes that depend on new columns)
@@ -656,6 +657,10 @@ export function migrate(db: Database.Database) {
 
   // Per-class progression: homebrew multiclass tracks (no single general level)
   migrateClassProgression(db);
+
+  // Region rows: one id format (`${worldId}:region:${n}`). Needs the
+  // owner_nation_id/control_level columns runMigrations adds.
+  migrateLegacyRegionIds(db);
 }
 
 function runMigrations(db: Database.Database) {

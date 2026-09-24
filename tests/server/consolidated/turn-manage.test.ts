@@ -333,6 +333,40 @@ describe('turn_manage consolidated tool', () => {
             expect(diplomacyRepo.getClaimsByRegion(testRegionId)).toHaveLength(1);
         });
 
+        it('lands a queued claim made by legacy region id on the canonical row', async () => {
+            // Campaign notes from before region ids were unified name the
+            // legacy `${worldId}:<n>` form.
+            const now = new Date().toISOString();
+            const canonicalId = `${testWorldId}:region:5`;
+            new RegionRepository(getDb()).create({
+                id: canonicalId,
+                worldId: testWorldId,
+                name: 'Rostok',
+                type: 'wilderness',
+                centerX: 0,
+                centerY: 0,
+                color: '#888888',
+                createdAt: now,
+                updatedAt: now
+            });
+
+            await handleTurnManage({
+                action: 'submit_actions',
+                worldId: testWorldId,
+                nationId: testNationId,
+                actions: [{ type: 'claim_region', regionId: `${testWorldId}:5` }]
+            }, ctx);
+            await handleTurnManage({ action: 'mark_ready', worldId: testWorldId, nationId: testNationId }, ctx);
+            const resolved = parseResult(await handleTurnManage({
+                action: 'mark_ready',
+                worldId: testWorldId,
+                nationId: testNation2Id
+            }, ctx));
+
+            expect(resolved.resolvedActions).toContain(`Claimed region ${canonicalId}`);
+            expect(new DiplomacyRepository(getDb()).getClaimsByRegion(canonicalId)).toHaveLength(1);
+        });
+
         it('should return error if not in planning phase', async () => {
             // This test is harder to trigger since phase only changes when all nations are ready
             // For now, test the basic error case with non-existent world
