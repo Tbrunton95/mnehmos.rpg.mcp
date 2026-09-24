@@ -116,6 +116,20 @@ export function withOperation(toolName: string, handler: Handler): Handler {
         queues.set(db, previous.then(() => mine));
         await previous.catch(() => undefined);
         try {
+            // Claude Desktop runs two server processes on one database. The
+            // outermost call takes the write lock up front (BEGIN IMMEDIATE),
+            // so the other process waits on busy_timeout instead of working
+            // from state about to go stale; a nested call keeps a savepoint.
+            const outer = !db.inTransaction;
+            const sp = `op_${++savepointSeq}`;
+            db.exec(outer ? 'BEGIN IMMEDIATE' : `SAVEPOINT ${sp}`);
+            const rollback = () => {
+                if (outer) { if (db.inTransaction) db.exec('ROLLBACK'); }
+                else { db.exec(`ROLLBACK TO ${sp}`); db.exec(`RELEASE ${sp}`); }
+            };
+            // Under the lock, read fresh: a cached combat engine may predate
+            // the other process's writes, and would roll its dice again.
+            if (outer) evictSessionEngines(sessionKey());
             let argsHash = '';
             if (opId) {
                 ensureOpLog(db);
@@ -124,26 +138,26 @@ export function withOperation(toolName: string, handler: Handler): Handler {
                 if (done) {
                     if (done.args_hash !== argsHash || done.tool !== toolName) {
                         const message = `opId ${opId} was already used for a different call (${done.tool} at ${done.created_at}). Nothing was applied; use a new opId.`;
+                        rollback();
                         return { content: [{ type: 'text', text: `▌ ✖ REFUSED — ${message}\n<!-- OPERATION_JSON\n${JSON.stringify({ error: true, opId, message, writes: 'none' })}\nOPERATION_JSON -->` }] };
                     }
+                    rollback();
                     return { content: [{ type: 'text', text: `▌ ↺ REPLAYED op ${opId}: already applied at ${done.created_at}; nothing applied again.\n${done.response}` }] };
                 }
             }
 
-            const sp = `op_${++savepointSeq}`;
-            db.exec(`SAVEPOINT ${sp}`);
             let res: ToolReply;
             const op = { opId, tool: toolName };
             try {
                 res = await opContext.run(op, () => handler(args, extra));
             } catch (e) {
-                db.exec(`ROLLBACK TO ${sp}`); db.exec(`RELEASE ${sp}`);
+                rollback();
                 evictSessionEngines(sessionKey());
                 throw e;
             }
             if (isErrorReply(res)) {
                 // The call failed partway or refused: nothing it wrote stays.
-                db.exec(`ROLLBACK TO ${sp}`); db.exec(`RELEASE ${sp}`);
+                rollback();
                 evictSessionEngines(sessionKey());
                 return res;
             }
@@ -153,7 +167,7 @@ export function withOperation(toolName: string, handler: Handler): Handler {
                     .run(opId, toolName, argsHash, res?.content?.[0]?.text ?? '', new Date().toISOString());
                 if (res?.content?.[0]) res = { ...res, content: [{ ...res.content[0], text: `▌ op ${opId} applied\n${res.content[0].text}` }, ...res.content.slice(1)] };
             }
-            db.exec(`RELEASE ${sp}`);
+            db.exec(outer ? 'COMMIT' : `RELEASE ${sp}`);
             return res;
         } finally {
             release();
