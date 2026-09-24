@@ -12,7 +12,7 @@
  * - level_up -> action: 'level_up'
  */
 
-import { loadRule, resolveWorldId, findPool, worldLexicon } from '../../engine/table-rules.js';
+import { loadRule, resolveWorldId, findPool, worldLexicon, conditionsForDisplay } from '../../engine/table-rules.js';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { SessionContext } from '../types.js';
@@ -94,7 +94,8 @@ const StatsSchema = z.object({
 const conditionSchema = () => z.object({
     name: z.string(),
     duration: z.number().int().optional(),
-    source: z.string().optional()
+    source: z.string().optional(),
+    pinned: z.boolean().optional()
 });
 
 const CreateSchema = z.object({
@@ -199,8 +200,10 @@ const UpdateSchema = z.object({
         match: z.string().min(1).describe('Case-insensitive text found in exactly one condition name'),
         name: z.string().optional().describe('Replace the whole name'),
         replace: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the name'),
+        replaceSource: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the source'),
         duration: z.number().int().optional(),
-        source: z.string().optional()
+        source: z.string().optional(),
+        pinned: z.boolean().optional().describe('Pin it: shown first in the tiny status block and the boot digest')
     })).optional().describe('Edit one condition in place without resending its text. Nothing is written if a match finds zero or several conditions'),
     background: z.string().optional(),
     alignment: z.string().optional(),
@@ -329,7 +332,7 @@ const GetStatusBlockSchema = z.object({
 // the renderer cannot leak it even by a future caller's mistake.
 async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>): Promise<object> {
     const { characterRepo } = ensureDb();
-    const char = characterRepo.findById(args.characterId) as unknown as { name?: string; hp?: number; maxHp?: number; resourcePools?: Record<string, { current: number; max: number }>; currency?: { gold?: number } | string; conditions?: Array<{ name?: string; duration?: number }> } | undefined;
+    const char = characterRepo.findById(args.characterId) as unknown as { name?: string; hp?: number; maxHp?: number; resourcePools?: Record<string, { current: number; max: number }>; currency?: { gold?: number } | string; conditions?: Array<{ name?: string; duration?: number; pinned?: boolean }> } | undefined;
     if (!char) throw new Error(`Character ${args.characterId} not found`);
     const db = getDb();
 
@@ -395,7 +398,7 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
             const firstId = (JSON.parse(log?.active_quests || '[]') as string[])[0];
             if (firstId) objective = (db.prepare('SELECT name FROM quests WHERE id = ?').get(firstId) as { name?: string } | undefined)?.name;
         } catch { /* no quest log */ }
-        const conditions = (char.conditions || []).slice(0, tiny.spec.maxConditions);
+        const conditions = conditionsForDisplay(char.conditions || [], tiny.spec.maxConditions);
         return {
             success: true,
             actionType: 'get_status_block',
@@ -1027,7 +1030,7 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     if (args.conditions !== undefined) {
         updateData.conditions = args.conditions;
     } else if (args.addConditions !== undefined || args.removeConditions !== undefined || args.editConditions !== undefined) {
-        let currentConditions: Array<{ name: string; duration?: number; source?: string }> =
+        let currentConditions: Array<{ name: string; duration?: number; source?: string; pinned?: boolean }> =
             (character as any).conditions || [];
 
         if (args.removeConditions?.length) {
@@ -1053,8 +1056,13 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
                     if (!c.name.includes(edit.replace.find)) throw new Error(`editConditions: '${edit.replace.find}' is not in the matched condition. Nothing was written.`);
                     c.name = c.name.split(edit.replace.find).join(edit.replace.with);
                 }
+                if (edit.replaceSource) {
+                    if (!c.source?.includes(edit.replaceSource.find)) throw new Error(`editConditions: '${edit.replaceSource.find}' is not in the matched condition's source. Nothing was written.`);
+                    c.source = c.source.split(edit.replaceSource.find).join(edit.replaceSource.with);
+                }
                 if (edit.duration !== undefined) c.duration = edit.duration;
                 if (edit.source !== undefined) c.source = edit.source;
+                if (edit.pinned !== undefined) c.pinned = edit.pinned;
             }
         }
 
@@ -2096,8 +2104,10 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         match: z.string().min(1).describe('Case-insensitive text found in exactly one condition name'),
         name: z.string().optional().describe('Replace the whole name'),
         replace: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the name'),
+        replaceSource: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the source'),
         duration: z.number().int().optional(),
-        source: z.string().optional()
+        source: z.string().optional(),
+        pinned: z.boolean().optional().describe('Pin it: shown first in the tiny status block and the boot digest')
     })).optional().describe('Edit one condition in place without resending its text. Nothing is written if a match finds zero or several conditions'),
         // Add XP field
         amount: z.number().int().optional(),

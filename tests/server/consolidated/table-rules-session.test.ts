@@ -45,9 +45,11 @@ describe('milestone XP, tiny status, principles at boot', () => {
         expect(res).toMatch(/150\/200/);
         expect(res).toMatch(/CORRUPTION/);
         expect(res).toMatch(/7\/100/);
-        expect(res).toMatch(/bleeding/);
+        // Newest first: the last two on the sheet, then the count of the rest.
+        expect(res).toMatch(/marked/);
+        expect(res).toMatch(/shaken/);
         expect(res).toMatch(/\+1/);
-        expect(res).not.toMatch(/marked/);
+        expect(res).not.toMatch(/bleeding/);
         // Only the named pool is shown.
         expect(res).not.toMatch(/WARP/i);
     });
@@ -67,6 +69,30 @@ describe('milestone XP, tiny status, principles at boot', () => {
         expect(res.warning).toMatch(/no character in this world has pool 'resolve'/);
         const known = tagJson((await handleTableRules({ action: 'define', worldId: W, kind: 'status_block', name: 'tiny-status', spec: { corePool: 'Warp' } }, ctx as any)).content[0].text, 'TABLE_RULES');
         expect(known.warning).toBeUndefined();
+    });
+
+    it('a pinned condition leads the tiny block, then the newest', async () => {
+        await importDay366();
+        await handleCharacterManage({ action: 'update', characterId: 'luciel', editConditions: [{ match: 'bleeding', pinned: true }] }, ctx as any);
+        const block = tagJson((await handleCharacterManage({ action: 'get_status_block', characterId: 'luciel' }, ctx as any)).content[0].text, 'CHARACTER_MANAGE');
+        expect(block.conditions.map((c: { name: string }) => c.name)).toEqual(['bleeding', 'marked']);
+        const boot = tagJson((await handleSessionManage({ action: 'boot', worldId: W }, ctx as any)).content[0].text, 'SESSION_MANAGE');
+        expect(boot.characters[0].conditions.first).toEqual(['bleeding', 'marked', 'shaken']);
+    });
+
+    it('editConditions replaceSource edits the source text in place', async () => {
+        await handleCharacterManage({ action: 'update', characterId: 'luciel', addConditions: [{ name: 'Day 366 reset', source: 'Luciel is an Astartes-scale warlord.' }] }, ctx as any);
+        await handleCharacterManage({ action: 'update', characterId: 'luciel', editConditions: [{ match: 'day 366', replaceSource: { find: 'an Astartes-scale warlord', with: 'the Unclaimed Prince' } }] }, ctx as any);
+        const got = tagJson((await handleCharacterManage({ action: 'get', characterId: 'luciel' }, ctx as any)).content[0].text, 'CHARACTER_MANAGE');
+        expect(got.conditions.find((c: { name: string }) => c.name === 'Day 366 reset').source).toBe('Luciel is the Unclaimed Prince.');
+        const miss = (await handleCharacterManage({ action: 'update', characterId: 'luciel', editConditions: [{ match: 'day 366', replaceSource: { find: 'Primarch', with: 'x' } }] }, ctx as any)).content[0].text;
+        expect(miss).toMatch(/not in the matched condition's source\. Nothing was written/);
+    });
+
+    it('the header strip has no empty segments without a clock', async () => {
+        await importDay366();
+        const res = (await handleCharacterManage({ action: 'get_status_block', characterId: 'luciel' }, ctx as any)).content[0].text;
+        expect(res).toMatch(/╓─ \+\+\+ ─── LUCIEL ──╖/);
     });
 
     it('get_context lists the enforced rules and the principles', async () => {

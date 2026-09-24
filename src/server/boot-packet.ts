@@ -10,7 +10,7 @@
 import { getDb } from '../storage/index.js';
 import { CustomEffectsRepository } from '../storage/repos/custom-effects.repo.js';
 import { CharacterRepository } from '../storage/repos/character.repo.js';
-import { loadRule, findPool } from '../engine/table-rules.js';
+import { loadRule, findPool, conditionsForDisplay } from '../engine/table-rules.js';
 import { recentPrecedents } from './consolidated/precedent-manage.js';
 import type { Character } from '../schema/character.js';
 
@@ -38,7 +38,7 @@ function digest(char: Character, worldId: string): Record<string, unknown> {
     const effectsRepo = new CustomEffectsRepository(db);
     const effects = [...tryAll(() => effectsRepo.getEffectsOnTarget(char.id, 'character', { is_active: true })),
         ...tryAll(() => effectsRepo.getEffectsOnTarget(char.id, 'npc', { is_active: true }))];
-    const conditions = (char.conditions ?? []) as Array<{ name: string }>;
+    const conditions = (char.conditions ?? []) as Array<{ name: string; pinned?: boolean }>;
     return {
         id: char.id,
         name: char.name,
@@ -46,7 +46,7 @@ function digest(char: Character, worldId: string): Record<string, unknown> {
         ...(char.band ? { band: char.band } : {}),
         ...(core ? { [core.key]: `${core.pool.current}/${core.pool.max}` } : {}),
         ...(char.parts?.some(p => p.state !== 'intact') ? { parts: char.parts.filter(p => p.state !== 'intact').map(p => `${p.name}: ${p.state}`) } : {}),
-        conditions: { count: conditions.length, first: conditions.slice(0, 5).map(c => clip(c.name, 100)) },
+        conditions: { count: conditions.length, first: conditionsForDisplay(conditions, 5).map(c => clip(c.name, 100)) },
         features: effects.map(e => {
             const auto = e.mechanics.some(m => (m as { autoApply?: boolean }).autoApply);
             const when = e.triggers.filter(t => t.event !== 'always_active').map(t => `${t.event}${t.condition ? ` (${t.condition})` : ''}`);
