@@ -24,6 +24,12 @@ import { closeDb, getDb } from '../../src/storage/index.js';
 import { getInitialSpellSlots, getMaxSpellLevel } from '../../src/engine/magic/spell-validator.js';
 import type { CharacterClass } from '../../src/schema/spell.js';
 
+// Encounter seeds are fixed strings. CombatRNG is seeded from them, so
+// initiative and attack rolls repeat run to run; a random seed let a
+// natural 1 auto-miss an "attackBonus: 20" attack about 1 run in 20.
+// Each seed was checked: the acting character wins initiative and every
+// attack hits. Spell damage and saves (spell-resolver) are not seeded.
+
 // Test utilities
 let charRepo: CharacterRepository;
 const TEST_SESSION_ID = 'llm-test-session';
@@ -156,7 +162,7 @@ describe('LLM AoE Spell Casting Patterns', () => {
         });
         
         const createResult = await handleCreateEncounter({
-            seed: `aoe-comma-test-${uuid()}`,
+            seed: 'aoe-comma-test-1',
             participants: [
                 { id: wizard.id!, name: 'Wizard', hp: 25, maxHp: 25, initiativeBonus: 10, isEnemy: false },
                 { id: 'goblin-1', name: 'Goblin A', hp: 7, maxHp: 7, initiativeBonus: 0, isEnemy: true, position: { x: 5, y: 5 } },
@@ -195,7 +201,7 @@ describe('LLM AoE Spell Casting Patterns', () => {
         });
         
         const createResult = await handleCreateEncounter({
-            seed: `aoe-array-test-${uuid()}`,
+            seed: 'aoe-array-test-2',
             participants: [
                 { id: wizard.id!, name: 'Wizard', hp: 25, maxHp: 25, initiativeBonus: 10, isEnemy: false },
                 { id: 'orc-1', name: 'Orc A', hp: 15, maxHp: 15, initiativeBonus: 0, isEnemy: true },
@@ -235,7 +241,7 @@ describe('LLM AoE Spell Casting Patterns', () => {
         });
         
         const createResult = await handleCreateEncounter({
-            seed: `damage-zero-test-${uuid()}`,
+            seed: 'damage-zero-test',
             participants: [
                 { id: wizard.id!, name: 'Wizard', hp: 20, maxHp: 20, initiativeBonus: 10, isEnemy: false },
                 { id: 'dummy', name: 'Dummy', hp: 100, maxHp: 100, initiativeBonus: 0, isEnemy: true },
@@ -274,7 +280,7 @@ describe('LLM AoE Spell Casting Patterns', () => {
         });
         
         const createResult = await handleCreateEncounter({
-            seed: `damage-reject-test-${uuid()}`,
+            seed: 'damage-reject-test',
             participants: [
                 { id: wizard.id!, name: 'Wizard', hp: 25, maxHp: 25, initiativeBonus: 10, isEnemy: false },
                 { id: 'target', name: 'Target', hp: 50, maxHp: 50, initiativeBonus: 0, isEnemy: true },
@@ -320,7 +326,7 @@ describe('Dead Creature Turn Skipping', () => {
         });
         
         const createResult = await handleCreateEncounter({
-            seed: `skip-dead-test-${uuid()}`,
+            seed: 'skip-dead-test-1',  // Weak Goblin acts before Tough Orc: the skip is exercised
             participants: [
                 { id: fighter.id!, name: 'Fighter', hp: 50, maxHp: 50, initiativeBonus: 20, isEnemy: false },
                 { id: 'goblin-weak', name: 'Weak Goblin', hp: 7, maxHp: 7, initiativeBonus: 10, isEnemy: true },
@@ -368,7 +374,7 @@ describe('Dead Creature Turn Skipping', () => {
         });
         
         const createResult = await handleCreateEncounter({
-            seed: `kill-all-test-${uuid()}`,
+            seed: 'kill-all-test',
             participants: [
                 { id: fighter.id!, name: 'Fighter', hp: 50, maxHp: 50, initiativeBonus: 20, isEnemy: false },
                 { id: 'minion-1', name: 'Minion 1', hp: 1, maxHp: 1, initiativeBonus: 5, isEnemy: true },
@@ -436,7 +442,7 @@ describe('LLM Turn Inquiry Patterns', () => {
         });
         
         const createResult = await handleCreateEncounter({
-            seed: `inquiry-test-${uuid()}`,
+            seed: 'inquiry-test',
             participants: [
                 { id: hero.id!, name: 'Hero', hp: 30, maxHp: 30, initiativeBonus: 10, isEnemy: false },
                 { id: 'villain', name: 'Villain', hp: 20, maxHp: 20, initiativeBonus: 5, isEnemy: true },
@@ -469,7 +475,7 @@ describe('LLM Turn Inquiry Patterns', () => {
         });
         
         const createResult = await handleCreateEncounter({
-            seed: `hp-sync-test-${uuid()}`,
+            seed: 'hp-sync-test',
             participants: [
                 { id: hero.id!, name: 'Hero', hp: 30, maxHp: 30, initiativeBonus: 10, isEnemy: false },
                 { id: 'enemy-1', name: 'Enemy', hp: 20, maxHp: 20, initiativeBonus: 5, isEnemy: true },
@@ -510,7 +516,7 @@ describe('Chat Output Formatting', () => {
          * When combat starts, user should see initiative order.
          */
         const createResult = await handleCreateEncounter({
-            seed: `output-init-test-${uuid()}`,
+            seed: 'output-init-test',
             participants: [
                 { id: 'gandalf', name: 'Gandalf', hp: 40, maxHp: 40, initiativeBonus: 4, isEnemy: false },
                 { id: 'balrog', name: 'Balrog', hp: 100, maxHp: 100, initiativeBonus: 3, isEnemy: true },
@@ -535,7 +541,7 @@ describe('Chat Output Formatting', () => {
         });
         
         const createResult = await handleCreateEncounter({
-            seed: `output-damage-test-${uuid()}`,
+            seed: 'output-damage-test',
             participants: [
                 { id: gandalf.id!, name: 'Gandalf', hp: 40, maxHp: 40, initiativeBonus: 10, isEnemy: false },
                 { id: 'balrog-out', name: 'Balrog', hp: 100, maxHp: 100, initiativeBonus: 5, isEnemy: true },
@@ -572,7 +578,7 @@ describe('Chat Output Formatting', () => {
         });
         
         const createResult = await handleCreateEncounter({
-            seed: `defeat-test-${uuid()}`,
+            seed: 'defeat-test-1',
             participants: [
                 { id: hero.id!, name: 'Hero', hp: 50, maxHp: 50, initiativeBonus: 10, isEnemy: false },
                 { id: 'minion-defeat', name: 'Minion', hp: 5, maxHp: 5, initiativeBonus: 5, isEnemy: true },
@@ -615,7 +621,7 @@ describe('LLM Edge Cases', () => {
         });
         
         const createResult = await handleCreateEncounter({
-            seed: `edge-target-test-${uuid()}`,
+            seed: 'edge-target-test',
             participants: [
                 { id: hero.id!, name: 'Hero', hp: 30, maxHp: 30, initiativeBonus: 10, isEnemy: false },
             ]
@@ -641,7 +647,7 @@ describe('LLM Edge Cases', () => {
          * LLM forgets to include sessionId.
          */
         const result = await handleCreateEncounter({
-            seed: `edge-session-test-${uuid()}`,
+            seed: 'edge-session-test',
             participants: [
                 { id: 'pc-empty-session', name: 'Hero', hp: 30, maxHp: 30, initiativeBonus: 10, isEnemy: false },
             ]
@@ -665,7 +671,7 @@ describe('LLM Edge Cases', () => {
         });
         
         const createResult = await handleCreateEncounter({
-            seed: `whitespace-test-${uuid()}`,
+            seed: 'whitespace-test',
             participants: [
                 { id: wizard.id!, name: 'Wizard', hp: 25, maxHp: 25, initiativeBonus: 10, isEnemy: false },
                 { id: 'goblin-ws-1', name: 'Goblin 1', hp: 7, maxHp: 7, initiativeBonus: 0, isEnemy: true },
