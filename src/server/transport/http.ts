@@ -4,6 +4,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { runInTenant, type TenantContext } from '../../storage/tenant-context.js';
 import { verifyTenantToken } from './tenant-token.js';
 import { deleteCampaignDatabase } from '../../storage/index.js';
+import { listenWithIpv4Fallback } from './listen.js';
 
 export interface HttpServerTransportOptions {
     host?: string;
@@ -110,6 +111,7 @@ export async function startHttpServerTransport(
     // IPv4 still works. Railway's private network is IPv6-only: a server bound
     // to '0.0.0.0' is reachable on its public domain but NOT on
     // <service>.railway.internal, so peer services can't reach it privately.
+    // On a host with no IPv6 at all, '::' falls back to '0.0.0.0' (listen.ts).
     const host = options.host ?? '::';
     const authToken = options.authToken ?? process.env.RPG_MCP_TRANSPORT_TOKEN;
     const tenantSecret = options.tenantSecret ?? process.env.RPG_MCP_TENANT_SECRET;
@@ -245,6 +247,6 @@ export async function startHttpServerTransport(
             });
     });
 
-    await new Promise<void>((resolve) => server.listen(port, host, resolve));
+    await listenWithIpv4Fallback(server, port, host, '[HTTP]');
     return server;
 }

@@ -1,7 +1,8 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import { JSONRPCMessage } from '@modelcontextprotocol/sdk/types.js';
-import type { IncomingMessage } from 'http';
+import { createServer, STATUS_CODES, type IncomingMessage, type Server } from 'http';
+import { isIpv6Unavailable, listenWithIpv4Fallback } from './listen.js';
 
 export interface WebSocketServerTransportOptions {
     host?: string;
@@ -18,7 +19,9 @@ function messageIdKey(message: JSONRPCMessage): string | null {
 }
 
 export class WebSocketServerTransport implements Transport {
+    private httpServer: Server;
     private wss: WebSocketServer;
+    private listening: Promise<void>;
     private clients: Set<WebSocket> = new Set();
     private requestClients: Map<string, WebSocket> = new Map();
     private readonly authToken?: string;
@@ -32,9 +35,21 @@ export class WebSocketServerTransport implements Transport {
         const host = options.host ?? '::';
         this.authToken = options.authToken || process.env.RPG_MCP_TRANSPORT_TOKEN;
 
+        // Own the HTTP server instead of handing ws a port: ws binds exactly
+        // once, so a '::' bind on a host without IPv6 could not be retried on
+        // 0.0.0.0 (see listen.ts). Plain HTTP requests get the same 426 reply
+        // ws gives them from a server it creates itself.
+        this.httpServer = createServer((_req, res) => {
+            const body = STATUS_CODES[426]!;
+            res.writeHead(426, {
+                'Content-Length': body.length,
+                'Content-Type': 'text/plain'
+            });
+            res.end(body);
+        });
+
         this.wss = new WebSocketServer({
-            port,
-            host,
+            server: this.httpServer,
             maxPayload: options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES,
             verifyClient: (info, done) => {
                 done(this.isAllowedRequest(info.req));
@@ -72,10 +87,21 @@ export class WebSocketServerTransport implements Transport {
         });
 
         this.wss.on('error', (error) => {
+            // ws forwards every HTTP server error, including the failed '::'
+            // bind that listenWithIpv4Fallback() recovers from; that one is not
+            // a transport error.
+            if (isIpv6Unavailable(host, error)) return;
             this.onerror?.(error);
         });
 
-        console.error(`[WebSocket] Server listening on ${host}:${port}`);
+        this.listening = listenWithIpv4Fallback(this.httpServer, port, host, '[WebSocket]')
+            .then((boundHost) => {
+                console.error(`[WebSocket] Server listening on ${boundHost}:${port}`);
+            });
+        // A failed bind still reaches onerror above; start() reports it too.
+        // Without this, a transport that is never started would leave the
+        // rejection unhandled.
+        this.listening.catch(() => {});
     }
 
     async send(message: JSONRPCMessage): Promise<void> {
@@ -114,32 +140,10 @@ export class WebSocketServerTransport implements Transport {
     }
 
     async start(): Promise<void> {
-        // WebSocketServer begins listening in its constructor, but the
-        // listening event is asynchronous. Await it so callers (and the MCP
-        // server's connect path) cannot race the first client connection.
-        if (this.wss.address() !== null) return;
-
-        await new Promise<void>((resolve, reject) => {
-            const onListening = () => {
-                cleanup();
-                resolve();
-            };
-            const onError = (error: Error) => {
-                cleanup();
-                reject(error);
-            };
-            const cleanup = () => {
-                this.wss.off('listening', onListening);
-                this.wss.off('error', onError);
-            };
-
-            this.wss.once('listening', onListening);
-            this.wss.once('error', onError);
-
-            // The server may have finished between the initial check and
-            // listener registration.
-            if (this.wss.address() !== null) onListening();
-        });
+        // The server begins listening in the constructor, but binding is
+        // asynchronous. Await it so callers (and the MCP server's connect
+        // path) cannot race the first client connection.
+        await this.listening;
     }
 
     async close(): Promise<void> {
@@ -149,14 +153,19 @@ export class WebSocketServerTransport implements Transport {
         }
         this.clients.clear();
 
-        // Close the WebSocket server
+        // Close the WebSocket server, then the HTTP server under it: ws does
+        // not close a server it was handed. Like ws closing its own server,
+        // ignore the "not running" error left by a bind that never succeeded.
         return new Promise((resolve, reject) => {
             this.wss.close((error) => {
-                if (error) reject(error);
-                else {
+                if (error) {
+                    reject(error);
+                    return;
+                }
+                this.httpServer.close(() => {
                     this.onclose?.();
                     resolve();
-                }
+                });
             });
         });
     }
