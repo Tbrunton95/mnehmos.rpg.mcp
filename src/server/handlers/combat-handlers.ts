@@ -45,7 +45,7 @@ export function setCombatPubSub(instance: PubSub) {
  * This implements "database is source of truth" - if character_manage
  * updated HP, we show that value in combat display.
  */
-function syncParticipantHpFromDb(state: CombatState): CombatState {
+export function syncParticipantHpFromDb(state: CombatState): CombatState {
     const db = getDb();
     const charRepo = new CharacterRepository(db);
 
@@ -96,9 +96,26 @@ function persistParticipantHpToDb(state: CombatState): void {
  * call syncParticipantHpFromDb first, so an HP change made through
  * character_manage between calls is read before this writes memory back.
  */
-function saveEncounterState(repo: EncounterRepository, encounterId: string, state: CombatState): void {
+export function saveEncounterState(repo: EncounterRepository, encounterId: string, state: CombatState): void {
     persistParticipantHpToDb(state);
     repo.saveState(encounterId, state);
+}
+
+/**
+ * The encounter's live engine: from process memory, or rehydrated from the
+ * database (after a restart or eviction) and registered. null when the
+ * encounter exists in neither.
+ */
+export function getOrLoadEngine(ctx: SessionContext, encounterId: string): CombatEngine | null {
+    const key = `${ctx.sessionId}:${encounterId}`;
+    const live = getCombatManager().get(key);
+    if (live) return live;
+    const persisted = new EncounterRepository(getDb()).loadState(encounterId);
+    if (!persisted) return null;
+    const engine = new CombatEngine(encounterId, pubsub || undefined);
+    engine.loadState(persisted);
+    getCombatManager().create(key, engine);
+    return engine;
 }
 
 // ============================================================

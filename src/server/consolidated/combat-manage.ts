@@ -17,7 +17,10 @@ import {
     handleLoadEncounter,
     handleAdvanceTurn,
     handleRollDeathSave,
-    handleExecuteLairAction
+    handleExecuteLairAction,
+    getOrLoadEngine,
+    syncParticipantHpFromDb,
+    saveEncounterState
 } from '../handlers/combat-handlers.js';
 import { expandCreatureTemplate, listAllTemplates } from '../../data/creature-presets.js';
 import { getDomainServices } from '../domain-services.js';
@@ -36,7 +39,7 @@ import { freshSeed } from '../../math/seed.js';
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'get_history', 'list'] as const;
+const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'get_history', 'list'] as const;
 type CombatManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -128,6 +131,17 @@ const LoadSchema = z.object({
 const AdvanceSchema = z.object({
     action: z.literal('advance'),
     encounterId: z.string().describe('The ID of the encounter')
+});
+
+const AdjustHpSchema = z.object({
+    action: z.literal('adjust_hp'),
+    encounterId: z.string(),
+    participantId: z.string().describe('Participant/token id whose HP to correct'),
+    value: z.number().int().min(0).optional().describe('Set HP to exactly this (clamped to maxHp)'),
+    delta: z.number().int().optional().describe('Shift HP by this amount (negative lowers); clamped to 0..maxHp'),
+    maxHp: z.number().int().min(1).optional().describe('Also set max HP (applied first)'),
+    reason: z.string().min(1).describe('Why — recorded in the combat log and audit'),
+    revive: z.boolean().optional().describe('Required to raise a participant marked dead above 0 HP')
 });
 
 const DeathSaveSchema = z.object({
@@ -836,6 +850,68 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         aliases: ['flee', 'banish', 'despawn'],
         description: '#67-D: Remove a participant from a running encounter (fled/banished/despawned) — turn pointer re-anchored, state persisted. The dead don\'t use this; they drop at 0 HP'
     },
+    adjust_hp: {
+        schema: AdjustHpSchema,
+        handler: async (params: z.infer<typeof AdjustHpSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'adjust_hp', message, writes: 'none' });
+            if (params.value !== undefined && params.delta !== undefined) return refuse('Pass value (set) or delta (shift), not both');
+            if (params.value === undefined && params.delta === undefined && params.maxHp === undefined) return refuse('Pass value, delta or maxHp');
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            // Read character_manage edits first so this write can't clobber them.
+            syncParticipantHpFromDb(state);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+
+            const before = p.hp;
+            const maxBefore = p.maxHp;
+            if (params.maxHp !== undefined) p.maxHp = params.maxHp;
+            const wanted = params.value ?? (params.delta !== undefined ? before + params.delta : before);
+            const after = Math.max(0, Math.min(p.maxHp, wanted));
+            if (p.isDead && after > 0 && !params.revive) {
+                p.maxHp = maxBefore;
+                return refuse(`${p.name} is dead — pass revive: true to bring them back`);
+            }
+            // Bookkeeping, not damage: crossing 0 in either direction starts the
+            // death-save track fresh; it never adds failures.
+            if ((before <= 0) !== (after <= 0)) {
+                p.deathSaveSuccesses = 0;
+                p.deathSaveFailures = 0;
+                p.isStabilized = false;
+            }
+            if (params.revive && after > 0) p.isDead = false;
+            p.hp = after;
+
+            saveEncounterState(new EncounterRepository(getDb()), params.encounterId, state);
+            getDomainServices().combatActionLog.log({
+                encounterId: params.encounterId,
+                round: state.round,
+                turnIndex: state.currentTurnIndex,
+                actorId: 'GM',
+                actorName: 'GM',
+                actionType: 'adjust_hp',
+                targetIds: [p.id],
+                resultSummary: `GM correction: ${p.name} HP ${before} → ${after}${p.maxHp !== maxBefore ? ` (max ${maxBefore} → ${p.maxHp})` : ''} — ${params.reason}`,
+                resultDetail: params.reason,
+                hpChanges: { [p.id]: { before, after } }
+            });
+            return {
+                success: true, actionType: 'adjust_hp', encounterId: params.encounterId,
+                participantId: p.id, name: p.name,
+                before, after, maxHp: p.maxHp,
+                mode: params.value !== undefined ? 'set' : params.delta !== undefined ? 'delta' : 'max_only',
+                clamped: after !== wanted,
+                defeated: after <= 0,
+                deathSaves: { successes: p.deathSaveSuccesses ?? 0, failures: p.deathSaveFailures ?? 0 },
+                reason: params.reason,
+                message: `${p.name}: HP ${before} → ${after}/${p.maxHp} (GM correction: ${params.reason})`
+            };
+        },
+        aliases: ['set_hp', 'fix_hp', 'correct_hp', 'hp_correction'],
+        description: 'GM HP correction on the encounter sheet — set (value) or shift (delta), required reason, logged as a correction (no damage/healing totals). Writes through to the character row; crossing 0 resets death saves; the dead need revive:true'
+    },
     get_history: {
         schema: GetHistorySchema,
         handler: async (params: z.infer<typeof GetHistorySchema>) => {
@@ -874,6 +950,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     summary: a.resultSummary,
                     damage: a.damageDealt,
                     healing: a.healingDone,
+                    hpChanges: a.hpChanges,
                     timestamp: a.timestamp
                 })),
                 summary,
@@ -1039,7 +1116,11 @@ For CORPSES after combat, use corpse_manage tool.`,
         maxHp: z.number().optional().describe('Participant max HP (add_participant)'),
         ac: z.number().optional().describe('Participant AC (add_participant)'),
         initiativeBonus: z.number().optional().describe('Initiative bonus (add_participant)'),
-        participantId: z.string().optional().describe('#67-D remove_participant: participant/token id to remove'),
+        participantId: z.string().optional().describe('remove_participant / adjust_hp: participant/token id'),
+        value: z.number().optional().describe('adjust_hp: set HP to exactly this'),
+        delta: z.number().optional().describe('adjust_hp: shift HP by this amount'),
+        reason: z.string().optional().describe('adjust_hp: why (required) — logged'),
+        revive: z.boolean().optional().describe('adjust_hp: allow raising a dead participant'),
         isEnemy: z.boolean().optional().describe('Hostile flag (add_participant)'),
         xpAward: z.number().optional().describe('XP credited on end'),
         xpRecipients: z.array(z.string()).optional().describe('XP recipient character IDs'),
@@ -1147,6 +1228,9 @@ export async function handleCombatManage(args: unknown, ctx: SessionContext): Pr
                     break;
                 case 'lair_action':
                     output = RichFormatter.header('Lair Action', '🏰');
+                    break;
+                case 'adjust_hp':
+                    output = RichFormatter.header('HP Correction', '🩹');
                     break;
                 default:
                     output = RichFormatter.header('Combat', '⚔️');
