@@ -2,9 +2,11 @@
 
 ## This Repository
 
-The reference backend game engine. **35 MCP tools** (31 consolidated action-routed + 4 meta/event) for complete RPG mechanics, including LLM-driven NPCs via `agent_manage` and the Operator's constraint-perception lens via `perception_manage`.
+The reference backend game engine. **43 MCP tools** (38 consolidated action-routed + 2 meta + 3 event) for complete RPG mechanics, including LLM-driven NPCs via `agent_manage` and the Operator's constraint-perception lens via `perception_manage`.
 **Philosophy:** "LLM describes, engine validates" - Database is source of truth.
-**Status:** Alpha - 2216 tests passing (7 skipped), 141 test files, MCP Protocol fully integrated
+**Status:** Alpha - 2381 tests passing (7 skipped), 154 test files, MCP Protocol fully integrated
+
+**Provenance:** This repo (`Tbrunton95/RPG-Engine`) was imported from the owner's fork `Tbrunton95/mnehmos.rpg.mcp`, which tracks upstream `Mnehmos/mnehmos.rpg.mcp`. The owner's campaign-layer work (the `FINDINGS #NN` comments; hull/siege, container, vehicle, ledger, comms, horde tools) lives on top of upstream.
 
 ## Who consumes this engine
 
@@ -24,6 +26,7 @@ npm test -- tests/specific.test.ts   # Single test file
 npm test -- --watch               # Watch mode
 npm run build                     # Compile TypeScript
 npm run build:binaries            # Create standalone executables
+npm run seed:bastion -- --db-path <file>   # Seed Bastion into an existing campaign DB (see header of scripts/seed-bastion.ts)
 ```
 
 ## Key Directories
@@ -31,7 +34,7 @@ npm run build:binaries            # Create standalone executables
 ```
 src/
 ├── server/
-│   ├── consolidated/  # 31 action-routed tool handlers (index.ts = registry)
+│   ├── consolidated/  # 38 action-routed tool handlers (index.ts = registry)
 │   ├── handlers/      # Extracted handler implementations (combat, spatial)
 │   ├── index.ts       # MCP server entry + transport setup
 │   └── meta-tools.ts  # search_tools, load_tool_schema
@@ -69,8 +72,10 @@ refactor(component): description  # Code cleanup
 **After successful test pass, immediately commit:**
 
 ```bash
-git add . && git commit -m "type(scope): message"
+git add <the files you changed> && git commit -m "type(scope): message"
 ```
+
+Stage files by path. Never `git add .` or `git add -A`: campaign database snapshots and personal settings files have been swept into commits that way.
 
 Do NOT ask permission for local commits. Just save the state.
 
@@ -84,7 +89,11 @@ Do NOT ask permission for local commits. Just save the state.
 
 ## Shell note
 
-`bash` in this environment fails on startup (`fnm env` is not evaluated in the shell profile). Use **PowerShell** for git and npm work; the Bash tool errors out before running the command.
+On the owner's Windows machine, `bash` fails on startup (`fnm env` is not evaluated in the shell profile), so use **PowerShell** there for git and npm work. Linux and cloud sessions use bash normally.
+
+## Merging upstream
+
+When merging `Mnehmos/mnehmos.rpg.mcp` into this code, resolve conflicts hunk by hunk. Never settle a conflicted file by taking one side whole: the 2026-09-24 merge did that and silently dropped ~4,400 lines of campaign work. After any merge, run `npx tsc --noEmit` and the full suite, and grep for doubled imports, object keys and migrations. Both sides have independently built the same features before (competency overrides, proficiency columns).
 
 ## Deploy
 
