@@ -221,7 +221,8 @@ export const ApplyCustomEffectArgsSchema = z.object({
     triggers: z.array(EffectTriggerSchema),
     removal_conditions: z.array(RemovalConditionSchema),
     stackable: z.boolean().optional().default(false),
-    max_stacks: z.number().int().min(1).optional().default(1)
+    max_stacks: z.number().int().min(1).optional().default(1),
+    cost: z.string().optional()
 });
 export type ApplyCustomEffectArgs = z.infer<typeof ApplyCustomEffectArgsSchema>;
 
@@ -247,7 +248,9 @@ export const CustomEffectSchema = z.object({
     current_stacks: z.number().int(),
     is_active: z.boolean(),
     created_at: z.string(),
-    expires_at: z.string().nullable()
+    expires_at: z.string().nullable(),
+    /** What using or keeping the feature costs ('1 RESOLVE per use', 'the Mouth\'s want'). */
+    cost: z.string().nullable().optional()
 });
 export type CustomEffect = z.infer<typeof CustomEffectSchema>;
 

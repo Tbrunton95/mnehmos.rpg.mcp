@@ -3,8 +3,8 @@ import { buildConsolidatedRegistry } from '../../src/server/consolidated-registr
 
 describe('consolidated tool contracts', () => {
     it('keeps metadata, schemas, action docs, and handlers in one contract per tool', () => {
-        expect(ConsolidatedTools).toHaveLength(39);
-        expect(new Set(ConsolidatedTools.map(contract => contract.name)).size).toBe(39);
+        expect(ConsolidatedTools).toHaveLength(41);
+        expect(new Set(ConsolidatedTools.map(contract => contract.name)).size).toBe(41);
 
         for (const contract of ConsolidatedTools) {
             expect(contract.metadata.name).toBe(contract.name);

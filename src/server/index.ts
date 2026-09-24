@@ -9,7 +9,7 @@ import { withOperation } from './operation-guard.js';
  * - On-demand schema loading
  */
 
-import { summarizeResult } from './output-mode.js';
+import { summarizeResult, pickFields } from './output-mode.js';
 import { config as loadDotenv } from 'dotenv';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -157,7 +157,8 @@ function buildServer(pubsub: PubSub, auditLogger: AuditLogger): McpServer {
   const envelopeShape = {
     sessionId: z.string().optional(),
     output_mode: z.enum(['json', 'banner', 'summary']).optional(),
-    opId: z.string().optional()
+    opId: z.string().optional(),
+    fields: z.array(z.string()).optional()
   };
   const sessionIdSchema = z.object(envelopeShape);
 
@@ -168,9 +169,10 @@ function buildServer(pubsub: PubSub, auditLogger: AuditLogger): McpServer {
   const withOutputMode = (handler: (args: Record<string, unknown>, extra: unknown) => Promise<{ content?: Array<{ type: string; text: string }> }>) =>
     async (args: Record<string, unknown>, extra: unknown) => {
       const mode = args?.output_mode ?? args?.outputMode;
-      const wantJson = mode === 'json';
-      const wantSummary = mode === 'summary';
-      if (args) { delete args.output_mode; delete args.outputMode; }
+      const fields = Array.isArray(args?.fields) ? (args.fields as unknown[]).map(String) : undefined;
+      const wantJson = mode === 'json' && !fields;
+      const wantSummary = mode === 'summary' || !!fields;
+      if (args) { delete args.output_mode; delete args.outputMode; delete args.fields; }
       const res = await handler(args, extra);
       if ((wantJson || wantSummary) && res?.content?.[0]?.text) {
         const text = res.content[0].text;
@@ -181,7 +183,8 @@ function buildServer(pubsub: PubSub, auditLogger: AuditLogger): McpServer {
           try {
             const parsed = JSON.parse(m[2].trim());
             if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-              return { ...res, content: [{ type: 'text', text: JSON.stringify(summarizeResult(parsed)) }] };
+              const shaped = fields ? pickFields(parsed, fields) : summarizeResult(parsed);
+              return { ...res, content: [{ type: 'text', text: JSON.stringify(shaped) }] };
             }
           } catch { /* not JSON: fall through to the full reply */ }
         }

@@ -19,6 +19,7 @@ import { CHANGELOG, type ChangelogEntry } from '../../data/changelog.js';
 import { getMeta, setMeta } from '../../storage/data-migrations.js';
 import { lookupOperation } from '../operation-guard.js';
 import { queryRolls } from '../../storage/roll-log.js';
+import { buildBootPacket, renderBootPacket } from '../boot-packet.js';
 
 /** Engine changes this database has not been shown yet. */
 function unseenChangelog(): ChangelogEntry[] {
@@ -60,7 +61,7 @@ export interface McpResponse {
     content: Array<{ type: 'text'; text: string }>;
 }
 
-const ACTIONS = ['initialize', 'get_context', 'capabilities', 'find', 'journal', 'revert', 'changelog', 'op_status', 'rolls'] as const;
+const ACTIONS = ['initialize', 'get_context', 'capabilities', 'find', 'journal', 'revert', 'changelog', 'op_status', 'rolls', 'boot'] as const;
 
 type SessionAction = typeof ACTIONS[number];
 
@@ -90,7 +91,7 @@ function ensureDb() {
 
 // Input schema
 const SessionManageInputSchema = z.object({
-    action: z.string().describe('Action: initialize, get_context, capabilities, find, journal, revert, changelog, op_status, rolls'),
+    action: z.string().describe('Action: initialize, get_context, capabilities, find, journal, revert, changelog, op_status, rolls, boot'),
 
     // FINDINGS #88 (mirror law): find / journal / revert params — the shared
     // schema IS the outer schema here, so one addition covers both sides.
@@ -102,6 +103,8 @@ const SessionManageInputSchema = z.object({
     all: z.boolean().optional().describe('changelog: every entry, not only the ones this database has not seen'),
     forOpId: z.string().optional().describe('op_status / rolls: the opId a call carried'),
     forId: z.string().optional().describe('rolls: whose rolls (character or token id)'),
+    characterIds: z.array(z.string()).optional().describe('boot: whose digest (default: the world\'s player characters)'),
+    journalLimit: z.number().int().min(0).max(20).optional().describe('boot: journal entries to include (default 5)'),
     encounterId: z.string().optional().describe('rolls: rolls in this encounter'),
 
     // initialize fields
@@ -147,6 +150,11 @@ const SessionManageActionSchemas = {
         schema: SessionManageInputSchema.extend({ action: z.literal('journal'), entityTable: z.string().optional(), entityId: z.string().optional(), limit: z.number().int().min(1).max(50).optional().default(10) }),
         aliases: ['write_journal', 'history', 'writes'],
         description: 'FINDINGS #88: list journaled writes (items, instances, notes…) — newest first, filterable by table/entity. Each row is revertable by id'
+    },
+    boot: {
+        schema: SessionManageInputSchema.extend({ action: z.literal('boot'), worldId: z.string() }),
+        aliases: ['boot_packet', 'before_play', 'session_start'],
+        description: "Everything to read before play in one call: what's new, table rules, character digests (features marked engine-applied or reminder), clocks, open threads, live telegraphs, last journal entries, recent precedents"
     },
     rolls: {
         schema: SessionManageInputSchema.extend({ action: z.literal('rolls') }),
@@ -673,6 +681,23 @@ export async function handleSessionManage(args: unknown, ctx: SessionContext): P
                 : { success: true, actionType: 'op_status', opId: input.forOpId, applied: false, message: 'No call with this opId applied. Retrying it is safe.' };
             let output = RichFormatter.header('Operation', '🧾');
             output += found ? `op ${input.forOpId} applied: ${found.tool} at ${found.createdAt}\n` : `op ${input.forOpId} did not apply. Retry it with the same opId.\n`;
+            output += RichFormatter.embedJson(payload, 'SESSION_MANAGE');
+            return { content: [{ type: 'text', text: output }] };
+        }
+        case 'boot': {
+            if (!input.worldId) {
+                const payload = { error: true, message: 'boot needs worldId' };
+                return { content: [{ type: 'text', text: RichFormatter.error(payload.message) + RichFormatter.embedJson(payload, 'SESSION_MANAGE') }] };
+            }
+            const whatsNew = unseenChangelog();
+            if (whatsNew.length) markChangelogSeen();
+            const rules = tableRulesAtBoot(input.worldId);
+            const packet = buildBootPacket(input.worldId, input.characterIds, input.journalLimit ?? 5);
+            const payload = { success: true, actionType: 'boot', ...(whatsNew.length ? { whatsNew } : {}), ...(rules ? { tableRules: rules } : {}), ...packet };
+            let output = RichFormatter.header('Before Play', '📋');
+            if (whatsNew.length) output += RichFormatter.section("🆕 What's new in the engine") + renderChangelog(whatsNew);
+            if (rules) output += renderTableRules(rules);
+            output += renderBootPacket(packet);
             output += RichFormatter.embedJson(payload, 'SESSION_MANAGE');
             return { content: [{ type: 'text', text: output }] };
         }

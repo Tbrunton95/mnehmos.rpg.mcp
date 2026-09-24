@@ -58,6 +58,8 @@ const TOOL_DESCRIPTORS: Readonly<Record<string, ToolDescriptor>> = {
     ledger_manage: { category: 'meta', keywords: ['ledger', 'debt', 'loan', 'due', 'settle', 'default', 'counterparty', 'crime'], capabilities: ['Debts with due dates and counterparties', 'Clock-driven status: pending → due → lapsed', 'process_due walks the in-fiction clock', 'settle/default as GM verbs'] },
     comms_manage: { category: 'npc', keywords: ['comms', 'phone', 'sim', 'contact', 'burner', 'reachable', 'handset', 'crime'], capabilities: ['Handset and SIM rows', 'Directional contact graph', 'Burn/swap/split SIMs', 'reachable(A→B) attribution checks'] },
     table_rules: { category: 'meta', keywords: ['rules', 'house', 'table', 'band', 'peer', 'called', 'strike', 'prepared', 'milestone', 'principle', 'homebrew'], capabilities: ['World house rules stored as data', 'Bands and peer consequences flagged on hits', 'Called strikes cripple limbs; prepared assets report tiers', 'Milestone XP, tiny status blocks, principles at boot'] },
+    precedent_manage: { category: 'meta', keywords: ['precedent', 'ruling', 'invention', 'continuity', 'canon', 'decided', 'lookup'], capabilities: ['Rulings and inventions as dated, searchable records', 'Scope and tags for lookup', 'Supersede keeps the old ruling and points to the new'] },
+    knowledge_manage: { category: 'npc', keywords: ['knowledge', 'secret', 'true name', 'who knows', 'rumour', 'investigation', 'told', 'witnessed'], capabilities: ['Who knows each fact and how they learned it', 'can_know before an NPC states a fact', 'Telling needs a teller who knows', 'Facts can grant effects to whoever knows them'] },
 };
 
 type ToolShape = {

@@ -7,7 +7,7 @@ Paste everything below the line into the GM's project instructions.
 ## Engine and table
 The rpg-mcp engine enforces the Day 366 table rules for this world. It computes the numbers: who is a peer, when a consequence is due, which tier a prepared asset lands in. You name the flavour. Never invent a number the engine already produced, and never roll one it already resolved.
 
-At the start of every session, call `session_manage get_context {worldId}`. The Table Rules section lists the enforced rules and the principles. Play by the principles; the engine does not enforce them.
+At the start of every session, call `session_manage boot {worldId}` and read all of it: what's new in the engine, the table rules and principles, each character's digest, clocks and debts coming due, open threads, live telegraphs, the last journal entries and recent precedents. Play by the principles; the engine does not enforce them.
 
 ## When to use what
 - The table rolled a result: post it with `combat_action attack {outcome: 'hit' | 'crit' | 'miss', damage}`. No engine d20 is rolled, and a posted number is never doubled. Don't re-roll it.
@@ -30,6 +30,10 @@ At the start of every session, call `session_manage get_context {worldId}`. The 
 - Check any number with `session_manage rolls {forId | encounterId | forOpId}`. Give `math_manage roll` a `forId` and `purpose` so the log says who it was for.
 - HP lives on the character sheet; the token mirrors it at every combat action. Token conditions, parts and intent are the fight's until you mirror them. `character_manage get` shows both sides.
 - Read the "What's new in the engine" section at session start; it lists anything added since you last looked.
+- Record every ruling and every invention with `precedent_manage record {worldId, kind: 'ruling' | 'invention', statement, scope}`. Search precedents before ruling on anything that may have come up before.
+- Before an NPC states a fact, ask `knowledge_manage can_know {worldId, key, knowerId}`. When someone learns something, record the road: `learn {key, knowerId, how: witnessed | told | position | deduced | read | rumour, fromId}`. A secret can only be told by someone who knows it.
+- Move each long prose condition into a feature with `improvisation_manage feature_from_condition {characterId, match, triggers?, cost?, mechanics?}`, and edit one clause with `edit_effect {effectId, descriptionReplace: {find, with}}`. The boot packet then lists it with its trigger and cost.
+- Ask for only what you need with `fields: ['hp', 'conditions']` on any call.
 
 ## A refusal is a rule, not an error
 If the engine refuses a called strike (the target is below the attacker's band) or reports "band unset", say so plainly and play on. A refused strike spends no action. Don't work around a refusal with a posted result.

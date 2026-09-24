@@ -64,6 +64,8 @@ export { LedgerManageTool, handleLedgerManage } from './ledger-manage.js';
 export { CommsManageTool, handleCommsManage } from './comms-manage.js';
 export { HordeManageTool, handleHordeManage } from './horde-manage.js';
 export { TableRulesTool, handleTableRules } from './table-rules.js';
+export { PrecedentManageTool, handlePrecedentManage } from './precedent-manage.js';
+export { KnowledgeManageTool, handleKnowledgeManage } from './knowledge-manage.js';
 
 /**
  * Array of all consolidated tool definitions for easy iteration
@@ -106,6 +108,8 @@ import { LedgerManageTool, handleLedgerManage } from './ledger-manage.js';
 import { CommsManageTool, handleCommsManage } from './comms-manage.js';
 import { HordeManageTool, handleHordeManage } from './horde-manage.js';
 import { TableRulesTool, handleTableRules } from './table-rules.js';
+import { PrecedentManageTool, handlePrecedentManage } from './precedent-manage.js';
+import { KnowledgeManageTool, handleKnowledgeManage } from './knowledge-manage.js';
 import { defineToolContract } from './contracts.js';
 import type { ToolContract } from '../tool-metadata.js';
 
@@ -149,4 +153,6 @@ export const ConsolidatedTools: ToolContract[] = [
     defineToolContract(CommsManageTool, handleCommsManage),
     defineToolContract(HordeManageTool, handleHordeManage),
     defineToolContract(TableRulesTool, handleTableRules),
+    defineToolContract(PrecedentManageTool, handlePrecedentManage),
+    defineToolContract(KnowledgeManageTool, handleKnowledgeManage),
 ];
