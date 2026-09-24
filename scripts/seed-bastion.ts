@@ -35,8 +35,12 @@
  * Run:
  *   npx tsx scripts/seed-bastion.ts
  *
- * The DB path resolves through getDb() — uses RPG_MCP_DB_PATH or the
- * platform AppData default (Windows: %APPDATA%/rpg-mcp/rpg.db).
+ * The database is selected the way the server's local transports select
+ * theirs (useSingleUserDatabase in src/storage/index.ts): --db-path, else
+ * RPG_MCP_DB_PATH, else $RPG_DATA_DIR/rpg.db, else the platform app-data
+ * default — Windows %APPDATA%\rpg-mcp\rpg.db, macOS ~/Library/Application
+ * Support/rpg-mcp/rpg.db, Linux $XDG_DATA_HOME (or ~/.local/share)/rpg-mcp/rpg.db.
+ * The resolved path is logged before anything is written.
  */
 
 import { readFileSync } from 'fs';
@@ -48,7 +52,7 @@ import { handleNarrativeManage } from '../src/server/consolidated/narrative-mana
 import { handleCreate as handleCharacterCreate } from '../src/server/consolidated/character-manage.js';
 import { handleCreate as handleAgentCreate, handleAddSecret as handleAgentAddSecret } from '../src/server/consolidated/agent-manage.js';
 import type { SessionContext } from '../src/server/types.js';
-import { getDb } from '../src/storage/index.js';
+import { getDb, useSingleUserDatabase } from '../src/storage/index.js';
 import { CharacterRepository } from '../src/storage/repos/character.repo.js';
 import { NpcMemoryRepository, type Familiarity, type Disposition, type Importance } from '../src/storage/repos/npc-memory.repo.js';
 
@@ -1483,14 +1487,37 @@ async function seedNestedNarrativeSeeds(boot: Bootstrap, worldId: string): Promi
 // MAIN
 // ═══════════════════════════════════════════════════════════════════════════
 
+/**
+ * The --db-path value, or undefined when the flag is absent (the storage layer
+ * then falls back to RPG_MCP_DB_PATH, RPG_DATA_DIR, then the app-data default).
+ * A flag with no value is refused rather than ignored: silently falling back
+ * would seed whatever database the environment happens to point at.
+ */
+function dbPathArg(): string | undefined {
+    const args = process.argv.slice(2);
+    const index = args.indexOf('--db-path');
+    if (index === -1) return undefined;
+    const value = args[index + 1];
+    if (!value || value.startsWith('--')) {
+        throw new Error('--db-path needs a value, e.g. --db-path /path/to/rpg.db');
+    }
+    return value;
+}
+
 async function main(): Promise<void> {
     log(`Loading bootstrap from ${BOOTSTRAP_PATH}`);
     const boot = JSON.parse(readFileSync(BOOTSTRAP_PATH, 'utf-8')) as Bootstrap;
     log(`Loaded: ${boot.locations.length} locations, ${boot.factions.length} factions, ${boot.npcs.length} npcs, ${boot.plot_threads.length} plots, ${boot.bestiary.length} beasts`);
     log(`Seeding into existing world: ${SEBASTOPYR_WORLD_ID}`);
 
-    // Touch the DB once up front so migrations run before any handler call.
-    getDb();
+    // Select the database explicitly, before any handler call. Since the
+    // per-campaign split, getDb() with nothing selected looks for a verified
+    // tenant and throws "No tenant context in scope", which says nothing about
+    // which file was meant. This is the single-user selection the server's
+    // local transports make (src/server/index.ts), so the path resolves the
+    // same way; it also runs migrations.
+    const db = useSingleUserDatabase(dbPathArg());
+    log(`Database: ${db.name}`);
 
     const worldId = SEBASTOPYR_WORLD_ID;
     const totals = newCounters();
