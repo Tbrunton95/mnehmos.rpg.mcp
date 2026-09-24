@@ -2590,8 +2590,17 @@ export async function handleEndEncounter(args: unknown, ctx: SessionContext) {
     const parsed = CombatTools.END_ENCOUNTER.inputSchema.parse(args);
     const namespacedId = `${ctx.sessionId}:${parsed.encounterId}`;
 
-    // Get the engine BEFORE deleting to access final state
-    const engine = getCombatManager().get(namespacedId);
+    // Every call reads the encounter fresh (operation-guard), so memory is
+    // empty here for a live fight too: the row's status decides.
+    const row = (() => {
+        try { return getDb().prepare('SELECT status FROM encounters WHERE id = ?').get(parsed.encounterId) as { status?: string } | undefined; }
+        catch { return undefined; }
+    })();
+    if (row && row.status !== 'active') {
+        return { content: [{ type: 'text' as const, text: `\n🏁 ENCOUNTER ALREADY ENDED\nEncounter ID: ${parsed.encounterId}\n\nThe row is '${row.status}'. Nothing was written.` }] };
+    }
+    let engine: CombatEngine | null = null;
+    try { engine = getOrLoadEngine(ctx, parsed.encounterId); } catch { engine = null; }
 
     if (!engine) {
         // FINDINGS #79: no engine in memory — but the DB row may be a ghost
@@ -2608,7 +2617,7 @@ export async function handleEndEncounter(args: unknown, ctx: SessionContext) {
                 return {
                     content: [{
                         type: 'text' as const,
-                        text: `\n🏁 GHOST ENCOUNTER CLOSED\nEncounter ID: ${parsed.encounterId}\n\nNo engine was running — the persisted row was still status='active' (pre-#79 residue). Row marked completed; it will no longer report as active combat at boot. Nothing was resumed, no state was replayed.`
+                        text: `\n🏁 UNREADABLE ENCOUNTER CLOSED\nEncounter ID: ${parsed.encounterId}\n\nThe row was status='active' but its saved state could not be read. Row marked completed; it will no longer report as active combat at boot. Nothing was resumed, no state was replayed.`
                     }]
                 };
             }
@@ -2741,7 +2750,7 @@ export async function handleLoadEncounter(args: unknown, ctx: SessionContext) {
  */
 export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
     const parsed = CombatTools.ROLL_DEATH_SAVE.inputSchema.parse(args);
-    const engine = getCombatManager().get(`${ctx.sessionId}:${parsed.encounterId}`);
+    const engine = getOrLoadEngine(ctx, parsed.encounterId);
 
     if (!engine) {
         throw new Error(`No active encounter with ID ${parsed.encounterId}`);
@@ -2818,7 +2827,7 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
  */
 export async function handleExecuteLairAction(args: unknown, ctx: SessionContext) {
     const parsed = CombatTools.EXECUTE_LAIR_ACTION.inputSchema.parse(args);
-    const engine = getCombatManager().get(`${ctx.sessionId}:${parsed.encounterId}`);
+    const engine = getOrLoadEngine(ctx, parsed.encounterId);
 
     if (!engine) {
         throw new Error(`No active encounter with ID ${parsed.encounterId}`);

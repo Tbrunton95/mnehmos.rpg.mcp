@@ -286,8 +286,8 @@ const ListEncountersSchema = z.object({
     action: z.literal('list'),
     status: z.enum(['active', 'completed', 'all']).default('active').describe('Row status filter — default active (the ghost hunt)'),
     limit: z.number().int().min(1).max(50).default(20),
-    buryGhosts: z.boolean().optional().describe('FINDINGS #80-B: mark every listed ghost (active row, no engine) completed IN THIS CALL — the bulk burial. Count reported from the store\'s changes. #102 GUARD: on a fresh process EVERY active row looks like a ghost (memory is empty) — burial refuses then unless confirmBury:true'),
-    confirmBury: z.boolean().optional().describe('FINDINGS #102: override the cold-boot guard — confirms burial when NO encounter is in memory (fresh process), where live cross-campaign fights are indistinguishable from ghosts'),
+    buryGhosts: z.boolean().optional().describe('Close every listed active encounter in this call (narrow with worldId). Refused unless confirmBury:true: an active row is a running fight as far as the engine can tell'),
+    confirmBury: z.boolean().optional().describe('Confirms buryGhosts: close every listed active encounter'),
     worldId: z.string().optional().describe('FINDINGS #105: STRICT filter — only encounters stamped to this world; untagged legacy rows are counted and EXCLUDED (claim by re-creating or direct update). Scopes the ghost sweep')
 });
 
@@ -525,6 +525,13 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         schema: EndSchema,
         handler: async (params: z.infer<typeof EndSchema>, ctx?: SessionContext) => {
             if (!ctx) throw new Error('No session context');
+            // Ending twice writes nothing and pays no XP twice.
+            try {
+                const row = getDb().prepare('SELECT status FROM encounters WHERE id = ?').get(params.encounterId) as { status?: string } | undefined;
+                if (row && row.status !== 'active') {
+                    return { success: true, actionType: 'end', alreadyEnded: true, encounterId: params.encounterId, message: `Encounter already ended (status '${row.status}'). Nothing was written; no XP was awarded.` };
+                }
+            } catch { /* no encounters table: fall through */ }
             // T4.17: capture pc participants BEFORE ending (state clears after)
             let xpTargets: string[] = params.xpRecipients ?? [];
             if (params.xpAward && xpTargets.length === 0) {
@@ -1287,11 +1294,15 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 status: r.status,
                 round: r.round,
                 updatedAt: r.updated_at,
-                // FINDINGS #80 liveness: an 'active' row with no engine in memory
-                // is a ghost (pre-#79 residue) or a crash-survivor — named either way.
-                inMemory: getCombatManager().get(`${ctx.sessionId}:${r.id}`) !== null
+                // The database is the running state: every call reads the
+                // encounter fresh, so an active row IS a running fight.
+                // inMemory stays for clients and now means the same.
+                running: r.status === 'active',
+                inMemory: r.status === 'active'
             }));
-            const ghosts = encounters.filter(e => e.status === 'active' && !e.inMemory);
+            // No memory test can tell a stale row from a live fight any more.
+            // Closing active rows in bulk is a deliberate act: confirmBury.
+            const ghosts = params.buryGhosts ? encounters.filter(e => e.status === 'active') : [];
             // FINDINGS #80-B: bulk burial — the census found 58+ ghosts spanning
             // the campaign's whole life; one-per-call burial doesn't scale.
             // Buried count comes from the store's changes, never the input.
@@ -1301,14 +1312,13 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             // genuinely-active fight reads as a ghost and buryGhosts would
             // force-complete them all. When NOTHING is in memory, burial needs
             // explicit confirmation.
-            const anyInMemory = encounters.some(e => e.inMemory);
-            if (params.buryGhosts && ghosts.length && !anyInMemory && !params.confirmBury) {
+            if (params.buryGhosts && ghosts.length && !params.confirmBury) {
                 return {
                 success: true, actionType: 'list', count: encounters.length, encounters,
                 ...(params.worldId !== undefined ? { worldId: params.worldId, untaggedOrOtherWorldExcluded: untaggedExcluded } : {}),
                     ghosts: ghosts.map(g => g.encounterId), buried: 0,
                     guardRefused: true,
-                    summary: `⚠ COLD-BOOT GUARD (#102): ${ghosts.length} active row(s) look like ghosts, but ZERO encounters are in this process's memory — a fresh process cannot tell a ghost from another campaign's live fight. Re-open yours with 'load' first, or pass confirmBury:true to bury all listed anyway.`
+                    summary: `⚠ GUARD: ${ghosts.length} active encounter(s) listed, and each is a running fight as far as the engine can tell. Nothing was closed. Pass confirmBury:true to close every listed one (narrow it with worldId first), or combat_manage end one at a time.`
                 };
             }
             if (params.buryGhosts && ghosts.length) {
@@ -1324,8 +1334,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 encounters,
                 ...(params.worldId !== undefined ? { worldId: params.worldId, untaggedOrOtherWorldExcluded: untaggedExcluded } : {}),
                 ...(params.buryGhosts ? { buried } : {}),
-                ...(ghosts.length && !params.buryGhosts ? { ghosts: ghosts.map(g => g.encounterId), hint: `${ghosts.length} active row(s) with no running engine — combat_manage end closes each, or list with buryGhosts:true closes all (#80-B)` } : {}),
-                summary: encounters.length === 0 ? `No ${params.status === 'all' ? '' : params.status + ' '}encounters.` : `${encounters.length} encounter(s)${params.buryGhosts ? ` — ${buried} ghost(s) BURIED` : (ghosts.length ? ` — ${ghosts.length} GHOST(s) needing burial` : '')}`
+                summary: encounters.length === 0 ? `No ${params.status === 'all' ? '' : params.status + ' '}encounters.` : `${encounters.length} encounter(s)${params.buryGhosts ? ` — ${buried} closed` : ''}`
             };
         },
         aliases: ['encounters', 'ls', 'ghosts']
@@ -1518,14 +1527,14 @@ export async function handleCombatManage(args: unknown, ctx: SessionContext): Pr
                     output = RichFormatter.header('Encounter State', '📋');
                     break;
                 case 'end':
-                    output = RichFormatter.header('Combat Ended', '🏁');
+                    output = RichFormatter.header(parsed.alreadyEnded ? 'Already Ended' : 'Combat Ended', '🏁');
                     if (parsed.xpNote) output += `\n⭐ ${parsed.xpNote}\n`;
                     break;
                 case 'list':
                     output = RichFormatter.header('Encounters', '📋');
                     if (parsed.encounters?.length > 0) {
                         const rows = parsed.encounters.map((e: { encounterId: string; status: string; round: number; inMemory: boolean; updatedAt: string }) =>
-                            [e.encounterId, e.status + (e.status === 'active' && !e.inMemory ? ' 👻 GHOST' : ''), String(e.round), e.inMemory ? 'running' : 'persisted', e.updatedAt]
+                            [e.encounterId, e.status, String(e.round), e.status === 'active' ? 'running' : 'closed', e.updatedAt]
                         );
                         output += RichFormatter.table(['Encounter', 'Status', 'Round', 'Engine', 'Updated'], rows);
                     }

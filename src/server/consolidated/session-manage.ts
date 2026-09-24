@@ -565,13 +565,12 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
                 // crash-survivor or a pre-#79 ghost whose end never marked the
                 // row. Report it as persisted, never as running: the boot
                 // banner must not claim a fight that is not happening.
-                const { getCombatManager } = await import('../state/combat-manager.js');
-                const live = getCombatManager().get(`${_ctx.sessionId}:${enc.id}`) !== null;
+                // Every call reads the encounter fresh, so an active row is
+                // the running fight; memory says nothing about it any more.
                 context.activeCombat = {
                     encounterId: enc.id,
                     round: enc.round,
-                    currentTurn: enc.active_token_id,
-                    ...(live ? {} : { inMemory: false, note: 'persisted encounter, not running — combat_manage load to resume, or combat_manage end to close the row' })
+                    currentTurn: enc.active_token_id
                 };
             }
         } catch {
