@@ -9,7 +9,9 @@ import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/a
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 import * as pda from '../../render/pda.js';
-import { handleExecuteCombatAction } from '../handlers/combat-handlers.js';
+import { handleExecuteCombatAction, getOrLoadEngine } from '../handlers/combat-handlers.js';
+import { normalizeCondition } from '../../engine/combat/conditions.js';
+import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { getCombatManager } from '../state/combat-manager.js';
 import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
@@ -497,7 +499,7 @@ Aliases: hit/strike→attack, cast/spell→cast_spell, sprint→dash, evade→do
 
 🤼 GRAPPLE (FINDINGS #99 — unarmed vocabulary):
 { action: "grapple", encounterId, actorId, targetId, move: clinch|takedown|throw|slam|control|break, surface? }
-Internal opposed check (Athletics vs better of Athletics/Acrobatics). Win writes conditions to the character row (clinch→Clinched, takedown/slam→Prone+Grappled, throw→Prone, control→Restrained, break→clears holds on the ACTOR). throw/slam ROLL surface damage (earth d4 / concrete-wall-table d6 / edge-glass d8, margin ≥5 adds a die) and RETURN it — apply via your damage lane; the encounter sheet owns mid-combat HP.`,
+Internal opposed check (Athletics vs better of Athletics/Acrobatics). Win writes conditions to the character row, and to the live encounter tokens when encounterId is given (clinch→Clinched, takedown/slam→Prone+Grappled, throw→Prone, control→Restrained, break→clears holds on the ACTOR). throw/slam ROLL surface damage (earth d4 / concrete-wall-table d6 / edge-glass d8, margin ≥5 adds a die) and RETURN it — apply via your damage lane; the encounter sheet owns mid-combat HP.`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
@@ -655,6 +657,30 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
     const actName = String(a?.action ?? '').toLowerCase();
     if (actName === 'grapple' || actName === 'clinch' || actName === 'takedown' || actName === 'slam' || actName === 'break_grapple') {
         const result = grappleResolve(a);
+        // With an encounterId the hold lands on the live tokens too, not only
+        // the character sheets, so the engine's mechanics see Prone/Grappled.
+        if (!result.error && typeof a.encounterId === 'string' && a.encounterId && (result.conditionsApplied || result.conditionsRemoved)) {
+            const engine = getOrLoadEngine(ctx, a.encounterId);
+            const state = engine?.getState();
+            if (engine && state) {
+                const onto = String(a.targetId ?? ''), from = String(a.actorId ?? '');
+                const src = `grapple: ${String(a.actorId ?? '')}`;
+                for (const name of (result.conditionsApplied as string[] | undefined) ?? []) {
+                    const tok = state.participants.find(p => p.id === onto);
+                    const c = tok && normalizeCondition({ name, source: src }, tok.id);
+                    if (tok && c) {
+                        tok.conditions = tok.conditions.filter(x => x.type.toLowerCase() !== c.type.toLowerCase());
+                        const { id: _id, ...rest } = c; void _id;
+                        engine.applyCondition(tok.id, rest);
+                    }
+                }
+                const drop = new Set(((result.conditionsRemoved as string[] | undefined) ?? []).map(n => n.toLowerCase()));
+                const actorTok = state.participants.find(p => p.id === from);
+                if (actorTok && drop.size) actorTok.conditions = actorTok.conditions.filter(x => !drop.has(x.type.toLowerCase()));
+                new EncounterRepository(getDb()).saveState(a.encounterId, state);
+                result.encounterTokensUpdated = true;
+            }
+        }
         let out = result.error ? RichFormatter.error(String(result.message)) : RichFormatter.header(`Grapple — ${String(result.move)}`, '🤼') + RichFormatter.alert(String(result.message), 'info');
         out += RichFormatter.embedJson(result, 'COMBAT_ACTION');
         return { content: [{ type: 'text', text: out }] };
