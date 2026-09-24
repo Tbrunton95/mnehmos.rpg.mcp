@@ -71,6 +71,33 @@ function syncParticipantHpFromDb(state: CombatState): CombatState {
     return state;
 }
 
+/**
+ * Write participant HP back to the character database (the reverse of
+ * syncParticipantHpFromDb). Lair damage, damage-over-time, opportunity
+ * attacks and death-save crits change HP only in the engine; without this
+ * the next DB→memory sync reverted them and the characters row never saw
+ * them. Only participants backed by a characters row are written.
+ */
+function persistParticipantHpToDb(state: CombatState): void {
+    const charRepo = new CharacterRepository(getDb());
+    for (const participant of state.participants) {
+        const character = charRepo.findById(participant.id);
+        if (character && (character.hp !== participant.hp || character.maxHp !== participant.maxHp)) {
+            charRepo.update(participant.id, { hp: participant.hp, maxHp: participant.maxHp });
+        }
+    }
+}
+
+/**
+ * Save encounter state from a handler that can change HP. Such handlers must
+ * call syncParticipantHpFromDb first, so an HP change made through
+ * character_manage between calls is read before this writes memory back.
+ */
+function saveEncounterState(repo: EncounterRepository, encounterId: string, state: CombatState): void {
+    persistParticipantHpToDb(state);
+    repo.saveState(encounterId, state);
+}
+
 // ============================================================
 // FORMATTING - Both human-readable AND machine-readable
 // ============================================================
@@ -1298,6 +1325,10 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         getCombatManager().create(`${ctx.sessionId}:${parsed.encounterId}`, engine);
     }
 
+    // Read character_manage HP changes before this action writes HP back.
+    const syncState = engine.getState();
+    if (syncState) syncParticipantHpFromDb(syncState);
+
     // Turn-identity advisory (issue #49). Every action routed through this
     // handler (attack / cast_spell / move / dash / dodge / help / heal /
     // disengage / ready) is an on-turn action. If actorId doesn't match the
@@ -2170,7 +2201,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
     if (state) {
         const db = getDb();
         const repo = new EncounterRepository(db);
-        repo.saveState(parsed.encounterId, state);
+        saveEncounterState(repo, parsed.encounterId, state);
 
         // PLAYTEST-FIX: Log action to combat history for context compaction resilience
         if (result) {
@@ -2287,6 +2318,9 @@ export async function handleAdvanceTurn(args: unknown, ctx: SessionContext) {
     }
 
     const previousParticipant = engine.getCurrentParticipant();
+    // Read character_manage HP changes before this turn writes HP back.
+    const preTurnState = engine.getState();
+    if (preTurnState) syncParticipantHpFromDb(preTurnState);
     engine.nextTurnWithConditions();
     const state = engine.getState();
 
@@ -2294,7 +2328,7 @@ export async function handleAdvanceTurn(args: unknown, ctx: SessionContext) {
     if (state) {
         const db = getDb();
         const repo = new EncounterRepository(db);
-        repo.saveState(parsed.encounterId, state);
+        saveEncounterState(repo, parsed.encounterId, state);
     }
 
     // PLAYTEST-FIX: Sync HP from character database before display
@@ -2486,6 +2520,8 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
     if (!state) {
         throw new Error('Encounter has no active state');
     }
+    // Read character_manage HP changes before the save writes HP back.
+    syncParticipantHpFromDb(state);
 
     const participant = state.participants.find(p => p.id === parsed.characterId);
     if (!participant) {
@@ -2534,7 +2570,7 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
     // Save state
     const db = getDb();
     const repo = new EncounterRepository(db);
-    repo.saveState(parsed.encounterId, engine.getState()!);
+    saveEncounterState(repo, parsed.encounterId, engine.getState()!);
 
     output += `\n<!-- STATE_JSON\n${JSON.stringify({ deathSave: { characterId: parsed.characterId, characterName: participant.name, roll: result.roll, isNat20: result.isNat20, isNat1: result.isNat1, success: result.success, successes: result.successes, failures: result.failures, stabilized: result.isStabilized, dead: result.isDead } })}\nSTATE_JSON -->`;
 
@@ -2561,6 +2597,8 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
     if (!state) {
         throw new Error('Encounter has no active state');
     }
+    // Read character_manage HP changes before the lair damage writes HP back.
+    syncParticipantHpFromDb(state);
 
     // Validate it's the lair's turn
     if (!engine.isLairActionPending()) {
@@ -2663,7 +2701,7 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
     // Save state
     const db = getDb();
     const repo = new EncounterRepository(db);
-    repo.saveState(parsed.encounterId, engine.getState()!);
+    saveEncounterState(repo, parsed.encounterId, engine.getState()!);
 
     return {
         content: [{
