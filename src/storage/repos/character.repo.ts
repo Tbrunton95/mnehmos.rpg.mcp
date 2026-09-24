@@ -18,7 +18,7 @@ export class CharacterRepository {
                                currency,
                                legendary_actions, legendary_actions_remaining, legendary_resistances,
                               legendary_resistances_remaining, has_lair_actions, resistances, vulnerabilities, immunities,
-                               current_room_id, perception_bonus, stealth_bonus, resource_pools, band, regeneration,
+                               current_room_id, perception_bonus, stealth_bonus, resource_pools, band, regeneration, parts,
                                skill_proficiencies, save_proficiencies, expertise,
                                armor_proficiencies, weapon_proficiencies, tool_proficiencies, languages,
                                background, alignment, origin,
@@ -29,7 +29,7 @@ export class CharacterRepository {
                @currency,
                @legendaryActions, @legendaryActionsRemaining, @legendaryResistances,
               @legendaryResistancesRemaining, @hasLairActions, @resistances, @vulnerabilities, @immunities,
-               @currentRoomId, @perceptionBonus, @stealthBonus, @resourcePools, @band, @regeneration,
+               @currentRoomId, @perceptionBonus, @stealthBonus, @resourcePools, @band, @regeneration, @parts,
                @skillProficiencies, @saveProficiencies, @expertise,
                @armorProficiencies, @weaponProficiencies, @toolProficiencies, @languages,
                @background, @alignment, @origin,
@@ -79,6 +79,7 @@ export class CharacterRepository {
             // Table rules: power band and per-round regeneration
             band: validChar.band ?? null,
             regeneration: validChar.regeneration ?? null,
+            parts: validChar.parts?.length ? JSON.stringify(validChar.parts) : null,
             skillProficiencies: JSON.stringify(validChar.skillProficiencies || []),
             saveProficiencies: JSON.stringify(validChar.saveProficiencies || []),
             expertise: JSON.stringify(validChar.expertise || []),
@@ -202,7 +203,7 @@ export class CharacterRepository {
                 legendary_resistances = ?, legendary_resistances_remaining = ?,
                  has_lair_actions = ?, resistances = ?, vulnerabilities = ?, immunities = ?,
                  current_room_id = ?, perception_bonus = ?, stealth_bonus = ?,
-                 resource_pools = ?, band = ?, regeneration = ?,
+                 resource_pools = ?, band = ?, regeneration = ?, parts = ?,
                  skill_proficiencies = ?, save_proficiencies = ?, expertise = ?,
                  armor_proficiencies = ?, weapon_proficiencies = ?, tool_proficiencies = ?, languages = ?,
                  background = ?, alignment = ?, origin = ?,
@@ -251,6 +252,7 @@ export class CharacterRepository {
             JSON.stringify(validChar.resourcePools || {}),
             validChar.band ?? null,
             validChar.regeneration ?? null,
+            validChar.parts?.length ? JSON.stringify(validChar.parts) : null,
             JSON.stringify(validChar.skillProficiencies || []),
             JSON.stringify(validChar.saveProficiencies || []),
             JSON.stringify(validChar.expertise || []),
@@ -326,6 +328,7 @@ export class CharacterRepository {
             resourcePools: row.resource_pools ? JSON.parse(row.resource_pools) : {},
             band: row.band ?? undefined,
             regeneration: row.regeneration ?? undefined,
+            parts: row.parts ? JSON.parse(row.parts) : undefined,
             skillProficiencies: row.skill_proficiencies ? JSON.parse(row.skill_proficiencies) : [],
             saveProficiencies: row.save_proficiencies ? JSON.parse(row.save_proficiencies) : [],
             expertise: row.expertise ? JSON.parse(row.expertise) : [],
@@ -394,6 +397,7 @@ interface CharacterRow {
     resource_pools: string | null;
     band?: string | null;
     regeneration?: number | null;
+    parts?: string | null;
     skill_proficiencies: string | null;
     save_proficiencies: string | null;
     expertise: string | null;

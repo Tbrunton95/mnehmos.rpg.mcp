@@ -10,6 +10,7 @@ import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 import * as pda from '../../render/pda.js';
 import { handleExecuteCombatAction, getOrLoadEngine } from '../handlers/combat-handlers.js';
+import { volleyTier } from '../../engine/combat/units.js';
 import { normalizeCondition } from '../../engine/combat/conditions.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { getCombatManager } from '../state/combat-manager.js';
@@ -31,8 +32,8 @@ import { CharacterRepository } from '../../storage/repos/character.repo.js';
 // first below and spells all ten; ENGINE_ACTIONS owns the router + the
 // definition type and deliberately excludes grapple (intercept-before-router,
 // #103). Keep the two lists in step by hand — duplication is the scanner's price.
-const ACTIONS = ['attack', 'heal', 'move', 'disengage', 'cast_spell', 'dash', 'dodge', 'help', 'ready', 'grapple'] as const;
-const ENGINE_ACTIONS = ['attack', 'heal', 'move', 'disengage', 'cast_spell', 'dash', 'dodge', 'help', 'ready'] as const;
+const ACTIONS = ['attack', 'heal', 'move', 'disengage', 'cast_spell', 'dash', 'dodge', 'help', 'ready', 'volley', 'grapple'] as const;
+const ENGINE_ACTIONS = ['attack', 'heal', 'move', 'disengage', 'cast_spell', 'dash', 'dodge', 'help', 'ready', 'volley'] as const;
 type CombatAction = typeof ENGINE_ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -52,6 +53,9 @@ const AttackSchema = z.object({
     calledStrike: z.string().optional().describe("Table rules (called_strike): 'leg' or 'arm'. No roll penalty; a hit cripples that limb. Needs a target of your band or greater"),
     preparedAsset: z.string().optional().describe('Table rules (prepared_asset): the rule name; reports miss / hit / catastrophic tier and the effect the GM names'),
     unaffectedLimb: z.boolean().optional().describe('The attacker uses a limb its crippling condition does not touch (skips that disadvantage)'),
+    withPart: z.string().optional().describe("The attacker's named part used: crippled = disadvantage; dead or latched = refused"),
+    atPart: z.string().optional().describe('The target part aimed at: breached = advantage; a called strike cripples this part'),
+    cleave: z.boolean().optional().describe('Cleave a packed unit of a lower band: damage flows through models'),
     advantage: z.boolean().optional(),
     disadvantage: z.boolean().optional(),
     declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('FINDINGS #34 T4.18: Register-B audit trail — declared conditional traits/cover. Values are ALREADY included in attackBonus by the GM; this array only prints them in the breakdown'),
@@ -90,6 +94,19 @@ const CastSpellSchema = z.object({
     targetId: z.string().optional(),
     targetIds: z.array(z.string()).optional(),
     slotLevel: z.number().int().min(1).max(9).optional()
+});
+
+const VolleySchema = z.object({
+    action: z.literal('volley'),
+    encounterId: z.string(),
+    actorId: z.string().describe('The unit token firing'),
+    targetId: z.string(),
+    outcome: z.enum(['hit', 'crit', 'miss']).optional().describe('GM-posted result: no engine d20; damage is still the tier dice unless damage is given'),
+    damage: z.union([z.number(), z.string()]).optional().describe('GM-posted damage (with outcome)'),
+    damageType: z.string().optional(),
+    atPart: z.string().optional(),
+    advantage: z.boolean().optional(),
+    disadvantage: z.boolean().optional()
 });
 
 const DashSchema = z.object({
@@ -191,6 +208,9 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                 calledStrike: params.calledStrike,
                 preparedAsset: params.preparedAsset,
                 unaffectedLimb: params.unaffectedLimb,
+                withPart: params.withPart,
+                atPart: params.atPart,
+                cleave: params.cleave,
                 advantage: params.advantage,
                 disadvantage: params.disadvantage,
                 declaredModifiers,
@@ -307,6 +327,37 @@ const definitions: Record<CombatAction, ActionDefinition> = {
             return extractResultData(result, 'cast_spell');
         },
         aliases: ['cast', 'spell', 'magic', 'invoke']
+    },
+
+    volley: {
+        schema: VolleySchema,
+        handler: async (params: z.infer<typeof VolleySchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const unitTok = engine?.getState()?.participants.find(p => p.id === params.actorId);
+            if (!engine || !unitTok) return { error: true, actionType: 'volley', message: `Encounter ${params.encounterId} or unit ${params.actorId} not found` };
+            if (!unitTok.unit) return { error: true, actionType: 'volley', message: `${unitTok.name} is not a unit token (add unit: {models, hpPerModel, ...})` };
+            const tier = volleyTier(unitTok)!;
+            if (!tier.dice) return { error: true, actionType: 'volley', message: `${unitTok.name} has no models left to fire` };
+            // One d20 against AC with the unit's attack bonus; on a hit the
+            // tier's dice land through the normal attack path.
+            const result = await handleExecuteCombatAction({
+                encounterId: params.encounterId,
+                action: 'attack',
+                actorId: params.actorId,
+                targetId: params.targetId,
+                attackBonus: unitTok.unit.attackBonus,
+                damage: params.damage ?? tier.dice,
+                damageType: params.damageType,
+                outcome: params.outcome,
+                atPart: params.atPart,
+                advantage: params.advantage,
+                disadvantage: params.disadvantage,
+                volley: { dice: tier.dice, reason: tier.reason }
+            }, ctx);
+            return extractResultData(result, 'volley');
+        },
+        aliases: ['fire', 'salvo', 'unit_attack']
     },
 
     dash: {
@@ -536,6 +587,9 @@ Internal opposed check (Athletics vs better of Athletics/Acrobatics). Win writes
         calledStrike: z.string().optional().describe("attack (mirror): Table rules (called_strike): 'leg' or 'arm'. No roll penalty; a hit cripples that limb. Needs a target of your band or greater"),
         preparedAsset: z.string().optional().describe('attack (mirror): Table rules (prepared_asset): the rule name; reports miss / hit / catastrophic tier and the effect the GM names'),
         unaffectedLimb: z.boolean().optional().describe('attack (mirror): The attacker uses a limb its crippling condition does not touch (skips that disadvantage)'),
+        withPart: z.string().optional().describe("attack (mirror): the attacker's named part used"),
+        atPart: z.string().optional().describe('attack (mirror): the target part aimed at'),
+        cleave: z.boolean().optional().describe('attack (mirror): cleave a packed lower-band unit'),
         ammoItemId: z.string().optional().describe('FINDINGS #58 (mirror): ammo template id — dry refuses the shot; decrements after the engine resolves'),
         hand: z.enum(['mainhand', 'offhand']).optional().describe('FINDINGS #96-C (mirror): which weapon the attack resolves with — its coating surfaces and debits (default mainhand)'),
         ammoCount: z.number().optional().describe('FINDINGS #58 (mirror): magazines expended (default 1)'),
@@ -730,8 +784,9 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
         } else {
             // Format based on action type
             switch (parsed.actionType) {
+                case 'volley':
                 case 'attack':
-                    output = RichFormatter.header('Attack', '⚔️');
+                    output = RichFormatter.header(parsed.actionType === 'volley' ? 'Volley' : 'Attack', parsed.actionType === 'volley' ? '🪖' : '⚔️');
                     if (parsed.hit !== undefined) {
                         output += RichFormatter.keyValue({
                             'Result': parsed.hit ? '🎯 HIT' : '💨 MISS',

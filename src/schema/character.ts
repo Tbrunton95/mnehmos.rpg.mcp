@@ -1,3 +1,4 @@
+import { PartSchema } from './token-extras.js';
 import { z } from 'zod';
 import { CharacterTypeSchema } from './party.js';
 import {
@@ -73,6 +74,7 @@ export const CharacterSchema = z.object({
     // regenerating creature heals at the start of each of its rounds.
     band: z.string().optional(),
     regeneration: z.number().int().min(0).optional(),
+    parts: z.array(PartSchema).optional(),
 
     // Spellcasting fields (CRIT-002/006)
     // Flexible character class - allows any string (standard D&D classes or custom like "Chronomancer")

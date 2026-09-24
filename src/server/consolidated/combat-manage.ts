@@ -5,6 +5,9 @@
  * advance_turn, roll_death_save, execute_lair_action
  */
 
+import { PartSchema, UnitSchema, ReadiedSchema, PART_STATES, PART_KINDS } from '../../schema/token-extras.js';
+import { volleyTier, describeUnit } from '../../engine/combat/units.js';
+import type { CombatParticipant } from '../../engine/combat/engine.js';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
@@ -41,7 +44,7 @@ import { freshSeed } from '../../math/seed.js';
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'get_history', 'list'] as const;
+const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_intent', 'trigger_readied', 'get_history', 'list'] as const;
 type CombatManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -75,7 +78,10 @@ const ParticipantSchema = z.object({
     vulnerabilities: z.array(z.string()).optional(),
     immunities: z.array(z.string()).optional(),
     band: z.string().optional(),
-    regeneration: z.number().int().min(0).optional()
+    regeneration: z.number().int().min(0).optional(),
+    parts: z.array(PartSchema).optional(),
+    unit: UnitSchema.optional(),
+    intent: z.string().optional()
 });
 
 /**
@@ -192,7 +198,9 @@ const AddParticipantSchema = z.object({
     position: z.object({ x: z.number(), y: z.number() }).optional(),
     importRowConditions: z.boolean().optional().describe('Copy the character sheet\'s conditions onto the new token (remove them later with remove_condition)'),
     band: z.string().optional().describe('Table rules: power band (defaults from the character row)'),
-    regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds (defaults from the character row)')
+    regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds (defaults from the character row)'),
+    parts: z.array(PartSchema).optional().describe('Named parts with states (defaults from the character row)'),
+    unit: UnitSchema.optional().describe('A mortal unit as one token')
 });
 
 const AddConditionSchema = z.object({
@@ -220,6 +228,54 @@ const GetHistorySchema = z.object({
     encounterId: z.string().describe('The ID of the encounter'),
     round: z.number().int().optional().describe('Get actions from a specific round (omit for all)'),
     limit: z.number().int().min(1).max(100).default(20).describe('Max actions to return (default 20)')
+});
+
+const SetPartSchema = z.object({
+    action: z.literal('set_part'),
+    encounterId: z.string(),
+    participantId: z.string(),
+    part: z.string().min(1).describe("Part name ('middle head', 'left elbow'); upserts by name, case-insensitive"),
+    state: z.enum(PART_STATES).describe('intact | crippled | dead | latched | breached'),
+    kind: z.enum(PART_KINDS).optional().describe('head | arm | leg | wing | torso | system | other (a crippled leg or wing halves speed)'),
+    latchedTo: z.object({ participantId: z.string(), part: z.string().optional() }).optional().describe('latched: who this part holds'),
+    note: z.string().optional(),
+    mirrorToCharacter: z.boolean().optional().describe('Also write the part onto the character sheet (a lasting injury)'),
+    reason: z.string().optional()
+});
+
+const RemovePartSchema = z.object({
+    action: z.literal('remove_part'),
+    encounterId: z.string(),
+    participantId: z.string(),
+    part: z.string().min(1),
+    mirrorToCharacter: z.boolean().optional(),
+    reason: z.string().optional()
+});
+
+const SetUnitSchema = z.object({
+    action: z.literal('set_unit'),
+    encounterId: z.string(),
+    participantId: z.string(),
+    suppressed: z.boolean().optional(),
+    inMelee: z.boolean().optional(),
+    brokenFormation: z.boolean().optional(),
+    packed: z.boolean().optional(),
+    reason: z.string().optional()
+});
+
+const SetIntentSchema = z.object({
+    action: z.literal('set_intent'),
+    encounterId: z.string(),
+    participantId: z.string(),
+    intent: z.string().nullable().optional().describe('Telegraphed intent; clears when its turn ends. null clears now'),
+    readied: ReadiedSchema.nullable().optional().describe('{action, trigger}: stays across turns until trigger_readied. null clears')
+});
+
+const TriggerReadiedSchema = z.object({
+    action: z.literal('trigger_readied'),
+    encounterId: z.string(),
+    participantId: z.string(),
+    note: z.string().optional().describe('What happened when it fired')
 });
 
 // FINDINGS #80: the ghost hunt gets a verb — encounters could previously only
@@ -359,6 +415,13 @@ function stageGateCheck(characterId: string): string | null {
  * sheet ({name, duration?, source?}; names match case-insensitively). Returns
  * false when the participant has no character row.
  */
+function mirrorPartsToRow(characterId: string, parts: NonNullable<CombatParticipant['parts']>): boolean {
+    const repo = new CharacterRepository(getDb());
+    if (!repo.findById(characterId)) return false;
+    repo.update(characterId, { parts } as never);
+    return true;
+}
+
 function logConditionChange(encounterId: string, state: { round: number; currentTurnIndex: number }, actionType: string, targetId: string, summary: string, reason?: string): void {
     getDomainServices().combatActionLog.log({
         encounterId, round: state.round, turnIndex: state.currentTurnIndex,
@@ -820,7 +883,9 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     vulnerabilities: (row as { vulnerabilities?: string[] }).vulnerabilities || [],
                     immunities: (row as { immunities?: string[] }).immunities || [],
                     band: params.band ?? row.band,
-                    regeneration: params.regeneration ?? row.regeneration
+                    regeneration: params.regeneration ?? row.regeneration,
+                    parts: params.parts ?? row.parts,
+                    unit: params.unit
                 };
             } else {
                 if (!params.name || params.hp === undefined || params.maxHp === undefined) {
@@ -833,7 +898,8 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     isEnemy: params.isEnemy ?? false, conditions: [],
                     position: params.position ?? { x: 0, y: 0 },
                     resistances: [], vulnerabilities: [], immunities: [],
-                    band: params.band, regeneration: params.regeneration
+                    band: params.band, regeneration: params.regeneration,
+                    parts: params.parts, unit: params.unit
                 };
             }
             const res = await appendToEncounter(ctx, params.encounterId, [participant]);
@@ -1016,6 +1082,128 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         },
         aliases: ['clear_condition', 'cure', 'end_condition'],
         description: 'Remove a condition from a live encounter participant by id or name (case-insensitive); optional mirror to the character sheet'
+    },
+    set_part: {
+        schema: SetPartSchema,
+        handler: async (params: z.infer<typeof SetPartSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'set_part', message, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            if (params.state === 'latched') {
+                if (!params.latchedTo) return refuse('latched needs latchedTo {participantId, part?}');
+                if (!state.participants.some(x => x.id === params.latchedTo!.participantId)) return refuse(`latchedTo ${params.latchedTo.participantId} is not in this encounter`);
+            }
+            const parts = [...(p.parts ?? [])];
+            const idx = parts.findIndex(x => x.name.toLowerCase() === params.part.toLowerCase());
+            const prev = idx >= 0 ? parts[idx] : undefined;
+            const next = {
+                name: prev?.name ?? params.part,
+                kind: params.kind ?? prev?.kind ?? 'other',
+                state: params.state,
+                ...(params.state === 'latched' ? { latchedTo: params.latchedTo } : {}),
+                ...((params.note ?? prev?.note) ? { note: params.note ?? prev?.note } : {})
+            } as NonNullable<typeof p.parts>[number];
+            if (idx >= 0) parts[idx] = next; else parts.push(next);
+            p.parts = parts;
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            const mirrored = params.mirrorToCharacter ? mirrorPartsToRow(p.id, parts) : false;
+            const summary = `${p.name}: ${next.name} ${prev ? `${prev.state} → ` : ''}${next.state}${next.latchedTo ? ` → ${next.latchedTo.participantId}${next.latchedTo.part ? ` ${next.latchedTo.part}` : ''}` : ''}`;
+            logConditionChange(params.encounterId, state, 'set_part', p.id, `${summary}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
+            return { success: true, actionType: 'set_part', encounterId: params.encounterId, participantId: p.id, part: next, previous: prev?.state, mirroredToCharacter: mirrored, message: summary };
+        },
+        aliases: ['part', 'wound_part', 'cripple'],
+        description: 'Set a named part on a token (intact, crippled, dead, latched, breached); upserts by name'
+    },
+    remove_part: {
+        schema: RemovePartSchema,
+        handler: async (params: z.infer<typeof RemovePartSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'remove_part', message, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            const before = p.parts ?? [];
+            const after = before.filter(x => x.name.toLowerCase() !== params.part.toLowerCase());
+            if (after.length === before.length) return refuse(`${p.name} has no part '${params.part}' (parts: ${before.map(x => x.name).join(', ') || 'none'})`);
+            p.parts = after;
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            const mirrored = params.mirrorToCharacter ? mirrorPartsToRow(p.id, after) : false;
+            logConditionChange(params.encounterId, state, 'remove_part', p.id, `${p.name}: ${params.part} removed${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
+            return { success: true, actionType: 'remove_part', encounterId: params.encounterId, participantId: p.id, removed: params.part, mirroredToCharacter: mirrored, message: `${p.name}: ${params.part} removed` };
+        },
+        aliases: ['clear_part', 'repair_part'],
+        description: 'Remove a named part from a token (repaired, or no longer tracked)'
+    },
+    set_unit: {
+        schema: SetUnitSchema,
+        handler: async (params: z.infer<typeof SetUnitSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'set_unit', message, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            if (!p.unit) return refuse(`${p.name} is not a unit token (create it with unit: {models, hpPerModel, ...})`);
+            for (const k of ['suppressed', 'inMelee', 'brokenFormation', 'packed'] as const) {
+                if (params[k] !== undefined) (p.unit as Record<string, unknown>)[k] = params[k];
+            }
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            const tier = volleyTier(p);
+            logConditionChange(params.encounterId, state, 'set_unit', p.id, `${p.name}: ${describeUnit(p)}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
+            return { success: true, actionType: 'set_unit', encounterId: params.encounterId, participantId: p.id, unit: p.unit, volley: tier, message: `${p.name}: ${describeUnit(p)}` };
+        },
+        aliases: ['unit', 'suppress', 'formation'],
+        description: 'Set a unit token\'s suppressed / inMelee / brokenFormation / packed flags; reports the volley tier'
+    },
+    set_intent: {
+        schema: SetIntentSchema,
+        handler: async (params: z.infer<typeof SetIntentSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'set_intent', message, writes: 'none' });
+            if (params.intent === undefined && params.readied === undefined) return refuse('set_intent needs intent and/or readied (null clears)');
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            if (params.intent !== undefined) p.intent = params.intent ?? undefined;
+            if (params.readied !== undefined) p.readied = params.readied ?? undefined;
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            return {
+                success: true, actionType: 'set_intent', encounterId: params.encounterId, participantId: p.id,
+                intent: p.intent ?? null, readied: p.readied ?? null,
+                message: `${p.name}${p.intent ? ` ⚑ ${p.intent}` : ''}${p.readied ? ` ⏳ ${p.readied.action} when ${p.readied.trigger}` : ''}${!p.intent && !p.readied ? ': intent cleared' : ''}`
+            };
+        },
+        aliases: ['intent', 'telegraph', 'ready_action'],
+        description: 'Telegraph a token\'s intent (clears when its turn ends) and/or a readied action {action, trigger} (stays until triggered)'
+    },
+    trigger_readied: {
+        schema: TriggerReadiedSchema,
+        handler: async (params: z.infer<typeof TriggerReadiedSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'trigger_readied', message, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            if (!p.readied) return refuse(`${p.name} has no readied action`);
+            const fired = p.readied;
+            p.readied = undefined;
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            logConditionChange(params.encounterId, state, 'trigger_readied', p.id, `${p.name}'s readied action fires: ${fired.action} (${fired.trigger})${params.note ? ` — ${params.note}` : ''}`, params.note);
+            return { success: true, actionType: 'trigger_readied', encounterId: params.encounterId, participantId: p.id, fired, message: `${p.name}: ${fired.action} fires (${fired.trigger}). Resolve it now with combat_action.` };
+        },
+        aliases: ['fire_readied', 'readied_fires'],
+        description: 'A readied action\'s trigger happened: clear it, log it, then resolve the action'
     },
     get_history: {
         schema: GetHistorySchema,
@@ -1233,6 +1421,19 @@ For CORPSES after combat, use corpse_manage tool.`,
         band: z.string().optional().describe('add_participant: table-rules power band (defaults from the character row)'),
         regeneration: z.number().int().min(0).optional().describe('add_participant: HP healed at the start of each of its rounds (defaults from the character row)'),
         revive: z.boolean().optional().describe('adjust_hp: allow raising a dead participant'),
+        parts: z.array(PartSchema).optional().describe('add_participant: named parts (defaults from the character row)'),
+        unit: UnitSchema.optional().describe('add_participant: a mortal unit {models, hpPerModel, packed, attackBonus, tiers}'),
+        part: z.string().optional().describe('set_part / remove_part: part name'),
+        state: z.enum(PART_STATES).optional().describe('set_part: intact | crippled | dead | latched | breached'),
+        kind: z.enum(PART_KINDS).optional().describe('set_part: head | arm | leg | wing | torso | system | other'),
+        latchedTo: z.object({ participantId: z.string(), part: z.string().optional() }).optional().describe('set_part latched: who it holds'),
+        note: z.string().optional().describe('set_part / trigger_readied: note'),
+        suppressed: z.boolean().optional().describe('set_unit'),
+        inMelee: z.boolean().optional().describe('set_unit'),
+        brokenFormation: z.boolean().optional().describe('set_unit'),
+        packed: z.boolean().optional().describe('set_unit'),
+        intent: z.string().nullable().optional().describe('set_intent: telegraphed intent (null clears); clears when its turn ends'),
+        readied: ReadiedSchema.nullable().optional().describe('set_intent: {action, trigger}, stays until trigger_readied (null clears)'),
         isEnemy: z.boolean().optional().describe('Hostile flag (add_participant)'),
         xpAward: z.number().optional().describe('XP credited on end'),
         xpRecipients: z.array(z.string()).optional().describe('XP recipient character IDs'),
@@ -1347,6 +1548,17 @@ export async function handleCombatManage(args: unknown, ctx: SessionContext): Pr
                 case 'add_condition':
                 case 'remove_condition':
                     output = RichFormatter.header('Condition', '🩸');
+                    break;
+                case 'set_part':
+                case 'remove_part':
+                    output = RichFormatter.header('Part', '🦴');
+                    break;
+                case 'set_unit':
+                    output = RichFormatter.header('Unit', '🪖');
+                    break;
+                case 'set_intent':
+                case 'trigger_readied':
+                    output = RichFormatter.header('Intent', '⚑');
                     break;
                 default:
                     output = RichFormatter.header('Combat', '⚔️');

@@ -1257,6 +1257,10 @@ function runMigrations(db: Database.Database) {
     console.error('[Migration] Adding band column to characters table');
     db.exec(`ALTER TABLE characters ADD COLUMN band TEXT;`);
   }
+  if (!ruleCharColumns.some(col => col.name === 'parts')) {
+    console.error('[Migration] Adding parts column to characters table');
+    db.exec(`ALTER TABLE characters ADD COLUMN parts TEXT;`);
+  }
   if (!ruleCharColumns.some(col => col.name === 'regeneration')) {
     console.error('[Migration] Adding regeneration column to characters table');
     db.exec(`ALTER TABLE characters ADD COLUMN regeneration INTEGER;`);

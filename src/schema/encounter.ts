@@ -1,3 +1,4 @@
+import { PartSchema, UnitSchema, ReadiedSchema } from './token-extras.js';
 import { z } from 'zod';
 import { DurationType, parseAbility, parseDurationType } from '../engine/combat/conditions.js';
 
@@ -184,7 +185,11 @@ export const TokenSchema = z.object({
     vulnerabilities: z.array(z.string()).optional().describe('Damage types dealt at double damage'),
     immunities: z.array(z.string()).optional().describe('Damage types ignored entirely'),
     band: z.string().optional().describe("Table rules: power band"),
-    regeneration: z.number().optional().describe('Table rules: HP healed at the start of each of its rounds')
+    regeneration: z.number().optional().describe('Table rules: HP healed at the start of each of its rounds'),
+    parts: z.array(PartSchema).optional(),
+    unit: UnitSchema.optional(),
+    intent: z.string().optional(),
+    readied: ReadiedSchema.optional()
 });
 
 export type Token = z.infer<typeof TokenSchema>;

@@ -7,6 +7,7 @@
 import type { CombatParticipant, CombatActionResult } from './engine.js';
 import type { Condition } from './conditions.js';
 import { DurationType } from './conditions.js';
+import { PART_KINDS, type Part } from '../../schema/token-extras.js';
 import { compareBands, type RuleSpec, type TableRule } from '../table-rules.js';
 
 export interface ConsequenceDue {
@@ -75,6 +76,13 @@ export function calledStrikeProblem(
     if (peer === null) return `${rule.name} needs both bands set (unset for ${!actor.band ? actor.name : target.name})`;
     if (!peer) return `${rule.name}: called strikes are against a single opponent of your band or greater; ${target.name} (${target.band}) is below ${actor.name} (${actor.band})`;
     return null;
+}
+
+/** The crippled part a called strike leaves on a hit: the part aimed at, or the limb. */
+export function crippledPart(rule: TableRule<'called_strike'>, limb: string, atPart?: string): Part {
+    const spec = (rule.spec as RuleSpec<'called_strike'>).limbs[limb];
+    const kind = (PART_KINDS as readonly string[]).includes(limb) ? limb as Part['kind'] : 'other';
+    return { name: atPart ?? limb, kind, state: 'crippled', note: `called strike (${rule.name})${spec?.notes?.length ? `: ${spec.notes.join('; ')}` : ''}` };
 }
 
 /** The crippling condition a called strike leaves on a hit. */

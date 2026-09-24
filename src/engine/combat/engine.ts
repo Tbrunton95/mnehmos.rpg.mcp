@@ -1,3 +1,4 @@
+import type { Part, Unit, Readied } from '../../schema/token-extras.js';
 import { CombatRNG, CheckResult } from './rng.js';
 import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS } from './conditions.js';
 
@@ -38,6 +39,10 @@ export interface CombatParticipant {
     helpedBy?: string;            // Help: advantage on its next attack, granted by this participant
     band?: string;                // Table rules: power band (see table_rules band)
     regeneration?: number;        // Table rules: HP healed at the start of each of its own turns
+    parts?: Part[];               // Named body parts with states (crippled, dead, latched, breached)
+    unit?: Unit;                  // A mortal unit as one token (models, volley tiers)
+    intent?: string;              // Telegraphed intent; clears when its turn ends
+    readied?: Readied;            // A readied action; stays until triggered
     // HIGH-002: Damage modifiers
     resistances?: string[];    // Damage types that deal half damage
     vulnerabilities?: string[]; // Damage types that deal double damage
@@ -131,6 +136,7 @@ export interface CombatActionResult {
     damageRolls?: number[];  // Individual damage dice
     damageType?: string;     // Findings #40: auditable against resistances
     damageModifier?: 'immune' | 'resistant' | 'vulnerable';  // HIGH-002: set only when one applied
+    situational?: string[];  // What changed the roll or the damage (dodge, help, parts, unit cap)
     
     // Heal specifics (if type === 'heal')
     healAmount?: number;
@@ -656,7 +662,10 @@ export class CombatEngine {
         resolved?: 'hit' | 'crit' | 'miss',
         // The attack is made with a limb no crippling condition touches
         // (e.g. the good arm), so condition attack disadvantage is skipped.
-        unaffectedLimb?: boolean
+        unaffectedLimb?: boolean,
+        // Named parts: the attacker's part used and the target part aimed at;
+        // uncapped lifts the one-model cap on unit targets (cleave, volleys).
+        partOpts?: { withPart?: string; atPart?: string; uncapped?: boolean }
     ): CombatActionResult {
         if (!this.state) throw new Error('No active combat');
 
@@ -668,6 +677,17 @@ export class CombatEngine {
 
         const hpBefore = target.hp;
 
+        // A dead or latched part cannot attack: refused before anything
+        // changes (no Help spent, no roll, no action).
+        const partName = (x?: string) => x?.trim().toLowerCase();
+        const findPart = (who: CombatParticipant, name?: string) => name ? who.parts?.find(pt => pt.name.toLowerCase() === partName(name)) : undefined;
+        const usedPart = findPart(actor, partOpts?.withPart);
+        if (partOpts?.withPart) {
+            if (!usedPart) throw new Error(`${actor.name} has no part '${partOpts.withPart}' (parts: ${actor.parts?.map(pt => pt.name).join(', ') || 'none'})`);
+            if (usedPart.state === 'dead') throw new Error(`${actor.name}'s ${usedPart.name} is dead and cannot attack`);
+            if (usedPart.state === 'latched') throw new Error(`${actor.name}'s ${usedPart.name} is latched and cannot attack while it holds`);
+        }
+
         // Dodge and Help feed the roll. Help is spent by the attack even when
         // the GM posts the result.
         const situational: string[] = [];
@@ -678,6 +698,22 @@ export class CombatEngine {
             situational.push(`helped by ${helper?.name ?? actor.helpedBy} (advantage)`);
             actor.helpedBy = undefined;
         }
+        // Parts: a dead or latched part cannot attack (refused before any
+        // roll, so nothing is spent); a crippled one attacks at disadvantage;
+        // a breached target part, or a latcher attacked by the one it holds,
+        // is hit with advantage.
+        if (usedPart?.state === 'crippled') { disadvantage = true; situational.push(`${actor.name}'s ${usedPart.name} crippled (disadvantage)`); }
+        // Measure of a Body: a crippled arm's attacks are at disadvantage. With
+        // no part named, assume the crippled arm unless the GM says otherwise.
+        const crippledArm = actor.parts?.find(pt => pt.state === 'crippled' && pt.kind === 'arm');
+        if (!partOpts?.withPart && crippledArm && !unaffectedLimb) { disadvantage = true; situational.push(`${actor.name}'s ${crippledArm.name} crippled (disadvantage; name withPart or unaffectedLimb for the good arm)`); }
+        const aimed = findPart(target, partOpts?.atPart);
+        if (aimed?.state === 'breached') { advantage = true; situational.push(`${target.name}'s ${aimed.name} breached (advantage)`); }
+        if (target.parts?.some(pt => pt.state === 'latched' && pt.latchedTo?.participantId === actor.id)) {
+            advantage = true;
+            situational.push(`${target.name} is latched onto ${actor.name} (advantage)`);
+        }
+
         // Conditions can carry mechanics in metadata (a called strike's
         // crippled arm). The GM passes unaffectedLimb for the good arm.
         const hampering = actor.conditions.filter(c => c.metadata?.attackDisadvantage);
@@ -720,6 +756,16 @@ export class CombatEngine {
             const modResult = this.calculateDamageWithModifiers(finalBaseDamage, damageType, target);
             damageDealt = modResult.finalDamage;
             damageModifier = modResult.modifier;
+            // A single blow on a unit kills at most one model; cleave on a
+            // packed unit, volleys and area attacks flow through models.
+            if (target.unit && !partOpts?.uncapped && target.hp > 0) {
+                const models = Math.ceil(target.hp / target.unit.hpPerModel);
+                const currentModelHp = target.hp - (models - 1) * target.unit.hpPerModel;
+                if (damageDealt > currentModelHp) {
+                    situational.push(`one model at most: ${damageDealt} → ${currentModelHp} (cleave a packed unit to go through)`);
+                    damageDealt = currentModelHp;
+                }
+            }
             target.hp = Math.max(0, target.hp - damageDealt);
         }
 
@@ -800,7 +846,8 @@ export class CombatEngine {
             success: attackRoll.isHit,
             defeated,
             message,
-            detailedBreakdown: breakdown
+            detailedBreakdown: breakdown,
+            ...(situational.length ? { situational } : {})
         };
     }
 
@@ -1147,11 +1194,15 @@ export class CombatEngine {
      * crippled leg halves it).
      */
     effectiveSpeed(participant: CombatParticipant): number {
+        // Held by another creature's latched part: it cannot move away.
+        if (this.state?.participants.some(o => o.parts?.some(pt => pt.state === 'latched' && pt.latchedTo?.participantId === participant.id))) return 0;
         const base = participant.movementSpeed ?? 30;
-        const factor = participant.conditions.reduce((f, c) => {
+        let factor = participant.conditions.reduce((f, c) => {
             const sf = c.metadata?.speedFactor;
             return typeof sf === 'number' ? f * sf : f;
         }, 1);
+        // A crippled leg or wing halves speed (once, however many).
+        if (participant.parts?.some(pt => pt.state === 'crippled' && (pt.kind === 'leg' || pt.kind === 'wing'))) factor *= 0.5;
         return Math.floor(base * factor);
     }
 
@@ -1327,6 +1378,8 @@ export class CombatEngine {
         if (currentParticipant && currentParticipant.hp > 0) {
             this.processEndOfTurnConditions(currentParticipant);
         }
+        // A telegraphed intent lasts one turn; a readied action stays.
+        if (currentParticipant) currentParticipant.intent = undefined;
 
         // Advance turn, automatically skipping dead participants
         let iterations = 0;
