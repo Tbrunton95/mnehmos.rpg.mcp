@@ -11,8 +11,29 @@ import seedrandom from 'seedrandom';
  * - Shadowrun/WoD: Dice pool success counting
  * - Pathfinder 2e: Degree-of-success mechanics (in CombatEngine)
  */
+/** Who a die was rolled for, against whom, and why; set by the engine before it rolls. */
+export interface RollTag {
+    purpose: string;
+    forId?: string;
+    targetId?: string;
+}
+
+/** One group of dice rolled under one tag: replayable from origin seed + draw index. */
+export interface RollRecord extends RollTag {
+    dice: Array<{ sides: number; value: number }>;
+    origin: string | null;
+    startDraw: number;
+}
+
 export class CombatRNG {
     private rng: seedrandom.StatefulPRNG<seedrandom.State.Arc4>;
+    /** The seed this stream started from (null for encounters saved before roll auditing). */
+    private origin: string | null;
+    /** Values drawn from the stream since the seed: replay = reseed, skip this many. */
+    private draws: number;
+    /** Current tag for the dice the engine is about to roll. */
+    tag: RollTag = { purpose: 'roll' };
+    private records: RollRecord[] = [];
 
     /**
      * @param saved a snapshot() from an earlier RNG. When given, the stream
@@ -20,21 +41,48 @@ export class CombatRNG {
      * a reloaded encounter must not replay the dice it already rolled.
      */
     constructor(seed: string, saved?: object) {
-        this.rng = saved
-            ? seedrandom('', { state: saved as seedrandom.State.Arc4 })
-            : seedrandom(seed, { state: true });
+        const s = saved as { arc4?: object; origin?: string | null; draws?: number } | undefined;
+        if (s?.arc4) {
+            this.rng = seedrandom('', { state: s.arc4 as seedrandom.State.Arc4 });
+            this.origin = s.origin ?? null;
+            this.draws = s.draws ?? 0;
+        } else if (saved) {
+            // Saved before roll auditing: the stream resumes, but its origin is unknown.
+            this.rng = seedrandom('', { state: saved as seedrandom.State.Arc4 });
+            this.origin = null;
+            this.draws = 0;
+        } else {
+            this.rng = seedrandom(seed, { state: true });
+            this.origin = seed;
+            this.draws = 0;
+        }
     }
 
     /** Current stream position, JSON-safe, for persisting with the encounter. */
     snapshot(): object {
-        return this.rng.state();
+        return { arc4: this.rng.state(), origin: this.origin, draws: this.draws };
+    }
+
+    /** The dice rolled since the last drain, grouped by tag. */
+    drainRecords(): RollRecord[] {
+        const out = this.records;
+        this.records = [];
+        return out;
     }
 
     /**
      * Roll a single die with N sides
      */
     private rollDie(sides: number): number {
-        return Math.floor(this.rng() * sides) + 1;
+        const value = Math.floor(this.rng() * sides) + 1;
+        const last = this.records[this.records.length - 1];
+        if (last && last.purpose === this.tag.purpose && last.forId === this.tag.forId && last.targetId === this.tag.targetId) {
+            last.dice.push({ sides, value });
+        } else {
+            this.records.push({ ...this.tag, dice: [{ sides, value }], origin: this.origin, startDraw: this.draws });
+        }
+        this.draws++;
+        return value;
     }
 
     /**

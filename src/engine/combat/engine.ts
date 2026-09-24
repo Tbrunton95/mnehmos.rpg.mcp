@@ -222,7 +222,7 @@ export class CombatEngine {
 
         const withInit = newParticipants.map(p => ({
             ...p,
-            initiative: this.rng.d20(p.initiativeBonus),
+            initiative: this.tagged({ purpose: 'initiative', forId: p.id }, () => this.rng.d20(p.initiativeBonus)),
             isEnemy: p.isEnemy ?? this.detectIsEnemy(p.id, p.name),
             movementRemaining: p.movementSpeed ?? 30,
             actionUsed: false,
@@ -263,7 +263,7 @@ export class CombatEngine {
     startEncounter(participants: CombatParticipant[]): CombatState {
         // Roll initiative for each participant and store the value
         const participantsWithInitiative = participants.map(p => {
-            const rolledInitiative = p.initiative ?? this.rng.d20(p.initiativeBonus);
+            const rolledInitiative = p.initiative ?? this.tagged({ purpose: 'initiative', forId: p.id }, () => this.rng.d20(p.initiativeBonus));
             return {
                 ...p,
                 ac: p.ac,
@@ -404,8 +404,20 @@ export class CombatEngine {
      * Get the current state
      */
     /** A bare d20 on the encounter's seeded stream, for saves handlers roll. */
-    rollD20(): number {
-        return this.rng.d20(0);
+    rollD20(tag: import('./rng.js').RollTag = { purpose: 'save' }): number {
+        return this.tagged(tag, () => this.rng.d20(0));
+    }
+
+    /** Roll under a tag so the audit log says who the dice were for and why. */
+    private tagged<T>(tag: import('./rng.js').RollTag, fn: () => T): T {
+        const prev = this.rng.tag;
+        this.rng.tag = tag;
+        try { return fn(); } finally { this.rng.tag = prev; }
+    }
+
+    /** The dice rolled since the last drain (the operation guard writes them to roll_log). */
+    drainRollRecords(): import('./rng.js').RollRecord[] {
+        return this.rng.drainRecords();
     }
 
     getState(): CombatState | null {
@@ -733,7 +745,7 @@ export class CombatEngine {
                 isHit: resolved !== 'miss', isCrit: resolved === 'crit',
                 allRolls: [], resolved
             }
-            : this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage);
+            : this.tagged({ purpose: 'attack', forId: actorId, targetId }, () => this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage));
 
         let damageDealt = 0;
         let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
@@ -742,7 +754,7 @@ export class CombatEngine {
         let baseDamageVal = 0;
         let damageBreakdownStr = '';
 
-        const rolled = this.rollAttackDamage(damage, attackRoll.isHit && attackRoll.isCrit);
+        const rolled = this.tagged({ purpose: 'damage', forId: actorId, targetId }, () => this.rollAttackDamage(damage, attackRoll.isHit && attackRoll.isCrit));
         baseDamageVal = rolled.total;
         const capturedDamageRolls = rolled.rolls;
         damageBreakdownStr = rolled.breakdown;
@@ -999,7 +1011,7 @@ export class CombatEngine {
         }
 
         // Roll the d20 on the encounter's seeded stream (recorded, replayable)
-        const roll = this.rng.d20(0);
+        const roll = this.tagged({ purpose: 'death save', forId: participantId }, () => this.rng.d20(0));
         const isNat20 = roll === 20;
         const isNat1 = roll === 1;
         const success = roll >= 10;
@@ -1296,7 +1308,7 @@ export class CombatEngine {
                         } else if (effect.type === 'healing' && effect.amount) {
                             this.heal(participant.id, effect.amount);
                         } else if (effect.type === 'damage' && effect.dice) {
-                            const damage = this.rng.roll(effect.dice);
+                            const damage = this.tagged({ purpose: `ongoing ${condition.type}`, forId: participant.id }, () => this.rng.roll(effect.dice!));
                             this.applyDamage(participant.id, damage);
                         }
                     }
@@ -1330,7 +1342,7 @@ export class CombatEngine {
                         } else if (effect.type === 'healing' && effect.amount) {
                             this.heal(participant.id, effect.amount);
                         } else if (effect.type === 'damage' && effect.dice) {
-                            const damage = this.rng.roll(effect.dice);
+                            const damage = this.tagged({ purpose: `ongoing ${condition.type}`, forId: participant.id }, () => this.rng.roll(effect.dice!));
                             this.applyDamage(participant.id, damage);
                         }
                     }
@@ -1345,7 +1357,7 @@ export class CombatEngine {
             // Handle save-ends conditions
             if (condition.durationType === DurationType.SAVE_ENDS && condition.saveDC && condition.saveAbility) {
                 const saveBonus = this.getSaveBonus(participant, condition.saveAbility);
-                const degree = this.rng.checkDegree(saveBonus, condition.saveDC);
+                const degree = this.tagged({ purpose: `save vs ${condition.type}`, forId: participant.id }, () => this.rng.checkDegree(saveBonus, condition.saveDC!));
 
                 if (degree === 'success' || degree === 'critical-success') {
                     this.removeCondition(participant.id, condition.id);
@@ -1629,12 +1641,12 @@ export class CombatEngine {
 
         const hpBefore = target.hp;
         // 5e: crit on the natural 20 only, never on the margin.
-        const attackRoll = this.rng.rollAttackD20(attackBonus, targetAC);
+        const attackRoll = this.tagged({ purpose: 'opportunity attack', forId: attackerId, targetId }, () => this.rng.rollAttackD20(attackBonus, targetAC));
 
         let damageDealt = 0;
         let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
         if (attackRoll.isHit) {
-            const rolled = this.rollAttackDamage(attacker.attackDamage ?? '1d6+2', attackRoll.isCrit);
+            const rolled = this.tagged({ purpose: 'opportunity damage', forId: attackerId, targetId }, () => this.rollAttackDamage(attacker.attackDamage ?? '1d6+2', attackRoll.isCrit));
             const modResult = this.calculateDamageWithModifiers(rolled.total, attacker.attackDamageType, target);
             damageDealt = modResult.finalDamage;
             damageModifier = modResult.modifier;

@@ -3,6 +3,9 @@
  * Replaces 5 separate tools: dice_roll, probability_calculate, algebra_solve, algebra_simplify, physics_projectile
  */
 
+import seedrandom from 'seedrandom';
+import { recordRolls, type RollLogEntry } from '../../storage/roll-log.js';
+import { currentOperation } from '../operation-guard.js';
 import { z } from 'zod';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { SessionContext } from '../types.js';
@@ -113,11 +116,21 @@ const OpposedSchema = z.object({
     declaredEffects: z.preprocess(jsonIfString, z.array(DeclaredEffectRefSchema)).optional().describe('Initiator declaredEffects — engine computes')
 });
 
-function d20(advantage?: boolean, disadvantage?: boolean): { rolls: number[]; natural: number } {
-    const r = () => Math.floor(Math.random() * 20) + 1;
-    if (advantage && !disadvantage) { const a = r(), b = r(); return { rolls: [a, b], natural: Math.max(a, b) }; }
-    if (disadvantage && !advantage) { const a = r(), b = r(); return { rolls: [a, b], natural: Math.min(a, b) }; }
-    const a = r(); return { rolls: [a], natural: a };
+// Seeded so every check is stored and replayable (roll_log keeps the seed).
+function d20(advantage?: boolean, disadvantage?: boolean, seed: string = freshSeed('check')): { rolls: number[]; natural: number; seed: string } {
+    const rng = seedrandom(seed);
+    const r = () => Math.floor(rng() * 20) + 1;
+    if (advantage && !disadvantage) { const a = r(), b = r(); return { rolls: [a, b], natural: Math.max(a, b), seed }; }
+    if (disadvantage && !advantage) { const a = r(), b = r(); return { rolls: [a, b], natural: Math.min(a, b), seed }; }
+    const a = r(); return { rolls: [a], natural: a, seed };
+}
+
+/** Store a math_manage roll in roll_log under the running operation. */
+function logRoll(db: ReturnType<typeof getDb>, entry: RollLogEntry): string | undefined {
+    try {
+        const op = currentOperation();
+        return recordRolls(db, [entry], { opId: op?.opId, tool: op?.tool ?? 'math_manage' })[0];
+    } catch { return undefined; }
 }
 
 function abilityMod(score: number): number { return Math.floor((score - 10) / 2); }
@@ -281,10 +294,17 @@ async function handleCharacterRoll(
             metadata: { characterRoll: { kind, characterId: args.characterId, skill: args.skill, ability: args.ability, bonus, breakdown, dc: args.dc, total } }
         });
     } catch { /* persistence is audit sugar — the roll stands regardless */ }
+    const rollId = logRoll(db, {
+        purpose: kind === 'save' ? `${args.ability} save` : `${args.skill ?? args.ability} check`,
+        forId: args.characterId, expression: args.advantage && !args.disadvantage ? '2d20kh1' : args.disadvantage && !args.advantage ? '2d20kl1' : '1d20',
+        dice: roll.rolls.map(value => ({ sides: 20, value })), result: total, replay: roll.seed
+    });
 
     return {
         success: true,
         calculationId: calcId,
+        rollId,
+        seed: roll.seed,
         actionType: `roll_${kind === 'save' ? 'saving_throw' : kind + '_check'}`,
         characterId: args.characterId,
         characterName: char.name,
@@ -312,6 +332,8 @@ const RollSchema = z.object({
     // it — a raw roll with a target evaluated nothing). dc now lands.
     dc: z.number().optional().describe('Optional target: total >= dc evaluates SUCCESS/FAILURE; absent = NO TARGET SET'),
     seed: z.string().optional(),
+    forId: z.string().optional().describe('Who the roll is for (character or token id), kept in the roll log'),
+    purpose: z.string().optional().describe("What the roll is for ('turret damage'), kept in the roll log"),
     exportFormat: ExportFormatSchema.optional().default('json')
 });
 
@@ -585,10 +607,17 @@ async function handleRoll(args: z.infer<typeof RollSchema>, sessionId?: string):
 
     repo.create(calculation);
     logCalculationEvent(db, calculation.id, 'dice_roll', sessionId);
+    const diceRolled = ((result.metadata as { rolls?: number[] } | undefined)?.rolls ?? []);
+    const sides = Number(args.expression.match(/d(\d+)/)?.[1] ?? 0);
+    const rollId = logRoll(db, {
+        purpose: args.purpose ?? 'roll', forId: args.forId, expression: args.expression,
+        dice: diceRolled.map(value => ({ sides, value })), result: Number(result.result), replay: calculation.seed ?? null
+    });
 
     return {
         success: true,
         actionType: 'roll',
+        rollId,
         expression: args.expression,
         total: result.result,
         rolls: result.steps,
@@ -871,6 +900,8 @@ Actions: roll, probability, solve, simplify, projectile, roll_skill_check, roll_
         // Roll params
         expression: z.string().optional(),
         seed: z.string().optional(),
+        forId: z.string().optional().describe('roll: who the roll is for, kept in the roll log'),
+        purpose: z.string().optional().describe('roll: what the roll is for, kept in the roll log'),
         successThreshold: z.number().optional().describe('Dice-pool mode: count dice >= this as successes'),
         // Probability params
         target: z.number().optional(),

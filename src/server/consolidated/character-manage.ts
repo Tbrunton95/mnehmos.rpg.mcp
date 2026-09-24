@@ -847,7 +847,25 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
         if (row?.composure_spec) composureSpec = JSON.parse(row.composure_spec);
     } catch { /* column predates #86 — no spec filed */ }
 
-    return { ...character, currency, currencyNote: currency ? `RU ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec };
+    // Ownership (docs/ownership.md): the sheet owns HP; a live token mirrors
+    // it at every combat action. Conditions, parts, intent and unit state on
+    // the token are the encounter's until mirrored. Say which fight holds it.
+    let liveEncounters: Array<Record<string, unknown>> | undefined;
+    try {
+        const rows = db.prepare("SELECT id, tokens FROM encounters WHERE status = 'active' AND tokens LIKE ?").all(`%"${args.characterId}"%`) as Array<{ id: string; tokens: string }>;
+        const found = rows.map(r => {
+            const tok = (JSON.parse(r.tokens) as Array<Record<string, any>>).find(t => t.id === args.characterId);
+            return tok ? {
+                encounterId: r.id,
+                tokenHp: tok.hp,
+                tokenConditions: (tok.conditions ?? []).map((c: { type?: string; name?: string }) => c.type ?? c.name),
+                ...(tok.parts?.length ? { tokenParts: tok.parts } : {}),
+                sync: 'HP: this sheet owns it; the token reads it before and writes it after every combat action. Conditions, parts, intent and unit state belong to the token unless mirrored.'
+            } : null;
+        }).filter(Boolean) as Array<Record<string, unknown>>;
+        if (found.length) liveEncounters = found;
+    } catch { /* no encounters table */ }
+    return { ...character, currency, currencyNote: currency ? `RU ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec, ...(liveEncounters ? { liveEncounters } : {}) };
 }
 
 async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object> {

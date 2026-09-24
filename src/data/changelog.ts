@@ -1,0 +1,24 @@
+/**
+ * What changed in the engine, newest last. session_manage shows the entries a
+ * database has not seen yet at initialize / get_context, so a GM learns about
+ * a new parameter the session it arrives (the outcome parameter went unused
+ * for a whole fight because nothing announced it).
+ */
+export interface ChangelogEntry {
+    id: string;       // sortable: YYYY-MM-DD-NN
+    title: string;
+    detail: string;
+}
+
+export const CHANGELOG: ChangelogEntry[] = [
+    { id: '2026-09-24-01', title: 'Post a result you rolled at the table', detail: "combat_action attack {outcome: 'hit' | 'crit' | 'miss', damage}: no engine d20, a posted number is never doubled, a crit doubles dice only. Never fake it with a huge attackBonus." },
+    { id: '2026-09-24-02', title: 'Fresh dice for every roll', detail: 'Unseeded rolls never share a seed (the batch repeats are gone). Never pass seed unless you want an exact replay.' },
+    { id: '2026-09-24-03', title: 'HP corrections and live conditions', detail: 'combat_manage adjust_hp {value | delta, reason} corrects HP with a logged reason; add_condition / remove_condition work mid-fight.' },
+    { id: '2026-09-24-04', title: 'Table rules', detail: "table_rules import {worldId, preset: 'day-366'}: bands, CONSEQUENCE DUE on peers, calledStrike, preparedAsset, regeneration, milestone XP, tiny status, principles at boot." },
+    { id: '2026-09-24-05', title: 'Small replies and in-place condition edits', detail: "output_mode: 'summary' on any call returns small fields only; character_manage update {editConditions: [{match, replace: {find, with}}]} edits one condition without resending it." },
+    { id: '2026-09-24-06', title: 'Parts, units and intent', detail: "set_part (crippled, dead, latched, breached) with withPart / atPart on attacks; unit tokens with combat_action volley and cleave; set_intent (clears at turn end) and readied actions (stay until trigger_readied)." },
+    { id: '2026-09-24-07', title: 'Safe retries with opId', detail: "Pass opId on any write (e.g. opId: 'r12-orla-melta'). A retry with the same opId replays the first reply and applies nothing; after a timeout, session_manage op_status {forOpId} says whether it landed. The same opId with other arguments is refused." },
+    { id: '2026-09-24-08', title: 'Every call applies fully or not at all', detail: 'A call that fails or refuses partway leaves no writes behind. batch_manage execute_sequence {atomic: true, steps} makes a whole turn (attack, condition, advance) land together or not at all.' },
+    { id: '2026-09-24-09', title: 'Every roll is logged and replayable', detail: "Combat dice, math_manage rolls and checks go to a roll log with who they were for, why, the dice and a replay key. math_manage roll takes forId and purpose. Look them up with session_manage rolls {forId | encounterId | forOpId}." },
+    { id: '2026-09-24-10', title: 'Who owns each number', detail: 'The sheet owns HP; a live token reads it before and writes it after every combat action. Conditions, parts, intent and unit state belong to the token unless mirrored. character_manage get lists liveEncounters with the token side. Full table: docs/ownership.md.' },
+];

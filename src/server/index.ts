@@ -1,3 +1,4 @@
+import { withOperation } from './operation-guard.js';
 /**
  * RPG-MCP Server - Dynamic Loader Pattern Implementation
  * 
@@ -155,7 +156,8 @@ function buildServer(pubsub: PubSub, auditLogger: AuditLogger): McpServer {
   // validation keeps it long enough for withOutputMode to see it.
   const envelopeShape = {
     sessionId: z.string().optional(),
-    output_mode: z.enum(['json', 'banner', 'summary']).optional()
+    output_mode: z.enum(['json', 'banner', 'summary']).optional(),
+    opId: z.string().optional()
   };
   const sessionIdSchema = z.object(envelopeShape);
 
@@ -206,10 +208,10 @@ function buildServer(pubsub: PubSub, auditLogger: AuditLogger): McpServer {
       toolName,
       entry.metadata.description,
       schemaShape(extendedSchema),
-      withOutputMode(auditLogger.wrapHandler(
+      withOutputMode(withOperation(toolName, auditLogger.wrapHandler(
         toolName,
         withSession(entry.schema, entry.handler as any)
-      ) as (args: Record<string, unknown>, extra: unknown) => Promise<{ content?: Array<{ type: string; text: string }> }>) as any
+      ) as (args: Record<string, unknown>, extra: unknown) => Promise<{ content?: Array<{ type: string; text: string }> }>)) as any
     );
   }
 
