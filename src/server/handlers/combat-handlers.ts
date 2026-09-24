@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { loadAutoMechanics, autoAttackBonus, autoAcBonus, autoDamageBonus, applyDeclaredEffects } from '../../engine/effects-resolver.js';
 import * as pda from '../../render/pda.js';
 import { randomUUID } from 'crypto';
+import { freshSeed } from '../../math/seed.js';
 import { CombatEngine, CombatParticipant, CombatState, CombatActionResult } from '../../engine/combat/engine.js';
 import { normalizeConditions } from '../../engine/combat/conditions.js';
 import { ConditionInputSchema } from '../../schema/encounter.js';
@@ -620,7 +621,7 @@ Example (use real UUID from context for player character!):
   ]
 }`,
         inputSchema: z.object({
-            seed: z.string().default('combat').describe('Seed for deterministic combat resolution'),
+            seed: z.string().optional().describe('Seed for deterministic combat resolution (omit for a fresh one; the id echoes it)'),
             participants: z.array(z.object({
                 id: z.string(),
                 name: z.string(),
@@ -1109,9 +1110,12 @@ MAZE WITH ROOMS:
 // Tool handlers
 export async function handleCreateEncounter(args: unknown, ctx: SessionContext) {
     const parsed = CombatTools.CREATE_ENCOUNTER.inputSchema.parse(args);
+    // An omitted seed used to default to the fixed string 'combat', so every
+    // unseeded encounter rolled the same initiative and attack dice.
+    const seed = parsed.seed ?? freshSeed('combat');
 
     // Create combat engine
-    const engine = new CombatEngine(parsed.seed, pubsub || undefined);
+    const engine = new CombatEngine(seed, pubsub || undefined);
 
     // Convert participants to proper format (preserve isEnemy, position, and resistances)
     const participants: CombatParticipant[] = parsed.participants.map(p => {
@@ -1195,7 +1199,9 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
     }
 
     // Generate encounter ID
-    const encounterId = `encounter-${parsed.seed}-${Date.now()}`;
+    // The random suffix keeps two creates with one seed in the same millisecond
+    // (a batch) from colliding on id.
+    const encounterId = `encounter-${seed}-${Date.now()}-${randomUUID().slice(0, 8)}`;
     // Store with session namespace
     getCombatManager().create(`${ctx.sessionId}:${encounterId}`, engine);
 
@@ -2662,8 +2668,8 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
 
             // Handle saving throw if specified
             if (parsed.savingThrow) {
-                // Roll saving throw
-                saveRoll = Math.floor(Math.random() * 20) + 1;
+                // Roll saving throw on the encounter's seeded stream
+                saveRoll = engine.rollD20();
                 const abilityScore = target.abilityScores?.[parsed.savingThrow.ability] ?? 10;
                 const modifier = Math.floor((abilityScore - 10) / 2);
                 saveTotal = saveRoll + modifier;

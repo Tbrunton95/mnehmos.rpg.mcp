@@ -38,6 +38,9 @@ export class EncounterRepository {
         if (!columnNames.includes('props')) {
             this.db.prepare('ALTER TABLE encounters ADD COLUMN props TEXT').run();
         }
+        if (!columnNames.includes('rng_state')) {
+            this.db.prepare('ALTER TABLE encounters ADD COLUMN rng_state TEXT').run();
+        }
     }
 
     create(encounter: Encounter): void {
@@ -96,7 +99,7 @@ export class EncounterRepository {
     saveState(encounterId: string, state: any): void {
         const stmt = this.db.prepare(`
             UPDATE encounters
-            SET tokens = ?, round = ?, active_token_id = ?, status = ?, terrain = ?, props = ?, grid_bounds = ?, updated_at = ?
+            SET tokens = ?, round = ?, active_token_id = ?, status = ?, terrain = ?, props = ?, grid_bounds = ?, rng_state = ?, updated_at = ?
             WHERE id = ?
         `);
 
@@ -115,6 +118,7 @@ export class EncounterRepository {
             state.props ? JSON.stringify(state.props) : null,
             // PHASE 2: Persist grid bounds
             state.gridBounds ? JSON.stringify(state.gridBounds) : null,
+            state.rngState ? JSON.stringify(state.rngState) : null,
             new Date().toISOString(),
             encounterId
         );
@@ -189,7 +193,8 @@ export class EncounterRepository {
             gridBounds,
             // LAIR action support
             hasLairActions: !!lairOwner,
-            lairOwnerId: lairOwner?.id
+            lairOwnerId: lairOwner?.id,
+            rngState: row.rng_state ? JSON.parse(row.rng_state) : undefined
         };
     }
 
@@ -216,6 +221,7 @@ interface EncounterRow {
     terrain: string | null;
     props: string | null;
     grid_bounds: string | null;
+    rng_state?: string | null;
     created_at: string;
     updated_at: string;
 }

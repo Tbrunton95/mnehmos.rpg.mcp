@@ -30,6 +30,7 @@ import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { getAgentRuntime, buildAgentRuntime } from '../../agent/runtime/deps.js';
 import { invokeAgent } from '../../agent/runtime/invoke.js';
 import { ProviderFactory } from '../../agent/provider/factory.js';
+import { freshSeed } from '../../math/seed.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -99,7 +100,7 @@ const TerrainSchema = z.preprocess(
 
 const CreateSchema = z.object({
     action: z.literal('create'),
-    seed: z.string().default('combat').describe('Seed for deterministic combat resolution'),
+    seed: z.string().optional().describe('Seed for deterministic combat resolution (omit for a fresh one; the id echoes it)'),
     participants: z.array(ParticipantSchema).min(1),
     terrain: TerrainSchema,
     includeParty: z.boolean().optional().describe('T1.2 (Findings #34): prepend the active party as PC-side participants'),
@@ -694,7 +695,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     if (!existing.has(pp.id as string)) participants.unshift(pp as typeof participants[number]);
                 }
             }
-            const seed = params.seed || `quick-${Date.now()}`;
+            const seed = params.seed || freshSeed('quick');
             const createParams = {
                 seed,
                 participants,

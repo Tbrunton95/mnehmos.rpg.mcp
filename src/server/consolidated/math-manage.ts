@@ -8,6 +8,7 @@ import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/a
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 import { DiceEngine } from '../../math/dice.js';
+import { freshSeed } from '../../math/seed.js';
 import { ProbabilityEngine } from '../../math/probability.js';
 import { AlgebraEngine } from '../../math/algebra.js';
 import { PhysicsEngine } from '../../math/physics.js';
@@ -415,8 +416,8 @@ async function handleReroll(args: z.infer<typeof RerollSchema>, sessionId?: stri
         return { error: true, actionType: 'reroll', message: `No rerolls left (0/${budget.max}). Earn more — the GM credits pool 'rerolls'.`, rerollsLeft: 0, writes: 'none' };
     }
 
-    const freshSeed = new Date().toISOString();
-    const engine = new DiceEngine(freshSeed);
+    const rerollSeed = freshSeed('reroll');
+    const engine = new DiceEngine(rerollSeed);
     const result = engine.roll(original.input);
 
     pools['rerolls'] = { ...budget, current: budget.current - 1 };
@@ -434,7 +435,7 @@ async function handleReroll(args: z.infer<typeof RerollSchema>, sessionId?: stri
         id: randomUUID(),
         sessionId,
         ...result,
-        seed: freshSeed,
+        seed: rerollSeed,
         metadata: { ...(result.metadata as object ?? {}), supersedes: args.calculationId, ...(cr ? { characterRoll: { ...cr, total: rerollTotal } } : {}) }
     } as StoredCalculation;
     repo.create(calculation);
@@ -451,7 +452,7 @@ async function handleReroll(args: z.infer<typeof RerollSchema>, sessionId?: stri
         total: rerollTotal,
         rolls: result.steps,
         ...(effectiveDc !== undefined && { dc: effectiveDc, outcome: rerollTotal >= effectiveDc ? 'SUCCESS' : 'FAILURE' }),
-        seed: freshSeed,
+        seed: rerollSeed,
         calculationId: calculation.id,
         rerollsLeft: budget.current - 1,
         message: `REROLL: ${original.input}${cr ? ` (${cr.kind}${cr.skill ? ':' + cr.skill : cr.ability ? ':' + cr.ability : ''})` : ''} — was ${original.result} (superseded), now ${result.result}${rerollBonus ? ` + ${rerollBonus} = ${rerollTotal}` : ''}. ${budget.current - 1}/${budget.max} rerolls left.`
@@ -514,8 +515,8 @@ async function handlePoolCheck(args: z.infer<typeof PoolCheckSchema>, sessionId?
     if (poolSize === 0) {
         return { error: true, actionType: 'roll_pool_check', message: 'Pool composed to 0 dice — pass dots as numbers or resolvable stat keys (chance die rules ride a later wave)', composition, writes: 'none' };
     }
-    const freshSeed = args.seed ?? new Date().toISOString();
-    const engine = new DiceEngine(freshSeed);
+    const poolSeed = args.seed ?? freshSeed('pool');
+    const engine = new DiceEngine(poolSeed);
     const result = engine.roll(`${poolSize}d10`);
     const dice: number[] = ((result.metadata as { rolls?: number[] } | undefined)?.rolls ?? []);
     const tens = dice.filter(d => d === 10).length;
@@ -527,7 +528,7 @@ async function handlePoolCheck(args: z.infer<typeof PoolCheckSchema>, sessionId?
     if (botch) successes = 0;
 
     const calculation: StoredCalculation = {
-        id: randomUUID(), sessionId, ...result, seed: freshSeed,
+        id: randomUUID(), sessionId, ...result, seed: poolSeed,
         metadata: { ...(result.metadata as object ?? {}), storyteller: { difficulty: args.difficulty, successes, botch } }
     } as StoredCalculation;
     repo.create(calculation);
@@ -548,7 +549,7 @@ async function handlePoolCheck(args: z.infer<typeof PoolCheckSchema>, sessionId?
         botch,
         specialty: args.specialty || undefined,
         willpowerAuto: args.willpowerAuto || undefined,
-        seed: freshSeed,
+        seed: poolSeed,
         calculationId: calculation.id,
         message: botch
             ? `${args.poolLabel ?? 'Pool'} ${poolSize}d10 vs ${args.difficulty}: BOTCH (${ones} one${ones > 1 ? 's' : ''}, zero successes)`

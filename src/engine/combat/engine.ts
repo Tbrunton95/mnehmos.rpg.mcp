@@ -83,6 +83,8 @@ export interface CombatParticipant {
  */
 export interface CombatState {
     participants: CombatParticipant[];
+    /** RNG stream position (CombatRNG.snapshot), refreshed by getState() and persisted with the encounter. */
+    rngState?: object;
     turnOrder: string[]; // IDs in initiative order (may include 'LAIR' for lair actions)
     currentTurnIndex: number;
     round: number;
@@ -388,15 +390,25 @@ export class CombatEngine {
     /**
      * Get the current state
      */
+    /** A bare d20 on the encounter's seeded stream, for saves handlers roll. */
+    rollD20(): number {
+        return this.rng.d20(0);
+    }
+
     getState(): CombatState | null {
+        // Every save goes through a getState() taken after the rolls, so the
+        // stored RNG position is current.
+        if (this.state) this.state.rngState = this.rng.snapshot();
         return this.state;
     }
 
     /**
-     * Load an existing combat state
+     * Load an existing combat state. A saved RNG position resumes the stream;
+     * without one (older rows) the constructor's seed is used.
      */
     loadState(state: CombatState): void {
         this.state = state;
+        if (state.rngState) this.rng = new CombatRNG('', state.rngState);
     }
 
     /**
@@ -884,8 +896,8 @@ export class CombatEngine {
             participant.deathSaveFailures = 0;
         }
 
-        // Roll the d20
-        const roll = Math.floor(Math.random() * 20) + 1;
+        // Roll the d20 on the encounter's seeded stream (recorded, replayable)
+        const roll = this.rng.d20(0);
         const isNat20 = roll === 20;
         const isNat1 = roll === 1;
         const success = roll >= 10;

@@ -23,6 +23,7 @@ import {
     ActorType
 } from '../../schema/improvisation.js';
 import { loadAutoMechanics, autoSkillBonus, applyDeclaredEffects } from '../../engine/effects-resolver.js';
+import { freshSeed } from '../../math/seed.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -342,7 +343,7 @@ function normalizeMechanics<T extends { type: string }>(mechanics: T[] | undefin
 
 async function handleStunt(args: z.infer<typeof StuntSchema>): Promise<object> {
     const { db, charRepo } = ensureDb();
-    const seed = `stunt-${args.encounterId || 'free'}-${args.actorId}-${Date.now()}`;
+    const seed = freshSeed(`stunt-${args.encounterId || 'free'}-${args.actorId}`);
     const rng = seedrandom(seed);
 
     // Validate every damage target before rolling or mutating any target. This
@@ -779,7 +780,7 @@ async function handleAdvanceDurations(args: z.infer<typeof AdvanceDurationsSchem
 
 async function handleSynthesize(args: z.infer<typeof SynthesizeSchema>): Promise<object> {
     const { db, charRepo } = ensureDb();
-    const seed = `synthesis-${args.casterId}-${Date.now()}`;
+    const seed = freshSeed(`synthesis-${args.casterId}`);
     const rng = seedrandom(seed);
 
     let spellcastingModifier = 0;
