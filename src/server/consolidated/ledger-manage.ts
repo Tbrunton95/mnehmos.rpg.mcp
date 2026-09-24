@@ -11,6 +11,7 @@ import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { RichFormatter } from '../utils/formatter.js';
 import { getDb } from '../../storage/index.js';
+import { loadRule } from '../../engine/table-rules.js';
 import { SessionContext } from '../types.js';
 
 const ACTIONS = ['create', 'get', 'list', 'process_due', 'settle', 'default', 'update', 'delete'] as const;
@@ -22,7 +23,7 @@ const LedgerInputSchema = z.object({
     debtor: z.string().optional().describe("create: who owes ('Marcus', a character id, a crew name)"),
     creditor: z.string().optional().describe("create: who is owed ('Kenny', 'the connect')"),
     amount: z.number().optional().describe('create/update/settle: principal. settle with a partial amount reduces; reaching 0 settles'),
-    currency: z.string().optional().describe("create: display currency ('$', 'RU', 'crowns'). Default '$'"),
+    currency: z.string().optional().describe("create: display currency ('$', 'RU', 'Thrones'). Default: the world lexicon's currency, else '$'"),
     dueDay: z.number().optional().describe('create/update: in-fiction day it comes due'),
     graceDays: z.number().optional().describe('create/update: days past due before due → lapsed. Default 0 (lapses the day after due)'),
     consequence: z.string().optional().describe("create/update: what lapsing/defaulting MEANS ('Kenny sends the cousins'). Register B — reported at the transition, run by the GM"),
@@ -59,6 +60,11 @@ function render(r: DebtRow) {
     };
 }
 
+/** '$' and other symbols lead; a word follows: '$5', '5 Thrones'. */
+function money(amount: number, currency: string): string {
+    return currency.length <= 2 ? `${currency}${amount}` : `${amount} ${currency}`;
+}
+
 async function route(args: unknown): Promise<Record<string, unknown>> {
     const input = LedgerInputSchema.parse(args);
     const db = ldb();
@@ -73,12 +79,14 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
                 return { error: true, message: 'create needs debtor, creditor, amount' };
             }
             const id = randomUUID();
+            // No currency given: the world lexicon's, else '$'.
+            const currency = input.currency ?? loadRule(db, input.worldId, 'lexicon')?.spec.currency ?? '$';
             db.prepare(`INSERT INTO ledger_debts (id, world_id, debtor, creditor, amount, currency, due_day, grace_days, status, consequence, note, created_at, updated_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`)
-                .run(id, input.worldId, input.debtor, input.creditor, input.amount, input.currency ?? '$', input.dueDay ?? null, input.graceDays ?? 0, input.consequence ?? null, input.note ?? null, now, now);
+                .run(id, input.worldId, input.debtor, input.creditor, input.amount, currency, input.dueDay ?? null, input.graceDays ?? 0, input.consequence ?? null, input.note ?? null, now, now);
             return {
                 success: true, actionType: 'create', ledgerId: id,
-                message: `${input.debtor} owes ${input.creditor} ${input.currency ?? '$'}${input.amount}${input.dueDay !== undefined ? `, due Day ${input.dueDay}` : ' (no due date — pressure is narrative)'}${input.consequence ? `. Lapse means: ${input.consequence}` : ''}`
+                message: `${input.debtor} owes ${input.creditor} ${money(input.amount, currency)}${input.dueDay !== undefined ? `, due Day ${input.dueDay}` : ' (no due date — pressure is narrative)'}${input.consequence ? `. Lapse means: ${input.consequence}` : ''}`
             };
         }
         case 'get': {
@@ -95,7 +103,7 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
             return {
                 success: true, actionType: 'list', count: rows.length,
                 openExposure: exposure, debts: rows.map(render),
-                message: `${rows.length} debt(s)${open.length ? ` — open exposure ${open[0]?.currency ?? '$'}${exposure}` : ''}`
+                message: `${rows.length} debt(s)${open.length ? ` — open exposure ${money(exposure, open[0]?.currency ?? '$')}` : ''}`
             };
         }
         case 'process_due': case 'tick': {

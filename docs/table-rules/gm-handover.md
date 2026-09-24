@@ -22,7 +22,8 @@ The table rules (the Day 366 reset) are loaded into the world. Most are enforced
     2. `character_manage list {worldId}`. Tag any 40k character missing from it with `character_manage update {characterId, worldId}`.
     3. Propose a band for each named combatant (Mortal, Elite Mortal, Astartes, Astartes Elite, Monster/Lord, Primarch-class) in a table. Since his apotheosis Luciel is Monster/Lord, and Greater Daemons and other Princes are his peers; keep Primarch-class for the likes of Angron. A peer is the same band or higher, so only a peer's hits flag CONSEQUENCE DUE and only a peer can be struck at a joint. Put raw strength in the numbers, not the band. Wait for the player to confirm, then write them with `character_manage update {characterId, band}`.
     4. Ask which pool the tiny status block shows, then `table_rules define {worldId, kind: 'status_block', name: 'tiny-status', spec: {corePool: '<pool>'}}`. A warning in the reply means no character carries that pool.
-    5. The preset's `character-fantasy` principle still calls Luciel Astartes-scale. Rewrite it for the world with `table_rules define {worldId, kind: 'principle', name: 'character-fantasy', spec: {text}}`, in words the player approves.
+    5. The import also sets the world's lexicon: money reads as Thrones and the status block header as `+++`. Change either with `table_rules define {worldId, kind: 'lexicon', name: 'lexicon', spec: {currency, badge}}`.
+    6. The preset's `character-fantasy` principle still calls Luciel Astartes-scale. Rewrite it for the world with `table_rules define {worldId, kind: 'principle', name: 'character-fantasy', spec: {text}}`, in words the player approves.
 5. **Pick up where the story left off.** The journal entries and open threads in the boot packet are the recap. Open with a short "previously", then the scene.
 
 Every later session is step 3, then play.

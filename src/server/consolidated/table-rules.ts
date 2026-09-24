@@ -174,6 +174,7 @@ Kinds:
 - prepared_asset {catastrophicMargin, missOptions, hitEffect, catastrophicEffect}: combat_action attack preparedAsset: <rule name> reports the tier (miss / hit / catastrophic); the GM names the effect.
 - progression {mode: 'milestone'}: add_xp stops offering level-ups.
 - status_block {compact, maxConditions, corePool}: tiny status blocks; corePool names the one resource pool shown (any case).
+- lexicon {currency, badge, questFailLine}: the world's words for fixed labels (currency on the gold field, the status block's header badge, the quest-failed line). Without one a world reads RU, ПДА and "The Zone doesn't wait."
 - principle {text}: reference text shown at session boot, never enforced.
 import {worldId, preset: 'day-366'} loads the Day 366 table rules. worldId REQUIRED on every call.`,
     inputSchema: TableRulesInputSchema,

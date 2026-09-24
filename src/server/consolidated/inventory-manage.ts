@@ -12,6 +12,7 @@ import { journalSnapshot } from '../utils/write-journal.js';
 import { INVENTORY_LIMITS } from '../../schema/inventory.js';
 import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
+import { characterLexicon } from '../../engine/table-rules.js';
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 import * as pda from '../../render/pda.js';
@@ -431,14 +432,16 @@ const definitions: Record<InventoryAction, ActionDefinition> = {
             }
             const updated = inventoryRepo.addCurrency(params.characterId, { gold: amount });
             updated.gold = Math.round(updated.gold * 100) / 100;
+            const label = characterLexicon(getDb(), params.characterId).currency;
             return {
                 success: true,
                 actionType: 'add_currency',
                 characterId: params.characterId,
                 delta: amount,
                 balance: updated.gold,
+                currencyLabel: label,
                 reason: params.reason,
-                message: `${amount >= 0 ? 'Credited' : 'Debited'} ${Math.abs(amount)}${params.reason ? ` (${params.reason})` : ''} — balance ${updated.gold}`
+                message: `${amount >= 0 ? 'Credited' : 'Debited'} ${Math.abs(amount)} ${label}${params.reason ? ` (${params.reason})` : ''} — balance ${updated.gold} ${label}`
             };
         },
         aliases: ['credit', 'debit', 'pay', 'currency']
@@ -877,6 +880,7 @@ const definitions: Record<InventoryAction, ActionDefinition> = {
                 gold: inventory.currency.gold,
                 silver: inventory.currency.silver,
                 copper: inventory.currency.copper,
+                currencyLabel: characterLexicon(getDb(), params.characterId).currency,
                 itemCount: inventory.items.length
             };
         },
@@ -1271,7 +1275,7 @@ Aliases: add→give, take→remove, trade→transfer, consume→use, wield→equ
         slot: z.enum(['mainhand', 'offhand', 'armor', 'head', 'feet', 'accessory']).optional().describe('Equipment slot (for equip)'),
         // FINDINGS #33 (mirror law, 5th strike): amount/reason were never in the
         // outer — direct add_currency was broken since wave 10; only batch worked.
-        amount: z.number().optional().describe('RU delta for add_currency: positive credits, negative debits'),
+        amount: z.number().optional().describe('Currency delta for add_currency (the world lexicon names it): positive credits, negative debits'),
         reason: z.string().optional().describe('Audit-trail reason for add_currency'),
         // FINDINGS #57 (mirror law, same edit as the inner): attach/detach params
         attachmentItemId: z.string().optional().describe('Attachment template id (attach)'),
@@ -1385,7 +1389,7 @@ export async function handleInventoryManage(args: unknown, _ctx: SessionContext)
                 ...(parsed.totalWeight !== undefined && {
                     'Weight': `${parsed.totalWeight}/${parsed.capacity} lbs`
                 }),
-                ...(parsed.gold !== undefined && { 'RU': parsed.gold }),
+                ...(parsed.gold !== undefined && { [parsed.currencyLabel ?? 'RU']: parsed.gold }),
                 'Items': parsed.itemCount || 0
             });
             if (parsed.inventory?.length) {
