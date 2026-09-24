@@ -136,9 +136,11 @@ export function configureDbPath(path: string): void {
 
 /**
  * Get the configured or default database path (for logging/debugging).
+ * Given a path, returns what useSingleUserDatabase(path) would open, without
+ * opening (and so creating) it.
  */
-export function getDbPath(): string {
-    return resolveDbPath();
+export function getDbPath(path?: string): string {
+    return resolveDbPath(path);
 }
 
 /**

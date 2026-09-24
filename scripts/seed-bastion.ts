@@ -47,10 +47,12 @@
  * RPG_MCP_DB_PATH, else $RPG_DATA_DIR/rpg.db, else the platform app-data
  * default — Windows %APPDATA%\rpg-mcp\rpg.db, macOS ~/Library/Application
  * Support/rpg-mcp/rpg.db, Linux $XDG_DATA_HOME (or ~/.local/share)/rpg-mcp/rpg.db.
- * The resolved path is logged before anything is written.
+ * That file must already exist and hold the Sebastopyr world. If it does not
+ * exist the script stops without creating it; if the world is missing it
+ * stops before seeding. The resolved path is logged before anything is seeded.
  */
 
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -59,7 +61,7 @@ import { handleNarrativeManage } from '../src/server/consolidated/narrative-mana
 import { handleCreate as handleCharacterCreate } from '../src/server/consolidated/character-manage.js';
 import { handleCreate as handleAgentCreate, handleAddSecret as handleAgentAddSecret } from '../src/server/consolidated/agent-manage.js';
 import type { SessionContext } from '../src/server/types.js';
-import { getDb, useSingleUserDatabase } from '../src/storage/index.js';
+import { getDb, getDbPath, useSingleUserDatabase } from '../src/storage/index.js';
 import { CharacterRepository } from '../src/storage/repos/character.repo.js';
 import { NpcMemoryRepository, type Familiarity, type Disposition, type Importance } from '../src/storage/repos/npc-memory.repo.js';
 
@@ -1523,7 +1525,20 @@ async function main(): Promise<void> {
     // which file was meant. This is the single-user selection the server's
     // local transports make (src/server/index.ts), so the path resolves the
     // same way; it also runs migrations.
-    const db = useSingleUserDatabase(dbPathArg());
+    //
+    // Opening creates a missing file, so check first. A new file cannot hold
+    // the world this seeder adds to, and the one the fallback creates,
+    // <RPG_DATA_DIR or app-data>/rpg.db, is a legacy name the HTTP server's
+    // assertNoLegacyDatabase() refuses to boot beside.
+    const requested = dbPathArg();
+    const target = getDbPath(requested);
+    if (!existsSync(target)) {
+        throw new Error(
+            `No database at ${target}. None was created and nothing was seeded. ` +
+            `Select the database that holds world ${SEBASTOPYR_WORLD_ID} (Sebastopyr) with --db-path or RPG_MCP_DB_PATH.`
+        );
+    }
+    const db = useSingleUserDatabase(requested);
     log(`Database: ${db.name}`);
 
     // This seeder only adds to the existing world, so its absence means the
