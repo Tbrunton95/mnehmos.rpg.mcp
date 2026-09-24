@@ -36,6 +36,8 @@
  *   npm run seed:bastion -- --db-path /path/to/rpg.db
  * which is shorthand for:
  *   node --loader ts-node/esm scripts/seed-bastion.ts --db-path /path/to/rpg.db
+ * --db-path=/path/to/rpg.db works too. Through npm the "--" is required;
+ * without it npm keeps the flag for itself and the script refuses to run.
  *
  * The package is "type": "module" and imports name .ts sources by their .js
  * specifiers, which only ts-node's ESM loader resolves; `ts-node` and
@@ -1497,18 +1499,31 @@ async function seedNestedNarrativeSeeds(boot: Bootstrap, worldId: string): Promi
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * The --db-path value, or undefined when the flag is absent (the storage layer
- * then falls back to RPG_MCP_DB_PATH, RPG_DATA_DIR, then the app-data default).
- * A flag with no value is refused rather than ignored: silently falling back
- * would seed whatever database the environment happens to point at.
+ * The --db-path value (`--db-path X` or `--db-path=X`), or undefined when the
+ * flag is absent (the storage layer then falls back to RPG_MCP_DB_PATH,
+ * RPG_DATA_DIR, then the app-data default). Anything else on the command line
+ * is refused rather than ignored: silently falling back would seed whatever
+ * database the environment happens to point at.
  */
 function dbPathArg(): string | undefined {
+    // `npm run seed:bastion --db-path X` (no `--`) keeps the flag for npm, which
+    // exports it as npm_config_db_path and hands the script only `X`, or
+    // nothing at all for the `=` form.
+    if (process.env.npm_config_db_path !== undefined) {
+        throw new Error('npm took --db-path for itself. Put it after "--": npm run seed:bastion -- --db-path /path/to/rpg.db');
+    }
     const args = process.argv.slice(2);
-    const index = args.indexOf('--db-path');
-    if (index === -1) return undefined;
-    const value = args[index + 1];
-    if (!value || value.startsWith('--')) {
-        throw new Error('--db-path needs a value, e.g. --db-path /path/to/rpg.db');
+    let value: string | undefined;
+    for (let i = 0; i < args.length; i++) {
+        let next: string | undefined;
+        if (args[i] === '--db-path') next = args[++i];
+        else if (args[i].startsWith('--db-path=')) next = args[i].slice('--db-path='.length);
+        else throw new Error(`Unexpected argument "${args[i]}". The only option is --db-path /path/to/rpg.db`);
+        if (!next || next.startsWith('--')) {
+            throw new Error('--db-path needs a value, e.g. --db-path /path/to/rpg.db');
+        }
+        if (value !== undefined) throw new Error('--db-path was given more than once.');
+        value = next;
     }
     return value;
 }
