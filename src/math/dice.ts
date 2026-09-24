@@ -2,6 +2,9 @@ import seedrandom from 'seedrandom';
 import { DiceExpression, CalculationResult } from './schemas.js';
 
 export class DiceEngine {
+    /** Backstop for one die's explosion chain; parse() already refuses d1!. */
+    static readonly MAX_EXPLOSIONS = 100;
+
     private rng: seedrandom.PRNG;
     private seed: string;
 
@@ -24,6 +27,10 @@ export class DiceEngine {
         const modifierCount = match[4] ? parseInt(match[4], 10) : 0;
         const modifier = match[5] ? parseInt(match[5], 10) : 0;
         const explode = !!match[6];
+        if (explode && sides < 2) {
+            // A d1 always rolls its maximum, so it would explode forever.
+            throw new Error(`Invalid dice expression: ${expression} — exploding dice need at least 2 sides`);
+        }
 
         const result: DiceExpression = {
             count,
@@ -113,7 +120,8 @@ export class DiceEngine {
             if (expr.explode && roll === expr.sides) {
                 // Explode!
                 let exploded = roll;
-                while (exploded === expr.sides) {
+                let explosions = 0;
+                while (exploded === expr.sides && explosions++ < DiceEngine.MAX_EXPLOSIONS) {
                     exploded = Math.floor(this.rng() * expr.sides) + 1;
                     rolls.push(exploded);
                 }
