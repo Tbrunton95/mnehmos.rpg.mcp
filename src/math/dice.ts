@@ -1,5 +1,6 @@
 import seedrandom from 'seedrandom';
 import { DiceExpression, CalculationResult } from './schemas.js';
+import { freshSeed } from './seed.js';
 
 export class DiceEngine {
     /** Backstop for one die's explosion chain; parse() already refuses d1!. */
@@ -9,7 +10,7 @@ export class DiceEngine {
     private seed: string;
 
     constructor(seed?: string) {
-        this.seed = seed || new Date().toISOString();
+        this.seed = seed || freshSeed('dice');
         this.rng = seedrandom(this.seed);
     }
 

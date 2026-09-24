@@ -34,6 +34,8 @@ export interface CombatParticipant {
     movementRemaining?: number;   // Remaining movement this turn (in feet)
     size?: SizeCategory;          // Creature size for footprint calculation
     hasDashed?: boolean;          // Whether dash action was used this turn
+    isDodging?: boolean;          // Dodge: attacks against it roll at disadvantage until its next turn
+    helpedBy?: string;            // Help: advantage on its next attack, granted by this participant
     // HIGH-002: Damage modifiers
     resistances?: string[];    // Damage types that deal half damage
     vulnerabilities?: string[]; // Damage types that deal double damage
@@ -75,6 +77,7 @@ export interface CombatParticipant {
      */
     ac?: number;
     attackDamage?: string;     // Default attack damage (e.g., "1d6+2")
+    attackDamageType?: string; // Damage type of the default attack (resistances on opportunity attacks)
     attackBonus?: number;      // Default attack bonus used if none provided
 }
 
@@ -83,6 +86,8 @@ export interface CombatParticipant {
  */
 export interface CombatState {
     participants: CombatParticipant[];
+    /** RNG stream position (CombatRNG.snapshot), refreshed by getState() and persisted with the encounter. */
+    rngState?: object;
     turnOrder: string[]; // IDs in initiative order (may include 'LAIR' for lair actions)
     currentTurnIndex: number;
     round: number;
@@ -388,15 +393,25 @@ export class CombatEngine {
     /**
      * Get the current state
      */
+    /** A bare d20 on the encounter's seeded stream, for saves handlers roll. */
+    rollD20(): number {
+        return this.rng.d20(0);
+    }
+
     getState(): CombatState | null {
+        // Every save goes through a getState() taken after the rolls, so the
+        // stored RNG position is current.
+        if (this.state) this.state.rngState = this.rng.snapshot();
         return this.state;
     }
 
     /**
-     * Load an existing combat state
+     * Load an existing combat state. A saved RNG position resumes the stream;
+     * without one (older rows) the constructor's seed is used.
      */
     loadState(state: CombatState): void {
         this.state = state;
+        if (state.rngState) this.rng = new CombatRNG('', state.rngState);
     }
 
     /**
@@ -564,7 +579,7 @@ export class CombatEngine {
     /**
      * HIGH-002: Calculate damage after applying resistance/vulnerability/immunity
      */
-    private calculateDamageWithModifiers(
+    calculateDamageWithModifiers(
         baseDamage: number,
         damageType: string | undefined,
         target: CombatParticipant
@@ -594,6 +609,25 @@ export class CombatEngine {
     }
 
     /**
+     * Roll an attack's damage. 5e crit: a dice expression rolls its dice twice
+     * and counts the modifier once; a plain number has no dice and lands as
+     * given, crit or not.
+     */
+    private rollAttackDamage(damage: number | string, crit: boolean): { total: number; rolls?: number[]; breakdown: string } {
+        if (typeof damage !== 'string') return { total: damage, breakdown: '' };
+        const first = this.rng.rollDamageDetailed(damage);
+        let diceTotal = first.diceTotal;
+        let rolls = first.rolls;
+        if (crit) {
+            const extra = this.rng.rollDamageDetailed(damage);
+            diceTotal += extra.diceTotal;
+            rolls = [...rolls, ...extra.rolls];
+        }
+        const mod = first.modifier;
+        return { total: diceTotal + mod, rolls, breakdown: ` (${rolls.join('+')}${mod >= 0 ? '+' + mod : mod})` };
+    }
+
+    /**
      * Execute an attack with full transparency
      * Returns detailed breakdown of what happened
      */
@@ -611,7 +645,11 @@ export class CombatEngine {
         // (spec ruling pending Tom's ratification; matches 5e dice-double law),
         // and resistance sees the true total.
         flatDamageBonus?: number,
-        flatDamageLabel?: string
+        flatDamageLabel?: string,
+        // An attack the GM resolved at the table: no d20 is rolled, so no
+        // natural 1 or 20 can override it, and a posted damage number lands
+        // exactly as posted (field report: a nat 20 doubled a posted 111).
+        resolved?: 'hit' | 'crit' | 'miss'
     ): CombatActionResult {
         if (!this.state) throw new Error('No active combat');
 
@@ -623,9 +661,29 @@ export class CombatEngine {
 
         const hpBefore = target.hp;
 
+        // Dodge and Help feed the roll. Help is spent by the attack even when
+        // the GM posts the result.
+        const situational: string[] = [];
+        if (target.isDodging) { disadvantage = true; situational.push(`${target.name} is dodging (disadvantage)`); }
+        if (actor.helpedBy) {
+            advantage = true;
+            const helper = this.state.participants.find(p => p.id === actor.helpedBy);
+            situational.push(`helped by ${helper?.name ?? actor.helpedBy} (advantage)`);
+            actor.helpedBy = undefined;
+        }
+
         // Roll with full transparency — 5e semantics (Findings #32):
         // crit reads the natural die, never the margin.
-        const attackRoll = this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage);
+        const attackRoll: CheckResult & { allRolls: number[]; resolved?: 'hit' | 'crit' | 'miss' } = resolved
+            ? {
+                roll: undefined as unknown as number, modifier: 0, total: undefined as unknown as number,
+                dc: undefined as unknown as number, margin: 0,
+                degree: resolved === 'crit' ? 'critical-success' : resolved === 'hit' ? 'success' : 'failure',
+                isNat20: false, isNat1: false,
+                isHit: resolved !== 'miss', isCrit: resolved === 'crit',
+                allRolls: [], resolved
+            }
+            : this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage);
 
         let damageDealt = 0;
         let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
@@ -634,24 +692,15 @@ export class CombatEngine {
         let baseDamageVal = 0;
         let damageBreakdownStr = '';
 
-        let capturedDamageRolls: number[] | undefined;
-        if (typeof damage === 'string') {
-            const dmgResult = this.rng.rollDamageDetailed(damage);
-            baseDamageVal = dmgResult.total;
-            capturedDamageRolls = dmgResult.rolls;
-            damageBreakdownStr = ` (${dmgResult.rolls.join('+')}${dmgResult.modifier >= 0 ? '+' + dmgResult.modifier : dmgResult.modifier})`;
-        } else {
-            baseDamageVal = damage;
-        }
+        const rolled = this.rollAttackDamage(damage, attackRoll.isHit && attackRoll.isCrit);
+        baseDamageVal = rolled.total;
+        const capturedDamageRolls = rolled.rolls;
+        damageBreakdownStr = rolled.breakdown;
 
         if (attackRoll.isHit) {
-            // Critical Hit: Double the dice (approx. double the value for now if passing number)
-            // If string was passed, we ideally double the DICE, but for now double the total is consistent with current impl.
-            // TODO(medium): Implement proper crit rules (double dice) using rollDamageDetailed
-            const critBase = attackRoll.isCrit ? baseDamageVal * 2 : baseDamageVal;
             // FINDINGS #70: the damage lane lands here — outside the crit
             // doubling, inside the resistance math.
-            const finalBaseDamage = critBase + (flatDamageBonus ?? 0);
+            const finalBaseDamage = baseDamageVal + (flatDamageBonus ?? 0);
             
             // HIGH-002: Apply resistance/vulnerability/immunity
             const modResult = this.calculateDamageWithModifiers(finalBaseDamage, damageType, target);
@@ -666,7 +715,9 @@ export class CombatEngine {
         const diceShown = attackRoll.allRolls.length > 1
             ? `d20(${attackRoll.allRolls.join(',')}${advantage ? ' adv' : ' dis'}→${attackRoll.roll})`
             : `d20(${attackRoll.roll})`;
-        let breakdown = `🎲 Attack Roll: ${diceShown} + ${attackBonus} = ${attackRoll.total} vs AC ${dc}\n`;
+        let breakdown = resolved
+            ? `🎲 Attack: resolved externally by the GM (${resolved.toUpperCase()})\n`
+            : `🎲 Attack Roll: ${diceShown} + ${attackBonus} = ${attackRoll.total} vs AC ${dc}\n`;
 
         if (attackRoll.isNat20) {
             breakdown += `   ⭐ NATURAL 20!\n`;
@@ -696,6 +747,8 @@ export class CombatEngine {
                 breakdown += ` [DEFEATED]`;
             }
         }
+
+        if (situational.length) breakdown += `\n   ⚖️ ${situational.join('; ')}`;
 
         // Build simple message
         let message = '';
@@ -884,8 +937,8 @@ export class CombatEngine {
             participant.deathSaveFailures = 0;
         }
 
-        // Roll the d20
-        const roll = Math.floor(Math.random() * 20) + 1;
+        // Roll the d20 on the encounter's seeded stream (recorded, replayable)
+        const roll = this.rng.d20(0);
         const isNat20 = roll === 20;
         const isNat1 = roll === 1;
         const success = roll >= 10;
@@ -1060,6 +1113,12 @@ export class CombatEngine {
      * HIGH-003: Reset reaction and disengage status at start of turn
      */
     private resetTurnResources(participant: CombatParticipant): void {
+        // Dodge lasts until the dodger's next turn; unused Help lapses when
+        // the helper's next turn starts.
+        participant.isDodging = false;
+        for (const p of this.state?.participants ?? []) {
+            if (p.helpedBy === participant.id) p.helpedBy = undefined;
+        }
         participant.reactionUsed = false;
         participant.hasDisengaged = false;
         participant.hasDashed = false;
@@ -1067,6 +1126,39 @@ export class CombatEngine {
         participant.bonusActionUsed = false;
         participant.spellsCast = {};
         participant.movementRemaining = participant.movementSpeed ?? 30;
+    }
+
+    /**
+     * The Dodge action: until the start of its next turn, attacks against the
+     * participant roll at disadvantage. Consumes the main action.
+     */
+    applyDodge(participantId: string): { ok: true } | { ok: false; error: string } {
+        if (!this.state) return { ok: false, error: 'No active combat' };
+        const participant = this.state.participants.find((p) => p.id === participantId);
+        if (!participant) return { ok: false, error: `Participant ${participantId} not found` };
+        const econ = this.validateActionEconomy(participantId, 'action');
+        if (!econ.valid) return { ok: false, error: econ.error || 'Action already used this turn' };
+        participant.isDodging = true;
+        participant.actionUsed = true;
+        return { ok: true };
+    }
+
+    /**
+     * The Help action: the ally's next attack before the helper's next turn
+     * rolls with advantage. Consumes the helper's main action.
+     */
+    applyHelp(helperId: string, allyId: string): { ok: true } | { ok: false; error: string } {
+        if (!this.state) return { ok: false, error: 'No active combat' };
+        const helper = this.state.participants.find((p) => p.id === helperId);
+        if (!helper) return { ok: false, error: `Participant ${helperId} not found` };
+        const ally = this.state.participants.find((p) => p.id === allyId);
+        if (!ally) return { ok: false, error: `Participant ${allyId} not found` };
+        if (helperId === allyId) return { ok: false, error: 'A participant cannot Help itself' };
+        const econ = this.validateActionEconomy(helperId, 'action');
+        if (!econ.valid) return { ok: false, error: econ.error || 'Action already used this turn' };
+        ally.helpedBy = helperId;
+        helper.actionUsed = true;
+        return { ok: true };
     }
 
     /**
@@ -1435,20 +1527,28 @@ export class CombatEngine {
         // Mark reaction as used
         attacker.reactionUsed = true;
 
-        // Simple attack calculation: use initiative bonus as attack modifier
-        // AC approximation: 10 + initiative bonus (simple heuristic)
-        const attackBonus = attacker.initiativeBonus + 2; // Add a small bonus
-        const targetAC = 10 + (target.initiativeBonus > 0 ? Math.floor(target.initiativeBonus / 2) : 0);
-
-        // Fixed damage for opportunity attacks: 1d6 + 2
-        const baseDamage = this.rng.roll('1d6') + 2;
+        // The attacker's own default attack and the target's AC, falling back
+        // to ability scores, then to the old heuristics for bare tokens.
+        const mod = (score?: number) => Math.floor(((score ?? 10) - 10) / 2);
+        const attackBonus = attacker.attackBonus
+            ?? (attacker.abilityScores
+                ? Math.max(mod(attacker.abilityScores.strength), mod(attacker.abilityScores.dexterity)) + 2
+                : attacker.initiativeBonus + 2);
+        const targetAC = target.ac
+            ?? (target.abilityScores ? 10 + mod(target.abilityScores.dexterity)
+                : 10 + (target.initiativeBonus > 0 ? Math.floor(target.initiativeBonus / 2) : 0));
 
         const hpBefore = target.hp;
-        const attackRoll = this.rng.checkDegreeDetailed(attackBonus, targetAC);
+        // 5e: crit on the natural 20 only, never on the margin.
+        const attackRoll = this.rng.rollAttackD20(attackBonus, targetAC);
 
         let damageDealt = 0;
+        let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
         if (attackRoll.isHit) {
-            damageDealt = attackRoll.isCrit ? baseDamage * 2 : baseDamage;
+            const rolled = this.rollAttackDamage(attacker.attackDamage ?? '1d6+2', attackRoll.isCrit);
+            const modResult = this.calculateDamageWithModifiers(rolled.total, attacker.attackDamageType, target);
+            damageDealt = modResult.finalDamage;
+            damageModifier = modResult.modifier;
             target.hp = Math.max(0, target.hp - damageDealt);
         }
 
@@ -1500,6 +1600,8 @@ export class CombatEngine {
             target: { id: target.id, name: target.name, hpBefore, hpAfter: target.hp, maxHp: target.maxHp },
             attackRoll,
             damage: damageDealt,
+            damageType: attacker.attackDamageType,
+            damageModifier: damageModifier === 'normal' ? undefined : damageModifier,
             success: attackRoll.isHit,
             defeated,
             message,

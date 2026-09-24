@@ -17,7 +17,10 @@ import {
     handleLoadEncounter,
     handleAdvanceTurn,
     handleRollDeathSave,
-    handleExecuteLairAction
+    handleExecuteLairAction,
+    getOrLoadEngine,
+    syncParticipantHpFromDb,
+    saveEncounterState
 } from '../handlers/combat-handlers.js';
 import { expandCreatureTemplate, listAllTemplates } from '../../data/creature-presets.js';
 import { getDomainServices } from '../domain-services.js';
@@ -25,17 +28,19 @@ import { getDb } from '../../storage/index.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { CombatEngine } from '../../engine/combat/engine.js';
 import { ConditionInputSchema } from '../../schema/encounter.js';
+import { normalizeCondition, normalizeConditions } from '../../engine/combat/conditions.js';
 import { getCombatManager } from '../state/combat-manager.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { getAgentRuntime, buildAgentRuntime } from '../../agent/runtime/deps.js';
 import { invokeAgent } from '../../agent/runtime/invoke.js';
 import { ProviderFactory } from '../../agent/provider/factory.js';
+import { freshSeed } from '../../math/seed.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'get_history', 'list'] as const;
+const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'get_history', 'list'] as const;
 type CombatManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -99,7 +104,7 @@ const TerrainSchema = z.preprocess(
 
 const CreateSchema = z.object({
     action: z.literal('create'),
-    seed: z.string().default('combat').describe('Seed for deterministic combat resolution'),
+    seed: z.string().optional().describe('Seed for deterministic combat resolution (omit for a fresh one; the id echoes it)'),
     participants: z.array(ParticipantSchema).min(1),
     terrain: TerrainSchema,
     includeParty: z.boolean().optional().describe('T1.2 (Findings #34): prepend the active party as PC-side participants'),
@@ -127,6 +132,17 @@ const LoadSchema = z.object({
 const AdvanceSchema = z.object({
     action: z.literal('advance'),
     encounterId: z.string().describe('The ID of the encounter')
+});
+
+const AdjustHpSchema = z.object({
+    action: z.literal('adjust_hp'),
+    encounterId: z.string(),
+    participantId: z.string().describe('Participant/token id whose HP to correct'),
+    value: z.number().int().min(0).optional().describe('Set HP to exactly this (clamped to maxHp)'),
+    delta: z.number().int().optional().describe('Shift HP by this amount (negative lowers); clamped to 0..maxHp'),
+    maxHp: z.number().int().min(1).optional().describe('Also set max HP (applied first)'),
+    reason: z.string().min(1).describe('Why — recorded in the combat log and audit'),
+    revive: z.boolean().optional().describe('Required to raise a participant marked dead above 0 HP')
 });
 
 const DeathSaveSchema = z.object({
@@ -170,8 +186,29 @@ const AddParticipantSchema = z.object({
     ac: z.number().int().optional(),
     initiativeBonus: z.number().int().optional(),
     isEnemy: z.boolean().optional().default(false),
-    position: z.object({ x: z.number(), y: z.number() }).optional()
+    position: z.object({ x: z.number(), y: z.number() }).optional(),
+    importRowConditions: z.boolean().optional().describe('Copy the character sheet\'s conditions onto the new token (remove them later with remove_condition)')
 });
+
+const AddConditionSchema = z.object({
+    action: z.literal('add_condition'),
+    encounterId: z.string(),
+    participantId: z.string().describe('Participant/token id'),
+    condition: ConditionInputSchema.describe('A name ("prone") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?}; unknown names are kept as custom conditions'),
+    replace: z.boolean().optional().describe('Drop existing conditions of the same type first'),
+    mirrorToCharacter: z.boolean().optional().describe('Also add it to the character sheet (upsert by name)'),
+    reason: z.string().optional().describe('Why — recorded in the combat log')
+});
+
+const RemoveConditionSchema = z.object({
+    action: z.literal('remove_condition'),
+    encounterId: z.string(),
+    participantId: z.string().describe('Participant/token id'),
+    conditionId: z.string().optional().describe('Remove this one condition instance'),
+    name: z.string().optional().describe('Remove every condition of this name/type (case-insensitive)'),
+    mirrorToCharacter: z.boolean().optional().describe('Also remove it from the character sheet'),
+    reason: z.string().optional().describe('Why — recorded in the combat log')
+}).refine(p => Boolean(p.conditionId || p.name), { message: 'Pass conditionId or name', path: ['name'] });
 
 const GetHistorySchema = z.object({
     action: z.literal('get_history'),
@@ -310,6 +347,32 @@ function stageGateCheck(characterId: string): string | null {
         }
     } catch { /* character unreadable — no gate, downstream lookup will refuse */ }
     return null;
+}
+
+/**
+ * One-way, explicit mirror of an encounter condition change onto the character
+ * sheet ({name, duration?, source?}; names match case-insensitively). Returns
+ * false when the participant has no character row.
+ */
+function mirrorConditionToRow(characterId: string, op: 'add' | 'remove', name: string, duration?: number, source?: string): boolean {
+    const repo = new CharacterRepository(getDb());
+    const row = repo.findById(characterId);
+    if (!row) return false;
+    const key = name.toLowerCase();
+    const others = (row.conditions ?? []).filter((c: { name: string }) => c.name.toLowerCase() !== key);
+    const next = op === 'add'
+        ? [...others, { name, ...(duration !== undefined ? { duration } : {}), ...(source !== undefined ? { source } : {}) }]
+        : others;
+    repo.update(characterId, { conditions: next } as never);
+    return true;
+}
+
+function logConditionChange(encounterId: string, state: { round: number; currentTurnIndex: number }, actionType: string, targetId: string, summary: string, reason?: string): void {
+    getDomainServices().combatActionLog.log({
+        encounterId, round: state.round, turnIndex: state.currentTurnIndex,
+        actorId: 'GM', actorName: 'GM', actionType,
+        targetIds: [targetId], resultSummary: summary, resultDetail: reason
+    });
 }
 
 const definitions: Record<CombatManageAction, ActionDefinition> = {
@@ -694,7 +757,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     if (!existing.has(pp.id as string)) participants.unshift(pp as typeof participants[number]);
                 }
             }
-            const seed = params.seed || `quick-${Date.now()}`;
+            const seed = params.seed || freshSeed('quick');
             const createParams = {
                 seed,
                 participants,
@@ -755,12 +818,11 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     ac: params.ac ?? row.ac,
                     initiativeBonus: params.initiativeBonus ?? Math.floor(((stats?.dex ?? 10) - 10) / 2),
                     isEnemy: params.isEnemy ?? false,
-                    // Sheet conditions stay off the engine token: nothing syncs
-                    // conditions between character rows and a live encounter,
-                    // and no tool removes an engine condition, so a copied
-                    // durationless condition would stick for the whole fight.
-                    // Pass conditions explicitly on create until that sync exists.
-                    conditions: [],
+                    // Sheet conditions join only on request: rows and tokens are
+                    // not synced (engine conditions expire by turn and save; row
+                    // durations never tick). Imported ones come off with
+                    // remove_condition like any other.
+                    conditions: params.importRowConditions ? normalizeConditions(row.conditions, row.id) : [],
                     position: params.position ?? { x: 0, y: 0 },
                     resistances: (row as { resistances?: string[] }).resistances || [],
                     vulnerabilities: (row as { vulnerabilities?: string[] }).vulnerabilities || [],
@@ -835,6 +897,131 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         aliases: ['flee', 'banish', 'despawn'],
         description: '#67-D: Remove a participant from a running encounter (fled/banished/despawned) — turn pointer re-anchored, state persisted. The dead don\'t use this; they drop at 0 HP'
     },
+    adjust_hp: {
+        schema: AdjustHpSchema,
+        handler: async (params: z.infer<typeof AdjustHpSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'adjust_hp', message, writes: 'none' });
+            if (params.value !== undefined && params.delta !== undefined) return refuse('Pass value (set) or delta (shift), not both');
+            if (params.value === undefined && params.delta === undefined && params.maxHp === undefined) return refuse('Pass value, delta or maxHp');
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            // Read character_manage edits first so this write can't clobber them.
+            syncParticipantHpFromDb(state);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+
+            const before = p.hp;
+            const maxBefore = p.maxHp;
+            if (params.maxHp !== undefined) p.maxHp = params.maxHp;
+            const wanted = params.value ?? (params.delta !== undefined ? before + params.delta : before);
+            const after = Math.max(0, Math.min(p.maxHp, wanted));
+            if (p.isDead && after > 0 && !params.revive) {
+                p.maxHp = maxBefore;
+                return refuse(`${p.name} is dead — pass revive: true to bring them back`);
+            }
+            // Bookkeeping, not damage: crossing 0 in either direction starts the
+            // death-save track fresh; it never adds failures.
+            if ((before <= 0) !== (after <= 0)) {
+                p.deathSaveSuccesses = 0;
+                p.deathSaveFailures = 0;
+                p.isStabilized = false;
+            }
+            if (params.revive && after > 0) p.isDead = false;
+            p.hp = after;
+
+            saveEncounterState(new EncounterRepository(getDb()), params.encounterId, state);
+            getDomainServices().combatActionLog.log({
+                encounterId: params.encounterId,
+                round: state.round,
+                turnIndex: state.currentTurnIndex,
+                actorId: 'GM',
+                actorName: 'GM',
+                actionType: 'adjust_hp',
+                targetIds: [p.id],
+                resultSummary: `GM correction: ${p.name} HP ${before} → ${after}${p.maxHp !== maxBefore ? ` (max ${maxBefore} → ${p.maxHp})` : ''} — ${params.reason}`,
+                resultDetail: params.reason,
+                hpChanges: { [p.id]: { before, after } }
+            });
+            return {
+                success: true, actionType: 'adjust_hp', encounterId: params.encounterId,
+                participantId: p.id, name: p.name,
+                before, after, maxHp: p.maxHp,
+                mode: params.value !== undefined ? 'set' : params.delta !== undefined ? 'delta' : 'max_only',
+                clamped: after !== wanted,
+                defeated: after <= 0,
+                deathSaves: { successes: p.deathSaveSuccesses ?? 0, failures: p.deathSaveFailures ?? 0 },
+                reason: params.reason,
+                message: `${p.name}: HP ${before} → ${after}/${p.maxHp} (GM correction: ${params.reason})`
+            };
+        },
+        aliases: ['set_hp', 'fix_hp', 'correct_hp', 'hp_correction'],
+        description: 'GM HP correction on the encounter sheet — set (value) or shift (delta), required reason, logged as a correction (no damage/healing totals). Writes through to the character row; crossing 0 resets death saves; the dead need revive:true'
+    },
+    add_condition: {
+        schema: AddConditionSchema,
+        handler: async (params: z.infer<typeof AddConditionSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'add_condition', message, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            const normalized = normalizeCondition(params.condition, p.id);
+            if (!normalized) return refuse('Condition needs a name');
+            let replaced = 0;
+            if (params.replace) {
+                const before = p.conditions.length;
+                p.conditions = p.conditions.filter(c => c.type.toLowerCase() !== normalized.type.toLowerCase());
+                replaced = before - p.conditions.length;
+            }
+            const { id: _drop, ...rest } = normalized;
+            void _drop;
+            const applied = engine.applyCondition(p.id, rest);
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            const mirrored = params.mirrorToCharacter ? mirrorConditionToRow(p.id, 'add', applied.type, normalized.duration, normalized.sourceId) : false;
+            logConditionChange(params.encounterId, state, 'add_condition', p.id, `${p.name} gains ${applied.type}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
+            return {
+                success: true, actionType: 'add_condition', encounterId: params.encounterId,
+                participantId: p.id, condition: applied, replaced, mirroredToCharacter: mirrored,
+                conditions: p.conditions.map(c => c.type),
+                message: `${p.name}: +${applied.type}${replaced ? ` (replaced ${replaced})` : ''}`
+            };
+        },
+        aliases: ['apply_condition', 'inflict', 'condition'],
+        description: 'Add a condition to a live encounter participant (name or {name, duration, durationType, save...}); optional mirror to the character sheet'
+    },
+    remove_condition: {
+        schema: RemoveConditionSchema,
+        handler: async (params: z.infer<typeof RemoveConditionSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'remove_condition', message, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            const wanted = params.name?.trim().toLowerCase();
+            const gone = p.conditions.filter(c => params.conditionId ? c.id === params.conditionId : c.type.toLowerCase() === wanted);
+            if (gone.length === 0) {
+                return refuse(`${p.name} has no ${params.conditionId ? `condition ${params.conditionId}` : `"${params.name}"`} — current: ${p.conditions.map(c => c.type).join(', ') || 'none'}`);
+            }
+            p.conditions = p.conditions.filter(c => !gone.includes(c));
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            const mirrored = params.mirrorToCharacter ? mirrorConditionToRow(p.id, 'remove', gone[0].type) : false;
+            logConditionChange(params.encounterId, state, 'remove_condition', p.id, `${p.name} loses ${gone.map(c => c.type).join(', ')}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
+            return {
+                success: true, actionType: 'remove_condition', encounterId: params.encounterId,
+                participantId: p.id, removed: gone.length, removedConditions: gone, mirroredToCharacter: mirrored,
+                conditions: p.conditions.map(c => c.type),
+                message: `${p.name}: -${gone.map(c => c.type).join(', ')}`
+            };
+        },
+        aliases: ['clear_condition', 'cure', 'end_condition'],
+        description: 'Remove a condition from a live encounter participant by id or name (case-insensitive); optional mirror to the character sheet'
+    },
     get_history: {
         schema: GetHistorySchema,
         handler: async (params: z.infer<typeof GetHistorySchema>) => {
@@ -873,6 +1060,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     summary: a.resultSummary,
                     damage: a.damageDealt,
                     healing: a.healingDone,
+                    hpChanges: a.hpChanges,
                     timestamp: a.timestamp
                 })),
                 summary,
@@ -1038,7 +1226,16 @@ For CORPSES after combat, use corpse_manage tool.`,
         maxHp: z.number().optional().describe('Participant max HP (add_participant)'),
         ac: z.number().optional().describe('Participant AC (add_participant)'),
         initiativeBonus: z.number().optional().describe('Initiative bonus (add_participant)'),
-        participantId: z.string().optional().describe('#67-D remove_participant: participant/token id to remove'),
+        participantId: z.string().optional().describe('remove_participant / adjust_hp: participant/token id'),
+        value: z.number().optional().describe('adjust_hp: set HP to exactly this'),
+        delta: z.number().optional().describe('adjust_hp: shift HP by this amount'),
+        reason: z.string().optional().describe('adjust_hp (required) / add_condition / remove_condition: why — logged'),
+        condition: z.any().optional().describe('add_condition: a name ("prone") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?}'),
+        conditionId: z.string().optional().describe('remove_condition: one condition instance id'),
+        replace: z.boolean().optional().describe('add_condition: drop existing conditions of the same type first'),
+        mirrorToCharacter: z.boolean().optional().describe('add_condition / remove_condition: also edit the character sheet'),
+        importRowConditions: z.boolean().optional().describe('add_participant: copy the sheet\'s conditions onto the new token'),
+        revive: z.boolean().optional().describe('adjust_hp: allow raising a dead participant'),
         isEnemy: z.boolean().optional().describe('Hostile flag (add_participant)'),
         xpAward: z.number().optional().describe('XP credited on end'),
         xpRecipients: z.array(z.string()).optional().describe('XP recipient character IDs'),
@@ -1146,6 +1343,13 @@ export async function handleCombatManage(args: unknown, ctx: SessionContext): Pr
                     break;
                 case 'lair_action':
                     output = RichFormatter.header('Lair Action', '🏰');
+                    break;
+                case 'adjust_hp':
+                    output = RichFormatter.header('HP Correction', '🩹');
+                    break;
+                case 'add_condition':
+                case 'remove_condition':
+                    output = RichFormatter.header('Condition', '🩸');
                     break;
                 default:
                     output = RichFormatter.header('Combat', '⚔️');

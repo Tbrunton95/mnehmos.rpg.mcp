@@ -9,7 +9,9 @@ import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/a
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 import * as pda from '../../render/pda.js';
-import { handleExecuteCombatAction } from '../handlers/combat-handlers.js';
+import { handleExecuteCombatAction, getOrLoadEngine } from '../handlers/combat-handlers.js';
+import { normalizeCondition } from '../../engine/combat/conditions.js';
+import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { getCombatManager } from '../state/combat-manager.js';
 import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
@@ -46,6 +48,7 @@ const AttackSchema = z.object({
     dc: z.number().int().optional(),
     damage: z.union([z.number(), z.string()]).optional(),
     damageType: z.string().optional(),
+    outcome: z.enum(['hit', 'crit', 'miss']).optional().describe('A result the GM resolved at the table. The engine rolls no d20 (no nat 1/20 override) and applies damage exactly as posted: a number is never doubled; a dice string with crit doubles its dice only. Resistances, HP write-through and concentration still apply. hit/crit need damage.'),
     advantage: z.boolean().optional(),
     disadvantage: z.boolean().optional(),
     declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('FINDINGS #34 T4.18: Register-B audit trail — declared conditional traits/cover. Values are ALREADY included in attackBonus by the GM; this array only prints them in the breakdown'),
@@ -181,6 +184,7 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                 dc: params.dc,
                 damage: params.damage,
                 damageType: params.damageType,
+                outcome: params.outcome,
                 advantage: params.advantage,
                 disadvantage: params.disadvantage,
                 declaredModifiers,
@@ -353,6 +357,9 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                     message: result.error
                 };
             }
+            // Save it: a reload used to lose the doubled movement and the spent action.
+            const dashState = engine.getState();
+            if (dashState) getDomainServices().encounter.saveState(params.encounterId, dashState);
             return {
                 success: true,
                 actionType: 'dash',
@@ -369,7 +376,14 @@ const definitions: Record<CombatAction, ActionDefinition> = {
         schema: DodgeSchema,
         handler: async (params: z.infer<typeof DodgeSchema>, ctx?: SessionContext) => {
             if (!ctx) throw new Error('No session context');
-            // Dodge grants advantage on DEX saves, attackers have disadvantage
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            if (!engine) return { error: true, actionType: 'dodge', message: `Encounter ${params.encounterId} not found.` };
+            const applied = engine.applyDodge(params.actorId);
+            if (!applied.ok) return { error: true, actionType: 'dodge', actorId: params.actorId, message: applied.error };
+            const dodgeState = engine.getState();
+            if (dodgeState) new EncounterRepository(getDb()).saveState(params.encounterId, dodgeState);
+            // Attack disadvantage is applied by the engine; the DEX-save
+            // advantage is on the GM, since saves are rolled outside it.
             return {
                 success: true,
                 actionType: 'dodge',
@@ -385,13 +399,20 @@ const definitions: Record<CombatAction, ActionDefinition> = {
         schema: HelpSchema,
         handler: async (params: z.infer<typeof HelpSchema>, ctx?: SessionContext) => {
             if (!ctx) throw new Error('No session context');
-            // Help grants advantage to an ally's next attack/check
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            if (!engine) return { error: true, actionType: 'help', message: `Encounter ${params.encounterId} not found.` };
+            const applied = engine.applyHelp(params.actorId, params.targetId);
+            if (!applied.ok) return { error: true, actionType: 'help', actorId: params.actorId, message: applied.error };
+            const helpState = engine.getState();
+            if (helpState) new EncounterRepository(getDb()).saveState(params.encounterId, helpState);
+            // The engine applies the advantage to the ally's next attack; an
+            // ability check it helps is on the GM.
             return {
                 success: true,
                 actionType: 'help',
                 actorId: params.actorId,
                 targetId: params.targetId,
-                effect: `${params.targetId} gains advantage on their next attack roll or ability check.`,
+                effect: `${params.targetId} gains advantage on its next attack roll before ${params.actorId}'s next turn (applied by the engine), or on one ability check (GM).`,
                 message: `${params.actorId} helps ${params.targetId}.`
             };
         },
@@ -480,7 +501,7 @@ Validates spell, rolls damage, applies effects, handles saves - all automatic.
 
 💚 SUPPORT:
 - heal - Restore HP to a target
-- help - Grant advantage to an ally
+- help - The ally's next attack before your next turn rolls with advantage (engine-applied)
 
 🏃 MOVEMENT:
 - move - Move to a position (use available movement)
@@ -488,14 +509,14 @@ Validates spell, rolls damage, applies effects, handles saves - all automatic.
 - disengage - Move without provoking opportunity attacks
 
 🛡️ DEFENSIVE:
-- dodge - Disadvantage on attacks against you, advantage on DEX saves
+- dodge - Attacks against you roll at disadvantage until your next turn (engine-applied; DEX-save advantage is on the GM)
 - ready - Prepare an action with a trigger
 
 Aliases: hit/strike→attack, cast/spell→cast_spell, sprint→dash, evade→dodge.
 
 🤼 GRAPPLE (FINDINGS #99 — unarmed vocabulary):
 { action: "grapple", encounterId, actorId, targetId, move: clinch|takedown|throw|slam|control|break, surface? }
-Internal opposed check (Athletics vs better of Athletics/Acrobatics). Win writes conditions to the character row (clinch→Clinched, takedown/slam→Prone+Grappled, throw→Prone, control→Restrained, break→clears holds on the ACTOR). throw/slam ROLL surface damage (earth d4 / concrete-wall-table d6 / edge-glass d8, margin ≥5 adds a die) and RETURN it — apply via your damage lane; the encounter sheet owns mid-combat HP.`,
+Internal opposed check (Athletics vs better of Athletics/Acrobatics). Win writes conditions to the character row, and to the live encounter tokens when encounterId is given (clinch→Clinched, takedown/slam→Prone+Grappled, throw→Prone, control→Restrained, break→clears holds on the ACTOR). throw/slam ROLL surface damage (earth d4 / concrete-wall-table d6 / edge-glass d8, margin ≥5 adds a die) and RETURN it — apply via your damage lane; the encounter sheet owns mid-combat HP.`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
@@ -505,6 +526,7 @@ Internal opposed check (Athletics vs better of Athletics/Acrobatics). Win writes
         targetIds: z.array(z.string()).optional().describe('Multiple targets (AoE spells)'),
         targetPosition: z.object({ x: z.number(), y: z.number() }).optional().describe('Target position (move, dash)'),
         attackBonus: z.number().optional().describe('Attack bonus modifier'),
+        outcome: z.enum(['hit', 'crit', 'miss']).optional().describe('attack (mirror): A result the GM resolved at the table. The engine rolls no d20 (no nat 1/20 override) and applies damage exactly as posted: a number is never doubled; a dice string with crit doubles its dice only. Resistances, HP write-through and concentration still apply. hit/crit need damage.'),
         ammoItemId: z.string().optional().describe('FINDINGS #58 (mirror): ammo template id — dry refuses the shot; decrements after the engine resolves'),
         hand: z.enum(['mainhand', 'offhand']).optional().describe('FINDINGS #96-C (mirror): which weapon the attack resolves with — its coating surfaces and debits (default mainhand)'),
         ammoCount: z.number().optional().describe('FINDINGS #58 (mirror): magazines expended (default 1)'),
@@ -634,7 +656,7 @@ function grappleResolve(args: Record<string, unknown>): Record<string, unknown> 
         success: true, actionType: 'grapple', move, hit: true, breakdown, margin,
         ...(applied.length ? { conditionsApplied: applied, onto: target.name } : {}),
         ...(removed.length ? { conditionsRemoved: removed, from: actor.name } : {}),
-        ...(surfaceDamage !== undefined ? { surfaceDamage, damageDetail, applyNote: 'surface damage is ROLLED, not applied — feed it to your damage lane (e.g. attack {damage: N} on the prone target, or the GM adjust verb). The encounter sheet owns mid-combat HP.' } : {}),
+        ...(surfaceDamage !== undefined ? { surfaceDamage, damageDetail, applyNote: 'surface damage is ROLLED, not applied — post it with attack {outcome: \"hit\", damage: N} on the target (no engine d20, no crit doubling), or combat_manage adjust_hp. The encounter sheet owns mid-combat HP.' } : {}),
         message: move === 'break'
             ? `${actor.name} breaks the hold — ${GRAPPLE_CONDITIONS.join('/')} cleared. ${breakdown}`
             : `${actor.name} lands the ${move} on ${target.name}${applied.length ? ` — ${applied.join(' + ')}` : ''}${surfaceDamage !== undefined ? `, ${surfaceDamage} surface damage (${damageDetail})` : ''}. ${breakdown}`
@@ -652,6 +674,30 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
     const actName = String(a?.action ?? '').toLowerCase();
     if (actName === 'grapple' || actName === 'clinch' || actName === 'takedown' || actName === 'slam' || actName === 'break_grapple') {
         const result = grappleResolve(a);
+        // With an encounterId the hold lands on the live tokens too, not only
+        // the character sheets, so the engine's mechanics see Prone/Grappled.
+        if (!result.error && typeof a.encounterId === 'string' && a.encounterId && (result.conditionsApplied || result.conditionsRemoved)) {
+            const engine = getOrLoadEngine(ctx, a.encounterId);
+            const state = engine?.getState();
+            if (engine && state) {
+                const onto = String(a.targetId ?? ''), from = String(a.actorId ?? '');
+                const src = `grapple: ${String(a.actorId ?? '')}`;
+                for (const name of (result.conditionsApplied as string[] | undefined) ?? []) {
+                    const tok = state.participants.find(p => p.id === onto);
+                    const c = tok && normalizeCondition({ name, source: src }, tok.id);
+                    if (tok && c) {
+                        tok.conditions = tok.conditions.filter(x => x.type.toLowerCase() !== c.type.toLowerCase());
+                        const { id: _id, ...rest } = c; void _id;
+                        engine.applyCondition(tok.id, rest);
+                    }
+                }
+                const drop = new Set(((result.conditionsRemoved as string[] | undefined) ?? []).map(n => n.toLowerCase()));
+                const actorTok = state.participants.find(p => p.id === from);
+                if (actorTok && drop.size) actorTok.conditions = actorTok.conditions.filter(x => !drop.has(x.type.toLowerCase()));
+                new EncounterRepository(getDb()).saveState(a.encounterId, state);
+                result.encounterTokensUpdated = true;
+            }
+        }
         let out = result.error ? RichFormatter.error(String(result.message)) : RichFormatter.header(`Grapple — ${String(result.move)}`, '🤼') + RichFormatter.alert(String(result.message), 'info');
         out += RichFormatter.embedJson(result, 'COMBAT_ACTION');
         return { content: [{ type: 'text', text: out }] };

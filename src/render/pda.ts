@@ -420,6 +420,8 @@ export interface ContactInput {
     damageModifier?: 'immune' | 'resistant' | 'vulnerable';
     jamCheckOwed?: { weapon?: string; condition?: number; jamsOn?: string };
     hpBefore?: number; hpAfter?: number; defeated?: boolean;
+    /** The GM resolved the attack at the table; the engine rolled no d20. */
+    resolved?: 'hit' | 'crit' | 'miss';
 }
 export function renderContact(c: ContactInput): string {
     const g = G();
@@ -427,17 +429,24 @@ export function renderContact(c: ContactInput): string {
     // and the natural 1; the bold line keeps HIT/MISS so the verdict stays
     // whole when the token is the crit lane.
     const margin = (typeof c.total === 'number' && typeof c.targetAc === 'number') ? c.total - c.targetAc : undefined;
-    const summary = `ATTACK ${g.sep} ${callsign(c.actorName ?? '???')} ${plain() ? '->' : '→'} ${callsign(c.targetName ?? '???')} ${g.sep} ${c.total ?? '?'} vs AC ${c.targetAc ?? '?'}${margin !== undefined ? ` ${g.sep} by ${margin >= 0 ? '+' : ''}${margin}` : ''}`;
+    const summary = c.resolved
+        ? `ATTACK ${g.sep} ${callsign(c.actorName ?? '???')} ${plain() ? '->' : '→'} ${callsign(c.targetName ?? '???')} ${g.sep} GM RESULT`
+        : `ATTACK ${g.sep} ${callsign(c.actorName ?? '???')} ${plain() ? '->' : '→'} ${callsign(c.targetName ?? '???')} ${g.sep} ${c.total ?? '?'} vs AC ${c.targetAc ?? '?'}${margin !== undefined ? ` ${g.sep} by ${margin >= 0 ? '+' : ''}${margin}` : ''}`;
     const token = c.crit ? '⚡ CRITICAL' : c.die === 1 ? '💀 FUMBLE' : c.hit ? `${g.pass} HIT` : `${g.fail} MISS`;
     const head = outcomeHead(token, (c.crit || c.die === 1) ? `${summary} ${g.sep} ${c.hit ? 'HIT' : 'MISS'}` : summary, c.hit ? 'good' : 'bad');
     const rows: Cell[][] = [];
     const sign = (c.bonus ?? 0) >= 0 ? '+' : '';
-    rows.push([
-        V(callsign(c.actorName ?? '???')), L(' → '), V(callsign(c.targetName ?? '???')),
-        L('   d20['), V(c.die ?? '?'), L('] '), V(`${sign}${c.bonus ?? 0}`), L(' → '), V(c.total ?? '?'),
-        L('   AC '), V(c.targetAc ?? '?'), L('   '),
-        V(c.hit ? `${g.pass} HIT` : `${g.fail} MISS`)
-    ]);
+    rows.push(c.resolved
+        ? [
+            V(callsign(c.actorName ?? '???')), L(' → '), V(callsign(c.targetName ?? '???')),
+            L('   GM RESULT '), V(c.resolved.toUpperCase()), L('   no engine d20')
+        ]
+        : [
+            V(callsign(c.actorName ?? '???')), L(' → '), V(callsign(c.targetName ?? '???')),
+            L('   d20['), V(c.die ?? '?'), L('] '), V(`${sign}${c.bonus ?? 0}`), L(' → '), V(c.total ?? '?'),
+            L('   AC '), V(c.targetAc ?? '?'), L('   '),
+            V(c.hit ? `${g.pass} HIT` : `${g.fail} MISS`)
+        ]);
     if (c.crit) rows.push([V(`${g.nat20} CRIT`)]);
     if (c.die === 1) rows.push([V(`${g.nat1} NAT 1`)]);
     if (c.jamCheckOwed)

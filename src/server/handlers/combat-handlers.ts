@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { loadAutoMechanics, autoAttackBonus, autoAcBonus, autoDamageBonus, applyDeclaredEffects } from '../../engine/effects-resolver.js';
 import * as pda from '../../render/pda.js';
 import { randomUUID } from 'crypto';
+import { freshSeed } from '../../math/seed.js';
 import { CombatEngine, CombatParticipant, CombatState, CombatActionResult } from '../../engine/combat/engine.js';
 import { normalizeConditions } from '../../engine/combat/conditions.js';
 import { ConditionInputSchema } from '../../schema/encounter.js';
@@ -44,7 +45,7 @@ export function setCombatPubSub(instance: PubSub) {
  * This implements "database is source of truth" - if character_manage
  * updated HP, we show that value in combat display.
  */
-function syncParticipantHpFromDb(state: CombatState): CombatState {
+export function syncParticipantHpFromDb(state: CombatState): CombatState {
     const db = getDb();
     const charRepo = new CharacterRepository(db);
 
@@ -95,9 +96,26 @@ function persistParticipantHpToDb(state: CombatState): void {
  * call syncParticipantHpFromDb first, so an HP change made through
  * character_manage between calls is read before this writes memory back.
  */
-function saveEncounterState(repo: EncounterRepository, encounterId: string, state: CombatState): void {
+export function saveEncounterState(repo: EncounterRepository, encounterId: string, state: CombatState): void {
     persistParticipantHpToDb(state);
     repo.saveState(encounterId, state);
+}
+
+/**
+ * The encounter's live engine: from process memory, or rehydrated from the
+ * database (after a restart or eviction) and registered. null when the
+ * encounter exists in neither.
+ */
+export function getOrLoadEngine(ctx: SessionContext, encounterId: string): CombatEngine | null {
+    const key = `${ctx.sessionId}:${encounterId}`;
+    const live = getCombatManager().get(key);
+    if (live) return live;
+    const persisted = new EncounterRepository(getDb()).loadState(encounterId);
+    if (!persisted) return null;
+    const engine = new CombatEngine(encounterId, pubsub || undefined);
+    engine.loadState(persisted);
+    getCombatManager().create(key, engine);
+    return engine;
 }
 
 // ============================================================
@@ -243,6 +261,7 @@ function formatAttackResult(result: CombatActionResult): string {
         actorName: result.actor?.name,
         targetName: result.target?.name,
         die: ar?.roll,
+        resolved: (ar as { resolved?: 'hit' | 'crit' | 'miss' } | undefined)?.resolved,
         allRolls: ar?.allRolls,
         bonus: ar?.modifier,
         total: ar?.total,
@@ -296,6 +315,7 @@ function formatSpellCastResult(
         attackRoll?: number;
         attackTotal?: number;
         hit?: boolean;
+        critical?: boolean;
     },
     target: { name: string; hp: number; maxHp: number } | undefined,
     targetHpBefore: number
@@ -307,7 +327,7 @@ function formatSpellCastResult(
 
     // Attack Roll details
     if (resolution.attackRoll !== undefined) {
-        const hitStr = resolution.hit ? 'HIT' : 'MISS';
+        const hitStr = resolution.critical ? 'CRITICAL HIT' : resolution.hit ? 'HIT' : resolution.attackRoll === 1 ? 'MISS (natural 1)' : 'MISS';
         const bonus = (resolution.attackTotal || 0) - resolution.attackRoll;
         const sign = bonus >= 0 ? '+' : '';
         output += `⚔️ Attack Roll: ${resolution.attackRoll} (d20) ${sign}${bonus} = ${resolution.attackTotal} → ${hitStr}\n`;
@@ -620,7 +640,7 @@ Example (use real UUID from context for player character!):
   ]
 }`,
         inputSchema: z.object({
-            seed: z.string().default('combat').describe('Seed for deterministic combat resolution'),
+            seed: z.string().optional().describe('Seed for deterministic combat resolution (omit for a fresh one; the id echoes it)'),
             participants: z.array(z.object({
                 id: z.string(),
                 name: z.string(),
@@ -711,6 +731,7 @@ Examples:
             attackBonus: z.number().int().optional(),
             dc: z.number().int().optional(),
             damage: z.union([z.number(), z.string()]).optional().describe('Damage amount (number) or dice expression (e.g., "1d6+2")'),
+            outcome: z.enum(['hit', 'crit', 'miss']).optional().describe('A result the GM resolved at the table. The engine rolls no d20 (no nat 1/20 override) and applies damage exactly as posted: a number is never doubled; a dice string with crit doubles its dice only. Resistances, HP write-through and concentration still apply. hit/crit need damage.'),
             advantage: z.boolean().optional().describe('Roll 2d20 keep highest (Findings #31/#32)'),
             disadvantage: z.boolean().optional().describe('Roll 2d20 keep lowest'),
             declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit trail: printed in output, never re-applied'),
@@ -1109,9 +1130,12 @@ MAZE WITH ROOMS:
 // Tool handlers
 export async function handleCreateEncounter(args: unknown, ctx: SessionContext) {
     const parsed = CombatTools.CREATE_ENCOUNTER.inputSchema.parse(args);
+    // An omitted seed used to default to the fixed string 'combat', so every
+    // unseeded encounter rolled the same initiative and attack dice.
+    const seed = parsed.seed ?? freshSeed('combat');
 
     // Create combat engine
-    const engine = new CombatEngine(parsed.seed, pubsub || undefined);
+    const engine = new CombatEngine(seed, pubsub || undefined);
 
     // Convert participants to proper format (preserve isEnemy, position, and resistances)
     const participants: CombatParticipant[] = parsed.participants.map(p => {
@@ -1195,7 +1219,9 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
     }
 
     // Generate encounter ID
-    const encounterId = `encounter-${parsed.seed}-${Date.now()}`;
+    // The random suffix keeps two creates with one seed in the same millisecond
+    // (a batch) from colliding on id.
+    const encounterId = `encounter-${seed}-${Date.now()}-${randomUUID().slice(0, 8)}`;
     // Store with session namespace
     getCombatManager().create(`${ctx.sessionId}:${encounterId}`, engine);
 
@@ -1382,6 +1408,18 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         let attackBonus = parsed.attackBonus;
         let dc = parsed.dc;
         let damage: number | string | undefined = parsed.damage;
+        // A GM-resolved attack (outcome) skips every auto-fill below: no d20 is
+        // rolled, so attack bonus and AC are unused, and the posted damage is
+        // the total (0 means 0; no trait damage lane is added on top).
+        const outcome = parsed.outcome;
+        if (outcome && outcome !== 'miss' && damage === undefined) {
+            throw new Error(`outcome '${outcome}' needs the damage you rolled (a number, or dice to roll)`);
+        }
+        if (outcome) {
+            attackBonus = attackBonus ?? 0;
+            dc = dc ?? 0;
+            damage = damage ?? 0;
+        }
 
         const currentState = engine.getState();
         const actor = currentState?.participants.find(p => p.id === parsed.actorId);
@@ -1444,7 +1482,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         }
 
         // 2. Target AC (DC)
-        if (dc === undefined || dc === 0) {
+        if (!outcome && (dc === undefined || dc === 0)) {
             if (target?.ac !== undefined) {
                 dc = target.ac;
             } else {
@@ -1462,10 +1500,10 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             }
         }
         const targetMechs = parsed.targetId ? loadAutoMechanics(resolverDb, parsed.targetId) : [];
-        dc += autoAcBonus(targetMechs, autoApplied);
+        dc = (dc ?? 0) + autoAcBonus(targetMechs, autoApplied);
 
         // 3. Damage - auto-calculate from multiple sources
-        if (damage === undefined || damage === 0) {
+        if (!outcome && (damage === undefined || damage === 0)) {
             // First: try preset on participant
             if (actor?.attackDamage) {
                 damage = actor.attackDamage;
@@ -1500,9 +1538,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // Value sources: fixed, valueFromPool, valueFromProficiency (#70 —
         // Odinets scales with level; hard-coding +2 kills it silently at L5).
         // Applied AFTER crit doubling, BEFORE resistance, inside executeAttack.
-        let damageLaneBonus = autoDamageBonus(actorMechs, autoApplied);
+        let damageLaneBonus = outcome ? 0 : autoDamageBonus(actorMechs, autoApplied);
         let damageLaneProblems: string[] = [];
-        if (declaredEffectRefs.length) {
+        if (!outcome && declaredEffectRefs.length) {
             const ddres = applyDeclaredEffects(resolverDb, parsed.actorId, declaredEffectRefs, 'damage_bonus', autoApplied);
             damageLaneBonus += ddres.total;
             damageLaneProblems = ddres.problems;
@@ -1540,7 +1578,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             parsed.advantage,
             parsed.disadvantage,
             damageLaneBonus || undefined,  // FINDINGS #70: resolver damage lane
-            damageLaneLabel
+            damageLaneLabel,
+            outcome
         );
 
         // Sync HP to character database after attack
@@ -1987,6 +2026,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             saveTotal?: number;
             saved?: boolean;
             damageDealt?: number;
+            damageModifier?: 'immune' | 'resistant' | 'vulnerable' | 'normal';
         }[] = [];
         const damageType = resolution.damageType || 'force';
 
@@ -2047,6 +2087,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     }
                 }
 
+                // Resistance, immunity and vulnerability apply after the save.
+                const typed = engine.calculateDamageWithModifiers(damageDealt, damageType, targetParticipant);
+                damageDealt = typed.finalDamage;
+                const damageModifier = typed.modifier;
+
                 // Apply damage via engine's applyDamage (direct HP reduction)
                 if (damageDealt > 0) {
                     engine.applyDamage(tid, damageDealt);
@@ -2075,7 +2120,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     saveRoll,
                     saveTotal,
                     saved,
-                    damageDealt
+                    damageDealt,
+                    damageModifier
                 });
 
                 // Check concentration if target is concentrating
@@ -2150,6 +2196,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             );
         }
 
+        const modTag = (m?: string) => (m && m !== 'normal' ? ` (${m})` : '');
         // Format output - now includes all targets hit
         if (damageResults.length > 1) {
             // AoE spell output
@@ -2167,9 +2214,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 if (dr.saveRoll !== undefined) {
                     const saveResult = dr.saved ? '✓ PASS' : '✗ FAIL';
                     output += `  • ${dr.name}: d20(${dr.saveRoll}) + ${(dr.saveTotal || 0) - dr.saveRoll} = ${dr.saveTotal} [${saveResult}]\n`;
-                    output += `    → ${dr.damageDealt} dmg | ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
+                    output += `    → ${dr.damageDealt} dmg${modTag(dr.damageModifier)} | ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
                 } else {
-                    output += `  • ${dr.name}: ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
+                    output += `  • ${dr.name}: ${dr.damageDealt} dmg${modTag(dr.damageModifier)} | ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
                 }
             }
         } else if (damageResults.length === 1) {
@@ -2178,8 +2225,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             const only = damageResults[0];
             const shown = requiresSave
                 ? { ...resolution, damage: only.damageDealt ?? baseDamage, saveResult: (only.saved ? 'passed' : 'failed') as 'passed' | 'failed', saveDC: spellSaveDC }
-                : resolution;
+                : { ...resolution, damage: only.damageDealt ?? resolution.damage };
             output = formatSpellCastResult(actor.name, shown, primaryTarget, targetHpBefore);
+            if (only.damageModifier && only.damageModifier !== 'normal') {
+                output += `\n🛡️ ${only.name} is ${only.damageModifier} to ${damageType}\n`;
+            }
         } else {
             output = `\n✨ ${actor.name} casts ${spell.name}!\n`;
             if (resolution.healing && resolution.healing > 0) {
@@ -2188,11 +2238,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         }
         // Save spells report what targets took; with no participant targets
         // (a point-targeted AoE) the full roll is the spell's damage.
-        const reportedDamage = requiresSave
-            ? (damageResults.length > 0
-                ? damageResults.reduce((sum, dr) => sum + (dr.damageDealt ?? 0), 0)
-                : baseDamage)
-            : (resolution.damage || 0);
+        const reportedDamage = damageResults.length > 0
+            ? damageResults.reduce((sum, dr) => sum + (dr.damageDealt ?? 0), 0)
+            : (requiresSave ? baseDamage : (resolution.damage || 0));
         output += `\n[SPELL: ${spell.name}, SLOT: ${effectiveSlotLevel > 0 ? effectiveSlotLevel : 'cantrip'}, DMG: ${reportedDamage}, HEAL: ${resolution.healing || 0}]`;
 
         // Commit Action Economy
@@ -2472,7 +2520,7 @@ export async function handleEndEncounter(args: unknown, ctx: SessionContext) {
     let staleCleared = 0;
     if (finalState) {
         for (const participant of finalState.participants) {
-            staleCleared += getCombatManager().deleteEncountersForCharacter(participant.id);
+            staleCleared += getCombatManager().deleteEncountersForCharacter(participant.id, ctx.sessionId);
         }
     }
 
@@ -2662,8 +2710,8 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
 
             // Handle saving throw if specified
             if (parsed.savingThrow) {
-                // Roll saving throw
-                saveRoll = Math.floor(Math.random() * 20) + 1;
+                // Roll saving throw on the encounter's seeded stream
+                saveRoll = engine.rollD20();
                 const abilityScore = target.abilityScores?.[parsed.savingThrow.ability] ?? 10;
                 const modifier = Math.floor((abilityScore - 10) / 2);
                 saveTotal = saveRoll + modifier;

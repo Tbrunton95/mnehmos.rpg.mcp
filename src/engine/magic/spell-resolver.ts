@@ -89,6 +89,8 @@ export interface SpellResolutionResult {
     attackRoll?: number;
     attackTotal?: number;
     hit?: boolean;
+    /** Natural 20 on a spell attack: the damage dice were rolled twice. */
+    critical?: boolean;
     autoHit?: boolean;
     acBonus?: number; // For Shield
     dartCount?: number; // For Magic Missile
@@ -188,11 +190,23 @@ export function resolveSpell(
                     result.attackTotal = attackRoll + spellAttackBonus;
 
                     const targetAC = options.targetAC ?? 10;
-                    result.hit = result.attackTotal >= targetAC;
+                    // A natural 20 always hits and crits; a natural 1 always misses.
+                    result.critical = attackRoll === 20;
+                    result.hit = attackRoll === 20 || (attackRoll !== 1 && result.attackTotal >= targetAC);
 
                     if (result.hit) {
-                        result.damageApplied = damageRoll.total;
-                        result.damage = damageRoll.total;
+                        let damage = damageRoll.total;
+                        if (result.critical) {
+                            // Roll the dice again; the flat modifier counts once.
+                            const extraDice = diceNotation.trim().replace(/[+-]\d+$/, '');
+                            if (/d/i.test(extraDice)) {
+                                damage += rollDice(extraDice).total;
+                                result.diceRolled = `${diceNotation} (crit: dice doubled)`;
+                            }
+                        }
+                        result.damageRolled = damage;
+                        result.damageApplied = damage;
+                        result.damage = damage;
                     } else {
                         result.damageApplied = 0;
                         result.damage = 0;

@@ -12,10 +12,22 @@ import seedrandom from 'seedrandom';
  * - Pathfinder 2e: Degree-of-success mechanics (in CombatEngine)
  */
 export class CombatRNG {
-    private rng: seedrandom.PRNG;
+    private rng: seedrandom.StatefulPRNG<seedrandom.State.Arc4>;
 
-    constructor(seed: string) {
-        this.rng = seedrandom(seed);
+    /**
+     * @param saved a snapshot() from an earlier RNG. When given, the stream
+     * resumes exactly where it was saved instead of restarting from the seed —
+     * a reloaded encounter must not replay the dice it already rolled.
+     */
+    constructor(seed: string, saved?: object) {
+        this.rng = saved
+            ? seedrandom('', { state: saved as seedrandom.State.Arc4 })
+            : seedrandom(seed, { state: true });
+    }
+
+    /** Current stream position, JSON-safe, for persisting with the encounter. */
+    snapshot(): object {
+        return this.rng.state();
     }
 
     /**
