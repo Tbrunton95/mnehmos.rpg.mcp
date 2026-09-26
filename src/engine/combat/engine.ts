@@ -1680,7 +1680,10 @@ export class CombatEngine {
         if (!participant) return { valid: false, error: 'Participant not found' };
         const of = participant.attacksPerAction ?? 1;
         const made = participant.attacksMade ?? 0;
-        if (made > 0 && made < of) {
+        // The open Attack action ends with its turn: off-turn, the spent
+        // action (actionUsed) refuses the rest, as it would any attack.
+        const ownTurn = this.state.turnOrder[this.state.currentTurnIndex] === participantId;
+        if (made > 0 && made < of && ownTurn) {
             if (!this.canTakeActions(participantId)) return { valid: false, error: 'Participant is incapacitated' };
             return { valid: true };
         }

@@ -91,6 +91,16 @@ describe('multiattack: attacksPerAction', () => {
         expect((await act({ actorId: 'karanak', targetId: 'luciel', using: 'whip' })).text).toMatch(/Action already used/);
     });
 
+    it('the rest of a partial multiattack is not available off its own turn', async () => {
+        await setup();
+        await act({ actorId: 'karanak', targetId: 'luciel', using: 'axe' });
+        await manage({ action: 'advance' });
+        // Luciel's turn now: Karanak's unfinished Attack action ended with its turn.
+        const late = await act({ actorId: 'karanak', targetId: 'luciel', using: 'whip' });
+        expect(late.text).toMatch(/Action already used this turn/);
+        expect(tok('karanak').attacksMade).toBe(1);
+    });
+
     it('the state view shows the attacks used', async () => {
         await setup();
         await act({ actorId: 'karanak', targetId: 'luciel', using: 'axe' });
