@@ -658,6 +658,16 @@ async function handleSpawnEncounter(input: SpawnManageInput, ctx: SessionContext
         createdAt: now,
         updatedAt: now
     });
+    // create validates a hand-listed token map; save the whole engine state
+    // straight after so every participant field (ac, attack, multiattack)
+    // and the RNG position survive an eviction, as combat create does. The
+    // terrain, props and bounds are the ones create just wrote.
+    encounterRepo.saveState(encounterId, {
+        ...engine.getState()!,
+        terrain: encounterData.terrain ? { ...encounterData.terrain, obstacles: encounterData.terrain.obstacles || [] } : { obstacles: [] },
+        props: [],
+        gridBounds: { minX: 0, maxX: 20, minY: 0, maxY: 20 }
+    });
 
     const asciiMap = generateEncounterMap({ state: encounterState }, 20, 20);
 
@@ -1132,6 +1142,11 @@ async function handleSpawnTactical(input: SpawnManageInput, ctx: SessionContext)
         createdAt: now,
         updatedAt: now
     });
+    // create validates a hand-listed token map; save the whole engine state
+    // straight after so every participant field (ac, attack, multiattack)
+    // and the RNG position survive an eviction, as combat create does. The
+    // terrain, props and bounds are the ones create just wrote.
+    encounterRepo.saveState(encounterId, { ...engine.getState()!, terrain, props: [], gridBounds: { minX: 0, maxX: width, minY: 0, maxY: height } });
 
     const asciiMap = generateEncounterMap({ state: encounterState }, width, height);
 

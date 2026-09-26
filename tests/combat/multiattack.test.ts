@@ -153,4 +153,24 @@ describe('multiattack: presets', () => {
         ] }, ctx as any)).content[0].text, 'COMBAT_MANAGE').encounterId;
         expect(tok('o1').attacksPerAction).toBe(2);
     });
+
+    it('spawn_manage encounters keep the statline across an eviction', async () => {
+        closeDb();
+        getDb(':memory:');
+        clearCombatState();
+        const { handleSpawnManage } = await import('../../src/server/consolidated/spawn-manage.js');
+        const { CREATURE_PRESETS } = await import('../../src/data/creature-presets.js');
+        const text = (await handleSpawnManage({
+            action: 'spawn_tactical', participants: [{ template: 'troll', position: '5,5', isEnemy: true }], seed: 'ma-tactical',
+            terrain: { obstacles: ['9,9'] }
+        }, ctx as any)).content[0].text;
+        const id = text.match(/encounter-[\w-]+/)![0];
+        clearCombatState();
+        const troll = getOrLoadEngine(ctx as any, id)!.getState()!.participants.find(p => /troll/i.test(p.name))!;
+        expect(troll.attacksPerAction).toBe(3);
+        expect(troll.ac).toBe(CREATURE_PRESETS.troll.ac);
+        expect(troll.attackDamage).toBe(CREATURE_PRESETS.troll.defaultAttack?.damage);
+        // The terrain create wrote is kept by the follow-up save.
+        expect(new EncounterRepository(getDb()).loadState(id)!.terrain.obstacles).toContain('9,9');
+    });
 });
