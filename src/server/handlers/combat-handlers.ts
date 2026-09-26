@@ -28,6 +28,7 @@ import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { CombatActionLogRepository } from '../../storage/repos/combat-action-log.repo.js';
 import { startConcentration, checkConcentration, breakConcentration } from '../../engine/magic/concentration.js';
+import { rollParticipantSave, toLongAbility, type ParticipantSaveResult } from '../../engine/combat/saves.js';
 import type { Character } from '../../schema/character.js';
 import { getPatternGenerator, PATTERN_DESCRIPTIONS } from '../terrain-patterns.js';
 import { hydrateExtras, matchPreset, type ExtrasRow } from '../../engine/combat/participant-extras.js';
@@ -1674,7 +1675,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 // RESOLVER v1: autoApply saving_throw_bonus (con-filtered) feeds the hold.
                 const conMechs = loadAutoMechanics(getDb(), parsed.targetId);
                 const conBonus = conMechs.filter(m => m.type === 'saving_throw_bonus' && (!m.condition || 'constitution'.includes(m.condition.toLowerCase()) || m.condition.toLowerCase().includes('con'))).reduce((s, m) => s + m.value, 0);
-                const concentrationCheck = checkConcentration(targetChar, result.damage, concentrationRepo, conBonus);
+                const concentrationCheck = checkConcentration(targetChar, result.damage, concentrationRepo, conBonus,
+                    () => engine.rollD20({ purpose: 'concentration', forId: parsed.targetId }));
                 if (concentrationCheck.broken) {
                     // Break concentration
                     breakConcentration(
@@ -2146,6 +2148,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             saved?: boolean;
             damageDealt?: number;
             damageModifier?: 'immune' | 'resistant' | 'vulnerable' | 'normal';
+            save?: ParticipantSaveResult;
         }[] = [];
         const damageType = resolution.damageType || 'force';
 
@@ -2176,26 +2179,17 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 let saveRoll: number | undefined;
                 let saveTotal: number | undefined;
                 let saved = false;
+                let targetSave: ParticipantSaveResult | undefined;
 
-                // Roll saving throw if spell requires it
+                // Roll saving throw if spell requires it: the sheet's ability
+                // modifier and save proficiency, on the encounter's seeded stream.
                 if (requiresSave) {
-                    saveRoll = Math.floor(Math.random() * 20) + 1;
-                    
-                    // Get save modifier from target's ability scores
-                    const abilityMap: Record<string, string> = {
-                        'dexterity': 'dex', 'dex': 'dex',
-                        'constitution': 'con', 'con': 'con',
-                        'wisdom': 'wis', 'wis': 'wis',
-                        'intelligence': 'int', 'int': 'int',
-                        'strength': 'str', 'str': 'str',
-                        'charisma': 'cha', 'cha': 'cha'
-                    };
-                    const abilityKey = abilityMap[saveType!.toLowerCase()] || 'dex';
-                    const abilityScore = targetParticipant.abilityScores?.[abilityKey as keyof typeof targetParticipant.abilityScores] ?? 10;
-                    const saveMod = Math.floor((abilityScore - 10) / 2);
-                    
-                    saveTotal = saveRoll + saveMod;
-                    saved = saveTotal >= spellSaveDC;
+                    targetSave = rollParticipantSave(engine, db, targetParticipant, saveType!, spellSaveDC, {
+                        purpose: `${toLongAbility(saveType!) ?? 'dexterity'} save vs ${spell.name}`
+                    });
+                    saveRoll = targetSave.natural;
+                    saveTotal = targetSave.total;
+                    saved = targetSave.saved;
 
                     if (saved) {
                         if (saveEffect === 'half') {
@@ -2240,13 +2234,15 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     saveTotal,
                     saved,
                     damageDealt,
-                    damageModifier
+                    damageModifier,
+                    save: targetSave
                 });
 
                 // Check concentration if target is concentrating
                 const targetChar = charRepo.findById(tid);
                 if (targetChar && concentrationRepo.isConcentrating(tid) && damageDealt > 0) {
-                    const concentrationCheck = checkConcentration(targetChar, damageDealt, concentrationRepo);
+                    const concentrationCheck = checkConcentration(targetChar, damageDealt, concentrationRepo, 0,
+                        () => engine.rollD20({ purpose: 'concentration', forId: tid }));
                     if (concentrationCheck.broken) {
                         breakConcentration(
                             { characterId: tid, reason: 'damage', damageAmount: damageDealt },
@@ -2333,6 +2329,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 if (dr.saveRoll !== undefined) {
                     const saveResult = dr.saved ? '✓ PASS' : '✗ FAIL';
                     output += `  • ${dr.name}: d20(${dr.saveRoll}) + ${(dr.saveTotal || 0) - dr.saveRoll} = ${dr.saveTotal} [${saveResult}]\n`;
+                    if (dr.save?.legendaryResisted) output += `    ⭐ Legendary resistance spent: the failed save becomes a success\n`;
+                    else if (dr.save?.legendaryResistanceAvailable) output += `    ⭐ Failed with ${dr.save.legendaryResistanceAvailable} legendary resistance(s) left: the GM may spend one\n`;
                     output += `    → ${dr.damageDealt} dmg${modTag(dr.damageModifier)} | ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
                 } else {
                     output += `  • ${dr.name}: ${dr.damageDealt} dmg${modTag(dr.damageModifier)} | ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
@@ -2348,6 +2346,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             output = formatSpellCastResult(actor.name, shown, primaryTarget, targetHpBefore);
             if (only.damageModifier && only.damageModifier !== 'normal') {
                 output += `\n🛡️ ${only.name} is ${only.damageModifier} to ${damageType}\n`;
+            }
+            if (only.save) {
+                output += `\n🎲 ${only.name} ${only.save.ability.toUpperCase()} save: d20(${only.save.rolls.join(',')}) ${only.save.modifier >= 0 ? '+' : '-'} ${Math.abs(only.save.modifier)} = ${only.save.total} vs DC ${spellSaveDC} [${only.save.parts.join(', ')}]\n`;
+                if (only.save.legendaryResisted) output += `⭐ Legendary resistance spent: the failed save becomes a success\n`;
+                else if (only.save.legendaryResistanceAvailable) output += `⭐ Failed with ${only.save.legendaryResistanceAvailable} legendary resistance(s) left: the GM may spend one\n`;
             }
         } else {
             output = `\n✨ ${actor.name} casts ${spell.name}!\n`;
@@ -2385,6 +2388,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             healAmount: resolution.healing,
             detailedBreakdown: output
         };
+        // Per-target saves ride the action JSON so the client sees each die and modifier.
+        const saves = damageResults.filter(dr => dr.save).map(dr => ({ id: dr.id, name: dr.name, ...dr.save! }));
+        if (saves.length) (result as { saves?: unknown }).saves = saves;
     } else {
         throw new Error(`Unknown action: ${parsed.action}`);
     }
@@ -2480,7 +2486,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             volley: (r as { volley?: unknown }).volley,
             situational: r.situational,
             targetUnit: (r as { targetUnit?: unknown }).targetUnit,
-            preparedEffectDue: (r as { preparedEffectDue?: unknown }).preparedEffectDue
+            preparedEffectDue: (r as { preparedEffectDue?: unknown }).preparedEffectDue,
+            saves: (r as { saves?: unknown }).saves
         } : undefined;
         output += `\n\n<!-- STATE_JSON\n${JSON.stringify({ ...stateJson, actionResult })}\nSTATE_JSON -->`;
     }
@@ -2843,15 +2850,20 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
             let saved = false;
             let saveRoll: number | undefined;
             let saveTotal: number | undefined;
+            let saveNote = '';
 
             // Handle saving throw if specified
             if (parsed.savingThrow) {
-                // Roll saving throw on the encounter's seeded stream
-                saveRoll = engine.rollD20({ purpose: `lair save (${parsed.savingThrow.ability})`, forId: targetId });
-                const abilityScore = target.abilityScores?.[parsed.savingThrow.ability] ?? 10;
-                const modifier = Math.floor((abilityScore - 10) / 2);
-                saveTotal = saveRoll + modifier;
-                saved = saveTotal >= parsed.savingThrow.dc;
+                // Roll on the encounter's seeded stream with the sheet's
+                // modifier and save proficiency.
+                const save = rollParticipantSave(engine, getDb(), target, parsed.savingThrow.ability, parsed.savingThrow.dc, {
+                    purpose: `lair save (${parsed.savingThrow.ability})`
+                });
+                saveRoll = save.natural;
+                saveTotal = save.total;
+                saved = save.saved;
+                saveNote = save.legendaryResisted ? ' (legendary resistance)'
+                    : save.legendaryResistanceAvailable ? ` (${save.legendaryResistanceAvailable} legendary resistance(s) left)` : '';
 
                 if (saved && parsed.halfDamageOnSave) {
                     damageTaken = Math.floor(parsed.damage / 2);
@@ -2888,8 +2900,9 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
             output += `🎯 ${target.name}`;
             if (parsed.savingThrow) {
                 const saveAbility = parsed.savingThrow.ability.charAt(0).toUpperCase() + parsed.savingThrow.ability.slice(1);
-                output += ` - ${saveAbility} Save: ${saveRoll} + ${Math.floor(((target.abilityScores?.[parsed.savingThrow.ability] ?? 10) - 10) / 2)} = ${saveTotal} vs DC ${parsed.savingThrow.dc}`;
+                output += ` - ${saveAbility} Save: ${saveRoll} + ${(saveTotal ?? 0) - (saveRoll ?? 0)} = ${saveTotal} vs DC ${parsed.savingThrow.dc}`;
                 output += saved ? ' ✓ SAVED' : ' ✗ FAILED';
+                output += saveNote;
             }
             output += `\n`;
             output += `   Damage: ${damageTaken}${parsed.damageType ? ` ${parsed.damageType}` : ''}\n`;

@@ -3,6 +3,7 @@ import { v4 as uuid } from 'uuid';
 import { CharacterRepository } from '../../src/storage/repos/character.repo.js';
 import { handleExecuteCombatAction, handleCreateEncounter, handleGetEncounterState, clearCombatState } from '../../src/server/handlers/combat-handlers.js';
 import { closeDb, getDb } from '../../src/storage/index.js';
+import { CombatEngine } from '../../src/engine/combat/engine.js';
 import { getInitialSpellSlots, getMaxSpellLevel } from '../../src/engine/magic/spell-validator.js';
 import { resolveSpell } from '../../src/engine/magic/spell-resolver.js';
 import { getSpell } from '../../src/engine/magic/spell-database.js';
@@ -76,6 +77,8 @@ describe('cast_spell damage modifiers', () => {
         const encounterId = created.content[0].text.match(/Encounter ID: (encounter-[^\n]+)/)![1];
         // 8d6 all sixes = 48 fire; every d20 = 20, so the save passes: 24.
         vi.spyOn(Math, 'random').mockReturnValue(0.99);
+        // The save rolls on the encounter's seeded stream now.
+        vi.spyOn(CombatEngine.prototype, 'rollD20').mockReturnValue(20);
         await handleExecuteCombatAction({ encounterId, action: 'cast_spell', actorId: wizardId, spellName: 'Fireball', targetId: 'dummy' }, ctx as any);
         const state = stateOf((await handleGetEncounterState({ encounterId }, ctx as any)).content[0].text);
         return state.participants.find((p: any) => p.id === 'dummy').hp;

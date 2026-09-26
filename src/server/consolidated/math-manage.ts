@@ -3,15 +3,13 @@
  * Replaces 5 separate tools: dice_roll, probability_calculate, algebra_solve, algebra_simplify, physics_projectile
  */
 
-import seedrandom from 'seedrandom';
-import { recordRolls, type RollLogEntry } from '../../storage/roll-log.js';
-import { currentOperation } from '../operation-guard.js';
 import { z } from 'zod';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 import { DiceEngine } from '../../math/dice.js';
 import { freshSeed } from '../../math/seed.js';
+import { d20, logRoll } from '../../math/logged-d20.js';
 import { ProbabilityEngine } from '../../math/probability.js';
 import { AlgebraEngine } from '../../math/algebra.js';
 import { PhysicsEngine } from '../../math/physics.js';
@@ -116,22 +114,8 @@ const OpposedSchema = z.object({
     declaredEffects: z.preprocess(jsonIfString, z.array(DeclaredEffectRefSchema)).optional().describe('Initiator declaredEffects — engine computes')
 });
 
-// Seeded so every check is stored and replayable (roll_log keeps the seed).
-function d20(advantage?: boolean, disadvantage?: boolean, seed: string = freshSeed('check')): { rolls: number[]; natural: number; seed: string } {
-    const rng = seedrandom(seed);
-    const r = () => Math.floor(rng() * 20) + 1;
-    if (advantage && !disadvantage) { const a = r(), b = r(); return { rolls: [a, b], natural: Math.max(a, b), seed }; }
-    if (disadvantage && !advantage) { const a = r(), b = r(); return { rolls: [a, b], natural: Math.min(a, b), seed }; }
-    const a = r(); return { rolls: [a], natural: a, seed };
-}
-
-/** Store a math_manage roll in roll_log under the running operation. */
-function logRoll(db: ReturnType<typeof getDb>, entry: RollLogEntry): string | undefined {
-    try {
-        const op = currentOperation();
-        return recordRolls(db, [entry], { opId: op?.opId, tool: op?.tool ?? 'math_manage' })[0];
-    } catch { return undefined; }
-}
+// d20() and logRoll() live in math/logged-d20.ts so combat and
+// concentration saves roll and log the same way.
 
 function abilityMod(score: number): number { return Math.floor((score - 10) / 2); }
 function profBonus(level: number): number { return Math.floor((level - 1) / 4) + 2; }
