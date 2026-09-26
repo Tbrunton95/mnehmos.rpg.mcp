@@ -68,7 +68,7 @@ export type Ability = z.infer<typeof AbilitySchema>;
  */
 export const ParticipantExtrasShape = {
     size: SizeCategorySchema.optional().describe('tiny | small | medium | large | huge | gargantuan (default medium)'),
-    reach: z.number().int().min(0).optional().describe('Melee reach in feet (default from size: 5, or 10 for large and up)'),
+    reach: z.number().int().min(0).optional().describe('Melee reach in feet (default from size: 5, or 10 for huge and up)'),
     movementSpeed: z.number().int().min(0).optional().describe('Speed in feet (default 30)'),
     attackBonus: z.number().int().optional().describe('Default attack bonus'),
     attackDamage: z.string().optional().describe("Default attack damage ('1d6+2')"),

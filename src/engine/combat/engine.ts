@@ -3,7 +3,7 @@ import { findPart as findNamedPart } from './parts.js';
 import { CombatRNG, CheckResult } from './rng.js';
 import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS, conditionAttackModifiers, conditionSpeedFactor } from './conditions.js';
 
-import { SizeCategory, GridBounds } from '../../schema/encounter.js';
+import { SizeCategory, GridBounds, edgeDistanceSquares, effectiveReachFt } from '../../schema/encounter.js';
 
 /**
  * Character interface for combat participants
@@ -795,7 +795,7 @@ export class CombatEngine {
         let autoCrit: string | undefined;
         if (!partOpts?.ignoreConditions) {
             const within5ft = partOpts?.ranged ? false
-                : (actor.position && target.position ? this.isAdjacent(actor.position, target.position) : true);
+                : (actor.position && target.position ? edgeDistanceSquares(actor, target) <= 1 : true);
             const mods = conditionAttackModifiers(actor, target, { within5ft, participants: this.state.participants });
             if (mods.adv.length) { advantage = true; situational.push(...mods.adv); }
             if (mods.dis.length) { disadvantage = true; situational.push(...mods.dis); }
@@ -1713,6 +1713,16 @@ export class CombatEngine {
     }
 
     /**
+     * Item 6: is the target (optionally standing at `targetAt`) within the
+     * attacker's melee reach? Measured edge to edge between footprints, so a
+     * large creature threatens from every square it fills.
+     */
+    isWithinReach(attacker: CombatParticipant, target: CombatParticipant, targetAt?: { x: number; y: number }): boolean {
+        const squares = edgeDistanceSquares(attacker, target, { b: targetAt });
+        return squares * 5 <= effectiveReachFt(attacker);
+    }
+
+    /**
      * HIGH-003: Get adjacent enemies that could make opportunity attacks
      * @param moverId - The creature that is moving
      * @param fromPos - Starting position
@@ -1750,12 +1760,11 @@ export class CombatEngine {
             // Skip if no position
             if (!p.position) continue;
 
-            // Check if creature was adjacent to mover at start and is no longer adjacent at end
-            const wasAdjacent = this.isAdjacent(fromPos, p.position);
-            const stillAdjacent = this.isAdjacent(toPos, p.position);
+            // Leaving the reactor's reach (size and reach aware) provokes.
+            const wasInReach = this.isWithinReach(p, mover, fromPos);
+            const stillInReach = this.isWithinReach(p, mover, toPos);
 
-            // Opportunity attack triggers when leaving threatened square (was adjacent, now not)
-            if (wasAdjacent && !stillAdjacent) {
+            if (wasInReach && !stillInReach) {
                 attackers.push(p);
             }
         }

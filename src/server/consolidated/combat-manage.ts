@@ -33,7 +33,7 @@ import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { CombatEngine } from '../../engine/combat/engine.js';
-import { ConditionInputSchema } from '../../schema/encounter.js';
+import { ConditionInputSchema, SIZE_TABLE } from '../../schema/encounter.js';
 import { normalizeCondition, normalizeConditions } from '../../engine/combat/conditions.js';
 import { getCombatManager } from '../state/combat-manager.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
@@ -716,12 +716,14 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             // Build participants from preset
             const count = params.count || 1;
             const participants = [];
+            // Spread a group so footprints never overlap (a huge creature fills 3x3).
+            const step = Math.max(2, SIZE_TABLE[preset.size ?? 'medium'].squares + 1);
 
             for (let i = 0; i < count; i++) {
                 const id = `enemy-${randomUUID().slice(0, 8)}`;
                 const basePos = params.position || { x: 10, y: 10 };
                 const pos = count > 1
-                    ? { x: basePos.x + (i % 3) * 2, y: basePos.y + Math.floor(i / 3) * 2 }
+                    ? { x: basePos.x + (i % 3) * step, y: basePos.y + Math.floor(i / 3) * step }
                     : basePos;
 
                 participants.push({
@@ -733,7 +735,12 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     ac: preset.ac,
                     attackDamage: preset.defaultAttack?.damage,
                     attackBonus: preset.defaultAttack?.toHit,
+                    ...(preset.defaultAttack?.damageType ? { attackDamageType: preset.defaultAttack.damageType } : {}),
                     ...(preset.attacksPerAction ? { attacksPerAction: preset.attacksPerAction } : {}),
+                    // Item 6: the preset's size and speed reach the token (reach, footprint, grapple limits).
+                    size: preset.size ?? 'medium',
+                    movementSpeed: preset.speed ?? 30,
+                    ...(preset.cr !== undefined ? { cr: preset.cr } : {}),
                     isEnemy: true,
                     conditions: [],
                     position: pos,

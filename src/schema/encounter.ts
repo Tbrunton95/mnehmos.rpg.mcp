@@ -145,6 +145,61 @@ export function getSizeFootprint(size: SizeCategory): number {
     }
 }
 
+/** Sizes smallest first; sizeRank indexes this list. */
+export const SIZE_ORDER: readonly SizeCategory[] = SizeCategorySchema.options;
+
+/** Squares per side and natural melee reach (5e: huge and up reach 10 ft). */
+export const SIZE_TABLE: Record<SizeCategory, { squares: number; reachFt: number }> = {
+    tiny: { squares: 1, reachFt: 5 },
+    small: { squares: 1, reachFt: 5 },
+    medium: { squares: 1, reachFt: 5 },
+    large: { squares: 2, reachFt: 5 },
+    huge: { squares: 3, reachFt: 10 },
+    gargantuan: { squares: 4, reachFt: 10 }
+};
+
+function sizeOf(size?: string | null): SizeCategory {
+    const s = (size ?? '').toLowerCase() as SizeCategory;
+    return s in SIZE_TABLE ? s : 'medium';
+}
+
+/** Position in SIZE_ORDER; unset or unknown reads as medium. */
+export function sizeRank(size?: string | null): number {
+    return SIZE_ORDER.indexOf(sizeOf(size));
+}
+
+type Sized = { size?: string | null; reach?: number | null; position?: { x: number; y: number } | null };
+
+/** Melee reach in feet: the attack profile's reach, then the token's, then its size. */
+export function effectiveReachFt(p: Sized, profile?: { reachFt?: number | null } | null): number {
+    return profile?.reachFt ?? p.reach ?? SIZE_TABLE[sizeOf(p.size)].reachFt;
+}
+
+/** Grid cells a token fills: its position is the top-left of a square footprint. */
+export function footprintCells(p: Sized, at?: { x: number; y: number }): Array<{ x: number; y: number }> {
+    const pos = at ?? p.position;
+    if (!pos) return [];
+    const n = SIZE_TABLE[sizeOf(p.size)].squares;
+    const cells: Array<{ x: number; y: number }> = [];
+    for (let dy = 0; dy < n; dy++) for (let dx = 0; dx < n; dx++) cells.push({ x: pos.x + dx, y: pos.y + dy });
+    return cells;
+}
+
+/**
+ * Squares between two footprints (Chebyshev, edge to edge): 1 = adjacent,
+ * 0 = overlapping. Infinity when either has no position.
+ */
+export function edgeDistanceSquares(
+    a: Sized, b: Sized,
+    at?: { a?: { x: number; y: number }; b?: { x: number; y: number } }
+): number {
+    const pa = at?.a ?? a.position, pb = at?.b ?? b.position;
+    if (!pa || !pb) return Infinity;
+    const na = SIZE_TABLE[sizeOf(a.size)].squares, nb = SIZE_TABLE[sizeOf(b.size)].squares;
+    const gap = (a0: number, an: number, b0: number, bn: number) => Math.max(0, b0 - (a0 + an - 1), a0 - (b0 + bn - 1));
+    return Math.max(gap(pa.x, na, pb.x, nb), gap(pa.y, na, pb.y, nb));
+}
+
 export const TokenSchema = z.object({
     id: z.string(),
     name: z.string(),

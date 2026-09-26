@@ -5,7 +5,7 @@ import { randomUUID } from 'crypto';
 import { freshSeed } from '../../math/seed.js';
 import { CombatEngine, CombatParticipant, CombatState, CombatActionResult } from '../../engine/combat/engine.js';
 import { normalizeConditions } from '../../engine/combat/conditions.js';
-import { ConditionInputSchema } from '../../schema/encounter.js';
+import { ConditionInputSchema, footprintCells } from '../../schema/encounter.js';
 import { SpatialEngine } from '../../engine/spatial/engine.js';
 
 import { PubSub } from '../../engine/pubsub.js';
@@ -2040,12 +2040,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 // Build obstacle set from other participants and terrain
                 const obstacles = new Set<string>();
 
-                // Add other participant positions as obstacles
+                // Every square another participant fills is an obstacle (a
+                // large token fills 2x2 from its position, item 6).
                 for (const p of currentState.participants) {
-                    if (p.id !== parsed.actorId && (p as any).position) {
-                        const pos = (p as any).position;
-                        obstacles.add(`${pos.x},${pos.y}`);
-                    }
+                    if (p.id === parsed.actorId) continue;
+                    for (const cell of footprintCells(p)) obstacles.add(`${cell.x},${cell.y}`);
                 }
 
                 // Add terrain obstacles if available
@@ -2056,9 +2055,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     }
                 }
 
-                // Check if destination is blocked
-                const destKey = `${parsed.targetPosition.x},${parsed.targetPosition.y}`;
-                if (obstacles.has(destKey)) {
+                // The mover's whole footprint at the destination must be clear.
+                // The path itself is found for the anchor square only.
+                const destBlocked = footprintCells(updatedActor, parsed.targetPosition)
+                    .some(cell => obstacles.has(`${cell.x},${cell.y}`));
+                if (destBlocked) {
                     output = opportunityAttackOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, 'Destination is blocked');
                 } else {
                     // Use spatial engine to find path
