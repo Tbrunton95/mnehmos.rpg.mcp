@@ -94,6 +94,33 @@ describe('combat_manage add_condition / remove_condition', () => {
         expect(repo.findById('luciel')!.conditions.map((c: any) => c.name)).toEqual(['Warp-touched']);
     });
 
+    it('remove_condition accepts the shapes add_condition takes (item 8)', async () => {
+        await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: 'prone' });
+        const r1 = await call({ action: 'remove_condition', encounterId, participantId: 'token-scion', condition: 'PRONE' });
+        expect(r1.removed).toBe(1);
+        await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: { name: 'restrained', duration: 2 } });
+        const r2 = await call({ action: 'remove_condition', encounterId, participantId: 'token-scion', condition: { name: 'restrained', duration: 2 } });
+        expect(r2.removed).toBe(1);
+        // The applied condition echoed by add_condition goes straight back in,
+        // and matches by instance id (only that one of two blinded goes).
+        const a = await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: 'blinded' });
+        await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: 'blinded' });
+        const r3 = await call({ action: 'remove_condition', encounterId, participantId: 'token-scion', condition: a.condition });
+        expect(r3.removed).toBe(1);
+        expect(r3.removedConditions[0].id).toBe(a.condition.id);
+        expect(tokenConditions(encounterId, 'token-scion').map(c => c.type)).toEqual(['blinded']);
+        const none = await call({ action: 'remove_condition', encounterId, participantId: 'token-scion' });
+        expect(none.error).toBeTruthy();
+    });
+
+    it('add_condition accepts a top-level name (item 8)', async () => {
+        const a = await call({ action: 'add_condition', encounterId, participantId: 'token-scion', name: 'prone' });
+        expect(a.success).toBe(true);
+        expect(tokenConditions(encounterId, 'token-scion').map(c => c.type)).toEqual(['prone']);
+        const none = await call({ action: 'add_condition', encounterId, participantId: 'token-scion' });
+        expect(none.error).toBeTruthy();
+    });
+
     it('add_participant imports sheet conditions only when asked', async () => {
         const now = new Date().toISOString();
         repo.create({ id: 'justicar', name: 'Justicar', stats: { str: 18, dex: 12, con: 16, int: 10, wis: 12, cha: 10 }, hp: 90, maxHp: 90, ac: 18, level: 8,

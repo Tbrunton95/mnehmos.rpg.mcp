@@ -211,11 +211,12 @@ const AddConditionSchema = z.object({
     action: z.literal('add_condition'),
     encounterId: z.string(),
     participantId: z.string().describe('Participant/token id'),
-    condition: ConditionInputSchema.describe('A name ("prone") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?}; unknown names are kept as custom conditions'),
+    condition: ConditionInputSchema.optional().describe('A name ("prone") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?, level?}; unknown names are kept as custom conditions'),
+    name: z.string().optional().describe('Shorthand for condition: a bare condition name'),
     replace: z.boolean().optional().describe('Drop existing conditions of the same type first'),
     mirrorToCharacter: z.boolean().optional().describe('Also add it to the character sheet (upsert by name)'),
     reason: z.string().optional().describe('Why — recorded in the combat log')
-});
+}).refine(p => Boolean(p.condition || p.name), { message: 'Pass condition or name', path: ['condition'] });
 
 const RemoveConditionSchema = z.object({
     action: z.literal('remove_condition'),
@@ -223,9 +224,13 @@ const RemoveConditionSchema = z.object({
     participantId: z.string().describe('Participant/token id'),
     conditionId: z.string().optional().describe('Remove this one condition instance'),
     name: z.string().optional().describe('Remove every condition of this name/type (case-insensitive)'),
+    // Removal needs only identity, so this is lenient: the condition object
+    // add_condition or get echoes (durationType, metadata...) goes straight back.
+    condition: z.union([z.string(), z.object({ id: z.string().optional(), type: z.string().optional(), name: z.string().optional() }).passthrough()]).optional()
+        .describe('A name, or the condition object add_condition returned (matched by id, else by name/type)'),
     mirrorToCharacter: z.boolean().optional().describe('Also remove it from the character sheet'),
     reason: z.string().optional().describe('Why — recorded in the combat log')
-}).refine(p => Boolean(p.conditionId || p.name), { message: 'Pass conditionId or name', path: ['name'] });
+}).refine(p => Boolean(p.conditionId || p.name || p.condition), { message: 'Pass conditionId, name or condition', path: ['name'] });
 
 const GetHistorySchema = z.object({
     action: z.literal('get_history'),
@@ -1042,7 +1047,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
             const p = state.participants.find(x => x.id === params.participantId);
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
-            const normalized = normalizeCondition(params.condition, p.id);
+            const normalized = normalizeCondition(params.condition ?? params.name!, p.id);
             if (!normalized) return refuse('Condition needs a name');
             let replaced = 0;
             if (params.replace) {
@@ -1064,7 +1069,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             };
         },
         aliases: ['apply_condition', 'inflict', 'condition'],
-        description: 'Add a condition to a live encounter participant (name or {name, duration, durationType, save...}); optional mirror to the character sheet'
+        description: 'Add a condition to a live encounter participant (condition: name or {name, duration, durationType, save..., level}; or top-level name); optional mirror to the character sheet'
     },
     remove_condition: {
         schema: RemoveConditionSchema,
@@ -1076,10 +1081,16 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
             const p = state.participants.find(x => x.id === params.participantId);
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
-            const wanted = params.name?.trim().toLowerCase();
-            const gone = p.conditions.filter(c => params.conditionId ? c.id === params.conditionId : c.type.toLowerCase() === wanted);
+            // An id that names a live instance wins; otherwise match by name/type.
+            const obj = typeof params.condition === 'string' ? { name: params.condition } : params.condition;
+            const id = params.conditionId ?? obj?.id;
+            const label = (params.name ?? obj?.type ?? obj?.name)?.trim();
+            const wanted = label?.toLowerCase();
+            const byId = id ? p.conditions.filter(c => c.id === id) : [];
+            const gone = byId.length ? byId : wanted ? p.conditions.filter(c => c.type.toLowerCase() === wanted) : [];
             if (gone.length === 0) {
-                return refuse(`${p.name} has no ${params.conditionId ? `condition ${params.conditionId}` : `"${params.name}"`} — current: ${p.conditions.map(c => c.type).join(', ') || 'none'}`);
+                const searched = [id ? `condition ${id}` : '', label ? `"${label}"` : ''].filter(Boolean).join(' or ');
+                return refuse(`${p.name} has no ${searched} — current: ${p.conditions.map(c => c.type).join(', ') || 'none'}`);
             }
             p.conditions = p.conditions.filter(c => !gone.includes(c));
             new EncounterRepository(getDb()).saveState(params.encounterId, state);
@@ -1093,7 +1104,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             };
         },
         aliases: ['clear_condition', 'cure', 'end_condition'],
-        description: 'Remove a condition from a live encounter participant by id or name (case-insensitive); optional mirror to the character sheet'
+        description: 'Remove a condition from a live encounter participant by conditionId, name (case-insensitive), or condition (a name or the object add_condition returned); optional mirror to the character sheet'
     },
     set_part: {
         schema: SetPartSchema,
@@ -1420,7 +1431,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         // FINDINGS #34 mirror block — add_participant + includeParty params
         includeParty: z.boolean().optional().describe('Include the active party in the new encounter (create / spawn_quick_enemy)'),
         partyId: z.string().optional().describe('Party to include (defaults to the only active party)'),
-        name: z.string().optional().describe('Ad-hoc participant name (add_participant)'),
+        name: z.string().optional().describe('add_participant: ad-hoc participant name; add_condition / remove_condition: condition name'),
         hp: z.number().optional().describe('Participant HP (add_participant)'),
         maxHp: z.number().optional().describe('Participant max HP (add_participant)'),
         ac: z.number().optional().describe('Participant AC (add_participant)'),
@@ -1429,7 +1440,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         value: z.number().optional().describe('adjust_hp: set HP to exactly this'),
         delta: z.number().optional().describe('adjust_hp: shift HP by this amount'),
         reason: z.string().optional().describe('adjust_hp (required) / add_condition / remove_condition: why — logged'),
-        condition: z.any().optional().describe('add_condition: a name ("prone") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?}'),
+        condition: z.any().optional().describe('add_condition / remove_condition: a name ("prone") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?, level?}; remove also takes the object add_condition returned'),
         conditionId: z.string().optional().describe('remove_condition: one condition instance id'),
         replace: z.boolean().optional().describe('add_condition: drop existing conditions of the same type first'),
         mirrorToCharacter: z.boolean().optional().describe('add_condition / remove_condition: also edit the character sheet'),
