@@ -12,7 +12,7 @@
  * - level_up -> action: 'level_up'
  */
 
-import { loadRule, resolveWorldId, findPool, worldLexicon, conditionsForDisplay } from '../../engine/table-rules.js';
+import { loadRule, resolveWorldId, findPool, worldLexicon, conditionsForDisplay, shownCounters } from '../../engine/table-rules.js';
 import { readWorldClock, dayClock, SET_CLOCK_HINT } from '../../engine/world-clock.js';
 import { z } from 'zod';
 import { ParticipantExtrasShape, SizeCategorySchema } from '../../schema/token-extras.js';
@@ -26,7 +26,10 @@ import {
     CharacterOriginSchema,
     SkillProficiencySchema,
     SaveProficiencySchema,
+    resourcePoolSchema,
+    type ResourcePool,
 } from '../../schema/character.js';
+import { resolveInstance, mintInstance } from './inventory-manage.js';
 import { provisionStartingEquipment } from '../../services/starting-equipment.service.js';
 import { CLASS_DATA, getSpellSlots, isSpellcaster } from '../../data/class-starting-data.js';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
@@ -126,11 +129,7 @@ const CreateSchema = z.object({
     // FINDINGS #93: create-lane params — resourcePools was accepted by the
     // OUTER schema only; the create schema never had it, which is precisely
     // how the silent drop happened (tsc caught the fix reaching for it).
-    resourcePools: z.record(z.object({
-        current: z.number(),
-        max: z.number(),
-        lastRefilledAt: z.string().optional()
-    })).optional().describe('Named numeric pools written AT CREATE (resolve, corruption, fatigue…) — #93: honored now, was silently dropped'),
+    resourcePools: z.record(resourcePoolSchema()).optional().describe('Named numeric pools written AT CREATE (resolve, corruption, fatigue…) — #93: honored now, was silently dropped'),
     conditions: z.array(conditionSchema()).optional().describe('FINDINGS #107: conditions written AT CREATE (wound clocks, THAW states…) — was the #93 anatomy repeated: outer schema accepted, create schema stripped, banner printed a clean card, and a GM could play six sessions off a condition that was never there'),
     worldId: z.string().optional().describe('FINDINGS #93: tag this character to a world — list {worldId} filters by it (nullable #91 pattern; untagged rows show everywhere)'),
     name: z.string().min(1).describe('Character name (required)'),
@@ -243,11 +242,7 @@ const UpdateSchema = z.object({
     saveProficiencies: z.array(z.string()).optional().describe('Saving throw proficiencies (str/dex/con/int/wis/cha)'),
     expertise: z.array(z.string()).optional().describe('Skills with double proficiency'),
     startingGold: z.number().int().min(0).optional().describe('Set currency to this exact amount (the world lexicon names it; RU by default) (absolute set; for deltas use inventory_manage add_currency)'),
-    resourcePools: z.record(z.object({
-        current: z.number(),
-        max: z.number(),
-        lastRefilledAt: z.string().optional()
-    })).optional().describe('Named numeric pools (resolve, corruption, ammo...) — ONE incrementing row per pool via read-modify-write, replacing per-delta effect-ledger rows'),
+    resourcePools: z.record(resourcePoolSchema()).optional().describe('Named numeric pools (resolve, corruption, ammo...) — ONE incrementing row per pool via read-modify-write, replacing per-delta effect-ledger rows'),
     // FINDINGS #86: the composure re-spec — per-character charge/repair table.
     // DATA, NOT LOGIC: the engine stores and returns it so every chair charges
     // the same number; no resolver evaluates it (Register B stays Register B).
@@ -268,7 +263,12 @@ const AdjustPoolSchema = z.object({
     max: z.number().optional().describe('Sets/updates the pool maximum (default 100 on creation)'),
     removePool: z.boolean().optional().describe('FINDINGS #34 T2.6: delete the pool entirely — zero is not gone; this is gone'),
     reason: z.string().optional().describe('FINDINGS #111: why the pool moved — stored on the pool\'s own history (last 20 entries) when given'),
-    witnesses: z.array(z.string()).optional().describe('FINDINGS #111: character ids who SAW it — the respect ledger\'s real content; stored on the pool history entry')
+    witnesses: z.array(z.string()).optional().describe('FINDINGS #111: character ids who SAW it — the respect ledger\'s real content; stored on the pool history entry'),
+    // Item 15: counters. The key stays the id; these describe and place it.
+    label: z.string().optional().describe("Display name for the counter (\"An'ggrath's calls\"); shown at boot and on the status block"),
+    note: z.string().optional().describe('What the counter is, or to whom it is owed'),
+    show: z.boolean().optional().describe('true: list it in the boot digest and the status block; false hides it again'),
+    linkItem: z.string().optional().describe("Item template or instance id the character owns (a token, a charm). The pool is authoritative: the item's charges mirror it on every write, and inventory_manage adjust_charges on it is refused")
 });
 
 const ListSchema = z.object({
@@ -410,6 +410,7 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
     const tiny = loadRule(db, worldId, 'status_block');
     if (tiny?.spec.compact) {
         const core = findPool(pools, tiny.spec.corePool);
+        const counters = shownCounters(pools, core?.key).map(c => ({ name: c.name, current: c.current, max: c.max }));
         let location: string | undefined;
         let objective: string | undefined;
         try {
@@ -436,6 +437,7 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
             hp: char.hp,
             maxHp: char.maxHp,
             corePool: core ? { name: core.key, current: core.pool.current, max: core.pool.max } : undefined,
+            ...(counters.length ? { counters } : {}),
             location,
             objective,
             conditions,
@@ -443,6 +445,12 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
             message: `${char.name}: HP ${char.hp}/${char.maxHp}`
         };
     }
+
+    // Item 15: shown counters on the full block too; rads and composure keep
+    // their own rows.
+    const fullCounters = shownCounters(pools as Parameters<typeof shownCounters>[0])
+        .filter(c => !['rads', 'composure'].includes(c.key.toLowerCase()))
+        .map(c => ({ name: c.name, current: c.current, max: c.max }));
 
     // #65-V: the repo's currency mapping drops the column — read it raw.
     let gold: number | undefined;
@@ -459,6 +467,7 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
         hp: char.hp,
         maxHp: char.maxHp,
         rads, composure, composureMax,
+        ...(fullCounters.length ? { counters: fullCounters } : {}),
         weaponName, weaponCondition, weaponAttachments,
         conditions: char.conditions || [],
         effects,
@@ -1274,7 +1283,7 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
     // reads that echo as the tell for whether resolution propagated.
     args = { ...args, characterId: char.id };
 
-    const pools = { ...((char as { resourcePools?: Record<string, { current: number; max: number; lastRefilledAt?: string }> }).resourcePools || {}) };
+    const pools: Record<string, ResourcePool> = { ...((char as { resourcePools?: Record<string, ResourcePool> }).resourcePools || {}) };
 
     // FINDINGS #34 T2.6: pool deletion — a traded rifle's condition pool
     // should not haunt its old owner at zero forever.
@@ -1288,7 +1297,19 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
         return Promise.resolve({ success: true, actionType: 'adjust_pool', characterId: args.characterId, pool: args.pool, removed: true, lastValue: `${last.current}/${last.max}`, message: `Pool "${args.pool}" removed (was ${last.current}/${last.max}).` });
     }
 
-    const existing = pools[args.pool] || { current: 0, max: args.max ?? 100 };
+    // Item 15: link a token item. Resolved like adjust_charges (template or
+    // instance id, minted on first use). A new pool linked to an item that
+    // already carries charges adopts them, so linking never zeroes a token.
+    let linked: { instanceId: string; charges: number | null; chargesMax: number | null } | undefined;
+    if (args.linkItem) {
+        const { db } = ensureDb();
+        const resolved = resolveInstance(db, char.id, args.linkItem);
+        if ('error' in resolved) return { error: true, actionType: 'adjust_pool', message: `linkItem: ${resolved.error}. Nothing was written.`, writes: 'none' };
+        const inst = (resolved.instance ?? mintInstance(db, char.id, resolved.templateId)) as { id: string; charges?: number | null; charges_max?: number | null };
+        linked = { instanceId: inst.id, charges: typeof inst.charges === 'number' ? inst.charges : null, chargesMax: typeof inst.charges_max === 'number' ? inst.charges_max : null };
+    }
+    const fresh = !(args.pool in pools);
+    const existing: ResourcePool = pools[args.pool] || { current: fresh && linked?.charges != null ? linked.charges : 0, max: args.max ?? linked?.chargesMax ?? 100 };
     const max = args.max ?? existing.max;
     const before = existing.current;
     // #67-F: value (absolute) beats delta; passing both is ambiguity — refused.
@@ -1298,7 +1319,13 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
     const current = args.value !== undefined
         ? Math.min(max, Math.max(0, args.value))
         : Math.min(max, Math.max(0, before + args.delta));
-    pools[args.pool] = { ...existing, current, max };
+    pools[args.pool] = {
+        ...existing, current, max,
+        ...(args.label !== undefined ? { label: args.label } : {}),
+        ...(args.note !== undefined ? { note: args.note } : {}),
+        ...(args.show !== undefined ? { show: args.show } : {}),
+        ...(linked ? { itemInstanceId: linked.instanceId } : {})
+    };
     // FINDINGS #111: the witness ledger. A respect number is not the fiction —
     // WHO SAW is. When a reason or witnesses ride the call, the pool keeps its
     // own history (capped at 20) so `get` answers "who knows this man's name
@@ -1310,6 +1337,8 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
     }
 
     characterRepo.update(args.characterId, { resourcePools: pools } as Partial<import('../../schema/character.js').Character>);
+    const item = mirrorLinkedCharges(char.id, { [args.pool]: pools[args.pool] })[0];
+    const p = pools[args.pool];
 
     return {
         success: true,
@@ -1327,8 +1356,33 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
         clamped: args.value !== undefined ? args.value !== current : before + (args.delta ?? 0) !== current,
         ...(args.witnesses?.length ? { witnesses: args.witnesses } : {}),
         ...(args.reason ? { reason: args.reason } : {}),
-        message: `${args.pool}: ${before} -> ${current} (of ${max})${args.value !== undefined ? ' [set]' : ''}${args.witnesses?.length ? ` — witnessed by ${args.witnesses.length}` : ''}`
+        ...(p.label ? { label: p.label } : {}),
+        ...(p.note ? { note: p.note } : {}),
+        ...(p.show !== undefined ? { show: p.show } : {}),
+        ...(item ? { item } : {}),
+        message: `${args.pool}: ${before} -> ${current} (of ${max})${args.value !== undefined ? ' [set]' : ''}${args.witnesses?.length ? ` — witnessed by ${args.witnesses.length}` : ''}${item ? ` · ${item.name} charges ${item.charges}/${item.max}` : ''}`
     };
+}
+
+/**
+ * Item 15: the pool is the one truth. After any write, each pool that links
+ * an item instance pushes current/max onto that instance's charges, scoped
+ * to the owner so a traded token is never written through a stale link.
+ */
+function mirrorLinkedCharges(characterId: string, pools: Record<string, ResourcePool | undefined>): Array<{ pool: string; instanceId: string; name: string; charges: number; max: number }> {
+    const { db } = ensureDb();
+    const out: Array<{ pool: string; instanceId: string; name: string; charges: number; max: number }> = [];
+    for (const [key, pool] of Object.entries(pools)) {
+        if (!pool?.itemInstanceId) continue;
+        try {
+            const res = db.prepare('UPDATE item_instances SET charges = ?, charges_max = ?, updated_at = ? WHERE id = ? AND owner_character_id = ?')
+                .run(pool.current, pool.max, new Date().toISOString(), pool.itemInstanceId, characterId);
+            if (!res.changes) continue;
+            const row = db.prepare('SELECT COALESCE(ii.custom_name, i.name) AS name FROM item_instances ii LEFT JOIN items i ON i.id = ii.template_id WHERE ii.id = ?').get(pool.itemInstanceId) as { name?: string } | undefined;
+            out.push({ pool: key, instanceId: pool.itemInstanceId, name: row?.name ?? pool.itemInstanceId, charges: pool.current, max: pool.max });
+        } catch { /* item_instances.charges absent on this database */ }
+    }
+    return out;
 }
 
 // ─── FINDINGS #60: THE MEND CLOCK — handlers ───
@@ -1503,6 +1557,7 @@ async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>):
                 // pool that never existed).
                 const written = characterRepo.update(args.characterId, updates as Partial<import('../../schema/character.js').Character>);
                 if (!written) throw new Error(`fireNow write FAILED for ${args.characterId} — ledger row ${info.lastInsertRowid} left unfired, nothing applied`);
+                if (updates.resourcePools) mirrorLinkedCharges(args.characterId, updates.resourcePools as Record<string, ResourcePool>);
             }
         }
         db.prepare('UPDATE scheduled_state_changes SET fired = 1, fired_at = ? WHERE id = ?').run(now, Number(info.lastInsertRowid));
@@ -1611,6 +1666,7 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
             ? { applied: [`📣 GM EVENT DUE${row.note ? `: ${row.note}` : ''}`], updates: {} as Record<string, unknown> }
             : applyScheduledOps(char, ops);
         if (Object.keys(updates).length) characterRepo.update(row.character_id, updates as Partial<import('../../schema/character.js').Character>);
+        if (updates.resourcePools) mirrorLinkedCharges(row.character_id, updates.resourcePools as Record<string, ResourcePool>);
         db.prepare('UPDATE scheduled_state_changes SET fired = 1, fired_at = ? WHERE id = ?').run(now, row.id);
         // FINDINGS #69: a recurring clock re-arms itself the moment it fires —
         // the next row inherits writes, note, and recurrence. The loop above
@@ -2108,11 +2164,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         // Sheet fields (update) — MUST mirror UpdateSchema: this outer schema
         // strips unknown keys, so any param missing here dies silently at the
         // tool boundary (the startingGold no-op's anatomy, mirrored).
-        resourcePools: z.record(z.object({
-            current: z.number(),
-            max: z.number(),
-            lastRefilledAt: z.string().optional()
-        })).optional(),
+        resourcePools: z.record(resourcePoolSchema()).optional(),
         composureSpec: z.record(z.unknown()).optional().describe('FINDINGS #86 (mirror): per-character Composure charge/repair table — {desensitised[], charges{}, repairs{}}; stored verbatim, returned by get, never engine-evaluated'),
         // FINDINGS #88 (mirror law): guard/preview + hour-clock params
         expectName: z.string().optional().describe('update guard: refuse unless the name matches (case-insensitive)'),
@@ -2121,6 +2173,9 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         viaParties: z.boolean().optional().describe('FINDINGS #105 (mirror): scope_characters — auto-claim members of parties tagged to this world'),
         reason: z.string().optional().describe('FINDINGS #111 (mirror): adjust_pool — why; stored on the pool history'),
         witnesses: z.array(z.string()).optional().describe('FINDINGS #111 (mirror): adjust_pool — who saw; stored on the pool history'),
+        label: z.string().optional().describe('adjust_pool (mirror): display name for the counter'),
+        show: z.boolean().optional().describe('adjust_pool (mirror): list the counter at boot and on the status block'),
+        linkItem: z.string().optional().describe('adjust_pool (mirror): item template or instance id whose charges mirror the pool'),
         firesAtHour: z.number().optional().describe('schedule_change: hour of the fires-at day (0–24)'),
         firesInHours: z.number().optional().describe('schedule_change: fires N hours from currentDay(+currentTime)'),
         limit: z.number().int().optional().describe('list #93: cap returned rows'),
@@ -2176,7 +2231,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         fireNow: z.boolean().optional().describe('FINDINGS #73 (mirror): fire the entry immediately in the same call — ledger one-off, applied[] reported'),
         event: z.boolean().optional().describe('FINDINGS #82 (mirror): GM EVENT — a clock that fires a notification instead of writes; empty writes allowed with this flag'),
         writes: z.preprocess(mendJsonIfString, z.array(ScheduledWriteOpSchema)).optional().describe('MEND CLOCK: ordered ops (schedule_change). ARRAY — direct calls only per batch law #16a'),
-        note: z.string().optional().describe('MEND CLOCK: what this clock is (schedule_change)'),
+        note: z.string().optional().describe('MEND CLOCK: what this clock is (schedule_change); adjust_pool: what the counter is'),
         currentDay: z.number().optional().describe('MEND CLOCK: current in-fiction day (process_scheduled)'),
         scheduleId: z.number().optional().describe('MEND CLOCK: row id (cancel_scheduled)'),
         includeFired: z.boolean().optional().describe('MEND CLOCK: include fired rows (list_scheduled)'),

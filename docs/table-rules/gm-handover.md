@@ -95,6 +95,7 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Who knows a secret | `knowledge_manage record` / `learn` / `can_know` |
 | Debts and deferred prices | `ledger_manage create` |
 | Souls taken or spent | `character_manage adjust_pool {characterId, pool: 'souls', delta, reason}` |
+| A counter shown at boot (uses left, linked token) | `character_manage adjust_pool {characterId, pool, value, max, label, show: true, linkItem?}`, then `delta: -1` |
 | Souls owed to a god | `ledger_manage create {worldId, debtor, creditor, amount, currency: 'souls', dueDay, consequence}` |
 | Time passes | `world_manage advance {worldId, hours}` (or `minutes`, `days`); set the clock once with `world_manage update {worldId, environment: {day, time}}` |
 | Clocks and debts the clock reached | `character_manage process_scheduled {worldId}`, `ledger_manage process_due {worldId}` (no day needed) |

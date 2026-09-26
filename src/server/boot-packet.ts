@@ -10,7 +10,7 @@
 import { getDb } from '../storage/index.js';
 import { CustomEffectsRepository } from '../storage/repos/custom-effects.repo.js';
 import { CharacterRepository } from '../storage/repos/character.repo.js';
-import { loadRule, findPool, conditionsForDisplay } from '../engine/table-rules.js';
+import { loadRule, findPool, conditionsForDisplay, shownCounters } from '../engine/table-rules.js';
 import { recentPrecedents } from './consolidated/precedent-manage.js';
 import { readWorldClock } from '../engine/world-clock.js';
 import type { Character } from '../schema/character.js';
@@ -36,8 +36,18 @@ function tryAll<T>(fn: () => T[]): T[] {
 
 function digest(char: Character, worldId: string): Record<string, unknown> {
     const db = getDb();
-    const pools = (char.resourcePools ?? {}) as Record<string, { current: number; max: number }>;
+    const pools = (char.resourcePools ?? {}) as NonNullable<Character['resourcePools']>;
     const core = findPool(pools, loadRule(db, worldId, 'status_block')?.spec.corePool);
+    // Item 15: counters the GM marked show: true, with the item they mirror.
+    const itemName = (instanceId: string): string | undefined => {
+        try {
+            return (db.prepare('SELECT COALESCE(ii.custom_name, i.name) AS name FROM item_instances ii LEFT JOIN items i ON i.id = ii.template_id WHERE ii.id = ?').get(instanceId) as { name?: string } | undefined)?.name;
+        } catch { return undefined; }
+    };
+    const counters = shownCounters(pools, core?.key).map(c => {
+        const item = c.itemInstanceId ? itemName(c.itemInstanceId) : undefined;
+        return { name: c.name, value: `${c.current}/${c.max}`, ...(item ? { item } : {}), ...(c.note ? { note: c.note } : {}) };
+    });
     const effectsRepo = new CustomEffectsRepository(db);
     const effects = [...tryAll(() => effectsRepo.getEffectsOnTarget(char.id, 'character', { is_active: true })),
         ...tryAll(() => effectsRepo.getEffectsOnTarget(char.id, 'npc', { is_active: true }))];
@@ -48,6 +58,7 @@ function digest(char: Character, worldId: string): Record<string, unknown> {
         hp: `${char.hp}/${char.maxHp}`,
         ...(char.band ? { band: char.band } : {}),
         ...(core ? { [core.key]: `${core.pool.current}/${core.pool.max}` } : {}),
+        ...(counters.length ? { counters } : {}),
         ...(char.parts?.some(p => p.state !== 'intact') ? { parts: char.parts.filter(p => p.state !== 'intact').map(p => `${p.name}: ${p.state}`) } : {}),
         conditions: { count: conditions.length, first: conditionsForDisplay(conditions, 5).map(c => clip(c.name, 100)) },
         features: effects.map(e => {
@@ -111,9 +122,10 @@ export function renderBootPacket(p: BootPacket): string {
     if (p.characters.length) {
         out += section('Characters');
         for (const c of p.characters) {
-            const pool = Object.entries(c).find(([k]) => !['id', 'name', 'hp', 'band', 'parts', 'conditions', 'features'].includes(k));
+            const pool = Object.entries(c).find(([k]) => !['id', 'name', 'hp', 'band', 'parts', 'conditions', 'features', 'counters'].includes(k));
             out += `• ${c.name}: HP ${c.hp}${c.band ? ` · ${c.band}` : ''}${pool ? ` · ${pool[0].toUpperCase()} ${pool[1]}` : ''}\n`;
             if (Array.isArray(c.parts)) out += `  parts: ${(c.parts as string[]).join(' · ')}\n`;
+            if (Array.isArray(c.counters)) out += `  counters: ${(c.counters as Array<{ name: string; value: string; item?: string; note?: string }>).map(k => `${k.name} ${k.value}${k.item ? ` (${k.item})` : ''}${k.note ? `: ${k.note}` : ''}`).join(' · ')}\n`;
             const conds = c.conditions as { count: number; first: string[] };
             if (conds.count) out += `  conditions (${conds.count}): ${conds.first.join(' | ')}${conds.count > conds.first.length ? ' | …' : ''}\n`;
             for (const f of c.features as Array<Record<string, unknown>>) {

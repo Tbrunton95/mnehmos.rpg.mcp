@@ -11,6 +11,7 @@ import type Database from 'better-sqlite3';
 import { z } from 'zod';
 import { PartSchema, UnitSchema, ParticipantExtrasShape, type AttackProfile, type Part } from '../schema/token-extras.js';
 import { expandCreatureTemplate, type CreaturePreset } from '../data/creature-presets.js';
+import { UNPRINTABLE_POOLS } from '../render/pda.js';
 
 export const DEFAULT_BAND_ORDER = ['Mortal', 'Elite Mortal', 'Astartes', 'Astartes Elite', 'Monster/Lord', 'Primarch-class'];
 
@@ -209,6 +210,20 @@ export function findPool<P>(pools: Record<string, P> | undefined | null, name: s
     if (pools[name] !== undefined) return { key: name, pool: pools[name] };
     const key = Object.keys(pools).find(k => k.toLowerCase() === name.toLowerCase());
     return key ? { key, pool: pools[key] } : undefined;
+}
+
+/**
+ * Item 15: the pools a GM marked show: true, as counters for the boot digest
+ * and the status block. The core pool is left out (it already has its own
+ * slot), and so is anything unprintable: psi never reaches a display.
+ */
+export function shownCounters(
+    pools: Record<string, { current: number; max: number; label?: string; show?: boolean; itemInstanceId?: string; note?: string }> | undefined | null,
+    coreKey?: string
+): Array<{ key: string; name: string; current: number; max: number; itemInstanceId?: string; note?: string }> {
+    return Object.entries(pools ?? {})
+        .filter(([k, p]) => p?.show === true && k !== coreKey && !UNPRINTABLE_POOLS.has(k.toLowerCase()))
+        .map(([k, p]) => ({ key: k, name: p.label ?? k, current: p.current, max: p.max, ...(p.itemInstanceId ? { itemInstanceId: p.itemInstanceId } : {}), ...(p.note ? { note: p.note } : {}) }));
 }
 
 export interface Lexicon { currency: string; badge: string; questFailLine: string }
