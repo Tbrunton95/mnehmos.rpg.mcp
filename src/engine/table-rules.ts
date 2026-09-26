@@ -44,6 +44,23 @@ const TableEntryApplySchema = z.object({
     hpMode: hpModeSchema().optional()
 }).passthrough();
 
+const SHORT_ABILITY_KEYS = ['str', 'dex', 'con', 'int', 'wis', 'cha'] as const;
+export type ShortAbility = typeof SHORT_ABILITY_KEYS[number];
+const LONG_TO_SHORT: Record<string, ShortAbility> = { strength: 'str', dexterity: 'dex', constitution: 'con', intelligence: 'int', wisdom: 'wis', charisma: 'cha' };
+const toShortAbility = (v: unknown) => {
+    if (typeof v !== 'string') return v;
+    const k = v.trim().toLowerCase();
+    return LONG_TO_SHORT[k] ?? k;
+};
+/** An ability named long or short, any case ('Strength', 'STR'), stored short. */
+const abilityShort = () => z.preprocess(toShortAbility, z.enum(SHORT_ABILITY_KEYS));
+const abilityBonusesSchema = () => z.preprocess(
+    (v) => v && typeof v === 'object' && !Array.isArray(v)
+        ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, n]) => [toShortAbility(k) as string, n]))
+        : v,
+    z.object({ str: z.number().int(), dex: z.number().int(), con: z.number().int(), int: z.number().int(), wis: z.number().int(), cha: z.number().int() }).partial().strict()
+);
+
 export const DEFAULT_BAND_ORDER = ['Mortal', 'Elite Mortal', 'Astartes', 'Astartes Elite', 'Monster/Lord', 'Primarch-class'];
 
 export const RuleSpecSchemas = {
@@ -179,6 +196,40 @@ export const RuleSpecSchemas = {
         jealousy: z.record(z.string(), z.record(z.string(), z.number().min(0))).default({}),
         /** What an offering is worth: an item name, 'kill', or a deed. */
         offering_values: z.record(z.string(), z.number()).default({})
+    }).passthrough(),
+    /** A world skill: the ability it rolls with. Skill checks and stunts read it. */
+    skill: z.object({
+        ability: abilityShort(),
+        description: z.string().optional()
+    }).passthrough(),
+    /** A world species (character_manage create race:). Beats an SRD species of the same name. */
+    species: z.object({
+        size: ParticipantExtrasShape.size,
+        speed: z.number().int().min(0).optional(),
+        abilityBonuses: abilityBonusesSchema().optional(),
+        languages: z.array(z.string()).default([]),
+        traits: z.array(z.string()).default([]),
+        /** Extra max HP per level (like the Dwarven Toughness mechanic). */
+        hpPerLevel: z.number().int().optional()
+    }).passthrough(),
+    /** A world class (character_manage create class:). Beats an SRD class of the same name. */
+    char_class: z.object({
+        hitDie: z.number().int().min(1).default(8),
+        saves: z.array(abilityShort()).default([]),
+        /** Skill proficiencies the class grants at create. */
+        skills: z.array(z.string()).default([]),
+        armor: z.array(z.string()).optional(),
+        weapons: z.array(z.string()).optional(),
+        /** Casts SRD spells with the slots, ability and spell list of an SRD caster class. */
+        casting: z.object({ as: z.string().min(1) }).passthrough().optional()
+    }).passthrough(),
+    /** A world background (character_manage create background:). Beats an SRD background of the same name. */
+    background: z.object({
+        skills: z.array(z.string()).default([]),
+        languages: z.array(z.string()).default([]),
+        tools: z.array(z.string()).default([]),
+        /** Starting gold when the create call names none. */
+        gold: z.number().min(0).optional()
     }).passthrough()
 } as const;
 
@@ -276,6 +327,37 @@ export function loadRules<K extends RuleKind>(db: Database.Database, worldId: st
 export function loadRule<K extends RuleKind>(db: Database.Database, worldId: string | null | undefined, kind: K, name?: string): TableRule<K> | undefined {
     const rules = loadRules(db, worldId, kind);
     return name ? rules.find(r => r.name.toLowerCase() === name.toLowerCase()) : rules[0];
+}
+
+/** Case, space, underscore and hyphen blind: 'Waaagh Lore' = 'waaagh_lore'. */
+function nameKey(s: string): string { return s.toLowerCase().replace(/[\s_-]+/g, ''); }
+
+/** A world's enabled rule of a kind by name, matched blind to case, spaces and underscores. */
+export function findWorldRule<K extends RuleKind>(db: Database.Database, worldId: string | null | undefined, kind: K, name: string | null | undefined): TableRule<K> | undefined {
+    if (!worldId || !name) return undefined;
+    const key = nameKey(name);
+    return loadRules(db, worldId, kind).find(r => nameKey(r.name) === key);
+}
+
+/** The ability a world skill rolls with, or undefined when the world defines no such skill. */
+export function worldSkillAbility(db: Database.Database, worldId: string | null | undefined, skill: string | null | undefined): ShortAbility | undefined {
+    return findWorldRule(db, worldId, 'skill', skill)?.spec.ability;
+}
+
+/** A world class's casting ({as: SRD caster class}), or undefined. */
+export function worldClassCasting(db: Database.Database, worldId: string | null | undefined, className: string | null | undefined): { as: string } | undefined {
+    const casting = findWorldRule(db, worldId, 'char_class', className)?.spec.casting;
+    return casting ? { as: casting.as } : undefined;
+}
+
+/**
+ * The class a character casts SRD spells as: its world class's casting.as,
+ * else its own class. Slot tables, the casting ability and spell lists read
+ * this name; the sheet keeps its own class.
+ */
+export function castingClassFor(db: Database.Database, character: { id: string; characterClass?: string | null }): string | undefined {
+    const worldId = resolveWorldId(db, { characterIds: [character.id] });
+    return worldClassCasting(db, worldId, character.characterClass)?.as ?? character.characterClass ?? undefined;
 }
 
 /**

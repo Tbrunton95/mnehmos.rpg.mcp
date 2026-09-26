@@ -19,7 +19,7 @@ import { SessionContext } from '../types.js';
 import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
 import { PartSchema, UnitSchema, ParticipantExtrasShape, type Part, type ReadiedAttack } from '../../schema/token-extras.js';
-import { resolveWorldId, bandOrder, loadRule, loadRules, type TableRule } from '../../engine/table-rules.js';
+import { resolveWorldId, bandOrder, loadRule, loadRules, castingClassFor, type TableRule } from '../../engine/table-rules.js';
 import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
 import { volleyTier, describeUnit } from '../../engine/combat/units.js';
 import { upsertPart, findPart, resolveAttackSource } from '../../engine/combat/parts.js';
@@ -2310,6 +2310,12 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             throw new Error(`Character ${parsed.actorId} not found in database. Spellcasting requires a character record with class and spell slots.`);
         }
 
+        // Item 8: a world class with casting.as casts SRD spells as that
+        // caster (slots, ability, spell list); the sheet keeps its own class.
+        const ownClass = casterChar.characterClass;
+        const castingAs = castingClassFor(db, casterChar);
+        if (castingAs && castingAs !== ownClass) casterChar = { ...casterChar, characterClass: castingAs };
+
         // Get target (needed for validation of range)
         // Re-use logic: defined outside or define here once?
         // Note: variable 'target' is defined later in the file.
@@ -2583,7 +2589,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // Consume spell slot (if not cantrip)
         if (effectiveSlotLevel > 0) {
             const updatedChar = consumeSpellSlot(casterChar, effectiveSlotLevel);
-            charRepo.update(casterChar.id, updatedChar);
+            charRepo.update(casterChar.id, { ...updatedChar, characterClass: ownClass });
         }
 
         // Handle concentration

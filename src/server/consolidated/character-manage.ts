@@ -12,7 +12,7 @@
  * - level_up -> action: 'level_up'
  */
 
-import { loadRule, resolveWorldId, findPool, worldLexicon, conditionsForDisplay, shownCounters, resolveCreature, creatureToParticipant } from '../../engine/table-rules.js';
+import { loadRule, loadRules, findWorldRule, castingClassFor, resolveWorldId, findPool, worldLexicon, conditionsForDisplay, shownCounters, resolveCreature, creatureToParticipant } from '../../engine/table-rules.js';
 import { FORM_KEYS, sheetFromCreature, snapshotBase, nextHp, hpModeSchema, type HpMode } from '../../engine/forms.js';
 import { pushSheetToLiveTokens } from '../handlers/combat-handlers.js';
 import { readWorldClock, dayClock, SET_CLOCK_HINT } from '../../engine/world-clock.js';
@@ -36,6 +36,7 @@ import {
 import { resolveInstance, mintInstance } from './inventory-manage.js';
 import { provisionStartingEquipment } from '../../services/starting-equipment.service.js';
 import { CLASS_DATA, getSpellSlots, isSpellcaster } from '../../data/class-starting-data.js';
+import { restoreAllSpellSlots } from '../../engine/magic/spell-validator.js';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { CorpseRepository } from '../../storage/repos/corpse.repo.js';
 import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
@@ -560,7 +561,8 @@ const OptionCategorySchema = z.enum(['all', 'classes', 'species', 'backgrounds',
 const OptionsSchema = z.object({
     action: z.literal('options'),
     category: OptionCategorySchema.optional().default('all'),
-    query: z.string().optional().describe('Optional case-insensitive name filter')
+    query: z.string().optional().describe('Optional case-insensitive name filter'),
+    worldId: z.string().optional().describe("Item 8: also list the world's own classes, species, backgrounds and skills (table_rules char_class, species, background, skill)")
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -631,21 +633,29 @@ function initialHitPoints(hitDie: number, constitutionModifier: number, level: n
 }
 
 function levelUpHitPointRule(character: {
+    id?: string;
     characterClass?: string | null;
     race?: string | null;
     stats: { con: number };
 }, levelsGained: number) {
     const className = character.characterClass || 'Adventurer';
-    const classSource = findOpen5eClass(className);
-    const classData = CLASS_DATA[className.trim().toLowerCase().replace(/^srd[-_:]/, '')];
-    const hitDie = classSource?.hitDie
+    // Item 8: a world class's hit die and a world species' HP per level first.
+    const db = getDb();
+    const worldId = character.id ? resolveWorldId(db, { characterIds: [character.id] }) : null;
+    const worldClass = findWorldRule(db, worldId, 'char_class', className)?.spec;
+    const worldSpecies = findWorldRule(db, worldId, 'species', character.race)?.spec;
+    const classSource = worldClass ? undefined : findOpen5eClass(className);
+    const classData = worldClass ? undefined : CLASS_DATA[className.trim().toLowerCase().replace(/^srd[-_:]/, '')];
+    const hitDie = worldClass?.hitDie ?? classSource?.hitDie
         ?? Number.parseInt(classData?.hitDice.replace('d', '') ?? '8', 10);
     const constitutionModifier = Math.floor((character.stats.con - 10) / 2);
     const hitDieIncrease = Math.max(1, Math.floor(hitDie / 2) + 1 + constitutionModifier);
-    const speciesSource = character.race ? findOpen5eSpecies(character.race) : undefined;
-    const speciesMaxHpPerLevel = speciesSource?.mechanics
-        .filter((mechanic) => mechanic.type === 'max_hp_per_level')
-        .reduce((total, mechanic) => total + mechanic.value, 0) ?? 0;
+    const speciesSource = character.race && !worldSpecies ? findOpen5eSpecies(character.race) : undefined;
+    const speciesMaxHpPerLevel = worldSpecies
+        ? worldSpecies.hpPerLevel ?? 0
+        : speciesSource?.mechanics
+            .filter((mechanic) => mechanic.type === 'max_hp_per_level')
+            .reduce((total, mechanic) => total + mechanic.value, 0) ?? 0;
     const hpPerLevel = hitDieIncrease + speciesMaxHpPerLevel;
 
     return {
@@ -675,34 +685,53 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         throw new Error('RENAMED (#95): perceptionBonus/stealthBonus are now perceptionOverride/stealthOverride — they OVERRIDE the composed WIS/DEX+proficiency column, they do not add to it. Re-issue with the new name. Nothing was written.');
     }
     const now = new Date().toISOString();
-    const classSource = findOpen5eClass(args.class || 'Adventurer');
-    const speciesSource = findOpen5eSpecies(args.race || 'Human');
-    const backgroundSource = args.background ? findOpen5eBackground(args.background) : undefined;
-    const className = classSource?.name ?? args.class ?? 'Adventurer';
-    const raceName = speciesSource?.name ?? args.race ?? 'Human';
-    const backgroundName = backgroundSource?.name ?? args.background;
-    const classData = CLASS_DATA[className.trim().toLowerCase().replace(/^srd[-_:]/, '')];
+    // Item 8: the world's own class, species and background come first
+    // (table_rules char_class / species / background); the SRD catalog is
+    // the fallback for names the world does not define.
+    const worldId = args.worldId;
+    const worldClassRule = findWorldRule(db, worldId, 'char_class', args.class || 'Adventurer');
+    const worldClass = worldClassRule?.spec;
+    const worldSpeciesRule = findWorldRule(db, worldId, 'species', args.race || 'Human');
+    const worldSpecies = worldSpeciesRule?.spec;
+    const worldBackgroundRule = args.background ? findWorldRule(db, worldId, 'background', args.background) : undefined;
+    const worldBackground = worldBackgroundRule?.spec;
+    const classSource = worldClass ? undefined : findOpen5eClass(args.class || 'Adventurer');
+    const speciesSource = worldSpecies ? undefined : findOpen5eSpecies(args.race || 'Human');
+    const backgroundSource = worldBackground || !args.background ? undefined : findOpen5eBackground(args.background);
+    const className = worldClassRule?.name ?? classSource?.name ?? args.class ?? 'Adventurer';
+    const raceName = worldSpeciesRule?.name ?? speciesSource?.name ?? args.race ?? 'Human';
+    const backgroundName = worldBackgroundRule?.name ?? backgroundSource?.name ?? args.background;
+    const classData = worldClass ? undefined : CLASS_DATA[className.trim().toLowerCase().replace(/^srd[-_:]/, '')];
     const legacyClassSaves = classData?.savingThrows
         .map((ability) => CLASS_SAVE_KEYS[ability])
         .filter((ability): ability is z.infer<typeof SaveProficiencySchema> => Boolean(ability)) ?? [];
-    const classSaveProficiencies = classSource?.savingThrows ?? legacyClassSaves;
-    const backgroundSkills = validSkillProficiencies(backgroundSource?.skillProficiencies);
+    const classSaveProficiencies = worldClass?.saves ?? classSource?.savingThrows ?? legacyClassSaves;
+    // World skills are free strings: the SRD enum filter is for SRD backgrounds only.
+    const backgroundSkills = worldBackground ? worldBackground.skills : validSkillProficiencies(backgroundSource?.skillProficiencies);
 
     const stats = { ...(args.stats ?? { str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 10 }) };
-    const speciesAbilityBonusesApplied = Boolean(args.applySpeciesAbilityBonuses && speciesSource);
+    const worldSpeciesBonuses = (worldSpecies?.abilityBonuses ?? {}) as Partial<Record<keyof typeof stats, number>>;
+    const speciesAbilityBonusesApplied = Boolean(args.applySpeciesAbilityBonuses && (speciesSource || Object.keys(worldSpeciesBonuses).length));
     if (speciesAbilityBonusesApplied && speciesSource) {
         for (const ability of Object.keys(speciesSource.abilityBonuses) as Array<keyof typeof stats>) {
             stats[ability] += speciesSource.abilityBonuses[ability];
+        }
+    } else if (speciesAbilityBonusesApplied) {
+        for (const [ability, bonus] of Object.entries(worldSpeciesBonuses) as Array<[keyof typeof stats, number]>) {
+            stats[ability] += bonus;
         }
     }
 
     // Source-backed classes own hit-die HP. Custom classes retain the d8 fallback.
     const conModifier = Math.floor((stats.con - 10) / 2);
-    const hitDie = classSource?.hitDie ?? Number.parseInt(classData?.hitDice.replace('d', '') ?? '8', 10);
+    const hitDie = worldClass?.hitDie ?? classSource?.hitDie ?? Number.parseInt(classData?.hitDice.replace('d', '') ?? '8', 10);
     const level = args.level ?? 1;
-    const speciesMaxHpBonus = speciesSource?.mechanics
-        .filter((mechanic) => mechanic.type === 'max_hp_per_level')
-        .reduce((total, mechanic) => total + mechanic.value * level, 0) ?? 0;
+    const speciesMaxHpBonus = worldSpecies
+        ? (worldSpecies.hpPerLevel ?? 0) * level
+        : speciesSource?.mechanics
+            .filter((mechanic) => mechanic.type === 'max_hp_per_level')
+            .reduce((total, mechanic) => total + mechanic.value * level, 0) ?? 0;
+    const startingGold = args.startingGold ?? worldBackground?.gold;
     const baseHp = initialHitPoints(hitDie, conModifier, level);
     const derivedMaxHp = baseHp + speciesMaxHpBonus;
     const hp = args.hp ?? derivedMaxHp;
@@ -748,13 +777,13 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         preparedSpells: args.preparedSpells?.length
             ? [...args.preparedSpells]
             : [...(args.knownSpells || [])],
-        skillProficiencies: uniqueStrings(backgroundSkills, args.skillProficiencies),
+        skillProficiencies: uniqueStrings(worldClass?.skills, backgroundSkills, args.skillProficiencies),
         saveProficiencies: args.saveProficiencies ?? classSaveProficiencies,
         expertise: args.expertise || [],
-        armorProficiencies: args.armorProficiencies ?? classSource?.armorProficiencies ?? classData?.armorProficiencies ?? [],
-        weaponProficiencies: args.weaponProficiencies ?? classSource?.weaponProficiencies ?? classData?.weaponProficiencies ?? [],
-        toolProficiencies: uniqueStrings(backgroundSource?.toolProficiencies, args.toolProficiencies),
-        languages: uniqueStrings(speciesSource?.languages, backgroundSource?.fixedLanguages, args.languages),
+        armorProficiencies: args.armorProficiencies ?? worldClass?.armor ?? classSource?.armorProficiencies ?? classData?.armorProficiencies ?? [],
+        weaponProficiencies: args.weaponProficiencies ?? worldClass?.weapons ?? classSource?.weaponProficiencies ?? classData?.weaponProficiencies ?? [],
+        toolProficiencies: uniqueStrings(worldBackground?.tools ?? backgroundSource?.toolProficiencies, args.toolProficiencies),
+        languages: uniqueStrings(worldSpecies?.languages ?? speciesSource?.languages, worldBackground?.languages ?? backgroundSource?.fixedLanguages, args.languages),
         resistances: args.resistances || [],
         vulnerabilities: args.vulnerabilities || [],
         immunities: args.immunities || [],
@@ -764,6 +793,7 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         regeneration: args.regeneration,
         // Combat profile and legendary counters (tokens hydrate from these)
         ...Object.fromEntries(COMBAT_PROFILE_FIELDS.filter(k => args[k] !== undefined).map(k => [k, args[k]])),
+        ...(args.size === undefined && worldSpecies?.size ? { size: worldSpecies.size } : {}),
         // FINDINGS #93: resourcePools was accepted by BOTH schemas and never
         // read by the payload — the #33/#59/#90 anatomy on the worst possible
         // verb: a create whose banner said it worked. Honored now.
@@ -802,7 +832,7 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
             {
                 customEquipment: args.customEquipment,
                 customSpells: args.knownSpells?.length ? args.knownSpells : undefined,
-                startingGold: args.startingGold ?? (backgroundSource
+                startingGold: startingGold ?? (backgroundSource
                     ? backgroundSource.startingCurrencyCopper / 100
                     : undefined),
                 additionalEquipmentSourceKeys: backgroundSource?.startingItemSourceKeys
@@ -830,7 +860,7 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
             spellSlots: character.spellSlots,
             pactMagicSlots: character.pactMagicSlots
         } as any);
-    } else if (args.startingGold !== undefined) {
+    } else if (startingGold !== undefined) {
         // Findings #40: startingGold rode the provisioning path and was
         // discarded with the kit when provisionEquipment was false. The #38
         // fix then failed SILENTLY — it wrote to a phantom 'inventories'
@@ -840,11 +870,21 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         // and the catch now REPORTS instead of swallowing.
         try {
             db.prepare('UPDATE characters SET currency = ? WHERE id = ?')
-                .run(JSON.stringify({ gold: args.startingGold, silver: 0, copper: 0 }), characterId);
+                .run(JSON.stringify({ gold: startingGold, silver: 0, copper: 0 }), characterId);
         } catch (goldErr) {
             (character as unknown as Record<string, unknown>)._startingGoldError =
                 `startingGold write failed: ${(goldErr as Error).message}`;
         }
+    }
+
+    // Item 8: a world class that casts as an SRD caster takes that caster's
+    // slots (or pact slots) for its level; the sheet keeps its own class.
+    if (worldClass?.casting) {
+        const asCaster = restoreAllSpellSlots({ ...(character as any), characterClass: worldClass.casting.as, level });
+        const slotUpdate: Record<string, unknown> = {};
+        if (asCaster.pactMagicSlots) slotUpdate.pactMagicSlots = character.pactMagicSlots = asCaster.pactMagicSlots;
+        else if (asCaster.spellSlots) slotUpdate.spellSlots = character.spellSlots = asCaster.spellSlots;
+        if (Object.keys(slotUpdate).length) characterRepo.update(characterId, slotUpdate as any);
     }
 
     const provenance = getOpen5eCatalogProvenance();
@@ -854,7 +894,14 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         _rules: {
             rulesVersion: provenance.rulesVersion,
             sourcePackHash: provenance.packHash,
-            class: classSource ? {
+            class: worldClass ? {
+                world: true,
+                name: className,
+                hitDie,
+                saves: worldClass.saves,
+                skills: worldClass.skills,
+                ...(worldClass.casting ? { casting: { as: worldClass.casting.as } } : {})
+            } : classSource ? {
                 sourceKey: classSource.sourceKey,
                 contentKey: classSource.contentKey,
                 hitDie: classSource.hitDie,
@@ -873,6 +920,16 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
                 deferredMechanics: deferredSpeciesMechanics,
                 unsupportedFeatureNames: unsupportedSpeciesFeatures,
                 maxHpBonus: speciesMaxHpBonus
+            } : worldSpecies ? {
+                world: true,
+                name: raceName,
+                size: worldSpecies.size,
+                speed: worldSpecies.speed,
+                traits: worldSpecies.traits,
+                abilityBonuses: worldSpecies.abilityBonuses ?? {},
+                abilityBonusesApplied: speciesAbilityBonusesApplied,
+                languages: worldSpecies.languages,
+                maxHpBonus: speciesMaxHpBonus
             } : { custom: true, name: raceName },
             background: backgroundSource ? {
                 sourceKey: backgroundSource.sourceKey,
@@ -888,6 +945,13 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
                     ...(backgroundSource.languageChoiceCount > 0 ? ['language_choice'] : []),
                     ...(backgroundSource.toolChoice ? ['tool_choice'] : [])
                 ]
+            } : worldBackground ? {
+                world: true,
+                name: backgroundName,
+                skills: worldBackground.skills,
+                languages: worldBackground.languages,
+                tools: worldBackground.tools,
+                gold: worldBackground.gold
             } : backgroundName ? { custom: true, name: backgroundName } : null
         }
     };
@@ -2107,7 +2171,8 @@ async function handleLevelUp(args: z.infer<typeof LevelUpSchema>): Promise<objec
     // Recompute spell slots for the new level. Without this, level_up would
     // not grant the new caster slots a player earned with the level. Mirrors
     // the create-time path through convertSpellSlotsToObject.
-    const className = char.characterClass;
+    // Item 8: a world class with casting.as levels on that caster's table.
+    const className = char.characterClass ? castingClassFor(getDb(), char) : undefined;
     if (className && isSpellcaster(className)) {
         const slots = getSpellSlots(className, targetLevel);
         const next = convertSpellSlotsToObject(slots);
@@ -2138,8 +2203,19 @@ async function handleOptions(args: z.infer<typeof OptionsSchema>): Promise<objec
         hitDie: (d as { hitDie?: number }).hitDie,
         spellcaster: isSpellcaster(key)
     }));
+    // Item 8: the world's own entries, listed beside the SRD catalog.
+    let world: Record<string, unknown> | undefined;
+    if (args.worldId) {
+        const db = getDb();
+        const q = args.query?.toLowerCase();
+        const list = (kind: 'char_class' | 'species' | 'background' | 'skill') => loadRules(db, args.worldId, kind)
+            .filter(r => !q || r.name.toLowerCase().includes(q))
+            .map(r => ({ name: r.name, ...(r.spec as Record<string, unknown>) }));
+        world = { worldId: args.worldId, classes: list('char_class'), species: list('species'), backgrounds: list('background'), skills: list('skill') };
+    }
     return {
         ...catalog,
+        ...(world ? { world } : {}),
         provisioningClasses,
         provisioningRule: "Kit key goes in class:, never background:. Provisioning fires ONLY for characterType 'pc' or omitted (PC-gate). Companions: create with class set + characterType OMITTED, then update characterType."
     };
@@ -2394,7 +2470,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         createCorpse: z.boolean().optional().describe('kill: false = death without a body (default true)'),
         encounterId: z.string().optional().describe('kill: encounter the corpse lands in'),
         position: z.object({ x: z.number(), y: z.number() }).optional().describe('kill: corpse position'),
-        worldId: z.string().optional().describe('kill: world for the corpse row'),
+        worldId: z.string().optional().describe("kill: world for the corpse row; create: the world whose classes, species and backgrounds to read first; options: also list the world's own entries"),
         currency: z.record(z.number()).optional().describe('kill: currency on the corpse (e.g. {gold: 150})'),
         // Create fields
         name: z.string().optional(),
@@ -2566,6 +2642,16 @@ export async function handleCharacterManage(args: unknown, _ctx: SessionContext)
                 output += RichFormatter.section('Provisioning Classes');
                 output += RichFormatter.list(data.provisioningClasses.map((c: { class: string; hitDie?: number; spellcaster?: boolean }) => `${c.class} (d${c.hitDie ?? '?'}${c.spellcaster ? ', caster' : ''})`));
                 output += RichFormatter.alert(String(data.provisioningRule), 'info');
+            }
+            if (data.world) {
+                const names = (xs: Array<{ name: string }>) => xs.map(x => x.name).join(', ') || 'none';
+                output += RichFormatter.section('World Options');
+                output += RichFormatter.list([
+                    `Classes: ${names(data.world.classes)}`,
+                    `Species: ${names(data.world.species)}`,
+                    `Backgrounds: ${names(data.world.backgrounds)}`,
+                    `Skills: ${names(data.world.skills)}`
+                ]);
             }
         } else if (action === 'create' || action === 'new' || action === 'add' || action === 'spawn') {
             output = RichFormatter.header(`Character Created: ${data.name}`, '👤');

@@ -17,6 +17,7 @@ import { PhysicsEngine } from '../../math/physics.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { loadAutoMechanics, autoSkillBonus, autoSaveBonus, autoAdvantage, applyDeclaredEffects } from '../../engine/effects-resolver.js';
 import { parseAbility } from '../../engine/combat/conditions.js';
+import { resolveWorldId, worldSkillAbility } from '../../engine/table-rules.js';
 import * as pda from '../../render/pda.js';
 import { ExportEngine } from '../../math/export.js';
 import { CalculationRepository, StoredCalculation } from '../../storage/repos/calculation.repo.js';
@@ -175,7 +176,8 @@ async function handleCharacterRoll(
 
     if (kind === 'skill') {
         const skill = (args.skill || '').toLowerCase().replace(/ /g, '_');
-        const ability = args.ability || SKILL_ABILITY[skill] || 'wis';
+        // Item 8: a world skill (table_rules skill) names its own ability.
+        const ability = args.ability || worldSkillAbility(db, resolveWorldId(db, { characterIds: [charId] }), args.skill) || SKILL_ABILITY[skill] || 'wis';
         const mod = abilityMod(stats[ability] ?? 10);
         // #67-E: stealth/perception COLUMNS are authoritative when present.
         // The eavesdrop listener layer already rolls these columns (Findings
