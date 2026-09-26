@@ -1619,6 +1619,22 @@ async function adjustPoolCore(args: z.input<typeof AdjustPoolSchema>): Promise<o
 
     const pools: Record<string, ResourcePool> = { ...((char as { resourcePools?: Record<string, ResourcePool> }).resourcePools || {}) };
 
+    // Item 3: favour families. Checked before removePool and linkItem, so a
+    // refused family move writes nothing (adjustFamilyPool links the item).
+    // The pool moves inside its family: the family's
+    // floor and max clamp, and a gain makes each jealous rival lose.
+    if (args.family) {
+        const { db } = ensureDb();
+        if (args.value !== undefined) return { error: true, actionType: 'adjust_pool', message: 'family moves take delta, not value: a set has no gain to be jealous of.', writes: 'none' };
+        if (args.removePool) return { error: true, actionType: 'adjust_pool', message: 'removePool does not take family.', writes: 'none' };
+        const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] });
+        const rule = loadRule(db, worldId, 'pool_family', args.family);
+        if (!rule) return { error: true, actionType: 'adjust_pool', message: `No pool_family '${args.family}' in ${worldId ? `world ${worldId}` : 'this world'}. Nothing was written.`, writes: 'none' };
+        const member = familyMember(rule.spec, args.pool);
+        if (!member) return { error: true, actionType: 'adjust_pool', message: `'${args.pool}' is not in family '${rule.name}' (${rule.spec.pools.join(', ')}). Nothing was written.`, writes: 'none' };
+        return adjustFamilyPool(char, pools, { name: rule.name, spec: rule.spec }, member, args);
+    }
+
     // FINDINGS #34 T2.6: pool deletion — a traded rifle's condition pool
     // should not haunt its old owner at zero forever.
     if (args.removePool) {
@@ -1641,19 +1657,6 @@ async function adjustPoolCore(args: z.input<typeof AdjustPoolSchema>): Promise<o
         if ('error' in resolved) return { error: true, actionType: 'adjust_pool', message: `linkItem: ${resolved.error}. Nothing was written.`, writes: 'none' };
         const inst = (resolved.instance ?? mintInstance(db, char.id, resolved.templateId)) as { id: string; charges?: number | null; charges_max?: number | null };
         linked = { instanceId: inst.id, charges: typeof inst.charges === 'number' ? inst.charges : null, chargesMax: typeof inst.charges_max === 'number' ? inst.charges_max : null };
-    }
-    // Item 3: favour families. The pool moves inside its family: the family's
-    // floor and max clamp, and a gain makes each jealous rival lose.
-    if (args.family) {
-        const { db } = ensureDb();
-        if (args.value !== undefined) return { error: true, actionType: 'adjust_pool', message: 'family moves take delta, not value: a set has no gain to be jealous of.', writes: 'none' };
-        if (args.removePool) return { error: true, actionType: 'adjust_pool', message: 'removePool does not take family.', writes: 'none' };
-        const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] });
-        const rule = loadRule(db, worldId, 'pool_family', args.family);
-        if (!rule) return { error: true, actionType: 'adjust_pool', message: `No pool_family '${args.family}' in ${worldId ? `world ${worldId}` : 'this world'}. Nothing was written.`, writes: 'none' };
-        const member = familyMember(rule.spec, args.pool);
-        if (!member) return { error: true, actionType: 'adjust_pool', message: `'${args.pool}' is not in family '${rule.name}' (${rule.spec.pools.join(', ')}). Nothing was written.`, writes: 'none' };
-        return adjustFamilyPool(char, pools, { name: rule.name, spec: rule.spec }, member, args);
     }
 
     const fresh = !(args.pool in pools);

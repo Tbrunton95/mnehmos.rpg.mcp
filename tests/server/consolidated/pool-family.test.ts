@@ -115,6 +115,10 @@ describe('adjust_pool {family}', () => {
         const c = await char({ action: 'adjust_pool', characterId: 'kharn', pool: 'Khorne', delta: 1, family: 'Nope' });
         expect(c).toMatchObject({ error: true, writes: 'none' });
         expect(pools()).toEqual({ slaanesh: { current: 6, max: 20 } });
+        // removePool with family is refused too, not a silent removal.
+        const d = await char({ action: 'adjust_pool', characterId: 'kharn', pool: 'slaanesh', removePool: true, family: 'Gods' });
+        expect(d).toMatchObject({ error: true, writes: 'none' });
+        expect(pools()).toEqual({ slaanesh: { current: 6, max: 20 } });
     });
 
     it('without family a pool still clamps at 0', async () => {
