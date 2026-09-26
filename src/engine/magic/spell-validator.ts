@@ -136,6 +136,16 @@ function lookupSpellConfig(characterClass: string | undefined | null): Spellcast
 }
 
 /**
+ * The stat a class casts with, as a short stat key ('int' | 'wis' | 'cha').
+ * Unknown or non-casting classes fall back to 'wis'.
+ */
+export function getSpellcastingAbility(characterClass: string | undefined | null): 'int' | 'wis' | 'cha' {
+    const config = lookupSpellConfig(characterClass);
+    if (!config || !config.canCast) return 'wis';
+    return config.ability === 'intelligence' ? 'int' : config.ability === 'charisma' ? 'cha' : 'wis';
+}
+
+/**
  * Get max spell level a character can cast based on class and level
  */
 export function getMaxSpellLevel(characterClass: CharacterClass, level: number): number {

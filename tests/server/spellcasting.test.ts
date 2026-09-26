@@ -932,7 +932,10 @@ describe('Category 7: Concentration Mechanics', () => {
             seed: 'test-encounter-7.3',
             participants: [
                 { id: wizard.id!, name: wizard.name!, hp: 30, maxHp: 30, initiativeBonus: 3 },
-                { id: 'enemy-1', name: 'Enemy', hp: 50, maxHp: 50, initiativeBonus: 2 }
+                { id: 'enemy-1', name: 'Enemy', hp: 50, maxHp: 50, initiativeBonus: 2 },
+                // Hold Person now paralyses on a failed save, so it holds a bystander:
+                // the enemy must stay free to attack.
+                { id: 'bystander', name: 'Bystander', hp: 50, maxHp: 50, initiativeBonus: -20 }
             ]
         }, getTestContext() as any);
 
@@ -941,7 +944,7 @@ describe('Category 7: Concentration Mechanics', () => {
         const match = text.match(/Encounter ID: (encounter-[^\n]+)/);
         const encounterId = match ? match[1] : 'unknown';
 
-        await castSpell(wizard.id!, 'Hold Person', { targetId: 'enemy-1', encounterId });
+        await castSpell(wizard.id!, 'Hold Person', { targetId: 'bystander', encounterId });
         await handleAdvanceTurn({ encounterId }, getTestContext() as any);
         await handleAdvanceTurn({ encounterId }, getTestContext() as any);
 
@@ -975,7 +978,10 @@ describe('Category 7: Concentration Mechanics', () => {
             seed: 'test-encounter-7.4',
             participants: [
                 { id: wizard.id!, name: wizard.name!, hp: 10, maxHp: 30, initiativeBonus: 3 },
-                { id: 'enemy-1', name: 'Enemy', hp: 50, maxHp: 50, initiativeBonus: 2 }
+                { id: 'enemy-1', name: 'Enemy', hp: 50, maxHp: 50, initiativeBonus: 2 },
+                // Hold Person now paralyses on a failed save, so it holds a bystander:
+                // the enemy must stay free to attack.
+                { id: 'bystander', name: 'Bystander', hp: 50, maxHp: 50, initiativeBonus: -20 }
             ]
         }, getTestContext() as any);
 
@@ -984,7 +990,7 @@ describe('Category 7: Concentration Mechanics', () => {
         const match = text.match(/Encounter ID: (encounter-[^\n]+)/);
         const encounterId = match ? match[1] : 'unknown';
 
-        await castSpell(wizard.id!, 'Hold Person', { targetId: 'enemy-1', encounterId });
+        await castSpell(wizard.id!, 'Hold Person', { targetId: 'bystander', encounterId });
         await handleAdvanceTurn({ encounterId }, getTestContext() as any);
         await handleAdvanceTurn({ encounterId }, getTestContext() as any);
 

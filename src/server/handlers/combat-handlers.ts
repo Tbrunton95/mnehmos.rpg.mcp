@@ -4,7 +4,7 @@ import * as pda from '../../render/pda.js';
 import { randomUUID } from 'crypto';
 import { freshSeed } from '../../math/seed.js';
 import { CombatEngine, CombatParticipant, CombatState, CombatActionResult } from '../../engine/combat/engine.js';
-import { normalizeConditions } from '../../engine/combat/conditions.js';
+import { normalizeConditions, normalizeCondition } from '../../engine/combat/conditions.js';
 import { ConditionInputSchema, footprintCells } from '../../schema/encounter.js';
 import { SpatialEngine } from '../../engine/spatial/engine.js';
 
@@ -2335,9 +2335,31 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             }
         }
 
-        // Resolve spell effects (damage calculation)
+        // Resolve spell effects (damage calculation) on the encounter's seeded,
+        // logged dice. Each target rolls its own save below, so the resolver
+        // rolls none (perTargetSaves) and leaves debuff conditions to us.
+        const attackTargetId = validationTarget?.id ?? parsed.targetIds?.[0];
+        let spellAttackSituational: string[] = [];
         const resolution = resolveSpell(spell, casterChar, effectiveSlotLevel, {
-            targetAC
+            targetAC,
+            perTargetSaves: true,
+            advantage: parsed.advantage,
+            disadvantage: parsed.disadvantage,
+            casterId: parsed.actorId,
+            targetId: attackTargetId,
+            dice: {
+                d20: (_tag, advantage, disadvantage) => {
+                    if (!attackTargetId || !currentState.participants.some(p => p.id === attackTargetId)) {
+                        const rolls = [engine.rollD20({ purpose: 'spell attack', forId: parsed.actorId })];
+                        if (!!advantage !== !!disadvantage) rolls.push(engine.rollD20({ purpose: 'spell attack', forId: parsed.actorId }));
+                        return { natural: advantage && !disadvantage ? Math.max(...rolls) : disadvantage && !advantage ? Math.min(...rolls) : rolls[0], rolls };
+                    }
+                    const r = engine.rollSpellAttackD20(parsed.actorId, attackTargetId, { ranged: parsed.ranged, advantage, disadvantage });
+                    spellAttackSituational = r.situational;
+                    return r;
+                },
+                roll: (notation, tag) => engine.rollDice(notation, { purpose: tag, forId: parsed.actorId, ...(attackTargetId ? { targetId: attackTargetId } : {}) })
+            }
         });
 
         // Collect all targets (support both single targetId and multiple targetIds for AoE)
@@ -2481,6 +2503,37 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             }
         }
 
+        // Debuff spells: each target rolls its own save (when the spell has
+        // one) on the encounter's dice; a failure, or no save, applies the
+        // spell's conditions to the token.
+        const conditionsApplied: Array<{ id: string; name: string; condition: string; save?: ParticipantSaveResult }> = [];
+        const conditionLines: string[] = [];
+        for (const effect of spell.effects.filter(e => e.type === 'debuff' && e.conditions?.length)) {
+            const hasSave = !!effect.saveType && effect.saveType !== 'none';
+            for (const tid of allTargetIds) {
+                const tp = engine.getState()?.participants.find(p => p.id === tid);
+                if (!tp) continue;
+                let save: ParticipantSaveResult | undefined;
+                if (hasSave) {
+                    save = rollParticipantSave(engine, getDb(), tp, effect.saveType!, spellSaveDC, {
+                        purpose: `${toLongAbility(effect.saveType!) ?? effect.saveType} save vs ${spell.name}`
+                    });
+                    const line = `🎲 ${tp.name} ${save.ability.toUpperCase()} save: d20(${save.rolls.join(',')}) ${save.modifier >= 0 ? '+' : '-'} ${Math.abs(save.modifier)} = ${save.total} vs DC ${spellSaveDC} [${save.saved ? 'PASS' : 'FAIL'}]`;
+                    conditionLines.push(line);
+                    if (save.legendaryResisted) conditionLines.push(`⭐ Legendary resistance spent: the failed save becomes a success`);
+                    if (save.saved) continue;
+                }
+                for (const name of effect.conditions!) {
+                    const norm = normalizeCondition({ name, sourceId: parsed.actorId, ...(hasSave ? { saveDC: spellSaveDC, saveAbility: effect.saveType } : {}) } as never, tid);
+                    if (!norm) continue;
+                    const { id: _drop, ...rest } = norm;
+                    const applied = engine.applyCondition(tid, rest);
+                    conditionsApplied.push({ id: tid, name: tp.name, condition: applied.type, ...(save ? { save } : {}) });
+                    conditionLines.push(`🔗 ${tp.name} is ${applied.type} (${spell.name})`);
+                }
+            }
+        }
+
         // Handle healing (single target only for now)
         let primaryTarget = currentState.participants.find(p => p.id === parsed.targetId);
         const targetHpBefore = primaryTarget?.hp || 0;
@@ -2581,6 +2634,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         const reportedDamage = damageResults.length > 0
             ? damageResults.reduce((sum, dr) => sum + (dr.damageDealt ?? 0), 0)
             : (requiresSave ? baseDamage : (resolution.damage || 0));
+        if (spellAttackSituational.length) output += `\n(${spellAttackSituational.join('; ')})\n`;
+        if (conditionLines.length) output += `\n${conditionLines.join('\n')}\n`;
         output += `\n[SPELL: ${spell.name}, SLOT: ${effectiveSlotLevel > 0 ? effectiveSlotLevel : 'cantrip'}, DMG: ${reportedDamage}, HEAL: ${resolution.healing || 0}]`;
 
         // Commit Action Economy
@@ -2609,6 +2664,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // Per-target saves ride the action JSON so the client sees each die and modifier.
         const saves = damageResults.filter(dr => dr.save).map(dr => ({ id: dr.id, name: dr.name, ...dr.save! }));
         if (saves.length) (result as { saves?: unknown }).saves = saves;
+        if (conditionsApplied.length) (result as { conditionsApplied?: unknown }).conditionsApplied = conditionsApplied;
+        if (spellAttackSituational.length) result.situational = spellAttackSituational;
     } else {
         throw new Error(`Unknown action: ${parsed.action}`);
     }
@@ -2711,6 +2768,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             legendary: (r as { legendary?: unknown }).legendary,
             reaction: (r as { reaction?: unknown }).reaction,
             saves: (r as { saves?: unknown }).saves,
+            conditionsApplied: (r as { conditionsApplied?: unknown }).conditionsApplied,
             // Item 11: reactions a move set off, each at the step it happened.
             opportunityAttacks: (r as { opportunityAttacks?: unknown }).opportunityAttacks,
             opportunityAttacksAvailable: (r as { opportunityAttacksAvailable?: unknown }).opportunityAttacksAvailable,

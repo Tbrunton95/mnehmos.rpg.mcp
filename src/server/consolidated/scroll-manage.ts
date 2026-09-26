@@ -14,6 +14,7 @@ import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { SessionContext } from '../types.js';
 import { getDb } from '../../storage/index.js';
+import { loggedD20 } from '../../math/logged-d20.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ItemRepository } from '../../storage/repos/item.repo.js';
 import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
@@ -118,7 +119,7 @@ async function handleUse(args: z.infer<typeof UseSchema>): Promise<object> {
         return { error: true, message: `Scroll item ${args.scrollItemId} not found` };
     }
 
-    const result = useSpellScroll(character, scroll, inventoryRepo);
+    const result = useSpellScroll(character, scroll, inventoryRepo, () => loggedD20(getDb(), { purpose: `arcana check (scroll of ${scroll.properties?.spellName ?? scroll.name})`, forId: character.id }, { tool: 'scroll_manage' }).natural);
 
     return {
         success: result.success,
@@ -211,7 +212,7 @@ async function handleIdentify(args: z.infer<typeof IdentifySchema>): Promise<obj
 
     // Otherwise, roll Arcana check
     const checkDC = 10 + scrollDetails.spellLevel!;
-    const arcanaCheck = rollArcanaCheck(character);
+    const arcanaCheck = rollArcanaCheck(character, () => loggedD20(getDb(), { purpose: `arcana check (identify ${scrollDetails.spellName ?? 'scroll'})`, forId: character.id }, { tool: 'scroll_manage' }).natural);
     const success = arcanaCheck.total >= checkDC;
 
     if (success) {

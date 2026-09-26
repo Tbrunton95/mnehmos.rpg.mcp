@@ -439,6 +439,39 @@ export class CombatEngine {
         return this.tagged(tag, () => this.rng.rollDamageDetailed(notation));
     }
 
+    /**
+     * A spell attack d20 on the encounter's stream, with the same Dodge, Help
+     * (spent) and standard-condition modifiers a weapon attack reads. Within
+     * 5 ft comes from the grid when both tokens are placed, else it is
+     * assumed unless the attack is ranged. Logged as 'spell attack'.
+     */
+    rollSpellAttackD20(actorId: string, targetId: string, opts: { ranged?: boolean; advantage?: boolean; disadvantage?: boolean } = {}): {
+        natural: number; rolls: number[]; advantage: boolean; disadvantage: boolean; situational: string[]; autoCrit?: string
+    } {
+        if (!this.state) throw new Error('No active combat');
+        const actor = this.state.participants.find(p => p.id === actorId);
+        const target = this.state.participants.find(p => p.id === targetId);
+        if (!actor) throw new Error(`Actor ${actorId} not found`);
+        if (!target) throw new Error(`Target ${targetId} not found`);
+        let advantage = !!opts.advantage;
+        let disadvantage = !!opts.disadvantage;
+        const situational: string[] = [];
+        if (target.isDodging) { disadvantage = true; situational.push(`${target.name} is dodging (disadvantage)`); }
+        if (actor.helpedBy) {
+            advantage = true;
+            const helper = this.state.participants.find(p => p.id === actor.helpedBy);
+            situational.push(`helped by ${helper?.name ?? actor.helpedBy} (advantage)`);
+            actor.helpedBy = undefined;
+        }
+        const within5ft = opts.ranged ? false
+            : (actor.position && target.position ? edgeDistanceSquares(actor, target) <= 1 : true);
+        const mods = conditionAttackModifiers(actor, target, { within5ft, participants: this.state.participants });
+        if (mods.adv.length) { advantage = true; situational.push(...mods.adv); }
+        if (mods.dis.length) { disadvantage = true; situational.push(...mods.dis); }
+        const r = this.tagged({ purpose: 'spell attack', forId: actorId, targetId }, () => this.rng.rollAttackD20(0, 0, advantage, disadvantage));
+        return { natural: r.roll, rolls: r.allRolls, advantage, disadvantage, situational, ...(mods.autoCrit ? { autoCrit: mods.autoCrit } : {}) };
+    }
+
     /** Roll under a tag so the audit log says who the dice were for and why. */
     private tagged<T>(tag: import('./rng.js').RollTag, fn: () => T): T {
         const prev = this.rng.tag;

@@ -6,7 +6,7 @@
 import type { Spell, DamageType, SpellCastResult } from '../../schema/spell.js';
 import type { Character } from '../../schema/character.js';
 import { calculateUpcastDice } from './spell-database.js';
-import { calculateSpellSaveDC, calculateSpellAttackBonus } from './spell-validator.js';
+import { calculateSpellSaveDC, calculateSpellAttackBonus, getSpellcastingAbility } from './spell-validator.js';
 
 /**
  * Roll dice and return total
@@ -68,10 +68,29 @@ export function getMagicMissileDarts(slotLevel: number): number {
     return 3 + (slotLevel - 1); // Base 3 darts + 1 per level above 1st
 }
 
+/**
+ * Dice the resolver rolls on instead of Math.random: inside an encounter the
+ * handler passes the encounter's seeded, logged stream. d20 is the spell
+ * attack die (advantage and disadvantage already folded in by the roller;
+ * autoCrit names a condition that turns a hit into a crit).
+ */
+export interface SpellDice {
+    d20(tag: string, advantage?: boolean, disadvantage?: boolean): { natural: number; rolls: number[]; autoCrit?: string };
+    roll(notation: string, tag: string): { total: number; rolls: number[] };
+}
+
 export interface SpellResolutionOptions {
     targetSaveRoll?: number; // For testing - mock the save roll
     targetAC?: number; // For spell attack rolls
     casterAbilityMod?: number; // Override ability modifier
+    /** Roll on these dice instead of Math.random. */
+    dice?: SpellDice;
+    /** The caller rolls each target's save: the resolver rolls none and leaves debuff conditions to it. */
+    perTargetSaves?: boolean;
+    advantage?: boolean;
+    disadvantage?: boolean;
+    casterId?: string;
+    targetId?: string;
 }
 
 export interface SpellResolutionResult {
@@ -116,9 +135,16 @@ export function resolveSpell(
         concentration: spell.concentration
     };
 
-    // Get caster's spell save DC and attack bonus
+    // Get caster's spell save DC and attack bonus (a set attack bonus of 0 stands)
     const spellSaveDC = caster.spellSaveDC || calculateSpellSaveDC(caster);
-    const spellAttackBonus = caster.spellAttackBonus || calculateSpellAttackBonus(caster);
+    const spellAttackBonus = caster.spellAttackBonus ?? calculateSpellAttackBonus(caster);
+    const dice = options.dice;
+    const roll = (notation: string, tag: string): { total: number; rolls: number[] } => {
+        if (!dice) return rollDice(notation);
+        const r = dice.roll(notation, tag);
+        return { total: Math.max(0, r.total), rolls: r.rolls };
+    };
+    const d20 = (tag: string): number => dice ? dice.d20(tag).natural : Math.floor(Math.random() * 20) + 1;
 
     // Process effects
     for (const effect of spell.effects) {
@@ -143,8 +169,12 @@ export function resolveSpell(
                     result.dartCount = darts;
                     // Each dart does 1d4+1
                     let totalDamage = 0;
-                    for (let i = 0; i < darts; i++) {
-                        totalDamage += Math.floor(Math.random() * 4) + 1 + 1;
+                    if (dice) {
+                        totalDamage = roll(`${darts}d4+${darts}`, `${spell.name} damage`).total;
+                    } else {
+                        for (let i = 0; i < darts; i++) {
+                            totalDamage += Math.floor(Math.random() * 4) + 1 + 1;
+                        }
                     }
                     result.damage = totalDamage;
                     result.damageRolled = totalDamage;
@@ -154,11 +184,12 @@ export function resolveSpell(
                     break;
                 }
 
-                // Roll damage
-                const damageRoll = rollDice(diceNotation);
+                // Check if spell requires attack roll or saving throw. An attack
+                // spell on injected dice rolls its d20 first, then damage on a hit.
+                const attackSpell = !spell.autoHit && !(effect.saveType && effect.saveType !== 'none');
+                const damageRoll = attackSpell && dice ? { total: 0, rolls: [] as number[] } : roll(diceNotation, `${spell.name} damage`);
                 result.damageRolled = damageRoll.total;
 
-                // Check if spell requires attack roll or saving throw
                 if (spell.autoHit) {
                     result.autoHit = true;
                     result.damageApplied = damageRoll.total;
@@ -167,11 +198,14 @@ export function resolveSpell(
                     // Saving throw spell
                     result.saveDC = spellSaveDC;
 
-                    // Roll save (or use provided mock)
-                    const saveRoll = options.targetSaveRoll ?? (Math.floor(Math.random() * 20) + 1);
+                    // Roll save (or use provided mock). With perTargetSaves the
+                    // caller rolls each target's save on the full roll instead.
+                    const saveRoll = options.perTargetSaves ? undefined : (options.targetSaveRoll ?? d20('save'));
                     const saveTotal = saveRoll; // TODO(high): Add target's save modifier
 
-                    if (saveTotal >= spellSaveDC) {
+                    if (saveTotal === undefined) {
+                        result.damageApplied = damageRoll.total;
+                    } else if (saveTotal >= spellSaveDC) {
                         result.saveResult = 'passed';
                         if (effect.saveEffect === 'half') {
                             result.damageApplied = Math.floor(damageRoll.total / 2);
@@ -185,22 +219,31 @@ export function resolveSpell(
                     result.damage = result.damageApplied;
                 } else {
                     // Spell attack roll
-                    const attackRoll = Math.floor(Math.random() * 20) + 1;
+                    const attackDie = dice
+                        ? dice.d20('spell attack', options.advantage, options.disadvantage)
+                        : { natural: Math.floor(Math.random() * 20) + 1, rolls: [] as number[], autoCrit: undefined as string | undefined };
+                    const attackRoll = attackDie.natural;
                     result.attackRoll = attackRoll;
                     result.attackTotal = attackRoll + spellAttackBonus;
 
                     const targetAC = options.targetAC ?? 10;
                     // A natural 20 always hits and crits; a natural 1 always misses.
-                    result.critical = attackRoll === 20;
                     result.hit = attackRoll === 20 || (attackRoll !== 1 && result.attackTotal >= targetAC);
+                    // A paralysed or unconscious target within 5 ft: a hit is a crit.
+                    result.critical = attackRoll === 20 || (result.hit && !!attackDie.autoCrit);
 
                     if (result.hit) {
+                        if (dice) {
+                            const hitRoll = roll(diceNotation, `${spell.name} damage`);
+                            damageRoll.total = hitRoll.total;
+                            damageRoll.rolls = hitRoll.rolls;
+                        }
                         let damage = damageRoll.total;
                         if (result.critical) {
                             // Roll the dice again; the flat modifier counts once.
                             const extraDice = diceNotation.trim().replace(/[+-]\d+$/, '');
                             if (/d/i.test(extraDice)) {
-                                damage += rollDice(extraDice).total;
+                                damage += roll(extraDice, `${spell.name} crit damage`).total;
                                 result.diceRolled = `${diceNotation} (crit: dice doubled)`;
                             }
                         }
@@ -239,10 +282,11 @@ export function resolveSpell(
                 result.diceRolled = healingDice;
 
                 // Roll healing
-                const healingRoll = rollDice(healingDice);
+                const healingRoll = roll(healingDice, `${spell.name} healing`);
 
-                // Add spellcasting modifier
-                const abilityMod = options.casterAbilityMod ?? Math.floor((caster.stats.wis - 10) / 2);
+                // Add the caster's own spellcasting modifier (WIS for an unknown class)
+                const castingStat = caster.stats[getSpellcastingAbility(caster.characterClass)] ?? caster.stats.wis;
+                const abilityMod = options.casterAbilityMod ?? Math.floor((castingStat - 10) / 2);
                 result.healing = healingRoll.total + abilityMod;
                 break;
             }
@@ -265,10 +309,15 @@ export function resolveSpell(
             }
 
             case 'debuff': {
-                // Saving throw for debuff
+                // Saving throw for debuff. With perTargetSaves the caller rolls
+                // each target's save and applies the conditions itself.
+                if (options.perTargetSaves) {
+                    if (effect.saveType && effect.saveType !== 'none') result.saveDC = spellSaveDC;
+                    break;
+                }
                 if (effect.saveType && effect.saveType !== 'none') {
                     result.saveDC = spellSaveDC;
-                    const saveRoll = options.targetSaveRoll ?? (Math.floor(Math.random() * 20) + 1);
+                    const saveRoll = options.targetSaveRoll ?? d20('save');
 
                     if (saveRoll >= spellSaveDC) {
                         result.saveResult = 'passed';
