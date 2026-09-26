@@ -510,6 +510,23 @@ export class CombatEngine {
     }
 
     /**
+     * Why a legendary action of this cost cannot be taken now, or undefined
+     * when it can. Checked before any roll so a refusal spends nothing.
+     */
+    legendaryActionProblem(participantId: string, cost: number = 1): string | undefined {
+        if (!this.state) return 'No active combat';
+        const participant = this.state.participants.find(p => p.id === participantId);
+        if (!participant) return `Participant ${participantId} not in this encounter`;
+        if (!participant.legendaryActions || participant.legendaryActions <= 0) return `${participant.name} has no legendary actions`;
+        const currentId = this.state.turnOrder[this.state.currentTurnIndex];
+        if (currentId === participantId) return `${participant.name} cannot take a legendary action on its own turn`;
+        if (currentId === 'LAIR') return 'No legendary action on the LAIR turn (there is no creature\'s turn to follow)';
+        const remaining = participant.legendaryActionsRemaining ?? 0;
+        if (remaining < cost) return `Not enough legendary actions (need ${cost}, have ${remaining})`;
+        return undefined;
+    }
+
+    /**
      * Use a legendary action
      * @param participantId - ID of the legendary creature
      * @param cost - How many legendary actions this use costs (default 1)
@@ -1298,6 +1315,7 @@ export class CombatEngine {
         participant.hasDisengaged = false;
         participant.hasDashed = false;
         participant.actionUsed = false;
+        participant.attacksMade = 0;
         participant.bonusActionUsed = false;
         participant.spellsCast = {};
         participant.movementRemaining = this.effectiveSpeed(participant);
@@ -1625,6 +1643,38 @@ export class CombatEngine {
         }
 
         return { valid: true };
+    }
+
+    /**
+     * Validate one attack against the Attack action. With multiattack
+     * (attacksPerAction > 1) the action stays open between swings, so the
+     * second attack is valid while the first already spent the action; any
+     * other use of the action (Dash, a spell) still closes it.
+     */
+    validateAttackEconomy(participantId: string): { valid: boolean; error?: string } {
+        if (!this.state) return { valid: false, error: 'No active combat' };
+        const participant = this.state.participants.find(p => p.id === participantId);
+        if (!participant) return { valid: false, error: 'Participant not found' };
+        const of = participant.attacksPerAction ?? 1;
+        const made = participant.attacksMade ?? 0;
+        if (made > 0 && made < of) {
+            if (!this.canTakeActions(participantId)) return { valid: false, error: 'Participant is incapacitated' };
+            return { valid: true };
+        }
+        const economy = this.validateActionEconomy(participantId, 'action');
+        if (!economy.valid && of > 1 && made >= of) {
+            return { valid: false, error: `Action already used this turn (attacks ${made}/${of})` };
+        }
+        return economy;
+    }
+
+    /** Count one attack of the Attack action (the action is spent from the first). */
+    commitAttack(participantId: string): { made: number; of: number } | undefined {
+        const participant = this.state?.participants.find(p => p.id === participantId);
+        if (!participant) return undefined;
+        participant.attacksMade = (participant.attacksMade ?? 0) + 1;
+        participant.actionUsed = true;
+        return { made: participant.attacksMade, of: participant.attacksPerAction ?? 1 };
     }
 
     /**

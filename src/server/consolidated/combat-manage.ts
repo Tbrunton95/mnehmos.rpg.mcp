@@ -46,7 +46,7 @@ import { freshSeed } from '../../math/seed.js';
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_intent', 'trigger_readied', 'get_history', 'list'] as const;
+const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_intent', 'trigger_readied', 'legendary_action', 'legendary_resistance', 'get_history', 'list'] as const;
 type CombatManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -290,6 +290,22 @@ const TriggerReadiedSchema = z.object({
     encounterId: z.string(),
     participantId: z.string(),
     note: z.string().optional().describe('What happened when it fired')
+});
+
+const LegendaryActionSchema = z.object({
+    action: z.literal('legendary_action'),
+    encounterId: z.string(),
+    participantId: z.string(),
+    cost: z.number().int().min(1).default(1).describe('Legendary actions this costs (default 1)'),
+    description: z.string().describe("What the creature does ('wing attack', 'moves 40 ft')"),
+    reason: z.string().optional()
+});
+
+const LegendaryResistanceSchema = z.object({
+    action: z.literal('legendary_resistance'),
+    encounterId: z.string(),
+    participantId: z.string(),
+    reason: z.string().describe('The save it turns into a success')
 });
 
 // FINDINGS #80: the ghost hunt gets a verb — encounters could previously only
@@ -676,7 +692,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             const result = await handleExecuteLairAction(lairParams, ctx);
             return extractResultData(result, 'lair_action');
         },
-        aliases: ['lair', 'legendary', 'boss_action']
+        aliases: ['lair', 'boss_action']
     },
 
     spawn_quick_enemy: {
@@ -717,6 +733,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     ac: preset.ac,
                     attackDamage: preset.defaultAttack?.damage,
                     attackBonus: preset.defaultAttack?.toHit,
+                    ...(preset.attacksPerAction ? { attacksPerAction: preset.attacksPerAction } : {}),
                     isEnemy: true,
                     conditions: [],
                     position: pos,
@@ -1241,6 +1258,59 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         aliases: ['fire_readied', 'readied_fires'],
         description: 'A readied action\'s trigger happened: clear it, log it, then resolve the action'
     },
+    legendary_action: {
+        schema: LegendaryActionSchema,
+        handler: async (params: z.infer<typeof LegendaryActionSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'legendary_action', message, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            const problem = engine.legendaryActionProblem(p.id, params.cost)
+                ?? (engine.canTakeActions(p.id) ? undefined : `${p.name} is incapacitated`);
+            if (problem) return refuse(problem);
+            const spent = engine.useLegendaryAction(p.id, params.cost);
+            if (!spent.success) return refuse(spent.error ?? 'Legendary action refused');
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            logConditionChange(params.encounterId, state, 'legendary_action', p.id, `${p.name} legendary action (cost ${params.cost}): ${params.description}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
+            return {
+                success: true, actionType: 'legendary_action', encounterId: params.encounterId, participantId: p.id,
+                cost: params.cost, remaining: spent.remaining, of: p.legendaryActions,
+                message: `👑 ${p.name}: ${params.description} (cost ${params.cost}; LA ${spent.remaining}/${p.legendaryActions} left). For an attack, use combat_action attack with legendaryCost instead.`
+            };
+        },
+        aliases: ['legendary', 'use_legendary_action'],
+        description: 'Spend legendary actions on a non-attack legendary action (move, wing buffet) at the end of another creature\'s turn; logged'
+    },
+    legendary_resistance: {
+        schema: LegendaryResistanceSchema,
+        handler: async (params: z.infer<typeof LegendaryResistanceSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'legendary_resistance', message, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            const spent = engine.useLegendaryResistance(p.id);
+            if (!spent.success) return refuse(`${p.name}: ${spent.error ?? 'legendary resistance refused'}`);
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            // Legendary resistances last the day, so the sheet keeps the count.
+            const charRepo = new CharacterRepository(getDb());
+            const mirrored = !!charRepo.findById(p.id);
+            if (mirrored) charRepo.update(p.id, { legendaryResistancesRemaining: spent.remaining });
+            logConditionChange(params.encounterId, state, 'legendary_resistance', p.id, `${p.name} uses a legendary resistance: ${params.reason}`, params.reason);
+            return {
+                success: true, actionType: 'legendary_resistance', encounterId: params.encounterId, participantId: p.id,
+                remaining: spent.remaining, of: p.legendaryResistances, mirroredToCharacter: mirrored,
+                message: `👑 ${p.name} turns a failed save into a success (${params.reason}); LR ${spent.remaining}/${p.legendaryResistances} left`
+            };
+        },
+        aliases: ['use_legendary_resistance', 'legendary_save'],
+        description: 'Spend a legendary resistance to turn a failed save into a success; mirrors the count to the sheet and logs'
+    },
     get_history: {
         schema: GetHistorySchema,
         handler: async (params: z.infer<typeof GetHistorySchema>) => {
@@ -1414,7 +1484,7 @@ const router = createActionRouter({
 export const CombatManageTool = {
     name: 'combat_manage',
     description: `Unified combat encounter management. Actions: ${ACTIONS.join(', ')}.
-Aliases: start/begin→create, state/status→get, finish/stop→end, restore/resume→load, next→advance, quick/spawn→spawn_quick_enemy.
+Aliases: start/begin→create, state/status→get, finish/stop→end, restore/resume→load, next→advance, quick/spawn→spawn_quick_enemy, legendary→legendary_action.
 
 ⚔️ QUICK START:
 - spawn_quick_enemy: Instantly create combat with preset creatures (goblin, orc, skeleton, etc.)
@@ -1425,7 +1495,9 @@ Aliases: start/begin→create, state/status→get, finish/stop→end, restore/re
 2. get - View current state
 3. advance - Move to next turn
 4. death_save - Roll death save for downed character
-5. lair_action - Execute boss lair action
+5. lair_action - Execute boss lair action (LAIR turn only)
+   legendary_action {participantId, cost?, description} - a non-attack legendary action off its turn (attacks: combat_action attack with legendaryCost)
+   legendary_resistance {participantId, reason} - turn a failed save into a success
 6. end - Finish combat
 
 For combat ACTIONS (attack, move, cast), use combat_action tool instead.
@@ -1450,7 +1522,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         participantId: z.string().optional().describe('remove_participant / adjust_hp: participant/token id'),
         value: z.number().optional().describe('adjust_hp: set HP to exactly this'),
         delta: z.number().optional().describe('adjust_hp: shift HP by this amount'),
-        reason: z.string().optional().describe('adjust_hp (required) / add_condition / remove_condition: why — logged'),
+        reason: z.string().optional().describe('adjust_hp / legendary_resistance (required) / add_condition / remove_condition / legendary_action: why — logged'),
         condition: z.any().optional().describe('add_condition / remove_condition: a name ("prone") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?, level?}; remove also takes the object add_condition returned'),
         conditionId: z.string().optional().describe('remove_condition: one condition instance id'),
         replace: z.boolean().optional().describe('add_condition: drop existing conditions of the same type first'),
@@ -1484,6 +1556,8 @@ For CORPSES after combat, use corpse_manage tool.`,
         holds: z.array(z.string()).optional().describe("set_part: weapons or slots the part wields ('axe', 'mainhand')"),
         breakAt: z.number().int().optional().describe('set_part: one aimed hit dealing at least this much severs the part'),
         note: z.string().optional().describe('set_part / trigger_readied: note'),
+        cost: z.number().optional().describe('legendary_action: legendary actions it costs (default 1)'),
+        description: z.string().optional().describe("legendary_action: what the creature does ('wing attack')"),
         suppressed: z.boolean().optional().describe('set_unit'),
         inMelee: z.boolean().optional().describe('set_unit'),
         brokenFormation: z.boolean().optional().describe('set_unit'),
@@ -1615,6 +1689,10 @@ export async function handleCombatManage(args: unknown, ctx: SessionContext): Pr
                 case 'set_intent':
                 case 'trigger_readied':
                     output = RichFormatter.header('Intent', '⚑');
+                    break;
+                case 'legendary_action':
+                case 'legendary_resistance':
+                    output = RichFormatter.header('Legendary', '👑');
                     break;
                 default:
                     output = RichFormatter.header('Combat', '⚔️');

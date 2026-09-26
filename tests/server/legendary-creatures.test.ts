@@ -11,6 +11,12 @@
  */
 
 import { CombatEngine, CombatParticipant } from '../../src/engine/combat/engine.js';
+import { handleCombatManage } from '../../src/server/consolidated/combat-manage.js';
+import { handleCombatAction } from '../../src/server/consolidated/combat-action.js';
+import { clearCombatState } from '../../src/server/handlers/combat-handlers.js';
+import { EncounterRepository } from '../../src/storage/repos/encounter.repo.js';
+import { CharacterRepository } from '../../src/storage/repos/character.repo.js';
+import { closeDb, getDb } from '../../src/storage/index.js';
 
 describe('Legendary Creatures', () => {
     let engine: CombatEngine;
@@ -374,5 +380,104 @@ describe('Legendary Creatures', () => {
             // This will depend on turn order, but the method should exist
             expect(typeof lairActionsPending).toBe('boolean');
         });
+    });
+});
+
+describe('Legendary creatures at the table (tools)', () => {
+    const ctx = { sessionId: 'legendary-tools' };
+    const tag = (text: string, t: string) => { const m = text.match(new RegExp(`<!-- ${t}_JSON\\n([\\s\\S]*?)\\n${t}_JSON -->`)); return m ? JSON.parse(m[1]) : null; };
+    let enc: string;
+    const manage = async (args: Record<string, unknown>) => {
+        const text = (await handleCombatManage({ encounterId: enc, ...args }, ctx as any)).content[0].text;
+        return { text, d: tag(text, 'COMBAT_MANAGE') };
+    };
+    const attack = async (args: Record<string, unknown>) => {
+        const text = (await handleCombatAction({ action: 'attack', encounterId: enc, ...args }, ctx as any)).content[0].text;
+        const d = tag(text, 'COMBAT_ACTION');
+        return { text, r: d?.actionResult ?? d };
+    };
+    const tok = (id: string) => new EncounterRepository(getDb()).loadState(enc)!.participants.find(p => p.id === id)! as any;
+
+    // The hero acts first, so the dragon is off turn.
+    async function setup() {
+        closeDb();
+        const db = getDb(':memory:');
+        clearCombatState();
+        const now = new Date().toISOString();
+        new CharacterRepository(db).create({ id: 'dragon', name: 'Dragon', stats: { str: 27, dex: 10, con: 25, int: 16, wis: 13, cha: 21 },
+            hp: 256, maxHp: 256, ac: 19, level: 1, legendaryActions: 3, legendaryResistances: 3, legendaryResistancesRemaining: 3,
+            createdAt: now, updatedAt: now } as any);
+        enc = tag((await handleCombatManage({ action: 'create', participants: [
+            { id: 'hero', name: 'Valeros', hp: 50, maxHp: 50, initiative: 25, ac: 10 },
+            { id: 'dragon', name: 'Dragon', hp: 256, maxHp: 256, initiative: 10, isEnemy: true, ac: 19 }
+        ] }, ctx as any)).content[0].text, 'COMBAT_MANAGE').encounterId;
+    }
+
+    afterEach(() => closeDb());
+
+    it('an off-turn attack with legendaryCost spends legendary actions, not the action, and carries no off-turn warning', async () => {
+        await setup();
+        const { text, r } = await attack({ actorId: 'dragon', targetId: 'hero', attackBonus: 14, damage: '2d6+8', legendaryCost: 1 });
+        expect(r.legendary).toEqual({ cost: 1, remaining: 2 });
+        expect(text).not.toMatch(/off_turn_action/);
+        expect(tok('dragon').legendaryActionsRemaining).toBe(2);
+        expect(tok('dragon').actionUsed).toBeFalsy();
+    });
+
+    it('legendaryCost is refused on its own turn and beyond what is left, writing nothing', async () => {
+        await setup();
+        const tooMuch = await attack({ actorId: 'dragon', targetId: 'hero', attackBonus: 14, damage: 5, legendaryCost: 4 });
+        expect(tooMuch.text).toMatch(/Not enough legendary actions \(need 4, have 3\)/);
+        expect(tok('dragon').legendaryActionsRemaining).toBe(3);
+        expect(tok('hero').hp).toBe(50);
+        await manage({ action: 'advance' });
+        const own = await attack({ actorId: 'dragon', targetId: 'hero', attackBonus: 14, damage: 5, legendaryCost: 1 });
+        expect(own.text).toMatch(/own turn/);
+    });
+
+    it('legendary_action spends, logs and refuses once spent', async () => {
+        await setup();
+        const first = await manage({ action: 'legendary_action', participantId: 'dragon', cost: 2, description: 'wing attack' });
+        expect(first.d).toMatchObject({ success: true, remaining: 1, cost: 2 });
+        expect(tok('dragon').legendaryActionsRemaining).toBe(1);
+        const second = await manage({ action: 'legendary_action', participantId: 'dragon', cost: 2, description: 'wing attack' });
+        expect(second.d.error).toBe(true);
+        expect(second.text).toMatch(/need 2, have 1/);
+        const history = await manage({ action: 'get_history' });
+        expect(history.text).toMatch(/wing attack/);
+    });
+
+    it("the 'legendary' alias reaches legendary_action", async () => {
+        await setup();
+        const { d } = await manage({ action: 'legendary', participantId: 'dragon', description: 'detect' });
+        expect(d.actionType).toBe('legendary_action');
+        expect(tok('dragon').legendaryActionsRemaining).toBe(2);
+    });
+
+    it('legendary_resistance spends one and mirrors the count to the sheet', async () => {
+        await setup();
+        const { d } = await manage({ action: 'legendary_resistance', participantId: 'dragon', reason: 'hold person' });
+        expect(d).toMatchObject({ success: true, remaining: 2 });
+        expect(tok('dragon').legendaryResistancesRemaining).toBe(2);
+        expect(new CharacterRepository(getDb()).findById('dragon')!.legendaryResistancesRemaining).toBe(2);
+        const hero = await manage({ action: 'legendary_resistance', participantId: 'hero', reason: 'x' });
+        expect(hero.d.error).toBe(true);
+    });
+
+    it('the state view shows legendary actions and resistances left', async () => {
+        await setup();
+        await manage({ action: 'legendary_resistance', participantId: 'dragon', reason: 'hold person' });
+        await manage({ action: 'legendary_action', participantId: 'dragon', description: 'tail' });
+        const { text } = await manage({ action: 'get' });
+        expect(text).toMatch(/LA 2\/3 · LR 2\/3/);
+    });
+
+    it('reaction:true spends the reaction, not the action, and a second reaction is refused', async () => {
+        await setup();
+        const { text } = await attack({ actorId: 'dragon', targetId: 'hero', attackBonus: 14, damage: 3, reaction: true });
+        expect(text).not.toMatch(/off_turn_action/);
+        expect(tok('dragon').reactionUsed).toBe(true);
+        expect(tok('dragon').actionUsed).toBeFalsy();
+        expect((await attack({ actorId: 'dragon', targetId: 'hero', attackBonus: 14, damage: 3, reaction: true })).text).toMatch(/Reaction already used/);
     });
 });

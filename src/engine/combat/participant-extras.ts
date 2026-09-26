@@ -33,6 +33,7 @@ function presetExtras(preset?: CreaturePreset): ExtrasInput {
         size: preset.size as SizeCategory | undefined,
         movementSpeed: preset.speed,
         cr: preset.cr,
+        attacksPerAction: preset.attacksPerAction,
         attackBonus: preset.defaultAttack?.toHit,
         attackDamage: preset.defaultAttack?.damage,
         attackDamageType: preset.defaultAttack?.damageType

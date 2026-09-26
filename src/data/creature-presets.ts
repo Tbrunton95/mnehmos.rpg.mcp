@@ -50,6 +50,9 @@ export interface CreaturePreset {
     cr?: number;
     xpValue?: number;
 
+    // Multiattack: attacks one Attack action allows (from the Multiattack trait)
+    attacksPerAction?: number;
+
     // Special traits description
     traits?: string[];
 }
@@ -389,6 +392,7 @@ export const CREATURE_PRESETS: Record<string, CreaturePreset> = {
             damageType: 'slashing',
             toHit: 5
         },
+        attacksPerAction: 3,
         traits: ['Multiattack: Three melee attacks or two ranged']
     },
 
@@ -648,6 +652,7 @@ export const CREATURE_PRESETS: Record<string, CreaturePreset> = {
             damageType: 'slashing',
             toHit: 4
         },
+        attacksPerAction: 2,
         traits: ['Multiattack: Bite and claws', 'Keen Smell']
     },
 
@@ -671,6 +676,7 @@ export const CREATURE_PRESETS: Record<string, CreaturePreset> = {
             damageType: 'slashing',
             toHit: 6
         },
+        attacksPerAction: 2,
         traits: ['Multiattack: Bite and claws', 'Keen Smell']
     },
 
@@ -823,6 +829,7 @@ export const CREATURE_PRESETS: Record<string, CreaturePreset> = {
             damageType: 'slashing',
             toHit: 7
         },
+        attacksPerAction: 2,
         traits: ['Multiattack: Beak and claws', 'Keen Sight and Smell']
     },
 
@@ -845,6 +852,7 @@ export const CREATURE_PRESETS: Record<string, CreaturePreset> = {
             damageType: 'slashing',
             toHit: 3
         },
+        attacksPerAction: 2,
         traits: ['Multiattack: Claws and club', 'Luring Song: DC 11 WIS or charmed']
     },
 
@@ -945,6 +953,7 @@ export const CREATURE_PRESETS: Record<string, CreaturePreset> = {
             damageType: 'slashing',
             toHit: 7
         },
+        attacksPerAction: 3,
         traits: ['Multiattack: Bite and 2 claws', 'Regeneration: 10 HP per turn unless fire/acid damage', 'Keen Smell']
     },
 

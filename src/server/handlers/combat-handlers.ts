@@ -198,6 +198,9 @@ function buildStateJson(state: CombatState, encounterId: string, sessionId?: str
             attackDamage: p.attackDamage,
             attackBonus: p.attackBonus,
             ...(p.attacks?.length ? { attacks: p.attacks } : {}),
+            ...((p.attacksPerAction ?? 1) > 1 ? { attacksPerAction: p.attacksPerAction, attacksMade: p.attacksMade ?? 0 } : {}),
+            ...(p.legendaryActions ? { legendaryActions: p.legendaryActions, legendaryActionsRemaining: p.legendaryActionsRemaining ?? 0 } : {}),
+            ...(p.legendaryResistances ? { legendaryResistances: p.legendaryResistances, legendaryResistancesRemaining: p.legendaryResistancesRemaining ?? 0 } : {}),
             // Table state the GM reads each round
             ...(p.band ? { band: p.band } : {}),
             ...(p.parts?.length ? { parts: p.parts } : {}),
@@ -250,6 +253,12 @@ function formatCombatStateText(state: CombatState): string {
         // Include ID for LLM targeting
         output += `${marker} ${icon} ${p.name.padEnd(18)} ${hpBar} ${p.hp}/${p.maxHp} HP  [Init: ${p.initiative}] ID: ${p.id} ${status}\n`;
         if (p.unit) output += `      🪖 ${describeUnit(p)}\n`;
+        const counters = [
+            p.legendaryActions ? `LA ${p.legendaryActionsRemaining ?? 0}/${p.legendaryActions}` : '',
+            p.legendaryResistances ? `LR ${p.legendaryResistancesRemaining ?? 0}/${p.legendaryResistances}` : '',
+            (p.attacksPerAction ?? 1) > 1 ? `attacks ${p.attacksMade ?? 0}/${p.attacksPerAction}` : ''
+        ].filter(Boolean);
+        if (counters.length) output += `      👑 ${counters.join(' · ')}\n`;
         if (p.attacks?.length) output += `      🗡 attacks: ${p.attacks.map(a => `${a.name} ${a.attackBonus >= 0 ? '+' : ''}${a.attackBonus}`).join(', ')}\n`;
         // Hurt parts, and armoured ones (own ac, hp or breakAt) even when intact.
         const hurt = (p.parts ?? []).filter(pt => pt.state !== 'intact' || pt.ac !== undefined || pt.hp !== undefined || pt.breakAt !== undefined);
@@ -798,6 +807,8 @@ Examples:
             ranged: z.boolean().optional().describe('A ranged attack (not within 5 ft): a prone target is disadvantage and paralysed/unconscious no auto-crit. Unset = from token positions, else melee'),
             ignoreConditions: z.boolean().optional().describe('Skip the automatic advantage/disadvantage/auto-crit from standard conditions (raw roll)'),
             cleave: z.boolean().optional().describe('Cleave through a packed unit of a lower band: damage flows through models instead of stopping at one'),
+            legendaryCost: z.number().int().min(1).optional().describe("A legendary action: spends this many of the creature's legendary actions instead of its action (off its own turn only)"),
+            reaction: z.boolean().optional().describe('An attack as a reaction (opportunity attack, readied swing): spends the reaction instead of the action'),
             volley: z.object({ dice: z.string(), reason: z.string() }).optional().describe('Internal: set by combat_action volley'),
             declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit trail: printed in output, never re-applied'),
             declaredEffects: z.array(z.object({ name: z.string(), lane: z.string().optional() })).optional().describe('FINDINGS #60 RESOLVER v2: GM declares the conditional trait by name (+lane for multi-lane rows); engine computes the value (incl. valueFromPool) and APPLIES it to the attack bonus'),
@@ -1644,10 +1655,26 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         }
         const damageLaneLabel = autoApplied.filter(a => a.type === 'damage_bonus').map(a => a.effect).join(' + ') || undefined;
 
-        // Validate Action Economy
-        const validation = engine.validateActionEconomy(parsed.actorId, 'action');
-        if (!validation.valid) {
-            throw new Error(validation.error);
+        // Validate Action Economy. A legendary action spends legendary
+        // actions and a reaction the reaction, so neither is off-turn misuse;
+        // any other attack is one swing of the Attack action (multiattack
+        // keeps the action open between swings).
+        if (parsed.legendaryCost !== undefined && parsed.reaction) {
+            throw new Error('An attack is a legendary action or a reaction, not both');
+        }
+        if (parsed.legendaryCost !== undefined) {
+            const problem = engine.legendaryActionProblem(parsed.actorId, parsed.legendaryCost)
+                ?? (engine.canTakeActions(parsed.actorId) ? undefined : 'Participant is incapacitated');
+            if (problem) throw new Error(problem);
+            turnWarning = undefined;
+        } else {
+            const validation = parsed.reaction
+                ? engine.validateActionEconomy(parsed.actorId, 'reaction')
+                : engine.validateAttackEconomy(parsed.actorId);
+            if (!validation.valid) {
+                throw new Error(validation.error);
+            }
+            if (parsed.reaction) turnWarning = undefined;
         }
 
         // Table rules: the world's called-strike and prepared-asset rules are
@@ -1845,6 +1872,24 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             ruleLines.push(`UNIT ${targetNow.name}: ${describeUnit(targetNow)}`);
         }
 
+        // Commit Action Economy: legendary actions, the reaction, or one
+        // attack of the Attack action.
+        if (parsed.legendaryCost !== undefined) {
+            const spent = engine.useLegendaryAction(parsed.actorId, parsed.legendaryCost);
+            resultRec.legendary = { cost: parsed.legendaryCost, remaining: spent.remaining };
+            ruleLines.push(`👑 legendary action (cost ${parsed.legendaryCost}): ${spent.remaining} left`);
+        } else if (parsed.reaction) {
+            engine.commitAction(parsed.actorId, 'reaction');
+            resultRec.reaction = true;
+            ruleLines.push('↩ reaction spent');
+        } else {
+            const swing = engine.commitAttack(parsed.actorId);
+            if (swing && swing.of > 1) {
+                resultRec.multiattack = swing;
+                ruleLines.push(`⚔ attack ${swing.made}/${swing.of}${swing.made < swing.of ? '' : ' (Attack action spent)'}`);
+            }
+        }
+
         output = formatAttackResult(result);
         // Rule and audit lines start on their own line under the contact block.
         if ((ruleLines.length || parsed.declaredModifiers?.length || autoApplied.length || resolverProblems.length) && !output.endsWith('\n')) output += '\n';
@@ -1862,9 +1907,6 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             output += `▌ ⚠ ${resolverProblems.join(' | ')}\n`;
             (result as unknown as Record<string, unknown>).resolverProblems = resolverProblems;
         }
-        
-        // Commit Action Economy
-        engine.commitAction(parsed.actorId, 'action');
 
     } else if (parsed.action === 'heal') {
         if (parsed.amount === undefined) {
@@ -2549,6 +2591,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             situational: r.situational,
             targetUnit: (r as { targetUnit?: unknown }).targetUnit,
             preparedEffectDue: (r as { preparedEffectDue?: unknown }).preparedEffectDue,
+            multiattack: (r as { multiattack?: unknown }).multiattack,
+            legendary: (r as { legendary?: unknown }).legendary,
+            reaction: (r as { reaction?: unknown }).reaction,
             saves: (r as { saves?: unknown }).saves
         } : undefined;
         output += `\n\n<!-- STATE_JSON\n${JSON.stringify({ ...stateJson, actionResult })}\nSTATE_JSON -->`;
