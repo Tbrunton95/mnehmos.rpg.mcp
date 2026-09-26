@@ -92,6 +92,42 @@ describe('parts', () => {
     });
 });
 
+describe('called strikes on parts, and the arm that swings', () => {
+    it('a called strike on a latched head keeps its hold and kind', async () => {
+        await setup();
+        await manage({ action: 'set_part', participantId: 'karanak', part: 'middle head', state: 'latched', latchedTo: { participantId: 'luciel', part: 'forearm' } });
+        const { text } = await act({ action: 'attack', actorId: 'luciel', targetId: 'karanak', calledStrike: 'middle head', outcome: 'hit', damage: 5 });
+        expect(text).toMatch(/Karanak's middle head crippled/);
+        const head = tok('karanak').parts.find((p: any) => p.name === 'middle head');
+        expect(head).toMatchObject({ kind: 'head', state: 'crippled', latchedTo: { participantId: 'luciel', part: 'forearm' } });
+    });
+
+    it('set_part records what a part holds, and keeps it across a state change', async () => {
+        await setup();
+        await manage({ action: 'set_part', participantId: 'karanak', part: 'left arm', kind: 'arm', state: 'intact', holds: ['whip'] });
+        await manage({ action: 'set_part', participantId: 'karanak', part: 'left arm', state: 'crippled' });
+        expect(tok('karanak').parts.find((p: any) => p.name === 'left arm')).toMatchObject({ kind: 'arm', state: 'crippled', holds: ['whip'] });
+    });
+
+    it('the crippled-arm penalty follows the weapon: the whip arm is fine, the axe arm is not', async () => {
+        await setup();
+        await manage({ action: 'set_part', participantId: 'karanak', part: 'left arm', kind: 'arm', state: 'intact', holds: ['whip'] });
+        await manage({ action: 'set_part', participantId: 'karanak', part: 'right arm', kind: 'arm', state: 'crippled', holds: ['axe'] });
+        await manage({ action: 'advance' });
+        const whip = await act({ action: 'attack', actorId: 'karanak', targetId: 'luciel', weapon: 'whip', attackBonus: 5, damage: 1 });
+        expect(whip.r.roll.allRolls).toHaveLength(1);
+        freshAction('karanak');
+        const axe = await act({ action: 'attack', actorId: 'karanak', targetId: 'luciel', weapon: 'axe', attackBonus: 5, damage: 1 });
+        expect(axe.r.roll.allRolls).toHaveLength(2);
+        expect(axe.text).toMatch(/right arm crippled \(disadvantage\)/);
+        // Nothing named: an intact arm exists, so no blanket penalty; a note says which arm was assumed.
+        freshAction('karanak');
+        const bare = await act({ action: 'attack', actorId: 'karanak', targetId: 'luciel', attackBonus: 5, damage: 1 });
+        expect(bare.r.roll.allRolls).toHaveLength(1);
+        expect(bare.text).toMatch(/assumed left arm/);
+    });
+});
+
 describe('unit tokens', () => {
     const scions = { id: 'scions', name: 'Scions', hp: 50, maxHp: 50, initiative: 25, isEnemy: true, band: 'Elite Mortal',
         unit: { models: 10, hpPerModel: 5, packed: true, attackBonus: 6 } };

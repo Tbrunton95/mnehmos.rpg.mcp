@@ -3,6 +3,7 @@ import { v4 as uuid } from 'uuid';
 import { CharacterRepository } from '../../src/storage/repos/character.repo.js';
 import { handleExecuteCombatAction, handleCreateEncounter, handleGetEncounterState, clearCombatState } from '../../src/server/handlers/combat-handlers.js';
 import { closeDb, getDb } from '../../src/storage/index.js';
+import { CombatEngine } from '../../src/engine/combat/engine.js';
 import { getInitialSpellSlots, getMaxSpellLevel } from '../../src/engine/magic/spell-validator.js';
 
 const ctx = { sessionId: 'test-session' };
@@ -59,6 +60,8 @@ describe('spell saves are rolled once per target', () => {
 
         // Every die rolls its maximum: 8d6 = 48 fire, every d20 = 20 (save passes).
         vi.spyOn(Math, 'random').mockReturnValue(0.99);
+        // The save rolls on the encounter's seeded stream now.
+        vi.spyOn(CombatEngine.prototype, 'rollD20').mockReturnValue(20);
 
         await handleExecuteCombatAction({
             encounterId,

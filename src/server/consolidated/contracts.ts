@@ -37,7 +37,7 @@ const TOOL_DESCRIPTORS: Readonly<Record<string, ToolDescriptor>> = {
     aura_manage: { category: 'aura', keywords: ['aura', 'effect', 'radius', 'buff', 'debuff', 'area'], capabilities: ['Create auras', 'Effect processing', 'Expiration'] },
     theft_manage: { category: 'theft', keywords: ['theft', 'steal', 'fence', 'crime', 'recognition', 'heat'], capabilities: ['Theft attempts', 'Fence operations', 'Heat tracking'] },
     improvisation_manage: { category: 'improvisation', keywords: ['stunt', 'improvise', 'creative', 'effect', 'homebrew'], capabilities: ['Stunts', 'Custom effects', 'Arcane synthesis'] },
-    math_manage: { category: 'math', keywords: ['dice', 'roll', 'probability', 'algebra', 'physics', 'math'], capabilities: ['Dice rolling', 'Probability', 'Math operations'] },
+    math_manage: { category: 'math', keywords: ['dice', 'roll', 'probability', 'algebra', 'physics', 'math', 'save', 'saving throw', 'check', 'skill'], capabilities: ['Dice rolling', 'Saving throws', 'Skill and ability checks', 'Probability', 'Math operations'] },
     strategy_manage: { category: 'strategy', keywords: ['nation', 'alliance', 'territory', 'strategy', 'diplomacy'], capabilities: ['Nation management', 'Diplomacy', 'Territory'] },
     turn_manage: { category: 'turn-management', keywords: ['turn', 'phase', 'ready', 'poll', 'results', 'async'], capabilities: ['Turn phases', 'Action submission', 'Result polling'] },
     spawn_manage: { category: 'world', keywords: ['spawn', 'create', 'encounter', 'location', 'tactical'], capabilities: ['Spawn characters', 'Create locations', 'Generate encounters'] },

@@ -94,6 +94,33 @@ describe('combat_manage add_condition / remove_condition', () => {
         expect(repo.findById('luciel')!.conditions.map((c: any) => c.name)).toEqual(['Warp-touched']);
     });
 
+    it('remove_condition accepts the shapes add_condition takes (item 8)', async () => {
+        await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: 'prone' });
+        const r1 = await call({ action: 'remove_condition', encounterId, participantId: 'token-scion', condition: 'PRONE' });
+        expect(r1.removed).toBe(1);
+        await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: { name: 'restrained', duration: 2 } });
+        const r2 = await call({ action: 'remove_condition', encounterId, participantId: 'token-scion', condition: { name: 'restrained', duration: 2 } });
+        expect(r2.removed).toBe(1);
+        // The applied condition echoed by add_condition goes straight back in,
+        // and matches by instance id (only that one of two blinded goes).
+        const a = await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: 'blinded' });
+        await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: 'blinded' });
+        const r3 = await call({ action: 'remove_condition', encounterId, participantId: 'token-scion', condition: a.condition });
+        expect(r3.removed).toBe(1);
+        expect(r3.removedConditions[0].id).toBe(a.condition.id);
+        expect(tokenConditions(encounterId, 'token-scion').map(c => c.type)).toEqual(['blinded']);
+        const none = await call({ action: 'remove_condition', encounterId, participantId: 'token-scion' });
+        expect(none.error).toBeTruthy();
+    });
+
+    it('add_condition accepts a top-level name (item 8)', async () => {
+        const a = await call({ action: 'add_condition', encounterId, participantId: 'token-scion', name: 'prone' });
+        expect(a.success).toBe(true);
+        expect(tokenConditions(encounterId, 'token-scion').map(c => c.type)).toEqual(['prone']);
+        const none = await call({ action: 'add_condition', encounterId, participantId: 'token-scion' });
+        expect(none.error).toBeTruthy();
+    });
+
     it('add_participant imports sheet conditions only when asked', async () => {
         const now = new Date().toISOString();
         repo.create({ id: 'justicar', name: 'Justicar', stats: { str: 18, dex: 12, con: 16, int: 10, wis: 12, cha: 10 }, hp: 90, maxHp: 90, ac: 18, level: 8,
@@ -104,6 +131,7 @@ describe('combat_manage add_condition / remove_condition', () => {
 });
 
 import { handleCombatAction } from '../../../src/server/consolidated/combat-action.js';
+import { CombatEngine } from '../../../src/engine/combat/engine.js';
 
 describe('grapple with an encounterId', () => {
     beforeEach(() => { closeDb(); getDb(':memory:'); clearCombatState(); });
@@ -119,11 +147,14 @@ describe('grapple with an encounterId', () => {
             { id: 'luciel', name: 'Luciel', hp: 50, maxHp: 50, initiative: 20 },
             { id: 'foe', name: 'Foe', hp: 50, maxHp: 50, initiative: 5, isEnemy: true }
         ] });
-        // Attacker rolls 20, defender rolls 1: the takedown lands.
-        vi.spyOn(Math, 'random').mockReturnValueOnce(0.99).mockReturnValueOnce(0.0);
+        // Attacker rolls 20, defender rolls 1 on the fight's dice: the takedown lands.
+        vi.spyOn(CombatEngine.prototype, 'rollD20').mockReturnValueOnce(20).mockReturnValueOnce(1);
         const res = await handleCombatAction({ action: 'grapple', move: 'takedown', encounterId: created.encounterId, actorId: 'luciel', targetId: 'foe' }, ctx as any);
         expect(res.content[0].text).toMatch(/encounterTokensUpdated/);
         expect(tokenConditions(created.encounterId, 'foe').map(c => c.type).sort()).toEqual(['grappled', 'prone']);
         expect(repo.findById('foe')!.conditions.map((c: any) => c.name).sort()).toEqual(['Grappled', 'Prone']);
+        // The grapple spent Luciel's attack.
+        const row = getDb().prepare('SELECT tokens FROM encounters WHERE id = ?').get(created.encounterId) as { tokens: string };
+        expect(JSON.parse(row.tokens).find((t: any) => t.id === 'luciel').actionUsed).toBe(true);
     });
 });

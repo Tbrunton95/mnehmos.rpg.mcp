@@ -3,20 +3,19 @@
  * Replaces 5 separate tools: dice_roll, probability_calculate, algebra_solve, algebra_simplify, physics_projectile
  */
 
-import seedrandom from 'seedrandom';
-import { recordRolls, type RollLogEntry } from '../../storage/roll-log.js';
-import { currentOperation } from '../operation-guard.js';
 import { z } from 'zod';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 import { DiceEngine } from '../../math/dice.js';
 import { freshSeed } from '../../math/seed.js';
+import { d20, logRoll } from '../../math/logged-d20.js';
 import { ProbabilityEngine } from '../../math/probability.js';
 import { AlgebraEngine } from '../../math/algebra.js';
 import { PhysicsEngine } from '../../math/physics.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
-import { loadAutoMechanics, autoSkillBonus, autoSaveBonus, applyDeclaredEffects } from '../../engine/effects-resolver.js';
+import { loadAutoMechanics, autoSkillBonus, autoSaveBonus, autoAdvantage, applyDeclaredEffects } from '../../engine/effects-resolver.js';
+import { parseAbility } from '../../engine/combat/conditions.js';
 import * as pda from '../../render/pda.js';
 import { ExportEngine } from '../../math/export.js';
 import { CalculationRepository, StoredCalculation } from '../../storage/repos/calculation.repo.js';
@@ -71,6 +70,19 @@ const jsonIfString = (v: unknown) => { if (typeof v === 'string') { try { return
 
 const DeclaredEffectRefSchema = z.object({ name: z.string(), lane: z.string().optional() });
 
+// Wishlist item 10: 'Wisdom', 'WIS' and 'wisdom' all mean wis. Long names map
+// back to the short stat key the sheet uses; anything unknown passes through
+// for the enum to refuse. A factory, so no zod instance is shared.
+const SHORT_ABILITY: Record<string, string> = { strength: 'str', dexterity: 'dex', constitution: 'con', intelligence: 'int', wisdom: 'wis', charisma: 'cha' };
+const abilityKey = (v: unknown) => {
+    if (typeof v !== 'string') return v;
+    const long = parseAbility(v);
+    return long ? SHORT_ABILITY[long] : v;
+};
+const abilityField = () => z.preprocess(abilityKey, z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']));
+const sourcesField = (what: string) => z.preprocess(jsonIfString, z.array(z.string())).optional()
+    .describe(`Wishlist item 10: names that grant ${what} — each must match exactly one of the character's conditions (name or source) or active effects (name), case-insensitive substring. A miss or an ambiguous match is refused and grants nothing. Logged in the roll's purpose.`);
+
 const CheckBaseFields = {
     characterId: z.string().describe('Character making the roll'),
     dc: z.number().int().optional().describe('Difficulty class — success/failure reported when provided'),
@@ -78,23 +90,25 @@ const CheckBaseFields = {
     disadvantage: z.boolean().optional(),
     modifier: z.number().int().optional().describe('Situational GM modifier (cover, tools, circumstance) — declared, added to the total'),
     declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('FINDINGS #34 T4.18: labeled declared modifiers — VALUES ARE APPLIED to the total and each prints in the breakdown by name'),
-    declaredEffects: z.preprocess(jsonIfString, z.array(DeclaredEffectRefSchema)).optional().describe('FINDINGS #60 RESOLVER v2: GM declares WHICH conditional trait fires (name + lane for multi-lane traits); the ENGINE reads the row and computes the value — including tier-from-hidden-pool (valueFromPool). Missing names and ambiguous lanes report loudly and apply nothing.')
+    declaredEffects: z.preprocess(jsonIfString, z.array(DeclaredEffectRefSchema)).optional().describe('FINDINGS #60 RESOLVER v2: GM declares WHICH conditional trait fires (name + lane for multi-lane traits); the ENGINE reads the row and computes the value — including tier-from-hidden-pool (valueFromPool). Missing names and ambiguous lanes report loudly and apply nothing.'),
+    advantageSources: sourcesField('advantage'),
+    disadvantageSources: sourcesField('disadvantage')
 };
 
 const RollSkillCheckSchema = z.object({
     action: z.literal('roll_skill_check'),
     skill: z.string().describe('Skill name (perception, stealth, persuasion... or any theme skill)'),
-    ability: z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']).optional().describe('Governing ability — overrides the 5e default map; REQUIRED in practice for non-5e skill lists'),
+    ability: abilityField().optional().describe('Governing ability — overrides the 5e default map; REQUIRED in practice for non-5e skill lists'),
     ...CheckBaseFields
 });
 const RollAbilityCheckSchema = z.object({
     action: z.literal('roll_ability_check'),
-    ability: z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']),
+    ability: abilityField(),
     ...CheckBaseFields
 });
 const RollSavingThrowSchema = z.object({
     action: z.literal('roll_saving_throw'),
-    ability: z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']),
+    ability: abilityField().describe('str|dex|con|int|wis|cha, or the long name in any case (Wisdom)'),
     ...CheckBaseFields
 });
 
@@ -105,10 +119,10 @@ const OpposedSchema = z.object({
     action: z.literal('opposed'),
     characterId: z.string().describe('Initiator — the one forcing the contest'),
     skill: z.string().optional().describe('Initiator skill (omit for raw ability)'),
-    ability: z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']).optional().describe('Initiator ability — governs or overrides'),
+    ability: abilityField().optional().describe('Initiator ability — governs or overrides'),
     targetId: z.string().describe('Defender'),
     targetSkill: z.string().optional().describe('Defender skill'),
-    targetAbility: z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']).optional().describe('Defender ability'),
+    targetAbility: abilityField().optional().describe('Defender ability'),
     advantage: z.boolean().optional(), disadvantage: z.boolean().optional(),
     targetAdvantage: z.boolean().optional(), targetDisadvantage: z.boolean().optional(),
     modifier: z.number().int().optional().describe('Initiator situational modifier'),
@@ -116,29 +130,15 @@ const OpposedSchema = z.object({
     declaredEffects: z.preprocess(jsonIfString, z.array(DeclaredEffectRefSchema)).optional().describe('Initiator declaredEffects — engine computes')
 });
 
-// Seeded so every check is stored and replayable (roll_log keeps the seed).
-function d20(advantage?: boolean, disadvantage?: boolean, seed: string = freshSeed('check')): { rolls: number[]; natural: number; seed: string } {
-    const rng = seedrandom(seed);
-    const r = () => Math.floor(rng() * 20) + 1;
-    if (advantage && !disadvantage) { const a = r(), b = r(); return { rolls: [a, b], natural: Math.max(a, b), seed }; }
-    if (disadvantage && !advantage) { const a = r(), b = r(); return { rolls: [a, b], natural: Math.min(a, b), seed }; }
-    const a = r(); return { rolls: [a], natural: a, seed };
-}
-
-/** Store a math_manage roll in roll_log under the running operation. */
-function logRoll(db: ReturnType<typeof getDb>, entry: RollLogEntry): string | undefined {
-    try {
-        const op = currentOperation();
-        return recordRolls(db, [entry], { opId: op?.opId, tool: op?.tool ?? 'math_manage' })[0];
-    } catch { return undefined; }
-}
+// d20() and logRoll() live in math/logged-d20.ts so combat and
+// concentration saves roll and log the same way.
 
 function abilityMod(score: number): number { return Math.floor((score - 10) / 2); }
 function profBonus(level: number): number { return Math.floor((level - 1) / 4) + 2; }
 
 async function handleCharacterRoll(
     kind: 'skill' | 'ability' | 'save',
-    args: { characterId: string; skill?: string; ability?: string; dc?: number; advantage?: boolean; disadvantage?: boolean; modifier?: number }
+    args: { characterId: string; skill?: string; ability?: string; dc?: number; advantage?: boolean; disadvantage?: boolean; modifier?: number; advantageSources?: string[]; disadvantageSources?: string[] }
 ): Promise<object> {
     const db = getDb();
     const charRepo = new CharacterRepository(db);
@@ -231,6 +231,10 @@ async function handleCharacterRoll(
     // (fixed or pool-derived) and applies it. Problems report loudly.
     const dRefs = (args as { declaredEffects?: Array<{ name: string; lane?: string }> }).declaredEffects ?? [];
     const resolverProblems: string[] = [];
+    // Wishlist item 10: where advantage and disadvantage came from. Each
+    // source prints as a zero-value contribution and in the roll_log purpose.
+    const advFrom: Array<{ label: string; lane: string }> = [];
+    const disFrom: Array<{ label: string; lane: string }> = [];
     if (dRefs.length) {
         const wantType = kind === 'save' ? 'saving_throw_bonus' : 'skill_bonus';
         // FINDINGS #101: name the domain so skill/save-scoped mechanics refuse
@@ -240,6 +244,8 @@ async function handleCharacterRoll(
         const res = applyDeclaredEffects(db, args.characterId, dRefs, wantType, autoApplied, domain);
         bonus += res.total;
         resolverProblems.push(...res.problems);
+        advFrom.push(...res.advantage.map(label => ({ label, lane: 'EFFECT' })));
+        disFrom.push(...res.disadvantage.map(label => ({ label, lane: 'EFFECT' })));
     }
 
     // #66-V DOUBLE-COUNT GUARD, third collision lane (caught live by the
@@ -276,9 +282,59 @@ async function handleCharacterRoll(
         contributions.push({ label: d.label, value: d.value, lane: 'SITUATIONAL' });
     }
 
-    const roll = d20(args.advantage, args.disadvantage);
+    // Wishlist item 10: the advantage lane. autoApply advantage_on /
+    // disadvantage_on traits (ENGINE), declared ones (EFFECT, collected
+    // above), and GM-named sources matched against the sheet (SITUATIONAL).
+    const longAbility: Record<string, string> = { str: 'strength', dex: 'dexterity', con: 'constitution', int: 'intelligence', wis: 'wisdom', cha: 'charisma' };
+    if (kind === 'save' || kind === 'skill') {
+        const auto = { adv: [] as string[], dis: [] as string[] };
+        const domain = kind === 'save' ? (longAbility[args.ability!] ?? args.ability) : (args.skill || '').toLowerCase().replace(/ /g, '_');
+        autoAdvantage(mechs, kind, domain, auto);
+        advFrom.push(...auto.adv.map(label => ({ label, lane: 'ENGINE' })));
+        disFrom.push(...auto.dis.map(label => ({ label, lane: 'ENGINE' })));
+    }
+    if (args.advantageSources?.length || args.disadvantageSources?.length) {
+        const conds = ((char as { conditions?: Array<{ name: string; source?: string }> }).conditions ?? []);
+        const effectNames = (db.prepare('SELECT name FROM custom_effects WHERE target_id = ? AND is_active = 1').all(charId) as Array<{ name: string }>).map(r => r.name);
+        // A prose condition is named by its text up to the first colon
+        // ('VAUREK: the ward-sigil…' → 'VAUREK'), as feature_from_condition does.
+        const shortName = (text: string) => text.split(':')[0].trim().slice(0, 60) || text.slice(0, 60);
+        const resolveSource = (text: string, which: string): string | undefined => {
+            const t = text.trim().toLowerCase();
+            if (!t) { resolverProblems.push(`${which} source "" is empty — nothing granted`); return undefined; }
+            // One hit per distinct name: a condition and the feature made from it count once.
+            const hits = new Map<string, string>();
+            for (const c of conds) {
+                if (c.name.toLowerCase().includes(t) || (c.source ?? '').toLowerCase().includes(t)) hits.set(shortName(c.name).toLowerCase(), shortName(c.name));
+            }
+            for (const n of effectNames) if (n.toLowerCase().includes(t)) hits.set(n.toLowerCase(), n);
+            if (hits.size === 1) return [...hits.values()][0];
+            resolverProblems.push(hits.size
+                ? `${which} source "${text}" matches ${hits.size} conditions or effects [${[...hits.values()].join(' | ')}] — use more of the text; nothing granted`
+                : `${which} source "${text}" matches nothing in ${char.name}'s conditions or active effects — nothing granted`);
+            return undefined;
+        };
+        for (const text of args.advantageSources ?? []) { const label = resolveSource(text, 'advantage'); if (label) advFrom.push({ label, lane: 'SITUATIONAL' }); }
+        for (const text of args.disadvantageSources ?? []) { const label = resolveSource(text, 'disadvantage'); if (label) disFrom.push({ label, lane: 'SITUATIONAL' }); }
+    }
+    for (const a of advFrom) { contributions.push({ label: `ADV ← ${a.label}`, value: 0, lane: a.lane }); breakdown.push(`advantage ← ${a.label}`); }
+    for (const d of disFrom) { contributions.push({ label: `DIS ← ${d.label}`, value: 0, lane: d.lane }); breakdown.push(`disadvantage ← ${d.label}`); }
+    // Source problems found after the resolver block also print as warnings.
+    for (const p of resolverProblems) if (!breakdown.includes(`⚠ ${p}`)) breakdown.push(`⚠ ${p}`);
+    const advantage = !!args.advantage || advFrom.length > 0;
+    const disadvantage = !!args.disadvantage || disFrom.length > 0;
+    const advantageSources = advFrom.map(a => a.label);
+    const disadvantageSources = disFrom.map(d => d.label);
+    const why = [advantageSources.length ? `adv: ${advantageSources.join(', ')}` : '', disadvantageSources.length ? `dis: ${disadvantageSources.join(', ')}` : ''].filter(Boolean).join('; ');
+    const expression = advantage && !disadvantage ? '2d20kh1' : disadvantage && !advantage ? '2d20kl1' : '1d20';
+
+    const roll = d20(advantage, disadvantage);
     const total = roll.natural + bonus;
     const success = args.dc !== undefined ? total >= args.dc : undefined;
+    // Wishlist item 10: a failed save by a creature with legendary
+    // resistances left says so. Reported only — the GM decides to spend one.
+    const lrLeft = (char as { legendaryResistancesRemaining?: number }).legendaryResistancesRemaining ?? 0;
+    const legendaryResistanceAvailable = kind === 'save' && success === false && lrLeft > 0 ? lrLeft : undefined;
 
     // FINDINGS #69: the trio persists like raw rolls, so reroll can supersede
     // them. Metadata carries the character bonus — a reroll of a skill check
@@ -287,16 +343,16 @@ async function handleCharacterRoll(
     try {
         new CalculationRepository(db).create({
             id: calcId,
-            input: args.advantage && !args.disadvantage ? '2d20kh1' : args.disadvantage && !args.advantage ? '2d20kl1' : '1d20',
+            input: expression,
             result: roll.natural,
             steps: [`${kind}:${args.skill ?? args.ability ?? ''}`, `natural ${roll.natural}`, `bonus ${bonus}`, `total ${total}`],
             timestamp: new Date().toISOString(),
-            metadata: { characterRoll: { kind, characterId: args.characterId, skill: args.skill, ability: args.ability, bonus, breakdown, dc: args.dc, total } }
+            metadata: { characterRoll: { kind, characterId: args.characterId, skill: args.skill, ability: args.ability, bonus, breakdown, dc: args.dc, total, advantageSources, disadvantageSources } }
         });
     } catch { /* persistence is audit sugar — the roll stands regardless */ }
     const rollId = logRoll(db, {
-        purpose: kind === 'save' ? `${args.ability} save` : `${args.skill ?? args.ability} check`,
-        forId: args.characterId, expression: args.advantage && !args.disadvantage ? '2d20kh1' : args.disadvantage && !args.advantage ? '2d20kl1' : '1d20',
+        purpose: (kind === 'save' ? `${args.ability} save` : `${args.skill ?? args.ability} check`) + (why ? ` (${why})` : ''),
+        forId: args.characterId, expression,
         dice: roll.rolls.map(value => ({ sides: 20, value })), result: total, replay: roll.seed
     });
 
@@ -318,9 +374,12 @@ async function handleCharacterRoll(
         contributions,
         autoApplied,
         resolverProblems: resolverProblems.length ? resolverProblems : undefined,
+        advantageSources: advantageSources.length ? advantageSources : undefined,
+        disadvantageSources: disadvantageSources.length ? disadvantageSources : undefined,
+        legendaryResistanceAvailable,
         dc: args.dc,
         outcome: success === undefined ? 'no DC set' : success ? 'SUCCESS' : 'FAILURE',
-        message: `${char.name} ${kind === 'save' ? `${args.ability!.toUpperCase()} save` : (args.skill || args.ability)}: d20(${roll.rolls.join(',')})=${roll.natural} + ${bonus} = ${total}${args.dc !== undefined ? ` vs DC ${args.dc} — ${success ? 'SUCCESS' : 'FAILURE'}` : ''}`
+        message: `${char.name} ${kind === 'save' ? `${args.ability!.toUpperCase()} save` : (args.skill || args.ability)}${why ? ` (${why})` : ''}: d20(${roll.rolls.join(',')})=${roll.natural} + ${bonus} = ${total}${args.dc !== undefined ? ` vs DC ${args.dc} — ${success ? 'SUCCESS' : 'FAILURE'}` : ''}${legendaryResistanceAvailable ? ` — ${legendaryResistanceAvailable} legendary resistance${legendaryResistanceAvailable === 1 ? '' : 's'} left: the GM may spend one to succeed` : ''}`
     };
 }
 
@@ -795,7 +854,7 @@ const definitions: Record<MathAction, ActionDefinition> = {
         schema: RollSavingThrowSchema,
         handler: async (args) => handleCharacterRoll('save', args as z.infer<typeof RollSavingThrowSchema>),
         aliases: ['saving_throw', 'save'],
-        description: 'Roll a saving throw for a character — d20 + ability mod + save proficiency + autoApply saving_throw_bonus traits'
+        description: 'Roll a saving throw for a character — d20 + ability mod + save proficiency + autoApply saving_throw_bonus traits; advantage from named conditions/effects; reports an available legendary resistance on a fail'
     },
     opposed: {
         schema: OpposedSchema,
@@ -858,10 +917,14 @@ export const MathManageTool = {
 ⚠️ REDIRECT - DO NOT USE FOR:
 - Attack rolls → Use combat_action { action: "attack" }
 - Spell damage → Use combat_action { action: "cast_spell" }
-- Ability or skill checks → Use improvisation_manage { action: "stunt", actorId, skill, dc, effectType: "none" }
-- Saving throws → Use the combat/effect tool that requires the save; there is no standalone roll_saving_throw tool on this MCP surface
+- A check with a fictional outcome to apply (a stunt that deals damage or moves someone) → Use improvisation_manage { action: "stunt", actorId, skill, dc }
 
-The DM chooses the appropriate skill and DC, and the stunt action rolls the d20 and applies the character's skill modifier automatically. Do not invent or call roll_skill_check, roll_ability_check, or roll_saving_throw; those tools are not registered here.
+🛡️ SAVES AND CHECKS (roll_saving_throw, roll_skill_check, roll_ability_check, opposed) — actions of this tool, not separate tools:
+- math_manage { action: "roll_saving_throw", characterId, ability: "wis" | "Wisdom", dc } reads the sheet: ability mod, save proficiency, autoApply traits
+- advantage / disadvantage: true, or advantageSources / disadvantageSources: ["VAUREK"] — each names one of the character's conditions or active effects (a miss or an ambiguous name is refused). The roll log records why: "wis save (adv: VAUREK)"
+- declaredEffects: [{name}] applies a conditional trait's bonus, or its advantage_on
+- A failed save by a creature with legendary resistances left reports legendaryResistanceAvailable
+- Skill checks take the same fields: math_manage { action: "roll_skill_check", characterId, skill, dc }
 
 🎲 DICE ROLLING (roll) - Use ONLY for:
 - Stat generation (4d6dl1)
@@ -919,7 +982,7 @@ Actions: roll, probability, solve, simplify, projectile, roll_skill_check, roll_
         // client-side in EVERY session, fresh or stale. Outer and inner must agree.
         characterId: z.string().optional(),
         skill: z.string().optional(),
-        ability: z.union([z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']), z.string(), z.number()]).optional().describe('5e rolls: str|dex|con|int|wis|cha · roll_pool_check: ability dots (number) or stat key'),
+        ability: z.union([z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']), z.string(), z.number()]).optional().describe('5e rolls: str|dex|con|int|wis|cha or the long name (Wisdom) · roll_pool_check: ability dots (number) or stat key'),
         dc: z.number().optional(),
         advantage: z.boolean().optional(),
         disadvantage: z.boolean().optional(),
@@ -928,10 +991,13 @@ Actions: roll, probability, solve, simplify, projectile, roll_skill_check, roll_
         // FINDINGS #60 (mirror law): declaredEffects — absent here means stripped
         // in every session; outer and inner must agree.
         declaredEffects: z.preprocess(jsonIfString, z.array(z.object({ name: z.string(), lane: z.string().optional() }))).optional().describe('RESOLVER v2: [{name, lane?}] — GM declares the conditional trait; engine computes the value (incl. valueFromPool)'),
+        // Wishlist item 10 mirror law: named advantage sources.
+        advantageSources: sourcesField('advantage'),
+        disadvantageSources: sourcesField('disadvantage'),
         // #67 mirror law: opposed-check params.
         targetId: z.string().optional().describe('opposed: defender characterId'),
         targetSkill: z.string().optional().describe('opposed: defender skill'),
-        targetAbility: z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']).optional().describe('opposed: defender ability'),
+        targetAbility: abilityField().optional().describe('opposed: defender ability (short or long name)'),
         targetAdvantage: z.boolean().optional(),
         targetDisadvantage: z.boolean().optional(),
         // #67-F mirror law: reroll param.

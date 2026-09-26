@@ -296,6 +296,8 @@ export function renderPoolLine(p: PoolPayload): Cell[][] {
     const delta = p.delta ?? 0;
     const row: Cell[] = [
         V(pool || '???'), L('    '), V(p.before ?? '?'), L(` ${g.to} `), V(p.current ?? '?'),
+        // Item 15: a counter reads '2/3', not a bare 2.
+        ...(typeof p.max === 'number' ? [L('/'), V(p.max)] : []),
         L('  ('), V(`${delta >= 0 ? '+' : ''}${delta}`), L(')')
     ];
     if (p.clamped) row.push(L('  [clamped]'));
@@ -372,7 +374,12 @@ export interface StatusInput {
     // Table rules status_block: the tiny block.
     compact?: boolean;
     corePool?: { name: string; current: number; max: number };
+    // Item 15: pools the GM marked show: true, one row each.
+    counters?: Array<{ name: string; current: number; max: number }>;
     location?: string; objective?: string; moreConditions?: number;
+    // Item 18: house-format knobs from the status_block rule.
+    conditionLayout?: 'rows' | 'line'; conditionLabel?: string; showMore?: boolean;
+    footer?: string[];
 }
 /**
  * Close a strip and its rows into one box: the strip's rule and the bottom
@@ -397,14 +404,21 @@ export function renderStatusBlock(d: StatusInput): string {
         const top: Cell[] = [L('HP '), V(`${d.hp ?? '?'}/${d.maxHp ?? '?'}`)];
         if (d.corePool) top.push(L(` ${g.sep} ${d.corePool.name.toUpperCase()} `), V(`${d.corePool.current}/${d.corePool.max}`));
         rows.push(top);
+        for (const c of d.counters ?? []) rows.push([L(`${c.name.toUpperCase()} `), V(`${c.current}/${c.max}`)]);
         if (d.location) rows.push([L('AT  '), V(d.location)]);
         if (d.objective) rows.push([L('OBJ '), V(d.objective)]);
-        // One condition a row: a long name never runs the frame off the edge.
-        for (const c of d.conditions ?? []) {
-            rows.push([V(typeof c === 'string' ? c : `${c.name}${c.duration ? ` (${c.duration}d)` : ''}`)]);
+        const names = (d.conditions ?? []).map(c => typeof c === 'string' ? c : `${c.name}${c.duration ? ` (${c.duration}d)` : ''}`);
+        if (d.conditionLayout === 'line') {
+            // The house format: one labelled row, 'COND A · B'.
+            if (names.length) rows.push([L(`${d.conditionLabel ?? 'COND'} `), V(names.join(` ${g.sep} `))]);
+        } else {
+            // One condition a row: a long name never runs the frame off the edge.
+            for (const n of names) rows.push([V(n)]);
         }
-        if (d.moreConditions) rows.push([L(`+${d.moreConditions} more`)]);
-        return framed(renderStrip({ callsign: callsign(d.characterName ?? '???'), badge: d.badge }), emit(rows));
+        if (d.moreConditions && d.showMore !== false) rows.push([L(`+${d.moreConditions} more`)]);
+        const box = framed(renderStrip({ callsign: callsign(d.characterName ?? '???'), badge: d.badge }), emit(rows));
+        // The footer rides under the frame, outside it.
+        return d.footer?.length ? `${box}${d.footer.join(` ${g.sep} `)}\n` : box;
     }
     let out = renderStrip({ callsign: callsign(d.characterName ?? '???'), day: d.day, time: d.time, rads: d.rads, badge: d.badge });
     const rows: Cell[][] = [];
@@ -413,6 +427,7 @@ export function renderStatusBlock(d: StatusInput): string {
         rows.push([L(g.rad + ' '), L('RADS '), V(d.rads), L('   '), V(bar(d.rads, 8, 1000)), L(' '), V(radBand(d.rads))]);
     if (typeof d.composure === 'number')
         rows.push([L('COMPOSURE '), V(d.composure), L('   '), V(bar(d.composure, 10, d.composureMax ?? 100, g.compFull)), L(' '), V(composureBand(d.composure))]);
+    for (const c of d.counters ?? []) rows.push([L(`${c.name.toUpperCase()} `), V(`${c.current}/${c.max}`)]);
     if (d.weaponName) {
         const w: Cell[] = [L('WEAPON: '), V(d.weaponName)];
         if (typeof d.weaponCondition === 'number') {

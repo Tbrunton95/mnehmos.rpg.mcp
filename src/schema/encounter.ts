@@ -1,4 +1,5 @@
-import { PartSchema, UnitSchema, ReadiedSchema } from './token-extras.js';
+import { PartSchema, UnitSchema, ReadiedSchema, SizeCategorySchema, AttackProfileSchema, AbilitySchema } from './token-extras.js';
+import type { SizeCategory } from './token-extras.js';
 import { z } from 'zod';
 import { DurationType, parseAbility, parseDurationType } from '../engine/combat/conditions.js';
 
@@ -41,7 +42,8 @@ export const ConditionInputSchema = z.union([
         source: z.string().optional(),
         sourceId: z.string().optional(),
         saveDC: z.number().optional().describe('Required with durationType save_ends'),
-        saveAbility: z.string().optional().describe('Ability name or abbreviation (con); required with durationType save_ends')
+        saveAbility: z.string().optional().describe('Ability name or abbreviation (con); required with durationType save_ends'),
+        level: z.number().int().min(1).max(6).optional().describe('Exhaustion level 1-6 (2 halves speed, 3+ disadvantage on attacks and saves, 5 speed 0)')
     }).strict().superRefine((c, ctx) => {
         if (!(c.type || c.name || '').trim()) {
             ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'condition object needs a name or type' });
@@ -117,18 +119,11 @@ export const DEFAULT_GRID_BOUNDS: GridBounds = {
 
 /**
  * Size category for creatures (affects occupied squares)
- * Based on D&D 5e size categories
+ * Based on D&D 5e size categories. Defined beside the token extras so there
+ * is one enum instance; re-exported here for existing importers.
  */
-export const SizeCategorySchema = z.enum([
-    'tiny',      // 2.5ft, shares space
-    'small',     // 5ft, 1 square
-    'medium',    // 5ft, 1 square
-    'large',     // 10ft, 2x2 squares
-    'huge',      // 15ft, 3x3 squares
-    'gargantuan' // 20ft+, 4x4+ squares
-]);
-
-export type SizeCategory = z.infer<typeof SizeCategorySchema>;
+export { SizeCategorySchema };
+export type { SizeCategory };
 
 /**
  * Get the grid footprint (squares occupied) for a size category
@@ -148,6 +143,61 @@ export function getSizeFootprint(size: SizeCategory): number {
         case 'gargantuan':
             return 4;
     }
+}
+
+/** Sizes smallest first; sizeRank indexes this list. */
+export const SIZE_ORDER: readonly SizeCategory[] = SizeCategorySchema.options;
+
+/** Squares per side and natural melee reach (5e: huge and up reach 10 ft). */
+export const SIZE_TABLE: Record<SizeCategory, { squares: number; reachFt: number }> = {
+    tiny: { squares: 1, reachFt: 5 },
+    small: { squares: 1, reachFt: 5 },
+    medium: { squares: 1, reachFt: 5 },
+    large: { squares: 2, reachFt: 5 },
+    huge: { squares: 3, reachFt: 10 },
+    gargantuan: { squares: 4, reachFt: 10 }
+};
+
+function sizeOf(size?: string | null): SizeCategory {
+    const s = (size ?? '').toLowerCase() as SizeCategory;
+    return s in SIZE_TABLE ? s : 'medium';
+}
+
+/** Position in SIZE_ORDER; unset or unknown reads as medium. */
+export function sizeRank(size?: string | null): number {
+    return SIZE_ORDER.indexOf(sizeOf(size));
+}
+
+type Sized = { size?: string | null; reach?: number | null; position?: { x: number; y: number } | null };
+
+/** Melee reach in feet: the attack profile's reach, then the token's, then its size. */
+export function effectiveReachFt(p: Sized, profile?: { reachFt?: number | null } | null): number {
+    return profile?.reachFt ?? p.reach ?? SIZE_TABLE[sizeOf(p.size)].reachFt;
+}
+
+/** Grid cells a token fills: its position is the top-left of a square footprint. */
+export function footprintCells(p: Sized, at?: { x: number; y: number }): Array<{ x: number; y: number }> {
+    const pos = at ?? p.position;
+    if (!pos) return [];
+    const n = SIZE_TABLE[sizeOf(p.size)].squares;
+    const cells: Array<{ x: number; y: number }> = [];
+    for (let dy = 0; dy < n; dy++) for (let dx = 0; dx < n; dx++) cells.push({ x: pos.x + dx, y: pos.y + dy });
+    return cells;
+}
+
+/**
+ * Squares between two footprints (Chebyshev, edge to edge): 1 = adjacent,
+ * 0 = overlapping. Infinity when either has no position.
+ */
+export function edgeDistanceSquares(
+    a: Sized, b: Sized,
+    at?: { a?: { x: number; y: number }; b?: { x: number; y: number } }
+): number {
+    const pa = at?.a ?? a.position, pb = at?.b ?? b.position;
+    if (!pa || !pb) return Infinity;
+    const na = SIZE_TABLE[sizeOf(a.size)].squares, nb = SIZE_TABLE[sizeOf(b.size)].squares;
+    const gap = (a0: number, an: number, b0: number, bn: number) => Math.max(0, b0 - (a0 + an - 1), a0 - (b0 + bn - 1));
+    return Math.max(gap(pa.x, na, pb.x, nb), gap(pa.y, na, pb.y, nb));
 }
 
 export const TokenSchema = z.object({
@@ -189,8 +239,21 @@ export const TokenSchema = z.object({
     parts: z.array(PartSchema).optional(),
     unit: UnitSchema.optional(),
     intent: z.string().optional(),
-    readied: ReadiedSchema.optional()
-});
+    readied: ReadiedSchema.optional(),
+    // Participant extras (token-extras.ts ParticipantExtrasShape)
+    reach: z.number().optional(),
+    attackDamageType: z.string().optional(),
+    attacksPerAction: z.number().optional(),
+    attacks: z.array(AttackProfileSchema).optional(),
+    abilities: z.array(AbilitySchema).optional(),
+    legendaryActions: z.number().optional(),
+    legendaryResistances: z.number().optional(),
+    legendaryResistancesRemaining: z.number().optional(),
+    autoLegendaryResistance: z.boolean().optional(),
+    cr: z.number().optional()
+// Tokens are engine participants; a field not listed here must still
+// survive a parse (create used to strip everything off this list).
+}).passthrough();
 
 export type Token = z.infer<typeof TokenSchema>;
 

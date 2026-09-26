@@ -614,4 +614,75 @@ describe('narrative_manage consolidated tool', () => {
             expect(parsed.error).toBe('validation_error');
         });
     });
+
+    describe('action: append, the soft cap and archive', () => {
+        const run = async (a: Record<string, unknown>) => JSON.parse((await handleNarrativeManage(a, ctx)).content[0].text);
+        const grow = async (n: number, size = 100) => {
+            const { noteId } = await run({ action: 'add', worldId, type: 'plot_thread', content: 'The Vaurek thread.\nOpened on day 1.' });
+            for (let i = 1; i <= n; i++) await run({ action: 'append', noteId, day: i + 1, content: `entry ${i} ` + 'x'.repeat(size) });
+            return noteId as string;
+        };
+
+        it('append reports the size, and warns once past the soft cap without refusing', async () => {
+            const noteId = await grow(1);
+            const small = await run({ action: 'append', noteId, day: 9, content: 'short' });
+            expect(small.size).toMatchObject({ softCap: 8000, over: false });
+            expect(small.warning).toBeUndefined();
+            const big = await run({ action: 'append', noteId, day: 10, content: 'y'.repeat(8000) });
+            expect(big.success).toBe(true);
+            expect(big.size.over).toBe(true);
+            expect(big.warning).toMatch(/soft cap 8000\): narrative_manage archive \{noteId, keepLast: 2\}/);
+            const added = await run({ action: 'add', worldId, type: 'plot_thread', content: 'z'.repeat(8001) });
+            expect(added.warning).toMatch(/soft cap/);
+            const updated = await run({ action: 'update', noteId: added.noteId, content: 'short now' });
+            expect(updated.size).toMatchObject({ chars: 9, over: false });
+        });
+
+        it("'append_section' is an alias of append", async () => {
+            const noteId = await grow(0);
+            const res = await run({ action: 'append_section', noteId, day: 3, content: 'the raid' });
+            expect(res.actionType).toBe('append');
+            expect((await run({ action: 'get', noteId })).content).toMatch(/── \[Day 3\] ──\nthe raid$/);
+        });
+
+        it('archive moves the older sections to an archived note and keeps the head and the last two', async () => {
+            const noteId = await grow(5);
+            const preview = await run({ action: 'archive', noteId, preview: true });
+            expect(preview).toMatchObject({ preview: true, sections: 5, archive: 3, keep: 2 });
+            expect((await run({ action: 'get', noteId })).content).toMatch(/entry 1/);
+
+            const res = await run({ action: 'archive', noteId });
+            expect(res).toMatchObject({ success: true, archived: 3, kept: 2, from: 'Day 2', to: 'Day 4' });
+            const live = await run({ action: 'get', noteId });
+            expect(live.content.startsWith('The Vaurek thread.\nOpened on day 1.')).toBe(true);
+            expect(live.content).not.toMatch(/entry [123] /);
+            expect(live.content).toMatch(/entry 4 .*\n*[\s\S]*entry 5 /);
+            expect(live.content).toContain(`── [archived 3 sections Day 2..Day 4 → note ${res.archiveNoteId}] ──`);
+            expect(live.metadata.archives).toEqual([res.archiveNoteId]);
+            const arch = await run({ action: 'get', noteId: res.archiveNoteId });
+            expect(arch).toMatchObject({ status: 'archived', type: 'plot_thread', worldId });
+            expect(arch.metadata).toMatchObject({ archiveOf: noteId, sections: 3, from: 'Day 2', to: 'Day 4' });
+            expect(arch.content).toMatch(/entry 1[\s\S]*entry 2[\s\S]*entry 3/);
+
+            // A second archive after more growth leaves the first marker alone.
+            await run({ action: 'append', noteId, day: 7, content: 'entry 6' });
+            const again = await run({ action: 'archive', noteId, keepLast: 1 });
+            expect(again.archived).toBe(2);
+            const after = await run({ action: 'get', noteId });
+            expect(after.content).toContain(`note ${res.archiveNoteId}] ──`);
+            expect(after.content).toContain(`note ${again.archiveNoteId}] ──`);
+            expect(after.metadata.archives).toEqual([res.archiveNoteId, again.archiveNoteId]);
+            expect(after.content).toMatch(/entry 6$/);
+        });
+
+        it('archive refuses when there is too little to archive, writing nothing', async () => {
+            const noteId = await grow(2);
+            const before = (await run({ action: 'get', noteId })).content;
+            const res = await run({ action: 'archive', noteId });
+            expect(res.error).toBe(true);
+            expect(res.message).toMatch(/2 sections; keepLast 2 leaves nothing to archive\. Nothing was written/);
+            expect((await run({ action: 'get', noteId })).content).toBe(before);
+            expect((await run({ action: 'search', worldId, status: 'archived' })).count).toBe(0);
+        });
+    });
 });

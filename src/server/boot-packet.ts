@@ -10,16 +10,21 @@
 import { getDb } from '../storage/index.js';
 import { CustomEffectsRepository } from '../storage/repos/custom-effects.repo.js';
 import { CharacterRepository } from '../storage/repos/character.repo.js';
-import { loadRule, findPool, conditionsForDisplay } from '../engine/table-rules.js';
+import { loadRule, findPool, conditionsForDisplay, shownCounters } from '../engine/table-rules.js';
 import { recentPrecedents } from './consolidated/precedent-manage.js';
+import { NOTE_SOFT_CAP, splitSections } from './consolidated/narrative-manage.js';
+import { readWorldClock } from '../engine/world-clock.js';
 import type { Character } from '../schema/character.js';
 
 export interface BootPacket {
     worldId: string;
     day: number | null;
+    /** 'HH:MM' when the world keeps a time. */
+    time?: string;
     characters: Array<Record<string, unknown>>;
     clocks: Array<Record<string, unknown>>;
-    threads: Array<{ id: string; text: string }>;
+    /** A grown thread reads as its first line, then its newest section; `long` past the soft cap. */
+    threads: Array<{ id: string; text: string; chars?: number; long?: true }>;
     telegraphs: Array<{ encounterId: string; name: string; intent?: string; readied?: string }>;
     journal: Array<{ type: string; text: string; at: string }>;
     precedents: Array<{ kind: string; statement: string; scope: string | null }>;
@@ -27,14 +32,34 @@ export interface BootPacket {
 
 const clip = (s: string, n: number) => s.length > n ? `${s.slice(0, n)}…` : s;
 
+// Item 17: the first 160 chars of a thread that grew by append are its
+// oldest words. Show where it started and where it is now.
+function threadDigest(content: string): string {
+    const { head, sections } = splitSections(content);
+    if (!sections.length) return clip(content, 160);
+    const last = sections[sections.length - 1];
+    const body = last.raw.replace(/^\n\n── \[[^\]\n]+\] ──\n?/, '').trim();
+    return `${clip(head.trim().split('\n')[0], 100)} … latest [${last.stamp}]: ${clip(body, 160)}`;
+}
+
 function tryAll<T>(fn: () => T[]): T[] {
     try { return fn(); } catch { return []; }
 }
 
 function digest(char: Character, worldId: string): Record<string, unknown> {
     const db = getDb();
-    const pools = (char.resourcePools ?? {}) as Record<string, { current: number; max: number }>;
+    const pools = (char.resourcePools ?? {}) as NonNullable<Character['resourcePools']>;
     const core = findPool(pools, loadRule(db, worldId, 'status_block')?.spec.corePool);
+    // Item 15: counters the GM marked show: true, with the item they mirror.
+    const itemName = (instanceId: string): string | undefined => {
+        try {
+            return (db.prepare('SELECT COALESCE(ii.custom_name, i.name) AS name FROM item_instances ii LEFT JOIN items i ON i.id = ii.template_id WHERE ii.id = ?').get(instanceId) as { name?: string } | undefined)?.name;
+        } catch { return undefined; }
+    };
+    const counters = shownCounters(pools, core?.key).map(c => {
+        const item = c.itemInstanceId ? itemName(c.itemInstanceId) : undefined;
+        return { name: c.name, value: `${c.current}/${c.max}`, ...(item ? { item } : {}), ...(c.note ? { note: c.note } : {}) };
+    });
     const effectsRepo = new CustomEffectsRepository(db);
     const effects = [...tryAll(() => effectsRepo.getEffectsOnTarget(char.id, 'character', { is_active: true })),
         ...tryAll(() => effectsRepo.getEffectsOnTarget(char.id, 'npc', { is_active: true }))];
@@ -45,6 +70,7 @@ function digest(char: Character, worldId: string): Record<string, unknown> {
         hp: `${char.hp}/${char.maxHp}`,
         ...(char.band ? { band: char.band } : {}),
         ...(core ? { [core.key]: `${core.pool.current}/${core.pool.max}` } : {}),
+        ...(counters.length ? { counters } : {}),
         ...(char.parts?.some(p => p.state !== 'intact') ? { parts: char.parts.filter(p => p.state !== 'intact').map(p => `${p.name}: ${p.state}`) } : {}),
         conditions: { count: conditions.length, first: conditionsForDisplay(conditions, 5).map(c => clip(c.name, 100)) },
         features: effects.map(e => {
@@ -65,11 +91,11 @@ export function buildBootPacket(worldId: string, characterIds?: string[], journa
     const db = getDb();
     const charRepo = new CharacterRepository(db);
 
-    let day: number | null = null;
-    try {
-        const env = JSON.parse(((db.prepare('SELECT environment FROM worlds WHERE id = ?').get(worldId) as { environment?: string } | undefined)?.environment) || '{}');
-        day = typeof env.day === 'number' ? env.day : null;
-    } catch { /* no environment */ }
+    // Item 14: the shared clock reader (legacy currentDay rows included).
+    // Scheduled rows compare against the fractional clock, debts the day.
+    const clock = readWorldClock(db, worldId);
+    const day: number | null = clock?.day ?? null;
+    const at: number | null = clock?.at ?? null;
 
     const ids = characterIds?.length ? characterIds : tryAll(() =>
         (db.prepare("SELECT id FROM characters WHERE world_id = ? AND character_type = 'pc'").all(worldId) as Array<{ id: string }>).map(r => r.id));
@@ -78,15 +104,15 @@ export function buildBootPacket(worldId: string, characterIds?: string[], journa
     const clocks: Array<Record<string, unknown>> = [
         ...tryAll(() => (db.prepare(`SELECT s.fires_at_day AS day, s.note, c.name AS who FROM scheduled_state_changes s JOIN characters c ON c.id = s.character_id
                                      WHERE s.fired = 0 AND c.world_id = ? ORDER BY s.fires_at_day LIMIT 8`).all(worldId) as Array<{ day: number; note: string | null; who: string }>)
-            .map(r => ({ kind: 'scheduled', day: r.day, due: day !== null && r.day <= day, what: `${r.who}: ${r.note ?? '(no note)'}` }))),
+            .map(r => ({ kind: 'scheduled', day: r.day, due: at !== null && r.day <= at, what: `${r.who}: ${r.note ?? '(no note)'}` }))),
         ...tryAll(() => (db.prepare(`SELECT debtor, creditor, amount, currency, due_day, status, consequence FROM ledger_debts
                                      WHERE world_id = ? AND status IN ('pending', 'due', 'lapsed') ORDER BY COALESCE(due_day, 1e9) LIMIT 8`).all(worldId) as Array<Record<string, unknown>>)
-            .map(r => ({ kind: 'debt', day: r.due_day, status: r.status, what: `${r.debtor} owes ${r.creditor} ${r.currency}${r.amount}${r.consequence ? `; if not: ${r.consequence}` : ''}` })))
+            .map(r => ({ kind: 'debt', day: r.due_day, status: r.status, due: day !== null && typeof r.due_day === 'number' && r.due_day <= day, what: `${r.debtor} owes ${r.creditor} ${r.currency}${r.amount}${r.consequence ? `; if not: ${r.consequence}` : ''}` })))
     ];
 
     const threads = tryAll(() => (db.prepare(`SELECT id, content FROM narrative_notes WHERE world_id = ? AND type = 'plot_thread' AND status = 'active'
                                              ORDER BY updated_at DESC LIMIT 8`).all(worldId) as Array<{ id: string; content: string }>)
-        .map(r => ({ id: r.id, text: clip(r.content, 160) })));
+        .map(r => ({ id: r.id, text: threadDigest(r.content), ...(r.content.length > NOTE_SOFT_CAP ? { chars: r.content.length, long: true as const } : {}) })));
 
     const telegraphs = tryAll(() => (db.prepare("SELECT id, tokens FROM encounters WHERE status = 'active' AND world_id = ?").all(worldId) as Array<{ id: string; tokens: string }>)
         .flatMap(e => (JSON.parse(e.tokens) as Array<{ name: string; intent?: string; readied?: { action: string; trigger: string } }>)
@@ -99,7 +125,7 @@ export function buildBootPacket(worldId: string, characterIds?: string[], journa
 
     const precedents = recentPrecedents(worldId, 5).map(p => ({ kind: p.kind, statement: p.statement, scope: p.scope }));
 
-    return { worldId, day, characters, clocks, threads, telegraphs, journal, precedents };
+    return { worldId, day, ...(clock?.time ? { time: clock.time } : {}), characters, clocks, threads, telegraphs, journal, precedents };
 }
 
 export function renderBootPacket(p: BootPacket): string {
@@ -108,9 +134,10 @@ export function renderBootPacket(p: BootPacket): string {
     if (p.characters.length) {
         out += section('Characters');
         for (const c of p.characters) {
-            const pool = Object.entries(c).find(([k]) => !['id', 'name', 'hp', 'band', 'parts', 'conditions', 'features'].includes(k));
+            const pool = Object.entries(c).find(([k]) => !['id', 'name', 'hp', 'band', 'parts', 'conditions', 'features', 'counters'].includes(k));
             out += `• ${c.name}: HP ${c.hp}${c.band ? ` · ${c.band}` : ''}${pool ? ` · ${pool[0].toUpperCase()} ${pool[1]}` : ''}\n`;
             if (Array.isArray(c.parts)) out += `  parts: ${(c.parts as string[]).join(' · ')}\n`;
+            if (Array.isArray(c.counters)) out += `  counters: ${(c.counters as Array<{ name: string; value: string; item?: string; note?: string }>).map(k => `${k.name} ${k.value}${k.item ? ` (${k.item})` : ''}${k.note ? `: ${k.note}` : ''}`).join(' · ')}\n`;
             const conds = c.conditions as { count: number; first: string[] };
             if (conds.count) out += `  conditions (${conds.count}): ${conds.first.join(' | ')}${conds.count > conds.first.length ? ' | …' : ''}\n`;
             for (const f of c.features as Array<Record<string, unknown>>) {
@@ -119,7 +146,7 @@ export function renderBootPacket(p: BootPacket): string {
         }
     }
     if (p.clocks.length) {
-        out += section(`Clocks${p.day !== null ? ` (day ${p.day})` : ''}`);
+        out += section(`Clocks${p.day !== null ? ` (day ${p.day}${p.time ? `, ${p.time}` : ''})` : ''}`);
         for (const c of p.clocks) out += `• ${c.due || c.status === 'due' || c.status === 'lapsed' ? 'DUE ' : ''}${c.kind === 'debt' ? `[${c.status}] ` : ''}${c.day !== null && c.day !== undefined ? `day ${c.day}: ` : ''}${c.what}\n`;
     }
     if (p.telegraphs.length) {

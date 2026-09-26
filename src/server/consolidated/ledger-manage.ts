@@ -12,6 +12,7 @@ import { randomUUID } from 'crypto';
 import { RichFormatter } from '../utils/formatter.js';
 import { getDb } from '../../storage/index.js';
 import { loadRule } from '../../engine/table-rules.js';
+import { readWorldClock, SET_CLOCK_HINT } from '../../engine/world-clock.js';
 import { SessionContext } from '../types.js';
 
 const ACTIONS = ['create', 'get', 'list', 'process_due', 'settle', 'default', 'update', 'delete'] as const;
@@ -28,7 +29,7 @@ const LedgerInputSchema = z.object({
     graceDays: z.number().optional().describe('create/update: days past due before due → lapsed. Default 0 (lapses the day after due)'),
     consequence: z.string().optional().describe("create/update: what lapsing/defaulting MEANS ('Kenny sends the cousins'). Register B — reported at the transition, run by the GM"),
     note: z.string().optional(),
-    currentDay: z.number().optional().describe('process_due: the fiction clock — REQUIRED for process_due'),
+    currentDay: z.number().optional().describe('process_due: the fiction day. Omit to use the world clock; the response echoes clockSource'),
     status: z.enum(['pending', 'due', 'lapsed', 'settled', 'defaulted']).optional().describe('list filter'),
     sessionId: z.string().optional()
 });
@@ -107,13 +108,21 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
             };
         }
         case 'process_due': case 'tick': {
-            if (typeof input.currentDay !== 'number') return { error: true, message: 'process_due needs currentDay (the fiction clock)' };
+            // Item 14: an explicit currentDay wins; else the world clock's day.
+            // The whole day, not the fraction: a debt due Day 47 is due all day.
+            const clock = typeof input.currentDay === 'number' ? null : readWorldClock(db, input.worldId);
+            const clockSource = typeof input.currentDay === 'number' ? 'param' : 'world';
+            if (typeof input.currentDay !== 'number') {
+                if (!clock) return { error: true, message: `process_due needs currentDay (the fiction clock), ${SET_CLOCK_HINT}` };
+                input.currentDay = clock.day;
+            }
+            const currentDay: number = input.currentDay;
             const rows = db.prepare("SELECT * FROM ledger_debts WHERE world_id = ? AND status IN ('pending','due') AND due_day IS NOT NULL").all(input.worldId) as DebtRow[];
             const transitions: Array<Record<string, unknown>> = [];
             for (const r of rows) {
                 let next: string | null = null;
-                if (r.status === 'pending' && input.currentDay >= (r.due_day as number)) next = 'due';
-                if ((r.status === 'due' || next === 'due') && input.currentDay > (r.due_day as number) + r.grace_days) next = 'lapsed';
+                if (r.status === 'pending' && currentDay >= (r.due_day as number)) next = 'due';
+                if ((r.status === 'due' || next === 'due') && currentDay > (r.due_day as number) + r.grace_days) next = 'lapsed';
                 if (next && next !== r.status) {
                     db.prepare('UPDATE ledger_debts SET status = ?, updated_at = ? WHERE id = ?').run(next, now, r.id);
                     transitions.push({
@@ -125,7 +134,7 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
             }
             const lapsed = transitions.filter(t => t.to === 'lapsed');
             return {
-                success: true, actionType: 'process_due', day: input.currentDay,
+                success: true, actionType: 'process_due', day: currentDay, clockSource,
                 transitions, count: transitions.length,
                 message: transitions.length
                     ? `${transitions.length} transition(s)${lapsed.length ? ` — ${lapsed.length} LAPSED: consequences are due and named above (Register B — the engine reports, the chair runs them)` : ''}`

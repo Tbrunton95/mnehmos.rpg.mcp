@@ -144,6 +144,17 @@ export type ConditionInput = string | {
     sourceId?: string;
     saveDC?: number;
     saveAbility?: string;
+    /** Exhaustion level (1-6), stored as metadata.level */
+    level?: number;
+};
+
+/**
+ * Spellings callers use for the standard conditions: British 'paralysed',
+ * and 'exhaustion' (base-schemas, improvisation) for the enum's 'exhausted'.
+ */
+export const CONDITION_ALIASES: Record<string, ConditionType> = {
+    paralysed: ConditionType.PARALYZED,
+    exhaustion: ConditionType.EXHAUSTED
 };
 
 /**
@@ -164,9 +175,10 @@ export function normalizeCondition(input: ConditionInput, participantId: string)
     const label = String(raw.type || raw.name || '').trim();
     if (!label) return null;
 
-    const type = (Object.values(ConditionType) as string[]).includes(label.toLowerCase())
-        ? label.toLowerCase() as ConditionType
-        : label as ConditionType;
+    const lower = label.toLowerCase();
+    const type = (Object.values(ConditionType) as string[]).includes(lower)
+        ? lower as ConditionType
+        : Object.hasOwn(CONDITION_ALIASES, lower) ? CONDITION_ALIASES[lower] : label as ConditionType;
     const durationType = parseDurationType(raw.durationType)
         ?? (raw.duration !== undefined ? DurationType.ROUNDS : DurationType.PERMANENT);
     const sourceId = raw.sourceId ?? raw.source;
@@ -180,7 +192,8 @@ export function normalizeCondition(input: ConditionInput, participantId: string)
         ...(raw.duration !== undefined ? { duration: raw.duration } : {}),
         ...(sourceId !== undefined ? { sourceId } : {}),
         ...(raw.saveDC !== undefined ? { saveDC: raw.saveDC } : {}),
-        ...(saveAbility ? { saveAbility } : {})
+        ...(saveAbility ? { saveAbility } : {}),
+        ...(raw.level !== undefined ? { metadata: { level: raw.level } } : {})
     };
 }
 
@@ -197,7 +210,15 @@ export function normalizeConditions(inputs: ConditionInput[] | undefined, partic
 export const CONDITION_EFFECTS: Record<ConditionType, {
     description: string;
     attackDisadvantage?: boolean;
+    /** The creature's own attacks have advantage (invisible, hidden) */
+    attackAdvantage?: boolean;
     attacksAgainstAdvantage?: boolean;
+    /** Attacks against the creature have disadvantage (invisible, hidden) */
+    attacksAgainstDisadvantage?: boolean;
+    /** Prone: attacks against have advantage within 5 ft, disadvantage beyond */
+    proneRule?: boolean;
+    /** A hit from within 5 ft is a critical hit (paralyzed, unconscious) */
+    autoCritWithin5ft?: boolean;
     abilityCheckDisadvantage?: boolean;
     savingThrowDisadvantage?: boolean;
     speed?: number; // 0 means no movement
@@ -235,7 +256,8 @@ export const CONDITION_EFFECTS: Record<ConditionType, {
     },
     [ConditionType.INVISIBLE]: {
         description: 'Attacks have advantage, attacks against have disadvantage',
-        attacksAgainstAdvantage: false // Actually disadvantage for attackers
+        attackAdvantage: true,
+        attacksAgainstDisadvantage: true
     },
     [ConditionType.PARALYZED]: {
         description: 'Incapacitated, auto-fail STR/DEX saves, attacks against have advantage, crits within 5ft',
@@ -243,14 +265,16 @@ export const CONDITION_EFFECTS: Record<ConditionType, {
         canTakeReactions: false,
         speed: 0,
         autoFail: [Ability.STRENGTH, Ability.DEXTERITY],
-        attacksAgainstAdvantage: true
+        attacksAgainstAdvantage: true,
+        autoCritWithin5ft: true
     },
     [ConditionType.PETRIFIED]: {
-        description: 'Transformed to stone, incapacitated, resistance to all damage',
+        description: 'Transformed to stone, incapacitated, resistance to all damage, attacks against have advantage',
         canTakeActions: false,
         canTakeReactions: false,
         speed: 0,
-        autoFail: [Ability.STRENGTH, Ability.DEXTERITY]
+        autoFail: [Ability.STRENGTH, Ability.DEXTERITY],
+        attacksAgainstAdvantage: true
     },
     [ConditionType.POISONED]: {
         description: 'Disadvantage on attack rolls and ability checks',
@@ -260,7 +284,7 @@ export const CONDITION_EFFECTS: Record<ConditionType, {
     [ConditionType.PRONE]: {
         description: 'Disadvantage on attacks, attacks against have advantage (if within 5ft)',
         attackDisadvantage: true,
-        speed: 0 // Half speed to stand up
+        proneRule: true // Standing up costs half speed; the GM charges it
     },
     [ConditionType.RESTRAINED]: {
         description: 'Speed 0, disadvantage on attacks and DEX saves, attacks against have advantage',
@@ -270,9 +294,10 @@ export const CONDITION_EFFECTS: Record<ConditionType, {
         attacksAgainstAdvantage: true
     },
     [ConditionType.STUNNED]: {
-        description: 'Incapacitated, auto-fail STR/DEX saves, attacks against have advantage',
+        description: 'Incapacitated, cannot move, auto-fail STR/DEX saves, attacks against have advantage',
         canTakeActions: false,
         canTakeReactions: false,
+        speed: 0,
         autoFail: [Ability.STRENGTH, Ability.DEXTERITY],
         attacksAgainstAdvantage: true
     },
@@ -282,7 +307,8 @@ export const CONDITION_EFFECTS: Record<ConditionType, {
         canTakeReactions: false,
         speed: 0,
         autoFail: [Ability.STRENGTH, Ability.DEXTERITY],
-        attacksAgainstAdvantage: true
+        attacksAgainstAdvantage: true,
+        autoCritWithin5ft: true
     },
     [ConditionType.BLEEDING]: {
         description: 'Takes ongoing damage at start of turn',
@@ -297,9 +323,10 @@ export const CONDITION_EFFECTS: Record<ConditionType, {
         attackDisadvantage: false
     },
     [ConditionType.EXHAUSTED]: {
-        description: 'Disadvantage on checks, reduced speed',
-        abilityCheckDisadvantage: true,
-        attackDisadvantage: true
+        // By level (metadata.level, default 1): see exhaustionLevel. Level 3+
+        // hampers attacks and saves, 2 halves speed, 5 stops it.
+        description: 'Disadvantage on checks; by level: 2 half speed, 3 disadvantage on attacks and saves, 5 speed 0',
+        abilityCheckDisadvantage: true
     },
     [ConditionType.HASTED]: {
         description: 'Increased speed and extra actions',
@@ -322,7 +349,80 @@ export const CONDITION_EFFECTS: Record<ConditionType, {
         attacksAgainstAdvantage: true
     },
     [ConditionType.HIDDEN]: {
-        description: 'Cannot be seen by enemies',
-        attacksAgainstAdvantage: false
+        description: 'Cannot be seen by enemies: attacks have advantage, attacks against have disadvantage',
+        attackAdvantage: true,
+        attacksAgainstDisadvantage: true
     }
 };
+
+/**
+ * The 5e standard conditions whose registry mechanics fire on their own.
+ * Homebrew entries (CURSED, MARKED, ...) stay descriptive: a GM's flavour tag
+ * must never start changing rolls silently.
+ */
+export const STANDARD_CONDITIONS: ReadonlySet<ConditionType> = new Set([
+    ConditionType.BLINDED, ConditionType.FRIGHTENED, ConditionType.GRAPPLED, ConditionType.INVISIBLE,
+    ConditionType.HIDDEN, ConditionType.PARALYZED, ConditionType.PETRIFIED, ConditionType.POISONED,
+    ConditionType.PRONE, ConditionType.RESTRAINED, ConditionType.STUNNED, ConditionType.UNCONSCIOUS,
+    ConditionType.EXHAUSTED
+]);
+
+/** The effective exhaustion level: the highest over the creature's exhausted conditions (0 when none; 1 when unlevelled). */
+export function exhaustionLevel(conditions: Condition[]): number {
+    return conditions
+        .filter(c => c.type === ConditionType.EXHAUSTED)
+        .reduce((max, c) => Math.max(max, typeof c.metadata?.level === 'number' ? c.metadata.level : 1), 0);
+}
+
+/** Speed after the standard conditions: 0 when rooted, a factor otherwise. */
+export function conditionSpeedFactor(conditions: Condition[]): number {
+    if (conditions.some(c => STANDARD_CONDITIONS.has(c.type) && CONDITION_EFFECTS[c.type].speed === 0)) return 0;
+    const level = exhaustionLevel(conditions);
+    return level >= 5 ? 0 : level >= 2 ? 0.5 : 1;
+}
+
+type ConditionHolder = { id: string; name: string; hp?: number; conditions: Condition[] };
+
+/**
+ * Advantage, disadvantage and auto-crit an attack gets from the standard
+ * conditions on both sides (the allow-list only). Each entry is a labelled
+ * note for the situational line: 'Bloodthirster prone (disadvantage)'.
+ * Frightened counts while its source is a living participant, or when it has
+ * no source or one the encounter cannot name.
+ */
+export function conditionAttackModifiers(
+    actor: ConditionHolder,
+    target: ConditionHolder,
+    opts: { within5ft: boolean; participants?: ConditionHolder[] }
+): { adv: string[]; dis: string[]; autoCrit?: string } {
+    const adv: string[] = [];
+    const dis: string[] = [];
+    let autoCrit: string | undefined;
+    const standard = (who: ConditionHolder) => who.conditions.filter(c => STANDARD_CONDITIONS.has(c.type));
+    const sourceGone = (c: Condition) => {
+        if (!c.sourceId) return false;
+        const key = c.sourceId.toLowerCase();
+        const src = opts.participants?.find(p => p.id === c.sourceId || p.name.toLowerCase() === key);
+        return src ? (src.hp ?? 1) <= 0 : false;
+    };
+    const seen = new Set<string>();
+    const push = (list: string[], note: string) => { if (!seen.has(note)) { seen.add(note); list.push(note); } };
+
+    for (const c of standard(actor)) {
+        const fx = CONDITION_EFFECTS[c.type];
+        if (c.type === ConditionType.FRIGHTENED && sourceGone(c)) continue;
+        if (fx.attackDisadvantage) push(dis, `${actor.name} ${c.type} (disadvantage)`);
+        if (fx.attackAdvantage) push(adv, `${actor.name} ${c.type} (advantage)`);
+    }
+    const level = exhaustionLevel(actor.conditions);
+    if (level >= 3) push(dis, `${actor.name} exhaustion ${level} (disadvantage)`);
+
+    for (const c of standard(target)) {
+        const fx = CONDITION_EFFECTS[c.type];
+        if (fx.attacksAgainstAdvantage) push(adv, `${target.name} ${c.type} (advantage)`);
+        if (fx.attacksAgainstDisadvantage) push(dis, `${target.name} ${c.type} (disadvantage)`);
+        if (fx.proneRule) push(opts.within5ft ? adv : dis, `${target.name} ${c.type} (${opts.within5ft ? 'advantage' : 'disadvantage'})`);
+        if (fx.autoCritWithin5ft && opts.within5ft && !autoCrit) autoCrit = `${target.name} ${c.type}: a hit within 5 ft is a crit`;
+    }
+    return { adv, dis, ...(autoCrit ? { autoCrit } : {}) };
+}

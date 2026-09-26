@@ -1291,6 +1291,12 @@ function runMigrations(db: Database.Database) {
     console.error('[Migration] Adding regeneration column to characters table');
     db.exec(`ALTER TABLE characters ADD COLUMN regeneration INTEGER;`);
   }
+  // Combat profile (size, reach, multiattack, named attacks, abilities, CR,
+  // automatic legendary resistance): one JSON column a token hydrates from.
+  if (!ruleCharColumns.some(col => col.name === 'combat_profile')) {
+    console.error('[Migration] Adding combat_profile column to characters table');
+    db.exec(`ALTER TABLE characters ADD COLUMN combat_profile TEXT;`);
+  }
 }
 
 function createPostMigrationIndexes(db: Database.Database) {

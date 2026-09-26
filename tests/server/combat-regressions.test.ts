@@ -44,7 +44,7 @@ describe('Combat Regressions', () => {
 
         expect(goblin).toBeDefined();
         expect(goblin?.ac).toBe(15); // Goblin preset AC
-        expect(goblin?.name).toBe('Goblin'); // Should adopt preset name
+        expect(goblin?.name).toBe('Goblin Warrior'); // Keeps the caller's name (preset supplies stats only)
     });
 
     it('should block "damage" parameter in cast_spell (CRIT-006 anti-hallucination)', async () => {

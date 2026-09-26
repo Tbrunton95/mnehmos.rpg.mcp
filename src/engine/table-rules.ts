@@ -9,6 +9,9 @@
  */
 import type Database from 'better-sqlite3';
 import { z } from 'zod';
+import { PartSchema, UnitSchema, ParticipantExtrasShape, type AttackProfile, type Part } from '../schema/token-extras.js';
+import { expandCreatureTemplate, type CreaturePreset } from '../data/creature-presets.js';
+import { UNPRINTABLE_POOLS } from '../render/pda.js';
 
 export const DEFAULT_BAND_ORDER = ['Mortal', 'Elite Mortal', 'Astartes', 'Astartes Elite', 'Monster/Lord', 'Primarch-class'];
 
@@ -31,7 +34,8 @@ export const RuleSpecSchemas = {
             notes: z.array(z.string()).default([])
         })).default({
             leg: { speed: 0.5, notes: ['no brace', 'footing/Athletics at disadvantage'] },
-            arm: { attackDisadvantage: true, notes: ["that arm's attacks at disadvantage"] }
+            arm: { attackDisadvantage: true, notes: ["that arm's attacks at disadvantage"] },
+            other: { notes: ['that part fails; GM names it'] }
         })
     }).passthrough(),
     prepared_asset: z.object({
@@ -47,7 +51,24 @@ export const RuleSpecSchemas = {
         compact: z.boolean().default(true),
         maxConditions: z.number().int().min(0).max(10).default(2),
         /** The one resource pool the tiny block shows (e.g. 'corruption'). Only a named pool is ever shown. */
-        corePool: z.string().optional()
+        corePool: z.string().optional(),
+        // Item 18: the house format. Unset, each reproduces the default block.
+        /** 'rows' (default): one condition a row. 'line': one labelled row, 'COND A · B'. */
+        conditionLayout: z.enum(['rows', 'line']).optional(),
+        /** Label on the 'line' layout's row (default 'COND'). */
+        conditionLabel: z.string().optional(),
+        /** false drops the '+N more' row. */
+        showMore: z.boolean().optional(),
+        /** false drops the AT row. */
+        showLocation: z.boolean().optional(),
+        /** false drops the OBJ row. */
+        showObjective: z.boolean().optional(),
+        /**
+         * A free line under the frame, segments joined by ' · ': 'scene.place',
+         * 'scene.<engineState key>', 'knows:<key prefix>' (or 'knows:<prefix>|Label')
+         * as 'Label (k of n)', 'location', 'objective'. Anything else prints as written.
+         */
+        footer: z.array(z.string()).optional()
     }).passthrough(),
     principle: z.object({
         text: z.string().min(1)
@@ -63,6 +84,34 @@ export const RuleSpecSchemas = {
         badge: z.string().default(''),
         /** Line appended when a quest fails. Empty for none. */
         questFailLine: z.string().default('')
+    }).passthrough(),
+    /**
+     * A bestiary entry: a statblock saved once and spawned by name
+     * (combat_manage spawn_quick_enemy / add_participant {creature}). Never
+     * enforced; session boot counts these instead of listing them.
+     */
+    creature: z.object({
+        ...ParticipantExtrasShape,
+        displayName: z.string().optional().describe('Token name when it differs from the rule name'),
+        hp: z.number().int().positive(),
+        maxHp: z.number().int().positive().optional(),
+        ac: z.number().int().min(0),
+        stats: z.object({
+            str: z.number().int(), dex: z.number().int(), con: z.number().int(),
+            int: z.number().int(), wis: z.number().int(), cha: z.number().int()
+        }).partial().optional(),
+        initiativeBonus: z.number().int().optional().describe('Default: the DEX modifier'),
+        /** The preset shape of a single attack; attackBonus/attackDamage or attacks[] are the token shapes. */
+        attack: z.object({ name: z.string(), damage: z.string(), damageType: z.string().optional(), toHit: z.number().int().optional() }).optional(),
+        resistances: z.array(z.string()).default([]),
+        vulnerabilities: z.array(z.string()).default([]),
+        immunities: z.array(z.string()).default([]),
+        regeneration: z.number().int().min(0).optional(),
+        band: z.string().optional(),
+        parts: z.array(PartSchema).optional(),
+        unit: UnitSchema.optional(),
+        xpValue: z.number().min(0).optional(),
+        traits: z.array(z.string()).default([])
     }).passthrough()
 } as const;
 
@@ -180,6 +229,20 @@ export function findPool<P>(pools: Record<string, P> | undefined | null, name: s
     return key ? { key, pool: pools[key] } : undefined;
 }
 
+/**
+ * Item 15: the pools a GM marked show: true, as counters for the boot digest
+ * and the status block. The core pool is left out (it already has its own
+ * slot), and so is anything unprintable: psi never reaches a display.
+ */
+export function shownCounters(
+    pools: Record<string, { current: number; max: number; label?: string; show?: boolean; itemInstanceId?: string; note?: string }> | undefined | null,
+    coreKey?: string
+): Array<{ key: string; name: string; current: number; max: number; itemInstanceId?: string; note?: string }> {
+    return Object.entries(pools ?? {})
+        .filter(([k, p]) => p?.show === true && k !== coreKey && !UNPRINTABLE_POOLS.has(k.toLowerCase()))
+        .map(([k, p]) => ({ key: k, name: p.label ?? k, current: p.current, max: p.max, ...(p.itemInstanceId ? { itemInstanceId: p.itemInstanceId } : {}), ...(p.note ? { note: p.note } : {}) }));
+}
+
 export interface Lexicon { currency: string; badge: string; questFailLine: string }
 
 /** What a world without a lexicon rule reads: the STALKER campaign's words. */
@@ -209,4 +272,121 @@ export function conditionsForDisplay<C extends { pinned?: boolean }>(conditions:
 /** The world's band order, or the Day 366 default when no band rule exists. */
 export function bandOrder(db: Database.Database, worldId: string | null | undefined): string[] {
     return loadRule(db, worldId, 'band')?.spec.order ?? DEFAULT_BAND_ORDER;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BESTIARY: creature rules and the built-in presets as one statblock shape
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type CreatureSpec = RuleSpec<'creature'>;
+
+export interface ResolvedCreature {
+    /** The token name ('Chaos Spawn'): displayName, the rule name, or the preset's. */
+    name: string;
+    source: 'world' | 'preset';
+    spec: CreatureSpec;
+    /** The single attack for spawn summaries, in the preset shape. */
+    defaultAttack?: { name: string; damage: string; damageType?: string; toHit?: number };
+}
+
+function presetToSpec(preset: CreaturePreset): CreatureSpec {
+    return parseRuleSpec('creature', {
+        displayName: preset.name,
+        hp: preset.hp,
+        maxHp: preset.maxHp,
+        ac: preset.ac,
+        stats: preset.stats,
+        initiativeBonus: Math.floor((preset.stats.dex - 10) / 2),
+        ...(preset.defaultAttack ? { attack: preset.defaultAttack } : {}),
+        ...(preset.attacksPerAction ? { attacksPerAction: preset.attacksPerAction } : {}),
+        ...(preset.size ? { size: preset.size } : {}),
+        ...(preset.speed !== undefined ? { movementSpeed: preset.speed } : {}),
+        ...(preset.cr !== undefined ? { cr: preset.cr } : {}),
+        ...(preset.xpValue !== undefined ? { xpValue: preset.xpValue } : {}),
+        resistances: preset.resistances ?? [],
+        vulnerabilities: preset.vulnerabilities ?? [],
+        immunities: preset.immunities ?? [],
+        traits: preset.traits ?? []
+    });
+}
+
+/** The attack a token makes when it names none: attack, then the default profile, then the first. */
+function defaultAttackOf(spec: CreatureSpec): ResolvedCreature['defaultAttack'] {
+    if (spec.attack) return spec.attack;
+    const profiles = (spec.attacks ?? []) as AttackProfile[];
+    const prof = profiles.find(a => a.default) ?? profiles[0];
+    if (prof) return { name: prof.name, damage: String(prof.damage), damageType: prof.damageType, toHit: prof.attackBonus };
+    if (spec.attackDamage) return { name: 'attack', damage: spec.attackDamage, damageType: spec.attackDamageType, toHit: spec.attackBonus };
+    return undefined;
+}
+
+/**
+ * A creature by name: the world's enabled creature rule first (any case),
+ * then the built-in preset ('goblin', 'orc:warrior'). null when neither.
+ */
+export function resolveCreature(db: Database.Database, worldId: string | null | undefined, ref: string): ResolvedCreature | null {
+    const rule = loadRule(db, worldId, 'creature', ref);
+    if (rule) {
+        const spec = parseRuleSpec('creature', rule.spec);
+        return { name: spec.displayName ?? rule.name, source: 'world', spec, defaultAttack: defaultAttackOf(spec) };
+    }
+    const preset = expandCreatureTemplate(ref);
+    if (!preset) return null;
+    const spec = presetToSpec(preset);
+    return { name: preset.name, source: 'preset', spec, defaultAttack: preset.defaultAttack ?? defaultAttackOf(spec) };
+}
+
+const LONG_STATS = { str: 'strength', dex: 'dexterity', con: 'constitution', int: 'intelligence', wis: 'wisdom', cha: 'charisma' } as const;
+
+/**
+ * One token from a statblock. Parts start intact and unlatched and limited
+ * abilities start ready, per token: the spec is a template, never a record
+ * of the last fight.
+ */
+export function creatureToParticipant(spec: CreatureSpec, opts: { id: string; name: string; position?: { x: number; y: number }; isEnemy?: boolean }): Record<string, unknown> {
+    const stats = spec.stats ?? {};
+    const abilityScores = Object.fromEntries(Object.entries(LONG_STATS).map(([s, l]) => [l, (stats as Record<string, number | undefined>)[s] ?? 10]));
+    const attack = defaultAttackOf(spec);
+    const parts = (spec.parts as Part[] | undefined)?.map(pt => {
+        const { latchedTo: _latched, ...rest } = pt;
+        return { ...rest, state: 'intact' as const, ...(pt.maxHp !== undefined || pt.hp !== undefined ? { hp: pt.maxHp ?? pt.hp } : {}) };
+    });
+    const out: Record<string, unknown> = {
+        id: opts.id,
+        name: opts.name,
+        hp: spec.maxHp ?? spec.hp,
+        maxHp: spec.maxHp ?? spec.hp,
+        ac: spec.ac,
+        initiativeBonus: spec.initiativeBonus ?? Math.floor(((stats.dex ?? 10) - 10) / 2),
+        isEnemy: opts.isEnemy ?? true,
+        conditions: [],
+        position: opts.position ?? { x: 0, y: 0 },
+        abilityScores,
+        resistances: [...spec.resistances],
+        vulnerabilities: [...spec.vulnerabilities],
+        immunities: [...spec.immunities],
+        size: spec.size ?? 'medium',
+        movementSpeed: spec.movementSpeed ?? 30
+    };
+    const copy = <T>(v: T): T => JSON.parse(JSON.stringify(v));
+    const optional: Record<string, unknown> = {
+        reach: spec.reach,
+        attackBonus: spec.attackBonus ?? attack?.toHit,
+        attackDamage: spec.attackDamage ?? attack?.damage,
+        attackDamageType: spec.attackDamageType ?? attack?.damageType,
+        attacksPerAction: spec.attacksPerAction,
+        attacks: spec.attacks ? copy(spec.attacks as AttackProfile[]) : undefined,
+        abilities: spec.abilities?.map(a => ({ ...a, ready: true })),
+        legendaryActions: spec.legendaryActions,
+        legendaryResistances: spec.legendaryResistances,
+        autoLegendaryResistance: spec.autoLegendaryResistance,
+        hasLairActions: spec.hasLairActions,
+        cr: spec.cr,
+        regeneration: spec.regeneration,
+        band: spec.band,
+        parts,
+        unit: spec.unit ? copy(spec.unit) : undefined
+    };
+    for (const [k, v] of Object.entries(optional)) if (v !== undefined) out[k] = v;
+    return out;
 }

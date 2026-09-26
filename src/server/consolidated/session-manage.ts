@@ -20,6 +20,7 @@ import { getMeta, setMeta } from '../../storage/data-migrations.js';
 import { lookupOperation } from '../operation-guard.js';
 import { queryRolls } from '../../storage/roll-log.js';
 import { buildBootPacket, renderBootPacket } from '../boot-packet.js';
+import { readWorldClock } from '../../engine/world-clock.js';
 
 /** Engine changes this database has not been shown yet. */
 function unseenChangelog(): ChangelogEntry[] {
@@ -40,19 +41,24 @@ function renderChangelog(entries: ChangelogEntry[]): string {
  * A world's table rules for session boot: the enforced rules by name and
  * kind, and the principles as text (reference only, never enforced).
  */
-function tableRulesAtBoot(worldId: string | undefined | null): { enforced: Array<{ name: string; kind: string }>; principles: string[] } | undefined {
+function tableRulesAtBoot(worldId: string | undefined | null): { enforced: Array<{ name: string; kind: string }>; principles: string[]; bestiary?: number } | undefined {
     if (!worldId) return undefined;
     const rules = listRules(getDb(), worldId).filter(r => r.enabled);
     if (!rules.length) return undefined;
+    // Creatures are the world's bestiary: statblocks to spawn, not rules the
+    // engine enforces, so boot counts them rather than listing them.
+    const bestiary = rules.filter(r => r.kind === 'creature').length;
     return {
-        enforced: rules.filter(r => r.kind !== 'principle').map(r => ({ name: r.name, kind: r.kind })),
-        principles: rules.filter(r => r.kind === 'principle').map(r => String((r.spec as { text?: string }).text ?? ''))
+        enforced: rules.filter(r => r.kind !== 'principle' && r.kind !== 'creature').map(r => ({ name: r.name, kind: r.kind })),
+        principles: rules.filter(r => r.kind === 'principle').map(r => String((r.spec as { text?: string }).text ?? '')),
+        ...(bestiary ? { bestiary } : {})
     };
 }
 
-function renderTableRules(t: { enforced: Array<{ name: string; kind: string }>; principles: string[] }): string {
+function renderTableRules(t: { enforced: Array<{ name: string; kind: string }>; principles: string[]; bestiary?: number }): string {
     let out = RichFormatter.section('📜 Table Rules');
     if (t.enforced.length) out += `Enforced: ${t.enforced.map(r => `${r.name} [${r.kind}]`).join(', ')}\n`;
+    if (t.bestiary) out += `Bestiary: ${t.bestiary} creature${t.bestiary === 1 ? '' : 's'} (table_rules list kind creature)\n`;
     for (const p of t.principles) out += `• ${p}\n`;
     return out;
 }
@@ -472,6 +478,12 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
                 name: world.name,
                 currentTime: (world.environment as any)?.timeOfDay || 'day'
             };
+            // Item 14: the stored clock itself, beside the legacy timeOfDay.
+            const worldClock = readWorldClock(db, world.id);
+            if (worldClock) {
+                context.world.day = worldClock.day;
+                if (worldClock.time) context.world.time = worldClock.time;
+            }
 
             // Get current location if party has position
             if (input.partyId) {
@@ -489,7 +501,7 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
             // writes === '[]' so this works on any schema vintage.
             try {
                 const env = (world.environment ?? {}) as Record<string, unknown>;
-                const day = typeof env.day === 'number' ? env.day
+                const day = worldClock ? worldClock.day
                     : typeof env.currentDay === 'number' ? env.currentDay
                         : (() => { const m = String(env.date ?? '').match(/(\d+(?:\.\d+)?)/); return m ? Number(m[1]) : null; })();
                 // FINDINGS #97 (SALT leak #2, session half): the ⏰ section scopes to

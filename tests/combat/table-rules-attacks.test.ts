@@ -124,6 +124,51 @@ describe('called strikes (Measure of a Body)', () => {
         expect(token('luciel').actionUsed).toBeFalsy();
     });
 
+    it('any named part of the target can be struck; it keeps its own kind', async () => {
+        await setup({ luciel: 'Astartes', karanak: 'Astartes' });
+        await handleCombatManage({ action: 'set_part', encounterId, participantId: 'karanak', part: 'jaw', kind: 'head', state: 'intact' }, ctx as any);
+        const { text, result } = await attack({ outcome: 'hit', damage: 5, calledStrike: 'jaw' });
+        expect(text).toMatch(/Karanak's jaw crippled until repaired/);
+        expect(result.calledStrike).toMatchObject({ crippled: true, part: 'jaw' });
+        expect(token('karanak').parts).toEqual([expect.objectContaining({ name: 'jaw', kind: 'head', state: 'crippled' })]);
+        // A jaw is not an arm or a leg: no speed loss, no blanket disadvantage.
+        await handleCombatManage({ action: 'advance', encounterId }, ctx as any);
+        expect(token('karanak').movementRemaining).toBe(30);
+        const bite = await attack({ actorId: 'karanak', targetId: 'luciel', attackBonus: 5, damage: 1 });
+        expect(bite.result.roll.allRolls).toHaveLength(1);
+    });
+
+    it("an arm strike aimed at an existing jaw leaves the jaw a head", async () => {
+        await setup({ luciel: 'Astartes', karanak: 'Astartes' });
+        await handleCombatManage({ action: 'set_part', encounterId, participantId: 'karanak', part: 'jaw', kind: 'head', state: 'intact' }, ctx as any);
+        await attack({ outcome: 'hit', damage: 5, calledStrike: 'arm', atPart: 'jaw' });
+        expect(token('karanak').parts).toEqual([expect.objectContaining({ name: 'jaw', kind: 'head', state: 'crippled' })]);
+    });
+
+    it("a part of kind other (a collar chain) takes the rule's 'other' limb", async () => {
+        await setup({ luciel: 'Astartes', karanak: 'Astartes' });
+        await handleCombatManage({ action: 'set_part', encounterId, participantId: 'karanak', part: 'collar chain', state: 'intact' }, ctx as any);
+        const { text } = await attack({ outcome: 'hit', damage: 5, calledStrike: 'Collar Chain' });
+        expect(text).toMatch(/Karanak's collar chain crippled until repaired \(called strike \(measure-of-a-body\): that part fails/);
+        expect(token('karanak').parts).toEqual([expect.objectContaining({ name: 'collar chain', kind: 'other', state: 'crippled' })]);
+    });
+
+    it('a part kind the target has not declared makes that part (wings count as a wing)', async () => {
+        await setup({ luciel: 'Astartes', karanak: 'Astartes' });
+        await attack({ outcome: 'hit', damage: 5, calledStrike: 'wings' });
+        expect(token('karanak').parts).toEqual([expect.objectContaining({ name: 'wings', kind: 'wing', state: 'crippled' })]);
+    });
+
+    it('an unknown part is refused, listing the limbs and the parts, and spends nothing', async () => {
+        await setup({ luciel: 'Astartes', karanak: 'Astartes' });
+        await handleCombatManage({ action: 'set_part', encounterId, participantId: 'karanak', part: 'jaw', kind: 'head', state: 'intact' }, ctx as any);
+        const { text } = await attack({ outcome: 'hit', damage: 5, calledStrike: 'tail' });
+        expect(text).toMatch(/no 'tail'/);
+        expect(text).toMatch(/limbs: leg, arm, other/);
+        expect(text).toMatch(/Karanak's parts: jaw/);
+        expect(token('luciel').actionUsed).toBeFalsy();
+    });
+
     it('a miss cripples nothing', async () => {
         await setup({ luciel: 'Astartes', karanak: 'Astartes' });
         const { text } = await attack({ outcome: 'miss', calledStrike: 'leg' });

@@ -1,8 +1,9 @@
-import type { Part, Unit, Readied } from '../../schema/token-extras.js';
+import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile } from '../../schema/token-extras.js';
+import { findPart as findNamedPart, matchProfile } from './parts.js';
 import { CombatRNG, CheckResult } from './rng.js';
-import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS } from './conditions.js';
+import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS, conditionAttackModifiers, conditionSpeedFactor } from './conditions.js';
 
-import { SizeCategory, GridBounds } from '../../schema/encounter.js';
+import { SizeCategory, GridBounds, edgeDistanceSquares, effectiveReachFt } from '../../schema/encounter.js';
 
 /**
  * Character interface for combat participants
@@ -86,6 +87,15 @@ export interface CombatParticipant {
     attackDamage?: string;     // Default attack damage (e.g., "1d6+2")
     attackDamageType?: string; // Damage type of the default attack (resistances on opportunity attacks)
     attackBonus?: number;      // Default attack bonus used if none provided
+    // PARTICIPANT EXTRAS (token-extras.ts ParticipantExtrasShape)
+    reach?: number;                  // Melee reach in feet (default from size)
+    attacksPerAction?: number;       // Multiattack: attacks one Attack action allows
+    attacksMade?: number;            // Attacks made with this turn's Attack action
+    attacks?: AttackProfile[];       // Named attack profiles (axe, whip), each with its part
+    abilities?: AbilityProfile[];    // Limited abilities (recharge 5-6)
+    autoLegendaryResistance?: boolean; // Spend a legendary resistance on a failed save automatically
+    cr?: number;                     // Challenge rating
+    lairUsedRound?: number;          // Round the lair action was last used (lair owner only)
 }
 
 /**
@@ -137,6 +147,9 @@ export interface CombatActionResult {
     damageType?: string;     // Findings #40: auditable against resistances
     damageModifier?: 'immune' | 'resistant' | 'vulnerable';  // HIGH-002: set only when one applied
     situational?: string[];  // What changed the roll or the damage (dodge, help, parts, unit cap)
+    // An aimed part with its own hp or breakAt took the hit instead of the
+    // body (damage is then 0): what it took and whether it broke (severed).
+    partHit?: { name: string; damage: number; hpBefore?: number; hpAfter?: number; broken: boolean; state: Part['state'] };
     
     // Heal specifics (if type === 'heal')
     healAmount?: number;
@@ -224,6 +237,9 @@ export class CombatEngine {
             ...p,
             initiative: this.tagged({ purpose: 'initiative', forId: p.id }, () => this.rng.d20(p.initiativeBonus)),
             isEnemy: p.isEnemy ?? this.detectIsEnemy(p.id, p.name),
+            // Legendary counters start full; a spent resistance (from the sheet) stays spent.
+            legendaryActionsRemaining: p.legendaryActions ?? p.legendaryActionsRemaining,
+            legendaryResistancesRemaining: p.legendaryResistancesRemaining ?? p.legendaryResistances,
             movementRemaining: p.movementSpeed ?? 30,
             actionUsed: false,
             bonusActionUsed: false,
@@ -243,10 +259,18 @@ export class CombatEngine {
             return a.id.localeCompare(b.id);
         });
 
+        // A lair owner joining a fight that had no lair brings the LAIR slot.
+        const lairJoiner = withInit.find(p => p.hasLairActions);
+        if (lairJoiner && !this.state.hasLairActions) {
+            this.state.hasLairActions = true;
+            this.state.lairOwnerId = lairJoiner.id;
+        }
+
         // Rebuild turn order, preserving any LAIR slot at its initiative-20 position.
         const newTurnOrder: string[] = merged.map(p => p.id);
         if (this.state.hasLairActions) {
-            const lairIndex = merged.findIndex(p => (p.initiative ?? 0) <= 20);
+            // The lair loses ties: a creature that rolled 20 acts first.
+            const lairIndex = merged.findIndex(p => (p.initiative ?? 0) < 20);
             if (lairIndex === -1) newTurnOrder.push('LAIR');
             else newTurnOrder.splice(lairIndex, 0, 'LAIR');
         }
@@ -274,7 +298,8 @@ export class CombatEngine {
                 isEnemy: p.isEnemy ?? this.detectIsEnemy(p.id, p.name),
                 // Initialize legendary actions remaining to max if applicable
                 legendaryActionsRemaining: p.legendaryActions ?? p.legendaryActionsRemaining,
-                legendaryResistancesRemaining: p.legendaryResistances ?? p.legendaryResistancesRemaining,
+                // Resistances are per day: a spent one (from the sheet) is not refilled by a new fight.
+                legendaryResistancesRemaining: p.legendaryResistancesRemaining ?? p.legendaryResistances,
                 // Initialize resources
                 movementRemaining: p.movementSpeed ?? 30,
                 actionUsed: false,
@@ -304,8 +329,9 @@ export class CombatEngine {
         // If there's a lair owner, insert 'LAIR' at initiative 20
         if (hasLairActions) {
             // Find the right position for initiative 20
-            // LAIR goes after all creatures with initiative > 20, before those with initiative <= 20
-            const lairIndex = participantsWithInitiative.findIndex(p => (p.initiative ?? 0) <= 20);
+            // LAIR goes after all creatures with initiative >= 20 (the lair
+            // loses ties), before those below 20
+            const lairIndex = participantsWithInitiative.findIndex(p => (p.initiative ?? 0) < 20);
             if (lairIndex === -1) {
                 // All initiatives are above 20, add at end
                 turnOrder.push('LAIR');
@@ -408,6 +434,11 @@ export class CombatEngine {
         return this.tagged(tag, () => this.rng.d20(0));
     }
 
+    /** Roll any dice ('2d6') on the encounter's stream, tagged for roll_log. */
+    rollDice(notation: string, tag: import('./rng.js').RollTag): import('./rng.js').DamageResult {
+        return this.tagged(tag, () => this.rng.rollDamageDetailed(notation));
+    }
+
     /** Roll under a tag so the audit log says who the dice were for and why. */
     private tagged<T>(tag: import('./rng.js').RollTag, fn: () => T): T {
         const prev = this.rng.tag;
@@ -483,6 +514,23 @@ export class CombatEngine {
         if (currentId === 'LAIR') return false;
 
         return true;
+    }
+
+    /**
+     * Why a legendary action of this cost cannot be taken now, or undefined
+     * when it can. Checked before any roll so a refusal spends nothing.
+     */
+    legendaryActionProblem(participantId: string, cost: number = 1): string | undefined {
+        if (!this.state) return 'No active combat';
+        const participant = this.state.participants.find(p => p.id === participantId);
+        if (!participant) return `Participant ${participantId} not in this encounter`;
+        if (!participant.legendaryActions || participant.legendaryActions <= 0) return `${participant.name} has no legendary actions`;
+        const currentId = this.state.turnOrder[this.state.currentTurnIndex];
+        if (currentId === participantId) return `${participant.name} cannot take a legendary action on its own turn`;
+        if (currentId === 'LAIR') return 'No legendary action on the LAIR turn (there is no creature\'s turn to follow)';
+        const remaining = participant.legendaryActionsRemaining ?? 0;
+        if (remaining < cost) return `Not enough legendary actions (need ${cost}, have ${remaining})`;
+        return undefined;
     }
 
     /**
@@ -677,7 +725,10 @@ export class CombatEngine {
         unaffectedLimb?: boolean,
         // Named parts: the attacker's part used and the target part aimed at;
         // uncapped lifts the one-model cap on unit targets (cleave, volleys).
-        partOpts?: { withPart?: string; atPart?: string; uncapped?: boolean }
+        // ranged says the attack is not made within 5 ft (prone, auto-crit);
+        // ignoreConditions skips the standard-condition modifiers entirely;
+        // opportunity tags the rolls and the event as an opportunity attack.
+        partOpts?: { withPart?: string; atPart?: string; uncapped?: boolean; ranged?: boolean; ignoreConditions?: boolean; opportunity?: boolean }
     ): CombatActionResult {
         if (!this.state) throw new Error('No active combat');
 
@@ -695,7 +746,10 @@ export class CombatEngine {
         const findPart = (who: CombatParticipant, name?: string) => name ? who.parts?.find(pt => pt.name.toLowerCase() === partName(name)) : undefined;
         const usedPart = findPart(actor, partOpts?.withPart);
         if (partOpts?.withPart) {
-            if (!usedPart) throw new Error(`${actor.name} has no part '${partOpts.withPart}' (parts: ${actor.parts?.map(pt => pt.name).join(', ') || 'none'})`);
+            if (!usedPart) {
+                const named = actor.attacks?.length ? `; named attacks: ${actor.attacks.map(a => a.name).join(', ')} (pass using)` : '';
+                throw new Error(`${actor.name} has no part '${partOpts.withPart}' (parts: ${actor.parts?.map(pt => pt.name).join(', ') || 'none'})${named}`);
+            }
             if (usedPart.state === 'dead') throw new Error(`${actor.name}'s ${usedPart.name} is dead and cannot attack`);
             if (usedPart.state === 'latched') throw new Error(`${actor.name}'s ${usedPart.name} is latched and cannot attack while it holds`);
         }
@@ -716,10 +770,19 @@ export class CombatEngine {
         // is hit with advantage.
         if (usedPart?.state === 'crippled') { disadvantage = true; situational.push(`${actor.name}'s ${usedPart.name} crippled (disadvantage)`); }
         // Measure of a Body: a crippled arm's attacks are at disadvantage. With
-        // no part named, assume the crippled arm unless the GM says otherwise.
+        // no part resolved (no withPart, weapon or profile part), assume the
+        // crippled arm only when no intact arm could be swinging instead.
         const crippledArm = actor.parts?.find(pt => pt.state === 'crippled' && pt.kind === 'arm');
-        if (!partOpts?.withPart && crippledArm && !unaffectedLimb) { disadvantage = true; situational.push(`${actor.name}'s ${crippledArm.name} crippled (disadvantage; name withPart or unaffectedLimb for the good arm)`); }
-        const aimed = findPart(target, partOpts?.atPart);
+        if (!usedPart && crippledArm && !unaffectedLimb) {
+            const goodArm = actor.parts?.find(pt => pt.kind === 'arm' && pt.state === 'intact');
+            if (goodArm) situational.push(`assumed ${goodArm.name}; name weapon or withPart if the crippled ${crippledArm.name} swings`);
+            else { disadvantage = true; situational.push(`${actor.name}'s ${crippledArm.name} crippled (disadvantage; name withPart or unaffectedLimb for the good arm)`); }
+        }
+        const aimed = partOpts?.atPart ? findNamedPart(target, partOpts.atPart) : undefined;
+        // A part with its own hp or breakAt is a separate object (a chain, a
+        // shield, a plate): an aimed hit lands on it, not on the body.
+        const armouredPart = aimed && aimed.state !== 'dead' && (aimed.hp !== undefined || aimed.breakAt !== undefined) ? aimed : undefined;
+        let partHit: CombatActionResult['partHit'];
         if (aimed?.state === 'breached') { advantage = true; situational.push(`${target.name}'s ${aimed.name} breached (advantage)`); }
         if (target.parts?.some(pt => pt.state === 'latched' && pt.latchedTo?.participantId === actor.id)) {
             advantage = true;
@@ -734,6 +797,19 @@ export class CombatEngine {
             situational.push(`${hampering.map(c => c.type).join(', ')} (disadvantage)`);
         }
 
+        // The 5e standard conditions on both sides (allow-list only; homebrew
+        // tags never fire). Within 5 ft comes from the grid when both tokens
+        // are placed, else it is assumed unless the attack is ranged.
+        let autoCrit: string | undefined;
+        if (!partOpts?.ignoreConditions) {
+            const within5ft = partOpts?.ranged ? false
+                : (actor.position && target.position ? edgeDistanceSquares(actor, target) <= 1 : true);
+            const mods = conditionAttackModifiers(actor, target, { within5ft, participants: this.state.participants });
+            if (mods.adv.length) { advantage = true; situational.push(...mods.adv); }
+            if (mods.dis.length) { disadvantage = true; situational.push(...mods.dis); }
+            autoCrit = mods.autoCrit;
+        }
+
         // Roll with full transparency — 5e semantics (Findings #32):
         // crit reads the natural die, never the margin.
         const attackRoll: CheckResult & { allRolls: number[]; resolved?: 'hit' | 'crit' | 'miss' } = resolved
@@ -745,7 +821,18 @@ export class CombatEngine {
                 isHit: resolved !== 'miss', isCrit: resolved === 'crit',
                 allRolls: [], resolved
             }
-            : this.tagged({ purpose: 'attack', forId: actorId, targetId }, () => this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage));
+            : this.tagged({ purpose: partOpts?.opportunity ? 'opportunity attack' : 'attack', forId: actorId, targetId }, () => this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage));
+        // Paralyzed or unconscious within 5 ft: a rolled hit is a crit. A
+        // GM-posted result lands exactly as posted, with a pointer instead.
+        if (autoCrit && attackRoll.isHit && !attackRoll.isCrit) {
+            if (resolved) {
+                situational.push(`${autoCrit} (posted as ${resolved}; post outcome:crit if so)`);
+            } else {
+                attackRoll.isCrit = true;
+                attackRoll.degree = 'critical-success';
+                situational.push(autoCrit);
+            }
+        }
 
         let damageDealt = 0;
         let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
@@ -754,7 +841,7 @@ export class CombatEngine {
         let baseDamageVal = 0;
         let damageBreakdownStr = '';
 
-        const rolled = this.tagged({ purpose: 'damage', forId: actorId, targetId }, () => this.rollAttackDamage(damage, attackRoll.isHit && attackRoll.isCrit));
+        const rolled = this.tagged({ purpose: partOpts?.opportunity ? 'opportunity damage' : 'damage', forId: actorId, targetId }, () => this.rollAttackDamage(damage, attackRoll.isHit && attackRoll.isCrit));
         baseDamageVal = rolled.total;
         const capturedDamageRolls = rolled.rolls;
         damageBreakdownStr = rolled.breakdown;
@@ -768,9 +855,14 @@ export class CombatEngine {
             const modResult = this.calculateDamageWithModifiers(finalBaseDamage, damageType, target);
             damageDealt = modResult.finalDamage;
             damageModifier = modResult.modifier;
+            if (armouredPart) {
+                partHit = this.damagePart(target, armouredPart, damageDealt);
+                situational.push(`${target.name}'s ${armouredPart.name} takes the hit${partHit.broken ? ' and is severed' : ''} (body untouched)`);
+                damageDealt = 0;
+            }
             // A single blow on a unit kills at most one model; cleave on a
             // packed unit, volleys and area attacks flow through models.
-            if (target.unit && !partOpts?.uncapped && target.hp > 0) {
+            else if (target.unit && !partOpts?.uncapped && target.hp > 0) {
                 const models = Math.ceil(target.hp / target.unit.hpPerModel);
                 const currentModelHp = target.hp - (models - 1) * target.unit.hpPerModel;
                 if (damageDealt > currentModelHp) {
@@ -813,7 +905,13 @@ export class CombatEngine {
                 modStr = ' [Vulnerable - Doubled!]';
             }
 
-            breakdown += `\n\n💥 Damage: ${damageDealt}${typeStr}${damageBreakdownStr}${attackRoll.isCrit ? ' (crit)' : ''}${flatDamageBonus ? ` + ${flatDamageLabel ?? 'trait'} ${flatDamageBonus >= 0 ? '+' : ''}${flatDamageBonus}` : ''}${modStr}\n`;
+            const dealtStr = `${typeStr}${damageBreakdownStr}${attackRoll.isCrit ? ' (crit)' : ''}${flatDamageBonus ? ` + ${flatDamageLabel ?? 'trait'} ${flatDamageBonus >= 0 ? '+' : ''}${flatDamageBonus}` : ''}${modStr}`;
+            if (partHit) {
+                const hpStr = partHit.hpBefore !== undefined ? `, ${partHit.hpBefore} → ${partHit.hpAfter} HP` : '';
+                breakdown += `\n\n💥 Part hit: ${partHit.name} takes ${partHit.damage}${dealtStr}${hpStr}${partHit.broken ? ' [SEVERED]' : ''}\n`;
+            } else {
+                breakdown += `\n\n💥 Damage: ${damageDealt}${dealtStr}\n`;
+            }
             breakdown += `   ${target.name}: ${hpBefore} → ${target.hp}/${target.maxHp} HP`;
             if (defeated) {
                 breakdown += ` [DEFEATED]`;
@@ -825,14 +923,16 @@ export class CombatEngine {
         // Build simple message
         let message = '';
         if (attackRoll.isHit) {
-            message = `${attackRoll.isCrit ? 'CRITICAL ' : ''}HIT! ${actor.name} deals ${damageDealt} damage to ${target.name}`;
+            message = partHit
+                ? `${attackRoll.isCrit ? 'CRITICAL ' : ''}HIT! ${actor.name} deals ${partHit.damage} damage to ${target.name}'s ${partHit.name}${partHit.broken ? ' [SEVERED]' : ''}`
+                : `${attackRoll.isCrit ? 'CRITICAL ' : ''}HIT! ${actor.name} deals ${damageDealt} damage to ${target.name}`;
             if (defeated) message += ' [DEFEATED]';
         } else {
             message = `MISS! ${actor.name}'s attack misses ${target.name}`;
         }
 
         this.emitter?.publish('combat', {
-            type: 'attack_executed',
+            type: partOpts?.opportunity ? 'opportunity_attack' : 'attack_executed',
             result: {
                 actor: actor.name,
                 target: target.name,
@@ -859,8 +959,35 @@ export class CombatEngine {
             defeated,
             message,
             detailedBreakdown: breakdown,
-            ...(situational.length ? { situational } : {})
+            ...(situational.length ? { situational } : {}),
+            ...(partHit ? { partHit } : {})
         };
+    }
+
+    /**
+     * Damage an armoured part: a hit of breakAt or more, or hp run down to 0,
+     * breaks it. A broken part is dead with a 'severed' note, and it lets go:
+     * its own latch and every part latched onto it are released.
+     */
+    private damagePart(owner: CombatParticipant, part: Part, damage: number): NonNullable<CombatActionResult['partHit']> {
+        const hpBefore = part.hp;
+        if (part.hp !== undefined) part.hp = Math.max(0, part.hp - damage);
+        const broken = (part.breakAt !== undefined && damage >= part.breakAt) || (part.hp !== undefined && part.hp <= 0);
+        if (broken) {
+            part.state = 'dead';
+            part.latchedTo = undefined;
+            part.note = part.note ? `${part.note}; severed` : 'severed';
+            const key = part.name.toLowerCase();
+            for (const other of this.state?.participants ?? []) {
+                for (const pt of other.parts ?? []) {
+                    if (pt.latchedTo?.participantId !== owner.id) continue;
+                    if (!pt.latchedTo.part || pt.latchedTo.part.toLowerCase() !== key) continue;
+                    pt.latchedTo = undefined;
+                    if (pt.state === 'latched') pt.state = 'intact';
+                }
+            }
+        }
+        return { name: part.name, damage, ...(hpBefore !== undefined ? { hpBefore, hpAfter: part.hp } : {}), broken, state: part.state };
     }
 
     /**
@@ -1196,6 +1323,7 @@ export class CombatEngine {
         participant.hasDisengaged = false;
         participant.hasDashed = false;
         participant.actionUsed = false;
+        participant.attacksMade = 0;
         participant.bonusActionUsed = false;
         participant.spellsCast = {};
         participant.movementRemaining = this.effectiveSpeed(participant);
@@ -1203,7 +1331,7 @@ export class CombatEngine {
 
     /**
      * Base speed after conditions whose metadata carries a speedFactor (a
-     * crippled leg halves it).
+     * crippled leg halves it) and the standard conditions' own speed.
      */
     effectiveSpeed(participant: CombatParticipant): number {
         // Held by another creature's latched part: it cannot move away.
@@ -1215,6 +1343,9 @@ export class CombatEngine {
         }, 1);
         // A crippled leg or wing halves speed (once, however many).
         if (participant.parts?.some(pt => pt.state === 'crippled' && (pt.kind === 'leg' || pt.kind === 'wing'))) factor *= 0.5;
+        // Standard conditions: grappled, restrained, stunned... root the
+        // creature; exhaustion 2 halves speed and 5 stops it.
+        factor *= conditionSpeedFactor(participant.conditions);
         return Math.floor(base * factor);
     }
 
@@ -1296,6 +1427,15 @@ export class CombatEngine {
             const before = participant.hp;
             participant.hp = Math.min(participant.maxHp, participant.hp + participant.regeneration);
             this.turnStartNotes.push(`${participant.name} regenerates ${participant.hp - before} HP (${before} → ${participant.hp}/${participant.maxHp})`);
+        }
+
+        // Recharge: each spent ability with a recharge number rolls a d6 on
+        // the encounter stream; that number or more makes it ready again.
+        for (const ability of participant.abilities ?? []) {
+            if (!ability.recharge || ability.ready !== false) continue;
+            const d6 = this.tagged({ purpose: `recharge ${ability.name}`, forId: participant.id }, () => this.rng.roll('1d6'));
+            if (d6 >= ability.recharge) ability.ready = true;
+            this.turnStartNotes.push(`${participant.name}: ${ability.name} ${ability.ready ? 'recharges' : 'does not recharge'} (d6=${d6}, needs ${ability.recharge}+)`);
         }
 
         for (const condition of [...participant.conditions]) {
@@ -1412,8 +1552,7 @@ export class CombatEngine {
 
             // Exit if we found a living participant or exhausted all options
         } while (
-            newParticipant && 
-            newParticipant.hp <= 0 && 
+            ((newParticipant && newParticipant.hp <= 0) || this.lairOwnerDown()) &&
             iterations < maxIterations
         );
 
@@ -1430,6 +1569,13 @@ export class CombatEngine {
         });
 
         return newParticipant;
+    }
+
+    /** The LAIR slot is up but the creature that owns the lair is dead: skip it. */
+    private lairOwnerDown(): boolean {
+        if (!this.state || this.state.turnOrder[this.state.currentTurnIndex] !== 'LAIR') return false;
+        const owner = this.state.participants.find(p => p.id === this.state!.lairOwnerId);
+        return !!owner && owner.hp <= 0;
     }
 
     /**
@@ -1523,6 +1669,41 @@ export class CombatEngine {
     }
 
     /**
+     * Validate one attack against the Attack action. With multiattack
+     * (attacksPerAction > 1) the action stays open between swings, so the
+     * second attack is valid while the first already spent the action; any
+     * other use of the action (Dash, a spell) still closes it.
+     */
+    validateAttackEconomy(participantId: string): { valid: boolean; error?: string } {
+        if (!this.state) return { valid: false, error: 'No active combat' };
+        const participant = this.state.participants.find(p => p.id === participantId);
+        if (!participant) return { valid: false, error: 'Participant not found' };
+        const of = participant.attacksPerAction ?? 1;
+        const made = participant.attacksMade ?? 0;
+        // The open Attack action ends with its turn: off-turn, the spent
+        // action (actionUsed) refuses the rest, as it would any attack.
+        const ownTurn = this.state.turnOrder[this.state.currentTurnIndex] === participantId;
+        if (made > 0 && made < of && ownTurn) {
+            if (!this.canTakeActions(participantId)) return { valid: false, error: 'Participant is incapacitated' };
+            return { valid: true };
+        }
+        const economy = this.validateActionEconomy(participantId, 'action');
+        if (!economy.valid && of > 1 && made >= of) {
+            return { valid: false, error: `Action already used this turn (attacks ${made}/${of})` };
+        }
+        return economy;
+    }
+
+    /** Count one attack of the Attack action (the action is spent from the first). */
+    commitAttack(participantId: string): { made: number; of: number } | undefined {
+        const participant = this.state?.participants.find(p => p.id === participantId);
+        if (!participant) return undefined;
+        participant.attacksMade = (participant.attacksMade ?? 0) + 1;
+        participant.actionUsed = true;
+        return { made: participant.attacksMade, of: participant.attacksPerAction ?? 1 };
+    }
+
+    /**
      * Commit an action to the economy tracking
      */
     commitAction(
@@ -1558,18 +1739,38 @@ export class CombatEngine {
     }
 
     /**
-     * HIGH-003: Get adjacent enemies that could make opportunity attacks
-     * @param moverId - The creature that is moving
-     * @param fromPos - Starting position
-     * @param toPos - Target position
-     * @returns Array of participants who can make opportunity attacks
+     * Item 6: is the target (optionally standing at `targetAt`) within the
+     * attacker's melee reach? Measured edge to edge between footprints, so a
+     * large creature threatens from every square it fills.
      */
+    isWithinReach(attacker: CombatParticipant, target: CombatParticipant, targetAt?: { x: number; y: number }, reachFt?: number): boolean {
+        const squares = edgeDistanceSquares(attacker, target, { b: targetAt });
+        return squares * 5 <= (reachFt ?? effectiveReachFt(attacker));
+    }
+
+    /**
+     * HIGH-003 / item 11: who gets an opportunity attack on this move.
+     *
+     * With a path (start first, as findPath returns it) every step is checked:
+     * a reactor swings at the first step i where the mover is in its reach at
+     * path[i] and out of it at path[i+1], so a path that skirts an enemy
+     * provokes even when both ends are clear of it. Reactors that cannot take
+     * reactions (stunned, paralysed, unconscious) or already spent theirs are
+     * skipped. The (from, to) form checks the two squares only and returns
+     * the attackers, as it always has.
+     */
+    getOpportunityAttackers(moverId: string, path: Array<{ x: number; y: number }>): Array<{ attacker: CombatParticipant; stepIndex: number }>;
+    getOpportunityAttackers(moverId: string, fromPos: { x: number; y: number }, toPos: { x: number; y: number }): CombatParticipant[];
     getOpportunityAttackers(
         moverId: string,
-        fromPos: { x: number; y: number },
-        toPos: { x: number; y: number }
-    ): CombatParticipant[] {
-        if (!this.state) return [];
+        pathOrFrom: Array<{ x: number; y: number }> | { x: number; y: number },
+        toPos?: { x: number; y: number }
+    ): Array<{ attacker: CombatParticipant; stepIndex: number }> | CombatParticipant[] {
+        if (!Array.isArray(pathOrFrom)) {
+            return this.getOpportunityAttackers(moverId, [pathOrFrom, toPos!]).map(h => h.attacker);
+        }
+        const path = pathOrFrom;
+        if (!this.state || path.length < 2) return [];
 
         const mover = this.state.participants.find(p => p.id === moverId);
         if (!mover) return [];
@@ -1577,41 +1778,78 @@ export class CombatEngine {
         // If mover has disengaged, no opportunity attacks are provoked
         if (mover.hasDisengaged) return [];
 
-        const attackers: CombatParticipant[] = [];
+        const attackers: Array<{ attacker: CombatParticipant; stepIndex: number }> = [];
 
         for (const p of this.state.participants) {
-            // Skip self
+            // Skip self, the defeated, allies, spent reactions and unplaced tokens
             if (p.id === moverId) continue;
-
-            // Skip defeated participants
             if (p.hp <= 0) continue;
-
-            // Skip same faction (allies don't attack each other)
-            if (p.isEnemy === mover.isEnemy) continue;
-
-            // Skip if reaction already used
+            if (!!p.isEnemy === !!mover.isEnemy) continue;
             if (p.reactionUsed) continue;
-
-            // Skip if no position
             if (!p.position) continue;
+            // Stunned, paralysed, unconscious and the like cannot react.
+            if (!this.canTakeReactions(p.id)) continue;
 
-            // Check if creature was adjacent to mover at start and is no longer adjacent at end
-            const wasAdjacent = this.isAdjacent(fromPos, p.position);
-            const stillAdjacent = this.isAdjacent(toPos, p.position);
-
-            // Opportunity attack triggers when leaving threatened square (was adjacent, now not)
-            if (wasAdjacent && !stillAdjacent) {
-                attackers.push(p);
-            }
+            // Leaving the reactor's reach (size and reach aware) provokes.
+            const step = this.firstReachChange(p, mover, path, 'leaves_reach');
+            if (step !== undefined) attackers.push({ attacker: p, stepIndex: step });
         }
 
-        return attackers;
+        return attackers.sort((a, b) => a.stepIndex - b.stepIndex);
     }
 
     /**
-     * HIGH-003: Execute an opportunity attack
-     * Uses simplified attack: d20 + attacker's initiative bonus vs target's initiative + 10
-     * Damage is fixed at 1d6 + 2 for simplicity
+     * The first step of a path where the mover enters or leaves a reactor's
+     * reach. Leaving counts at the square it leaves from (path[i]); entering
+     * at the square it enters (path[i+1]).
+     */
+    private firstReachChange(
+        reactor: CombatParticipant, mover: CombatParticipant,
+        path: Array<{ x: number; y: number }>, on: 'enters_reach' | 'leaves_reach', reachFt?: number
+    ): number | undefined {
+        for (let i = 0; i + 1 < path.length; i++) {
+            const was = this.isWithinReach(reactor, mover, path[i], reachFt);
+            const now = this.isWithinReach(reactor, mover, path[i + 1], reachFt);
+            if (on === 'leaves_reach' && was && !now) return i;
+            if (on === 'enters_reach' && !was && now) return i + 1;
+        }
+        return undefined;
+    }
+
+    /**
+     * Item 11: readied actions this move sets off. A readied action with
+     * `on` (enters_reach / leaves_reach) fires when its watched creature
+     * (a participant id or name, 'enemy' by default, or 'any') crosses the
+     * reactor's reach, measured with the readied attack's profile reach
+     * when it names one. Reactors that cannot react are skipped.
+     */
+    getReadiedTriggers(moverId: string, path: Array<{ x: number; y: number }>): Array<{ reactor: CombatParticipant; stepIndex: number; readied: Readied }> {
+        if (!this.state || path.length < 2) return [];
+        const mover = this.state.participants.find(p => p.id === moverId);
+        if (!mover) return [];
+        const hits: Array<{ reactor: CombatParticipant; stepIndex: number; readied: Readied }> = [];
+        for (const p of this.state.participants) {
+            const readied = p.readied;
+            if (!readied?.on || p.id === moverId || !p.position) continue;
+            if (p.reactionUsed || !this.canTakeReactions(p.id)) continue;
+            const watch = (readied.watch ?? 'enemy').trim().toLowerCase();
+            const watched = watch === 'any'
+                || (watch === 'enemy' && !!p.isEnemy !== !!mover.isEnemy)
+                || watch === mover.id.toLowerCase() || watch === mover.name.toLowerCase();
+            if (!watched) continue;
+            const profile = readied.attack?.using && p.attacks?.length ? matchProfile(p.attacks, readied.attack.using) : undefined;
+            const step = this.firstReachChange(p, mover, path, readied.on, profile?.reachFt ?? undefined);
+            if (step !== undefined) hits.push({ reactor: p, stepIndex: step, readied });
+        }
+        return hits.sort((a, b) => a.stepIndex - b.stepIndex);
+    }
+
+    /**
+     * HIGH-003: Execute an opportunity attack with the attacker's default
+     * attack against the target's AC. It rolls like any attack: standard
+     * conditions on both sides (a prone mover within 5 ft is hit with
+     * advantage, a paralysed one takes a crit), Dodge, Help and the one-model
+     * cap on units. Spends the attacker's reaction.
      */
     executeOpportunityAttack(
         attackerId: string,
@@ -1625,89 +1863,34 @@ export class CombatEngine {
         if (!attacker) throw new Error(`Attacker ${attackerId} not found`);
         if (!target) throw new Error(`Target ${targetId} not found`);
 
-        // Mark reaction as used
-        attacker.reactionUsed = true;
-
-        // The attacker's own default attack and the target's AC, falling back
-        // to ability scores, then to the old heuristics for bare tokens.
+        // The attacker's own default attack (or its default profile) and the
+        // target's AC, falling back to ability scores, then to the old
+        // heuristics for bare tokens.
         const mod = (score?: number) => Math.floor(((score ?? 10) - 10) / 2);
-        const attackBonus = attacker.attackBonus
+        const profile = attacker.attackBonus === undefined
+            ? attacker.attacks?.find(a => a.default) ?? (attacker.attacks?.length === 1 ? attacker.attacks[0] : undefined)
+            : undefined;
+        const attackBonus = attacker.attackBonus ?? profile?.attackBonus
             ?? (attacker.abilityScores
                 ? Math.max(mod(attacker.abilityScores.strength), mod(attacker.abilityScores.dexterity)) + 2
                 : attacker.initiativeBonus + 2);
+        const damage = profile && attacker.attackDamage === undefined ? profile.damage : attacker.attackDamage ?? '1d6+2';
+        const damageType = profile && attacker.attackDamage === undefined ? profile.damageType : attacker.attackDamageType;
         const targetAC = target.ac
             ?? (target.abilityScores ? 10 + mod(target.abilityScores.dexterity)
                 : 10 + (target.initiativeBonus > 0 ? Math.floor(target.initiativeBonus / 2) : 0));
 
-        const hpBefore = target.hp;
-        // 5e: crit on the natural 20 only, never on the margin.
-        const attackRoll = this.tagged({ purpose: 'opportunity attack', forId: attackerId, targetId }, () => this.rng.rollAttackD20(attackBonus, targetAC));
+        const result = this.executeAttack(attackerId, targetId, attackBonus, targetAC, damage, damageType,
+            false, false, undefined, undefined, undefined, undefined, { opportunity: true });
 
-        let damageDealt = 0;
-        let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
-        if (attackRoll.isHit) {
-            const rolled = this.tagged({ purpose: 'opportunity damage', forId: attackerId, targetId }, () => this.rollAttackDamage(attacker.attackDamage ?? '1d6+2', attackRoll.isCrit));
-            const modResult = this.calculateDamageWithModifiers(rolled.total, attacker.attackDamageType, target);
-            damageDealt = modResult.finalDamage;
-            damageModifier = modResult.modifier;
-            target.hp = Math.max(0, target.hp - damageDealt);
-        }
+        // Mark reaction as used
+        attacker.reactionUsed = true;
 
-        const defeated = target.hp <= 0;
-
-        // Build detailed breakdown
-        let breakdown = `⚡ OPPORTUNITY ATTACK by ${attacker.name}!\n`;
-        breakdown += `🎲 Attack Roll: d20(${attackRoll.roll}) + ${attackBonus} = ${attackRoll.total} vs AC ${targetAC}\n`;
-
-        if (attackRoll.isNat20) {
-            breakdown += `   ⭐ NATURAL 20!\n`;
-        } else if (attackRoll.isNat1) {
-            breakdown += `   💀 NATURAL 1!\n`;
-        }
-
-        breakdown += `   ${attackRoll.isHit ? '✅ HIT' : '❌ MISS'}`;
-
-        if (attackRoll.isHit) {
-            breakdown += attackRoll.isCrit ? ' (CRITICAL!)' : '';
-            breakdown += `\n\n💥 Damage: ${damageDealt}${attackRoll.isCrit ? ' (crit)' : ''}\n`;
-            breakdown += `   ${target.name}: ${hpBefore} → ${target.hp}/${target.maxHp} HP`;
-            if (defeated) {
-                breakdown += ` [DEFEATED]`;
-            }
-        }
-
-        const message = attackRoll.isHit
-            ? `OPPORTUNITY ATTACK HIT! ${attacker.name} strikes ${target.name} for ${damageDealt} damage`
+        result.detailedBreakdown = `⚡ OPPORTUNITY ATTACK by ${attacker.name}!\n${result.detailedBreakdown}`;
+        result.message = result.success
+            ? `OPPORTUNITY ATTACK HIT! ${attacker.name} strikes ${target.name} for ${result.damage} damage${result.defeated ? ' [DEFEATED]' : ''}`
             : `OPPORTUNITY ATTACK MISS! ${attacker.name}'s attack misses ${target.name}`;
-
-        this.emitter?.publish('combat', {
-            type: 'opportunity_attack',
-            result: {
-                attacker: attacker.name,
-                target: target.name,
-                roll: attackRoll.roll,
-                total: attackRoll.total,
-                ac: targetAC,
-                hit: attackRoll.isHit,
-                crit: attackRoll.isCrit,
-                damage: damageDealt,
-                targetHp: target.hp
-            }
-        });
-
-        return {
-            type: 'attack',
-            actor: { id: attacker.id, name: attacker.name },
-            target: { id: target.id, name: target.name, hpBefore, hpAfter: target.hp, maxHp: target.maxHp },
-            attackRoll,
-            damage: damageDealt,
-            damageType: attacker.attackDamageType,
-            damageModifier: damageModifier === 'normal' ? undefined : damageModifier,
-            success: attackRoll.isHit,
-            defeated,
-            message,
-            detailedBreakdown: breakdown
-        };
+        return result;
     }
 
     /**

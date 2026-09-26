@@ -12,8 +12,10 @@
  * - level_up -> action: 'level_up'
  */
 
-import { loadRule, resolveWorldId, findPool, worldLexicon, conditionsForDisplay } from '../../engine/table-rules.js';
+import { loadRule, resolveWorldId, findPool, worldLexicon, conditionsForDisplay, shownCounters } from '../../engine/table-rules.js';
+import { readWorldClock, dayClock, SET_CLOCK_HINT } from '../../engine/world-clock.js';
 import { z } from 'zod';
+import { ParticipantExtrasShape, SizeCategorySchema } from '../../schema/token-extras.js';
 import { randomUUID } from 'crypto';
 import { SessionContext } from '../types.js';
 import { getDb } from '../../storage/index.js';
@@ -24,11 +26,15 @@ import {
     CharacterOriginSchema,
     SkillProficiencySchema,
     SaveProficiencySchema,
+    resourcePoolSchema,
+    type ResourcePool,
 } from '../../schema/character.js';
+import { resolveInstance, mintInstance } from './inventory-manage.js';
 import { provisionStartingEquipment } from '../../services/starting-equipment.service.js';
 import { CLASS_DATA, getSpellSlots, isSpellcaster } from '../../data/class-starting-data.js';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { CorpseRepository } from '../../storage/repos/corpse.repo.js';
+import { SceneRepository } from '../../storage/repos/scene.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { RichFormatter } from '../utils/formatter.js';
 import {
@@ -98,16 +104,33 @@ const conditionSchema = () => z.object({
     pinned: z.boolean().optional()
 });
 
+/**
+ * Combat profile on the sheet: what a token made from this character starts
+ * with (combat create and add_participant read it when the caller omits it).
+ * The legendary counters and lair flag are older columns exposed here too.
+ */
+const COMBAT_PROFILE_FIELDS = ['size', 'reach', 'attacksPerAction', 'attacks', 'abilities', 'cr', 'autoLegendaryResistance',
+    'legendaryActions', 'legendaryResistances', 'legendaryResistancesRemaining', 'hasLairActions'] as const;
+const CombatProfileShape = {
+    size: ParticipantExtrasShape.size,
+    reach: ParticipantExtrasShape.reach,
+    attacksPerAction: ParticipantExtrasShape.attacksPerAction,
+    attacks: ParticipantExtrasShape.attacks,
+    abilities: ParticipantExtrasShape.abilities,
+    cr: ParticipantExtrasShape.cr,
+    autoLegendaryResistance: ParticipantExtrasShape.autoLegendaryResistance,
+    legendaryActions: ParticipantExtrasShape.legendaryActions,
+    legendaryResistances: ParticipantExtrasShape.legendaryResistances,
+    legendaryResistancesRemaining: ParticipantExtrasShape.legendaryResistancesRemaining,
+    hasLairActions: ParticipantExtrasShape.hasLairActions
+};
+
 const CreateSchema = z.object({
     action: z.literal('create'),
     // FINDINGS #93: create-lane params — resourcePools was accepted by the
     // OUTER schema only; the create schema never had it, which is precisely
     // how the silent drop happened (tsc caught the fix reaching for it).
-    resourcePools: z.record(z.object({
-        current: z.number(),
-        max: z.number(),
-        lastRefilledAt: z.string().optional()
-    })).optional().describe('Named numeric pools written AT CREATE (resolve, corruption, fatigue…) — #93: honored now, was silently dropped'),
+    resourcePools: z.record(resourcePoolSchema()).optional().describe('Named numeric pools written AT CREATE (resolve, corruption, fatigue…) — #93: honored now, was silently dropped'),
     conditions: z.array(conditionSchema()).optional().describe('FINDINGS #107: conditions written AT CREATE (wound clocks, THAW states…) — was the #93 anatomy repeated: outer schema accepted, create schema stripped, banner printed a clean card, and a GM could play six sessions off a condition that was never there'),
     worldId: z.string().optional().describe('FINDINGS #93: tag this character to a world — list {worldId} filters by it (nullable #91 pattern; untagged rows show everywhere)'),
     name: z.string().min(1).describe('Character name (required)'),
@@ -152,6 +175,7 @@ const CreateSchema = z.object({
     stealthOverride: z.number().int().optional(),
     band: z.string().optional().describe("Table rules: power band, as named in the world's band rule (e.g. 'Astartes')"),
     regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
+    ...CombatProfileShape,
     skillProficiencies: z.array(z.string()).optional(),
     saveProficiencies: z.array(z.string()).optional(),
     expertise: z.array(z.string()).optional()
@@ -215,14 +239,11 @@ const UpdateSchema = z.object({
     stealthOverride: z.number().int().optional().describe('OVERRIDES the composed DEX+prof stealth column in the eavesdrop/listener layer — it does not add (#95 R4a)'),
     band: z.string().optional().describe("Table rules: power band, as named in the world's band rule (e.g. 'Astartes')"),
     regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
+    ...CombatProfileShape,
     saveProficiencies: z.array(z.string()).optional().describe('Saving throw proficiencies (str/dex/con/int/wis/cha)'),
     expertise: z.array(z.string()).optional().describe('Skills with double proficiency'),
     startingGold: z.number().int().min(0).optional().describe('Set currency to this exact amount (the world lexicon names it; RU by default) (absolute set; for deltas use inventory_manage add_currency)'),
-    resourcePools: z.record(z.object({
-        current: z.number(),
-        max: z.number(),
-        lastRefilledAt: z.string().optional()
-    })).optional().describe('Named numeric pools (resolve, corruption, ammo...) — ONE incrementing row per pool via read-modify-write, replacing per-delta effect-ledger rows'),
+    resourcePools: z.record(resourcePoolSchema()).optional().describe('Named numeric pools (resolve, corruption, ammo...) — ONE incrementing row per pool via read-modify-write, replacing per-delta effect-ledger rows'),
     // FINDINGS #86: the composure re-spec — per-character charge/repair table.
     // DATA, NOT LOGIC: the engine stores and returns it so every chair charges
     // the same number; no resolver evaluates it (Register B stays Register B).
@@ -243,7 +264,12 @@ const AdjustPoolSchema = z.object({
     max: z.number().optional().describe('Sets/updates the pool maximum (default 100 on creation)'),
     removePool: z.boolean().optional().describe('FINDINGS #34 T2.6: delete the pool entirely — zero is not gone; this is gone'),
     reason: z.string().optional().describe('FINDINGS #111: why the pool moved — stored on the pool\'s own history (last 20 entries) when given'),
-    witnesses: z.array(z.string()).optional().describe('FINDINGS #111: character ids who SAW it — the respect ledger\'s real content; stored on the pool history entry')
+    witnesses: z.array(z.string()).optional().describe('FINDINGS #111: character ids who SAW it — the respect ledger\'s real content; stored on the pool history entry'),
+    // Item 15: counters. The key stays the id; these describe and place it.
+    label: z.string().optional().describe("Display name for the counter (\"An'ggrath's calls\"); shown at boot and on the status block"),
+    note: z.string().optional().describe('What the counter is, or to whom it is owed'),
+    show: z.boolean().optional().describe('true: list it in the boot digest and the status block; false hides it again'),
+    linkItem: z.string().optional().describe("Item template or instance id the character owns (a token, a charm). The pool is authoritative: the item's charges mirror it on every write, and inventory_manage adjust_charges on it is refused")
 });
 
 const ListSchema = z.object({
@@ -289,8 +315,8 @@ const ScheduleChangeSchema = z.object({
     // should hand-compute 18/24. firesAtHour rides on firesAtDay; firesInHours
     // is relative to a base the caller names (currentDay [+ currentTime]).
     firesAtHour: z.number().min(0).max(24).optional().describe('Hour of the fires-at day (0–24) — stored as floor(firesAtDay) + hour/24. "Day 48 at 18:00" = firesAtDay:48, firesAtHour:18'),
-    firesInHours: z.number().positive().optional().describe('Relative arming: fires N hours from the base — REQUIRES currentDay (+ optional currentTime). "back in six hours" = firesInHours:6, currentDay:47, currentTime:"14:01"'),
-    currentDay: z.number().optional().describe('Base day for firesInHours (fractional ok)'),
+    firesInHours: z.number().positive().optional().describe('Relative arming: fires N hours from the base — currentDay (+ optional currentTime), or the world clock when omitted. "back in six hours" = firesInHours:6'),
+    currentDay: z.number().optional().describe('Base day for firesInHours (fractional ok). Omit to use the world clock'),
     currentTime: z.string().regex(/^\d{1,2}:\d{2}$/).optional().describe('Base time HH:MM for firesInHours — combined with currentDay into a fractional base'),
     worldId: z.string().optional().describe('FINDINGS #91: scope this row to a world — process_scheduled {worldId} fires ONLY matching rows. Multi-world dbs pass it ALWAYS (KEEPER discipline §13); single-world saves may omit'),
     writes: z.preprocess(mendJsonIfString, z.array(ScheduledWriteOpSchema)).default([]).describe('Ordered ops applied when due. ARRAY param — batch law #16a: direct calls only. May be empty ONLY with event: true'),
@@ -302,7 +328,7 @@ const ScheduleChangeSchema = z.object({
 
 const ProcessScheduledSchema = z.object({
     action: z.literal('process_scheduled'),
-    currentDay: z.number().describe('Current IN-FICTION campaign day — all unfired rows with fires_at_day <= this apply and report'),
+    currentDay: z.number().optional().describe('Current IN-FICTION campaign day — all unfired rows with fires_at_day <= this apply and report. Omit to use the world clock (day and time); the response echoes clockSource'),
     currentTime: z.string().regex(/^\d{1,2}:\d{2}$/).optional().describe('FINDINGS #88: current time HH:MM — combined into a fractional day so hour-clocks fire mid-day (currentDay:47 + "14:01" processes through 47.584)'),
     worldId: z.string().describe("FINDINGS #100: REQUIRED, filtered at the query. An optional filter on a destructive global write is the same bug with better manners — the SALT incident fired 35 cross-campaign events from one call. Unscoped legacy rows are counted and skipped with a warning; claim them via scope_scheduled"),
     characterId: z.string().optional().describe("FINDINGS #100: narrow further to one character's clocks. Honored at the query — before this fix the param was accepted and silently stripped"),
@@ -326,6 +352,53 @@ const GetStatusBlockSchema = z.object({
     characterId: z.string().describe('Character ID'),
     sessionId: z.string().optional()
 });
+
+// Item 18: the status block's footer, one string per segment, resolved from
+// data so the banner stays a pure render of the JSON. A segment with nothing
+// behind it (no scene, no such key, no facts) is left out.
+function statusFooter(db: ReturnType<typeof getDb>, segments: string[], at: { characterId: string; worldId: string | null; location?: string; objective?: string }): string[] {
+    let scene: { placeLabel: string | null; engineState: Record<string, unknown> } | null | undefined;
+    const latestScene = () => {
+        if (scene === undefined) {
+            try { scene = new SceneRepository(db).findLatestForParticipant(at.characterId, at.worldId ?? undefined); } catch { scene = null; }
+        }
+        return scene;
+    };
+    const titled = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+    const out: string[] = [];
+    for (const seg of segments) {
+        if (seg === 'location') { if (at.location) out.push(at.location); continue; }
+        if (seg === 'objective') { if (at.objective) out.push(at.objective); continue; }
+        if (seg === 'scene.place') { const p = latestScene()?.placeLabel; if (p) out.push(p); continue; }
+        if (seg.startsWith('scene.')) {
+            const key = seg.slice(6);
+            const state = latestScene()?.engineState ?? {};
+            const hit = Object.keys(state).find(k => k.toLowerCase() === key.toLowerCase());
+            if (hit !== undefined && state[hit] !== null && state[hit] !== undefined && state[hit] !== '') {
+                out.push(`${titled(key.replace(/[_-]+/g, ' '))}: ${typeof state[hit] === 'object' ? JSON.stringify(state[hit]) : String(state[hit])}`);
+            }
+            continue;
+        }
+        if (seg.startsWith('knows:')) {
+            // n = facts in this world whose key starts with the prefix; k = the
+            // ones this character holds. 'Vaurek (2 of 4)', or just the label
+            // when all are known.
+            const [prefix, given] = seg.slice(6).split('|');
+            const label = given?.trim() || titled(prefix.replace(/[-_:. ]+$/, '').replace(/[-_]+/g, ' '));
+            try {
+                const like = `${prefix.toLowerCase().replace(/[\\%_]/g, c => `\\${c}`)}%`;
+                const n = (db.prepare(`SELECT COUNT(*) AS n FROM knowledge_facts WHERE world_id = ? AND LOWER(key) LIKE ? ESCAPE '\\'`).get(at.worldId, like) as { n: number }).n;
+                if (!n) continue;
+                const k = (db.prepare(`SELECT COUNT(*) AS n FROM knowledge_facts f JOIN knowledge_holders h ON h.fact_id = f.id
+                                        WHERE f.world_id = ? AND LOWER(f.key) LIKE ? ESCAPE '\\' AND h.knower_id = ?`).get(at.worldId, like, at.characterId) as { n: number }).n;
+                out.push(k === n ? label : `${label} (${k} of ${n})`);
+            } catch { /* no knowledge tables yet */ }
+            continue;
+        }
+        out.push(seg);
+    }
+    return out;
+}
 
 // FINDINGS #64: the 00-schema status block, every value from a read this
 // call. NAMED pool reads only — psi is never read into this payload, so
@@ -369,24 +442,23 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
         effects = (db.prepare(`SELECT name FROM custom_effects WHERE target_id = ? AND is_active = 1`).all(args.characterId) as Array<{ name: string }>).map(r => r.name);
     } catch { /* effects line degrades to absent */ }
 
-    // World clock — the #62 honesty rule: day/time render ONLY when exactly
-    // one world row exists; a scratch world never puts a wrong clock on the glass.
-    let day: number | undefined; let time: string | undefined; let weather: string | undefined;
-    try {
-        const count = (db.prepare(`SELECT COUNT(*) AS c FROM worlds`).get() as { c: number }).c;
-        if (count === 1) {
-            const env = JSON.parse(((db.prepare(`SELECT environment FROM worlds`).get() as { environment?: string })?.environment) || '{}');
-            day = env.day; time = env.time; weather = env.weather;
-        }
-    } catch { /* clock degrades to absent */ }
+    // World clock — the #62 honesty rule: day/time render only for the
+    // character's own world (resolveWorldId: its tag, else the only world);
+    // a scratch world never puts a wrong clock on the glass. Weather is
+    // stored as weatherConditions.
+    const worldId = resolveWorldId(db, { characterIds: [args.characterId] });
+    const clock = readWorldClock(db, worldId);
+    const day: number | undefined = clock?.day;
+    const time: string | undefined = clock?.time;
+    const weather: string | undefined = clock?.weather;
 
     // Table rules: a world's status_block rule asks for the tiny block: HP,
     // core pool, location, objective, one or two conditions.
-    const worldId = resolveWorldId(db, { characterIds: [args.characterId] });
     const lex = worldLexicon(db, worldId);
     const tiny = loadRule(db, worldId, 'status_block');
     if (tiny?.spec.compact) {
         const core = findPool(pools, tiny.spec.corePool);
+        const counters = shownCounters(pools, core?.key).map(c => ({ name: c.name, current: c.current, max: c.max }));
         let location: string | undefined;
         let objective: string | undefined;
         try {
@@ -402,6 +474,12 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
         // block is tiny on the wire too. The full text stays on get.
         const conditions = conditionsForDisplay(char.conditions || [], tiny.spec.maxConditions)
             .map(c => ({ name: c.name ?? '', ...(c.duration !== undefined ? { duration: c.duration } : {}), ...(c.pinned ? { pinned: true } : {}) }));
+        // Item 18: the house knobs. Each is echoed only when set, so a block
+        // without them reads exactly as before.
+        const spec = tiny.spec;
+        const footer = spec.footer?.length ? statusFooter(db, spec.footer, { characterId: args.characterId, worldId, location, objective }) : undefined;
+        if (spec.showLocation === false) location = undefined;
+        if (spec.showObjective === false) objective = undefined;
         return {
             success: true,
             actionType: 'get_status_block',
@@ -413,13 +491,24 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
             hp: char.hp,
             maxHp: char.maxHp,
             corePool: core ? { name: core.key, current: core.pool.current, max: core.pool.max } : undefined,
+            ...(counters.length ? { counters } : {}),
             location,
             objective,
             conditions,
             moreConditions: Math.max(0, (char.conditions || []).length - conditions.length),
+            ...(spec.conditionLayout ? { conditionLayout: spec.conditionLayout } : {}),
+            ...(spec.conditionLabel ? { conditionLabel: spec.conditionLabel } : {}),
+            ...(spec.showMore === false ? { showMore: false } : {}),
+            ...(footer?.length ? { footer } : {}),
             message: `${char.name}: HP ${char.hp}/${char.maxHp}`
         };
     }
+
+    // Item 15: shown counters on the full block too; rads and composure keep
+    // their own rows.
+    const fullCounters = shownCounters(pools as Parameters<typeof shownCounters>[0])
+        .filter(c => !['rads', 'composure'].includes(c.key.toLowerCase()))
+        .map(c => ({ name: c.name, current: c.current, max: c.max }));
 
     // #65-V: the repo's currency mapping drops the column — read it raw.
     let gold: number | undefined;
@@ -436,6 +525,7 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
         hp: char.hp,
         maxHp: char.maxHp,
         rads, composure, composureMax,
+        ...(fullCounters.length ? { counters: fullCounters } : {}),
         weaponName, weaponCondition, weaponAttachments,
         conditions: char.conditions || [],
         effects,
@@ -673,6 +763,8 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         stealthBonus: args.stealthOverride ?? 0,
         band: args.band,
         regeneration: args.regeneration,
+        // Combat profile and legendary counters (tokens hydrate from these)
+        ...Object.fromEntries(COMBAT_PROFILE_FIELDS.filter(k => args[k] !== undefined).map(k => [k, args[k]])),
         // FINDINGS #93: resourcePools was accepted by BOTH schemas and never
         // read by the payload — the #33/#59/#90 anatomy on the worst possible
         // verb: a create whose banner said it worked. Honored now.
@@ -883,7 +975,10 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
         if (found.length) liveEncounters = found;
     } catch { /* no encounters table */ }
     const currencyLabel = worldLexicon(db, resolveWorldId(db, { characterIds: [args.characterId] })).currency;
-    return { ...character, worldId, currency, currencyLabel, currencyNote: currency ? `${currencyLabel} ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec, ...(liveEncounters ? { liveEncounters } : {}) };
+    // The names alone: fields:['conditionNames'] is the condition index
+    // without the kilobytes of source text.
+    const conditionNames = ((character as any).conditions ?? []).map((c: { name: string }) => c.name);
+    return { ...character, conditionNames, worldId, currency, currencyLabel, currencyNote: currency ? `${currencyLabel} ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec, ...(liveEncounters ? { liveEncounters } : {}) };
 }
 
 async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object> {
@@ -943,6 +1038,9 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     if (args.stealthOverride !== undefined) updateData.stealthBonus = args.stealthOverride;
     if (args.band !== undefined) updateData.band = args.band;
     if (args.regeneration !== undefined) updateData.regeneration = args.regeneration;
+    for (const key of COMBAT_PROFILE_FIELDS) {
+        if (args[key] !== undefined) updateData[key] = args[key];
+    }
     if (args.resourcePools !== undefined) updateData.resourcePools = args.resourcePools;
 
     // FINDINGS #88: preview lane — the diff of mapped fields, zero writes.
@@ -1051,7 +1149,7 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
                 if (hits.length !== 1) {
                     throw new Error(hits.length === 0
                         ? `editConditions: '${edit.match}' matches no condition. Nothing was written.`
-                        : `editConditions: '${edit.match}' matches ${hits.length} conditions; use more of the text. Nothing was written.`);
+                        : `editConditions: '${edit.match}' matches ${hits.length} conditions: ${hits.map(h => `'${h.name.length > 60 ? h.name.slice(0, 59) + '…' : h.name}'`).join(', ')}; use more of the text. Nothing was written.`);
                 }
                 const c = hits[0];
                 if (edit.name !== undefined) c.name = edit.name;
@@ -1246,7 +1344,7 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
     // reads that echo as the tell for whether resolution propagated.
     args = { ...args, characterId: char.id };
 
-    const pools = { ...((char as { resourcePools?: Record<string, { current: number; max: number; lastRefilledAt?: string }> }).resourcePools || {}) };
+    const pools: Record<string, ResourcePool> = { ...((char as { resourcePools?: Record<string, ResourcePool> }).resourcePools || {}) };
 
     // FINDINGS #34 T2.6: pool deletion — a traded rifle's condition pool
     // should not haunt its old owner at zero forever.
@@ -1260,7 +1358,19 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
         return Promise.resolve({ success: true, actionType: 'adjust_pool', characterId: args.characterId, pool: args.pool, removed: true, lastValue: `${last.current}/${last.max}`, message: `Pool "${args.pool}" removed (was ${last.current}/${last.max}).` });
     }
 
-    const existing = pools[args.pool] || { current: 0, max: args.max ?? 100 };
+    // Item 15: link a token item. Resolved like adjust_charges (template or
+    // instance id, minted on first use). A new pool linked to an item that
+    // already carries charges adopts them, so linking never zeroes a token.
+    let linked: { instanceId: string; charges: number | null; chargesMax: number | null } | undefined;
+    if (args.linkItem) {
+        const { db } = ensureDb();
+        const resolved = resolveInstance(db, char.id, args.linkItem);
+        if ('error' in resolved) return { error: true, actionType: 'adjust_pool', message: `linkItem: ${resolved.error}. Nothing was written.`, writes: 'none' };
+        const inst = (resolved.instance ?? mintInstance(db, char.id, resolved.templateId)) as { id: string; charges?: number | null; charges_max?: number | null };
+        linked = { instanceId: inst.id, charges: typeof inst.charges === 'number' ? inst.charges : null, chargesMax: typeof inst.charges_max === 'number' ? inst.charges_max : null };
+    }
+    const fresh = !(args.pool in pools);
+    const existing: ResourcePool = pools[args.pool] || { current: fresh && linked?.charges != null ? linked.charges : 0, max: args.max ?? linked?.chargesMax ?? 100 };
     const max = args.max ?? existing.max;
     const before = existing.current;
     // #67-F: value (absolute) beats delta; passing both is ambiguity — refused.
@@ -1270,7 +1380,13 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
     const current = args.value !== undefined
         ? Math.min(max, Math.max(0, args.value))
         : Math.min(max, Math.max(0, before + args.delta));
-    pools[args.pool] = { ...existing, current, max };
+    pools[args.pool] = {
+        ...existing, current, max,
+        ...(args.label !== undefined ? { label: args.label } : {}),
+        ...(args.note !== undefined ? { note: args.note } : {}),
+        ...(args.show !== undefined ? { show: args.show } : {}),
+        ...(linked ? { itemInstanceId: linked.instanceId } : {})
+    };
     // FINDINGS #111: the witness ledger. A respect number is not the fiction —
     // WHO SAW is. When a reason or witnesses ride the call, the pool keeps its
     // own history (capped at 20) so `get` answers "who knows this man's name
@@ -1282,6 +1398,8 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
     }
 
     characterRepo.update(args.characterId, { resourcePools: pools } as Partial<import('../../schema/character.js').Character>);
+    const item = mirrorLinkedCharges(char.id, { [args.pool]: pools[args.pool] })[0];
+    const p = pools[args.pool];
 
     return {
         success: true,
@@ -1299,8 +1417,33 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
         clamped: args.value !== undefined ? args.value !== current : before + (args.delta ?? 0) !== current,
         ...(args.witnesses?.length ? { witnesses: args.witnesses } : {}),
         ...(args.reason ? { reason: args.reason } : {}),
-        message: `${args.pool}: ${before} -> ${current} (of ${max})${args.value !== undefined ? ' [set]' : ''}${args.witnesses?.length ? ` — witnessed by ${args.witnesses.length}` : ''}`
+        ...(p.label ? { label: p.label } : {}),
+        ...(p.note ? { note: p.note } : {}),
+        ...(p.show !== undefined ? { show: p.show } : {}),
+        ...(item ? { item } : {}),
+        message: `${args.pool}: ${before} -> ${current} (of ${max})${args.value !== undefined ? ' [set]' : ''}${args.witnesses?.length ? ` — witnessed by ${args.witnesses.length}` : ''}${item ? ` · ${item.name} charges ${item.charges}/${item.max}` : ''}`
     };
+}
+
+/**
+ * Item 15: the pool is the one truth. After any write, each pool that links
+ * an item instance pushes current/max onto that instance's charges, scoped
+ * to the owner so a traded token is never written through a stale link.
+ */
+function mirrorLinkedCharges(characterId: string, pools: Record<string, ResourcePool | undefined>): Array<{ pool: string; instanceId: string; name: string; charges: number; max: number }> {
+    const { db } = ensureDb();
+    const out: Array<{ pool: string; instanceId: string; name: string; charges: number; max: number }> = [];
+    for (const [key, pool] of Object.entries(pools)) {
+        if (!pool?.itemInstanceId) continue;
+        try {
+            const res = db.prepare('UPDATE item_instances SET charges = ?, charges_max = ?, updated_at = ? WHERE id = ? AND owner_character_id = ?')
+                .run(pool.current, pool.max, new Date().toISOString(), pool.itemInstanceId, characterId);
+            if (!res.changes) continue;
+            const row = db.prepare('SELECT COALESCE(ii.custom_name, i.name) AS name FROM item_instances ii LEFT JOIN items i ON i.id = ii.template_id WHERE ii.id = ?').get(pool.itemInstanceId) as { name?: string } | undefined;
+            out.push({ pool: key, instanceId: pool.itemInstanceId, name: row?.name ?? pool.itemInstanceId, charges: pool.current, max: pool.max });
+        } catch { /* item_instances.charges absent on this database */ }
+    }
+    return out;
 }
 
 // ─── FINDINGS #60: THE MEND CLOCK — handlers ───
@@ -1406,15 +1549,6 @@ function applyScheduledOps(
     return { applied, updates };
 }
 
-// FINDINGS #89: fractional days print as a clock — 47.5993 is "Day 47, 14:23",
-// not "Day 47". The banner truncation hid the very hours #88 added.
-function dayClock(d: number): string {
-    const frac = d - Math.floor(d);
-    if (frac < 1 / 1440) return `Day ${Math.floor(d)}`;
-    const mins = Math.round(frac * 1440);
-    return `Day ${Math.floor(d)}, ${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`;
-}
-
 async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>): Promise<object> {
     const { db, characterRepo } = ensureDb();
     ensureScheduleTable(db);
@@ -1438,14 +1572,22 @@ async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>):
     // refuses with the recipe. firesInHours overrides firesAtDay when both
     // are passed (the dummy-day workaround stays legal).
     let firesAt: number;
+    let clockSource: 'param' | 'world' | undefined;
     if (args.firesInHours !== undefined) {
-        if (args.currentDay === undefined) {
-            throw new Error('firesInHours needs a base: pass currentDay (and optionally currentTime "HH:MM"). Nothing was inserted.');
-        }
-        let base = args.currentDay;
-        if (args.currentTime) {
-            const [h, m] = args.currentTime.split(':').map(Number);
-            base = Math.floor(args.currentDay) + (h * 60 + m) / 1440;
+        // Item 14: no base passed means the world clock is the base.
+        let base: number;
+        if (args.currentDay !== undefined) {
+            base = args.currentDay;
+            if (args.currentTime) {
+                const [h, m] = args.currentTime.split(':').map(Number);
+                base = Math.floor(args.currentDay) + (h * 60 + m) / 1440;
+            }
+            clockSource = 'param';
+        } else {
+            const clock = readWorldClock(db, args.worldId ?? resolveWorldId(db, { characterIds: [char.id] }));
+            if (!clock) throw new Error(`firesInHours needs a base: pass currentDay (and optionally currentTime "HH:MM"), ${SET_CLOCK_HINT}. Nothing was inserted.`);
+            base = clock.at;
+            clockSource = 'world';
         }
         firesAt = base + args.firesInHours / 24;
     } else if (args.firesAtDay !== undefined) {
@@ -1476,6 +1618,7 @@ async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>):
                 // pool that never existed).
                 const written = characterRepo.update(args.characterId, updates as Partial<import('../../schema/character.js').Character>);
                 if (!written) throw new Error(`fireNow write FAILED for ${args.characterId} — ledger row ${info.lastInsertRowid} left unfired, nothing applied`);
+                if (updates.resourcePools) mirrorLinkedCharges(args.characterId, updates.resourcePools as Record<string, ResourcePool>);
             }
         }
         db.prepare('UPDATE scheduled_state_changes SET fired = 1, fired_at = ? WHERE id = ?').run(now, Number(info.lastInsertRowid));
@@ -1495,6 +1638,7 @@ async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>):
         characterName: char.name,
         firesAtDay: firesAt,
         firesAtClock: dayClock(firesAt),
+        ...(clockSource ? { clockSource } : {}),
         ops: args.writes.length,
         note: args.note ?? null,
         recurEveryDays: args.recurEveryDays ?? null,
@@ -1508,11 +1652,24 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
     const { db, characterRepo } = ensureDb();
     ensureScheduleTable(db);
     const now = new Date().toISOString();
+    // Item 14: an explicit currentDay wins; otherwise the world clock gives
+    // both day and time. The world's time is used only with the world's day.
+    let currentDay: number;
+    let currentTime: string | undefined;
+    let clockSource: 'param' | 'world';
+    if (args.currentDay !== undefined) {
+        currentDay = args.currentDay; currentTime = args.currentTime; clockSource = 'param';
+    } else {
+        const clock = readWorldClock(db, args.worldId);
+        if (!clock) throw new Error(`process_scheduled needs currentDay (the in-fiction day), ${SET_CLOCK_HINT}. Nothing fired.`);
+        currentDay = clock.day; currentTime = clock.time; clockSource = 'world';
+    }
+    args = { ...args, currentDay, currentTime };
     // FINDINGS #88: fractionalize the clock — hour-clocks fire mid-day.
-    let effectiveDay = args.currentDay;
-    if (args.currentTime) {
-        const [h, m] = args.currentTime.split(':').map(Number);
-        effectiveDay = Math.floor(args.currentDay) + (h * 60 + m) / 1440;
+    let effectiveDay = currentDay;
+    if (currentTime) {
+        const [h, m] = currentTime.split(':').map(Number);
+        effectiveDay = Math.floor(currentDay) + (h * 60 + m) / 1440;
     }
     const results: Array<Record<string, unknown>> = [];
     // FINDINGS #100: worldId is REQUIRED at the schema and filtered here — an
@@ -1541,7 +1698,7 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
         const chains = wouldFire.filter(w => w.recurEveryDays).length;
         return {
             success: true, actionType: 'process_scheduled', preview: true, writes: 'none',
-            currentDay: args.currentDay, ...(args.currentTime ? { currentTime: args.currentTime, effectiveDay } : {}),
+            currentDay: args.currentDay, clockSource, ...(args.currentTime ? { currentTime: args.currentTime, effectiveDay } : {}),
             worldId: args.worldId, ...(args.characterId ? { characterId: args.characterId } : {}),
             ...(skippedUnscoped > 0 ? { skippedUnscoped } : {}),
             wouldFireCount: wouldFire.length, wouldFire,
@@ -1570,6 +1727,7 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
             ? { applied: [`📣 GM EVENT DUE${row.note ? `: ${row.note}` : ''}`], updates: {} as Record<string, unknown> }
             : applyScheduledOps(char, ops);
         if (Object.keys(updates).length) characterRepo.update(row.character_id, updates as Partial<import('../../schema/character.js').Character>);
+        if (updates.resourcePools) mirrorLinkedCharges(row.character_id, updates.resourcePools as Record<string, ResourcePool>);
         db.prepare('UPDATE scheduled_state_changes SET fired = 1, fired_at = ? WHERE id = ?').run(now, row.id);
         // FINDINGS #69: a recurring clock re-arms itself the moment it fires —
         // the next row inherits writes, note, and recurrence. The loop above
@@ -1591,6 +1749,7 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
         success: true,
         actionType: 'process_scheduled',
         currentDay: args.currentDay,
+        clockSource,
         ...(args.currentTime ? { currentTime: args.currentTime, effectiveDay } : {}),
         ...(args.worldId ? { worldId: args.worldId } : {}),
         ...(args.characterId ? { characterId: args.characterId } : {}),
@@ -2027,6 +2186,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
         // #67 mirror law: kill params.
         cause: z.string().optional().describe('kill: what killed it — canon for the wall map'),
+        sessionId: z.string().optional().describe('get_status_block: session id (mirror; unused by the read)'),
         createCorpse: z.boolean().optional().describe('kill: false = death without a body (default true)'),
         encounterId: z.string().optional().describe('kill: encounter the corpse lands in'),
         position: z.object({ x: z.number(), y: z.number() }).optional().describe('kill: corpse position'),
@@ -2065,11 +2225,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         // Sheet fields (update) — MUST mirror UpdateSchema: this outer schema
         // strips unknown keys, so any param missing here dies silently at the
         // tool boundary (the startingGold no-op's anatomy, mirrored).
-        resourcePools: z.record(z.object({
-            current: z.number(),
-            max: z.number(),
-            lastRefilledAt: z.string().optional()
-        })).optional(),
+        resourcePools: z.record(resourcePoolSchema()).optional(),
         composureSpec: z.record(z.unknown()).optional().describe('FINDINGS #86 (mirror): per-character Composure charge/repair table — {desensitised[], charges{}, repairs{}}; stored verbatim, returned by get, never engine-evaluated'),
         // FINDINGS #88 (mirror law): guard/preview + hour-clock params
         expectName: z.string().optional().describe('update guard: refuse unless the name matches (case-insensitive)'),
@@ -2078,6 +2234,9 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         viaParties: z.boolean().optional().describe('FINDINGS #105 (mirror): scope_characters — auto-claim members of parties tagged to this world'),
         reason: z.string().optional().describe('FINDINGS #111 (mirror): adjust_pool — why; stored on the pool history'),
         witnesses: z.array(z.string()).optional().describe('FINDINGS #111 (mirror): adjust_pool — who saw; stored on the pool history'),
+        label: z.string().optional().describe('adjust_pool (mirror): display name for the counter'),
+        show: z.boolean().optional().describe('adjust_pool (mirror): list the counter at boot and on the status block'),
+        linkItem: z.string().optional().describe('adjust_pool (mirror): item template or instance id whose charges mirror the pool'),
         firesAtHour: z.number().optional().describe('schedule_change: hour of the fires-at day (0–24)'),
         firesInHours: z.number().optional().describe('schedule_change: fires N hours from currentDay(+currentTime)'),
         limit: z.number().int().optional().describe('list #93: cap returned rows'),
@@ -2091,6 +2250,18 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         stealthOverride: z.number().int().optional().describe('#95 R4a: OVERRIDES composed DEX+prof in the eavesdrop layer — does not add'),
         band: z.string().optional().describe("Table rules: power band, as named in the world's band rule (e.g. 'Astartes')"),
         regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
+        // Combat profile (create/update): tokens made from this sheet start with it
+        size: SizeCategorySchema.optional().describe('create/update: tiny | small | medium | large | huge | gargantuan'),
+        reach: z.number().int().min(0).optional().describe('create/update: melee reach in feet'),
+        attacksPerAction: z.number().int().min(1).optional().describe('create/update: multiattack, attacks one Attack action allows'),
+        attacks: z.array(z.any()).optional().describe('create/update: named attack profiles [{name, attackBonus, damage, damageType?, part?, reachFt?, ranged?, default?, note?}]'),
+        abilities: z.array(z.any()).optional().describe('create/update: limited abilities [{name, recharge?, ready?, note?}]'),
+        cr: z.number().min(0).optional().describe('create/update: challenge rating'),
+        autoLegendaryResistance: z.boolean().optional().describe('create/update: spend a legendary resistance on a failed save automatically'),
+        legendaryActions: z.number().int().min(0).optional().describe('create/update: legendary actions per round'),
+        legendaryResistances: z.number().int().min(0).optional().describe('create/update: legendary resistances per day'),
+        legendaryResistancesRemaining: z.number().int().min(0).optional().describe('create/update: legendary resistances left'),
+        hasLairActions: z.boolean().optional().describe('create/update: adds a LAIR slot at initiative 20 when it joins a fight'),
         // adjust_pool fields
         pool: z.string().optional(),
         removePool: z.boolean().optional().describe('Delete the pool entirely (adjust_pool)'),
@@ -2121,7 +2292,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         fireNow: z.boolean().optional().describe('FINDINGS #73 (mirror): fire the entry immediately in the same call — ledger one-off, applied[] reported'),
         event: z.boolean().optional().describe('FINDINGS #82 (mirror): GM EVENT — a clock that fires a notification instead of writes; empty writes allowed with this flag'),
         writes: z.preprocess(mendJsonIfString, z.array(ScheduledWriteOpSchema)).optional().describe('MEND CLOCK: ordered ops (schedule_change). ARRAY — direct calls only per batch law #16a'),
-        note: z.string().optional().describe('MEND CLOCK: what this clock is (schedule_change)'),
+        note: z.string().optional().describe('MEND CLOCK: what this clock is (schedule_change); adjust_pool: what the counter is'),
         currentDay: z.number().optional().describe('MEND CLOCK: current in-fiction day (process_scheduled)'),
         scheduleId: z.number().optional().describe('MEND CLOCK: row id (cancel_scheduled)'),
         includeFired: z.boolean().optional().describe('MEND CLOCK: include fired rows (list_scheduled)'),

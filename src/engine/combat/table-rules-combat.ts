@@ -5,10 +5,9 @@
  * owns flavour.
  */
 import type { CombatParticipant, CombatActionResult } from './engine.js';
-import type { Condition } from './conditions.js';
-import { DurationType } from './conditions.js';
 import { PART_KINDS, type Part } from '../../schema/token-extras.js';
 import { compareBands, type RuleSpec, type TableRule } from '../table-rules.js';
+import { findPart } from './parts.js';
 
 export interface ConsequenceDue {
     rule: string;
@@ -69,16 +68,69 @@ export function peerConsequence(
     return reason ? { rule: rule.name, reason, options: spec.options, direction: peer ? 'up' : 'down' } : null;
 }
 
-/** Refuses a called strike on a target below the attacker's band. */
+type LimbSpec = RuleSpec<'called_strike'>['limbs'][string];
+
+/** What a called strike lands on: an existing part of the target, or a new one. */
+export interface ResolvedStrike {
+    partName: string;
+    kind: Part['kind'];
+    limbSpec: LimbSpec;
+    existing?: Part;
+}
+
+const singularKind = (s: string): Part['kind'] | undefined => {
+    const kinds = PART_KINDS as readonly string[];
+    if (kinds.includes(s)) return s as Part['kind'];
+    const one = s.length > 1 && s.endsWith('s') ? s.slice(0, -1) : s;
+    return kinds.includes(one) ? one as Part['kind'] : undefined;
+};
+
+/**
+ * Where a called strike lands, before any roll:
+ * 1. the target's own part named atPart ?? calledStrike: it keeps its kind,
+ *    and reads the rule's limb for its name, then its kind, then 'other';
+ * 2. the rule's limb: a new part named atPart ?? limb (today's behaviour);
+ * 3. a part kind ('wing', 'wings'): a new part of that kind;
+ * otherwise a problem naming the limbs and the target's parts.
+ */
+export function resolveCalledStrike(
+    rule: TableRule<'called_strike'>,
+    target: CombatParticipant,
+    calledStrike: string,
+    atPart?: string
+): ResolvedStrike | { problem: string } {
+    const limbs = (rule.spec as RuleSpec<'called_strike'>).limbs;
+    const limb = (key: string): LimbSpec | undefined => {
+        const k = key.trim().toLowerCase();
+        const hit = Object.keys(limbs).find(l => l.toLowerCase() === k);
+        return hit ? limbs[hit] : undefined;
+    };
+    const called = calledStrike.trim().toLowerCase();
+    const existing = findPart(target, atPart ?? calledStrike);
+    if (existing) {
+        const limbSpec = limb(existing.name) ?? limb(existing.kind) ?? limb('other') ?? { notes: [] };
+        return { partName: existing.name, kind: existing.kind, limbSpec, existing };
+    }
+    const ruleLimb = limb(called);
+    if (ruleLimb) return { partName: atPart ?? called, kind: singularKind(called) ?? 'other', limbSpec: ruleLimb };
+    const kind = singularKind(called);
+    if (kind) return { partName: atPart ?? called, kind, limbSpec: limb(kind) ?? limb('other') ?? { notes: [] } };
+    const parts = target.parts?.map(p => p.name).join(', ') || 'none';
+    return { problem: `${rule.name} has no '${calledStrike}' limb and ${target.name} has no part by that name (limbs: ${Object.keys(limbs).join(', ')}; ${target.name}'s parts: ${parts})` };
+}
+
+/** Refuses a called strike at nothing, or on a target below the attacker's band. */
 export function calledStrikeProblem(
     rule: TableRule<'called_strike'>,
     order: string[],
     actor: CombatParticipant,
     target: CombatParticipant,
-    limb: string
+    limb: string,
+    atPart?: string
 ): string | null {
     const spec = rule.spec as RuleSpec<'called_strike'>;
-    if (!spec.limbs[limb]) return `${rule.name} has no '${limb}' limb (limbs: ${Object.keys(spec.limbs).join(', ')})`;
+    const resolved = resolveCalledStrike(rule, target, limb, atPart);
+    if ('problem' in resolved) return resolved.problem;
     if (!spec.requirePeer) return null;
     const peer = isPeer(order, actor, target);
     if (peer === null) return `${rule.name} needs both bands set (unset for ${!actor.band ? actor.name : target.name})`;
@@ -86,26 +138,18 @@ export function calledStrikeProblem(
     return null;
 }
 
-/** The crippled part a called strike leaves on a hit: the part aimed at, or the limb. */
-export function crippledPart(rule: TableRule<'called_strike'>, limb: string, atPart?: string): Part {
-    const spec = (rule.spec as RuleSpec<'called_strike'>).limbs[limb];
-    const kind = (PART_KINDS as readonly string[]).includes(limb) ? limb as Part['kind'] : 'other';
-    return { name: atPart ?? limb, kind, state: 'crippled', note: `called strike (${rule.name})${spec?.notes?.length ? `: ${spec.notes.join('; ')}` : ''}` };
-}
-
-/** The crippling condition a called strike leaves on a hit. */
-export function crippleCondition(rule: TableRule<'called_strike'>, limb: string, actorName: string): Omit<Condition, 'id'> {
-    const spec = (rule.spec as RuleSpec<'called_strike'>).limbs[limb];
+/**
+ * The crippled part a called strike leaves on a hit. An existing part keeps
+ * its kind, hold and every other field; only its state and note change.
+ */
+export function crippledPart(rule: TableRule<'called_strike'>, resolved: ResolvedStrike): Part {
+    const notes = resolved.limbSpec?.notes ?? [];
     return {
-        type: `crippled:${limb}` as Condition['type'],
-        durationType: DurationType.PERMANENT,
-        sourceId: `called strike: ${actorName}`,
-        metadata: {
-            rule: rule.name,
-            ...(spec.speed !== undefined && spec.speed < 1 ? { speedFactor: spec.speed } : {}),
-            ...(spec.attackDisadvantage ? { attackDisadvantage: true } : {}),
-            notes: spec.notes
-        }
+        ...resolved.existing,
+        name: resolved.partName,
+        kind: resolved.existing?.kind ?? resolved.kind,
+        state: 'crippled',
+        note: `called strike (${rule.name})${notes.length ? `: ${notes.join('; ')}` : ''}`
     };
 }
 

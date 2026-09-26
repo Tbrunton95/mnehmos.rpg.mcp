@@ -1,4 +1,6 @@
 import { handleImprovisationManage } from '../../../src/server/consolidated/improvisation-manage.js';
+import { handleCharacterManage } from '../../../src/server/consolidated/character-manage.js';
+import { handleNarrativeManage } from '../../../src/server/consolidated/narrative-manage.js';
 import { handleSessionManage } from '../../../src/server/consolidated/session-manage.js';
 import { handlePrecedentManage } from '../../../src/server/consolidated/precedent-manage.js';
 import { handleCombatManage } from '../../../src/server/consolidated/combat-manage.js';
@@ -80,9 +82,48 @@ describe('boot packet', () => {
     });
 });
 
+describe('boot threads', () => {
+    it('show the head of a grown thread and its latest section, never an archive', async () => {
+        const nm = async (a: Record<string, unknown>) => json(await handleNarrativeManage(a, ctx as any));
+        const { noteId } = await nm({ action: 'add', worldId: W, type: 'plot_thread', content: 'The Vaurek quarters.\nFour pieces, scattered by the Mouth.' });
+        await nm({ action: 'append', noteId, day: 360, content: 'First quarter found under the Brass Gate.' });
+        await nm({ action: 'append', noteId, day: 366, content: 'Second quarter taken from the Ithraes vault.' });
+        const t = json(await handleSessionManage({ action: 'boot', worldId: W }, ctx as any)).threads;
+        expect(t).toHaveLength(1);
+        expect(t[0].text).toBe('The Vaurek quarters. … latest [Day 366]: Second quarter taken from the Ithraes vault.');
+        expect(t[0].long).toBeUndefined();
+
+        await nm({ action: 'append', noteId, day: 367, content: 'z'.repeat(8000) });
+        await nm({ action: 'archive', noteId, keepLast: 1 });
+        const again = json(await handleSessionManage({ action: 'boot', worldId: W }, ctx as any)).threads;
+        expect(again).toHaveLength(1);
+        expect(again[0]).toMatchObject({ id: noteId, long: true });
+        expect(again[0].chars).toBeGreaterThan(8000);
+        expect(again[0].text).toMatch(/^The Vaurek quarters\. … latest \[Day 367\]: z+…$/);
+    });
+
+    it('a thread with no sections keeps its first 160 chars', async () => {
+        await handleNarrativeManage({ action: 'add', worldId: W, type: 'plot_thread', content: 'The Oath of the Ninth binds Luciel.' }, ctx as any);
+        expect(json(await handleSessionManage({ action: 'boot', worldId: W }, ctx as any)).threads[0].text).toBe('The Oath of the Ninth binds Luciel.');
+    });
+});
+
 describe('field selection', () => {
     it('keeps only the named fields plus the essentials', () => {
         expect(pickFields({ success: true, actionType: 'get', hp: 5, conditions: [1, 2], name: 'x' }, ['hp'])).toEqual({ success: true, actionType: 'get', hp: 5 });
         expect(summarizeResult({ big: 'x'.repeat(400) }).big).toMatch(/400 chars/);
+    });
+
+    it('a dotted field projects into each element of a list, or into an object', () => {
+        const sheet = { success: true, hp: 5, conditions: [{ name: 'A', source: 'x'.repeat(900) }, { name: 'B', pinned: true, source: 'y' }], combat: { reach: 10, size: 'huge' } };
+        expect(pickFields(sheet, ['conditions.name', 'conditions.pinned'])).toEqual({ success: true, conditions: [{ name: 'A' }, { name: 'B', pinned: true }] });
+        expect(pickFields(sheet, ['combat.size', 'hp'])).toEqual({ success: true, hp: 5, combat: { size: 'huge' } });
+        // An undotted name still takes the whole value.
+        expect(pickFields(sheet, ['combat'])).toEqual({ success: true, combat: { reach: 10, size: 'huge' } });
+    });
+
+    it('get carries the condition names, so fields:[conditionNames] is the index', async () => {
+        const got = json(await handleCharacterManage({ action: 'get', characterId: 'luciel' }, ctx as any));
+        expect(got.conditionNames).toEqual([WARP, 'Oath of the Ninth: sworn']);
     });
 });

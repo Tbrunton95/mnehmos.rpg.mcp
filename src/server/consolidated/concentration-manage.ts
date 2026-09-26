@@ -14,6 +14,7 @@ import { SessionContext } from '../types.js';
 import { getDb } from '../../storage/index.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
+import { loggedD20 } from '../../math/logged-d20.js';
 import {
     checkConcentration,
     breakConcentration,
@@ -88,7 +89,9 @@ async function handleCheckSave(args: z.infer<typeof CheckSaveSchema>): Promise<o
         throw new Error(`Character ${args.characterId} not found`);
     }
 
-    const result = checkConcentration(character, args.damageAmount, concentrationRepo);
+    // Seeded and logged like every other save (roll_log purpose 'concentration').
+    const result = checkConcentration(character, args.damageAmount, concentrationRepo, 0,
+        () => loggedD20(getDb(), { purpose: 'concentration', forId: character.id }, { tool: 'concentration_manage' }).natural);
 
     if (result.broken) {
         breakConcentration(

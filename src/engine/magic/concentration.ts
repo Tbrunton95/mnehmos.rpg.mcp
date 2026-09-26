@@ -7,6 +7,7 @@ import { ConcentrationState, ConcentrationCheckResult, BreakConcentrationRequest
 import { Character, NPC } from '../../schema/character.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
+import { saveModifier } from '../combat/saves.js';
 
 /**
  * Calculate the DC for a concentration save after taking damage
@@ -18,22 +19,26 @@ export function calculateConcentrationDC(damageAmount: number): number {
 }
 
 /**
- * Roll a constitution saving throw for concentration
+ * Roll a constitution saving throw for concentration. Callers pass the die:
+ * the encounter's seeded stream in combat, a logged d20 outside it.
+ * Math.random is only the last-resort default for direct engine callers.
  */
-export function rollConcentrationSave(constitutionModifier: number): { roll: number; total: number } {
-    const roll = Math.floor(Math.random() * 20) + 1;
+export function rollConcentrationSave(constitutionModifier: number, d20: () => number = () => Math.floor(Math.random() * 20) + 1): { roll: number; total: number } {
+    const roll = d20();
     const total = roll + constitutionModifier;
     return { roll, total };
 }
 
 /**
- * Check if concentration is maintained after taking damage
+ * Check if concentration is maintained after taking damage. The CON save
+ * adds save proficiency from the sheet.
  */
 export function checkConcentration(
     character: Character | NPC,
     damageAmount: number,
     concentrationRepo: ConcentrationRepository,
-    extraSaveBonus: number = 0
+    extraSaveBonus: number = 0,
+    d20?: () => number
 ): ConcentrationCheckResult {
     const concentration = concentrationRepo.findByCharacterId(character.id);
 
@@ -47,8 +52,14 @@ export function checkConcentration(
     }
 
     const dc = calculateConcentrationDC(damageAmount);
-    const constitutionModifier = Math.floor((character.stats.con - 10) / 2) + extraSaveBonus;
-    const { roll, total } = rollConcentrationSave(constitutionModifier);
+    const con = saveModifier({
+        stats: character.stats as Record<string, number>,
+        saveProficiencies: (character as { saveProficiencies?: string[] }).saveProficiencies,
+        level: character.level
+    }, 'constitution');
+    const constitutionModifier = con.total + extraSaveBonus;
+    // Only reached with an active concentration, so no die is drawn otherwise.
+    const { roll, total } = rollConcentrationSave(constitutionModifier, d20);
 
     const success = total >= dc;
 

@@ -5,7 +5,7 @@
 
 import { handleCombatAction, CombatActionTool } from '../../../src/server/consolidated/combat-action.js';
 import { handleCombatManage } from '../../../src/server/consolidated/combat-manage.js';
-import { clearCombatState } from '../../../src/server/handlers/combat-handlers.js';
+import { clearCombatState, getOrLoadEngine } from '../../../src/server/handlers/combat-handlers.js';
 import { getDb } from '../../../src/storage/index.js';
 import { randomUUID } from 'crypto';
 
@@ -548,6 +548,10 @@ describe('combat_action consolidated tool', () => {
             expect(data.actionType).toBe('ready');
             expect(data.readiedAction).toBe('Attack with sword');
             expect(data.trigger).toContain('goblin');
+            // Item 11: ready is written on the token and spends the action.
+            expect(data.readied).toEqual({ action: 'Attack with sword', trigger: 'When the goblin moves closer' });
+            const state = getOrLoadEngine(ctx as any, testEncounterId)!.getState()!;
+            expect(state.participants.find(p => p.id === 'hero-1')!.actionUsed).toBe(true);
         });
 
         it('should accept "prepare" alias', async () => {

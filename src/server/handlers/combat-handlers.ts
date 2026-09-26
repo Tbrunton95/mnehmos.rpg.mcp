@@ -5,7 +5,7 @@ import { randomUUID } from 'crypto';
 import { freshSeed } from '../../math/seed.js';
 import { CombatEngine, CombatParticipant, CombatState, CombatActionResult } from '../../engine/combat/engine.js';
 import { normalizeConditions } from '../../engine/combat/conditions.js';
-import { ConditionInputSchema } from '../../schema/encounter.js';
+import { ConditionInputSchema, footprintCells } from '../../schema/encounter.js';
 import { SpatialEngine } from '../../engine/spatial/engine.js';
 
 import { PubSub } from '../../engine/pubsub.js';
@@ -18,18 +18,20 @@ import { SessionContext } from '../types.js';
 // CRIT-006: Import spellcasting validation and resolution
 import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
-import { PartSchema, UnitSchema } from '../../schema/token-extras.js';
+import { PartSchema, UnitSchema, ParticipantExtrasShape, type Part, type ReadiedAttack } from '../../schema/token-extras.js';
 import { resolveWorldId, bandOrder, loadRule, loadRules, type TableRule } from '../../engine/table-rules.js';
-import { peerConsequence, calledStrikeProblem, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
+import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
 import { volleyTier, describeUnit } from '../../engine/combat/units.js';
+import { upsertPart, findPart, resolveAttackSource } from '../../engine/combat/parts.js';
 import { compareBands } from '../../engine/table-rules.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { CombatActionLogRepository } from '../../storage/repos/combat-action-log.repo.js';
 import { startConcentration, checkConcentration, breakConcentration } from '../../engine/magic/concentration.js';
+import { rollParticipantSave, toLongAbility, type ParticipantSaveResult } from '../../engine/combat/saves.js';
 import type { Character } from '../../schema/character.js';
 import { getPatternGenerator, PATTERN_DESCRIPTIONS } from '../terrain-patterns.js';
-import { CREATURE_PRESETS } from '../../data/creature-presets.js';
+import { hydrateExtras, matchPreset, type ExtrasRow } from '../../engine/combat/participant-extras.js';
 
 // Global combat state (in-memory for MVP)
 let pubsub: PubSub | null = null;
@@ -195,8 +197,15 @@ function buildStateJson(state: CombatState, encounterId: string, sessionId?: str
             ac: p.ac,
             attackDamage: p.attackDamage,
             attackBonus: p.attackBonus,
+            ...(p.attacks?.length ? { attacks: p.attacks } : {}),
+            ...(p.abilities?.length ? { abilities: p.abilities } : {}),
+            ...((p.attacksPerAction ?? 1) > 1 ? { attacksPerAction: p.attacksPerAction, attacksMade: p.attacksMade ?? 0 } : {}),
+            ...(p.legendaryActions ? { legendaryActions: p.legendaryActions, legendaryActionsRemaining: p.legendaryActionsRemaining ?? 0 } : {}),
+            ...(p.legendaryResistances ? { legendaryResistances: p.legendaryResistances, legendaryResistancesRemaining: p.legendaryResistancesRemaining ?? 0 } : {}),
             // Table state the GM reads each round
             ...(p.band ? { band: p.band } : {}),
+            ...(p.regeneration ? { regeneration: p.regeneration } : {}),
+            ...(p.cr !== undefined ? { cr: p.cr } : {}),
             ...(p.parts?.length ? { parts: p.parts } : {}),
             ...(p.unit ? { unit: { ...p.unit, ...unitView(p) } } : {}),
             ...(p.intent ? { intent: p.intent } : {}),
@@ -222,11 +231,13 @@ function formatCombatStateText(state: CombatState): string {
     );
 
     const isEnemy = currentParticipant?.isEnemy ?? false;
+    const lairUp = state.turnOrder[state.currentTurnIndex] === 'LAIR';
+    const lairOwner = state.participants.find(p => p.id === state.lairOwnerId);
 
     // Header with round info
-    const turnIcon = isEnemy ? '👹' : '⚔️';
+    const turnIcon = lairUp ? '🏰' : isEnemy ? '👹' : '⚔️';
     let output = `\n┌─────────────────────────────────────────┐\n`;
-    output += `│ ${turnIcon} ROUND ${state.round} — ${currentParticipant?.name}'s Turn\n`;
+    output += `│ ${turnIcon} ROUND ${state.round} — ${lairUp ? 'LAIR (initiative 20)' : `${currentParticipant?.name}'s Turn`}\n`;
     output += `└─────────────────────────────────────────┘\n\n`;
 
     // Initiative order with clear formatting
@@ -234,6 +245,11 @@ function formatCombatStateText(state: CombatState): string {
     output += `───────────────────────────────────────────\n`;
     
     state.turnOrder.forEach((id: string, index: number) => {
+        if (id === 'LAIR') {
+            const used = lairOwner?.lairUsedRound === state.round;
+            output += `${index === state.currentTurnIndex ? '▶' : ' '} 🏰 ${'LAIR (init 20)'.padEnd(18)} ${lairOwner ? `owner: ${lairOwner.name}` : ''}${lairOwner && lairOwner.hp <= 0 ? ' (dead: skipped)' : used ? ' (used this round)' : ''}\n`;
+            return;
+        }
         const p = state.participants.find((part) => part.id === id);
         if (!p) return;
 
@@ -247,8 +263,18 @@ function formatCombatStateText(state: CombatState): string {
         // Include ID for LLM targeting
         output += `${marker} ${icon} ${p.name.padEnd(18)} ${hpBar} ${p.hp}/${p.maxHp} HP  [Init: ${p.initiative}] ID: ${p.id} ${status}\n`;
         if (p.unit) output += `      🪖 ${describeUnit(p)}\n`;
-        const hurt = (p.parts ?? []).filter(pt => pt.state !== 'intact');
-        if (hurt.length) output += `      🦴 ${hurt.map(pt => `${pt.name}: ${pt.state}${pt.latchedTo ? `→${state.participants.find(o => o.id === pt.latchedTo!.participantId)?.name ?? pt.latchedTo.participantId}${pt.latchedTo.part ? ` ${pt.latchedTo.part}` : ''}` : ''}`).join(' · ')}\n`;
+        const counters = [
+            p.legendaryActions ? `LA ${p.legendaryActionsRemaining ?? 0}/${p.legendaryActions}` : '',
+            p.legendaryResistances ? `LR ${p.legendaryResistancesRemaining ?? 0}/${p.legendaryResistances}` : '',
+            (p.attacksPerAction ?? 1) > 1 ? `attacks ${p.attacksMade ?? 0}/${p.attacksPerAction}` : ''
+        ].filter(Boolean);
+        if (counters.length) output += `      👑 ${counters.join(' · ')}\n`;
+        if (p.abilities?.length) output += `      ✴ abilities: ${p.abilities.map(a => `${a.name}${a.recharge ? ` (recharge ${a.recharge}${a.recharge < 6 ? '-6' : ''})` : ''}${a.ready === false ? ' SPENT' : ''}`).join(', ')}\n`;
+        if (p.attacks?.length) output += `      🗡 attacks: ${p.attacks.map(a => `${a.name} ${a.attackBonus >= 0 ? '+' : ''}${a.attackBonus}`).join(', ')}\n`;
+        // Hurt parts, and armoured ones (own ac, hp or breakAt) even when intact.
+        const hurt = (p.parts ?? []).filter(pt => pt.state !== 'intact' || pt.ac !== undefined || pt.hp !== undefined || pt.breakAt !== undefined);
+        const armour = (pt: Part) => `${pt.ac !== undefined ? ` AC ${pt.ac}` : ''}${pt.hp !== undefined ? ` ${pt.hp}/${pt.maxHp ?? pt.hp} HP` : ''}${pt.breakAt !== undefined ? ` breaks at ${pt.breakAt}` : ''}`;
+        if (hurt.length) output += `      🦴 ${hurt.map(pt => `${pt.name}: ${pt.state}${pt.latchedTo ? `→${state.participants.find(o => o.id === pt.latchedTo!.participantId)?.name ?? pt.latchedTo.participantId}${pt.latchedTo.part ? ` ${pt.latchedTo.part}` : ''}` : ''}${armour(pt)}`).join(' · ')}\n`;
         if (p.intent) output += `      ⚑ intent: ${p.intent}\n`;
         if (p.readied) output += `      ⏳ readied: ${p.readied.action} when ${p.readied.trigger}\n`;
     });
@@ -265,7 +291,11 @@ function formatCombatStateText(state: CombatState): string {
         .map(p => `${p.name} (${p.id})`);
 
     // Action guidance
-    if (isEnemy && currentParticipant && currentParticipant.hp > 0) {
+    if (lairUp) {
+        output += lairOwner?.lairUsedRound === state.round
+            ? `🏰 LAIR ACTION USED this round → call advance_turn\n`
+            : `🏰 LAIR ACTION PENDING → combat_manage lair_action {encounterId, actionDescription, targetIds?, damage?, savingThrow?}, then advance\n`;
+    } else if (isEnemy && currentParticipant && currentParticipant.hp > 0) {
         output += `⚡ ENEMY TURN\n`;
         output += `   Available targets: ${validPlayerTargets.join(', ') || 'None'}\n`;
         output += `   → Execute attack, then call advance_turn\n`;
@@ -448,6 +478,54 @@ function formatDisengageResult(actorName: string): string {
     output += `Movement this turn will not provoke opportunity attacks.\n`;
     output += `\n→ Call advance_turn to proceed (or move first)`;
     return output;
+}
+
+/**
+ * Item 11: a reactor the players run (on the heroes' side, with a PC
+ * character row). Its opportunity attacks are offered, never rolled for it.
+ */
+function isPlayerReactor(p: CombatParticipant): boolean {
+    if (p.isEnemy) return false;
+    const row = new CharacterRepository(getDb()).findById(p.id);
+    return !!row && (row.characterType ?? 'pc') === 'pc';
+}
+
+/**
+ * Item 11: resolve a stored attack spec (a readied action's attack) as a
+ * reaction on the encounter's dice. Omitted fields come from the named
+ * profile, then the token's default attack; the target's AC from its token,
+ * then its sheet. Spends the reaction; the caller checks it was available
+ * and saves the state.
+ */
+export function resolveReadiedAttack(engine: CombatEngine, reactor: CombatParticipant, target: CombatParticipant, spec: ReadiedAttack): CombatActionResult {
+    const profiles = reactor.attacks?.length ? reactor.attacks : (new CharacterRepository(getDb()).findById(reactor.id)?.attacks ?? []);
+    const source = resolveAttackSource({ parts: reactor.parts, attacks: profiles }, { using: spec.using, withPart: spec.withPart });
+    const profile = source.profile;
+    const attackBonus = spec.attackBonus ?? profile?.attackBonus ?? reactor.attackBonus ?? reactor.initiativeBonus + 2;
+    const damage = spec.damage ?? profile?.damage ?? reactor.attackDamage ?? '1d6';
+    const damageType = spec.damageType ?? profile?.damageType ?? reactor.attackDamageType;
+    const ac = target.ac ?? new CharacterRepository(getDb()).findById(target.id)?.ac ?? 10;
+    const withPart = spec.withPart && findPart(reactor, spec.withPart) ? spec.withPart : source.part?.name;
+    const result = engine.executeAttack(reactor.id, target.id, attackBonus, ac, damage, damageType,
+        false, false, undefined, undefined, undefined, undefined, { withPart, ranged: profile?.ranged });
+    engine.commitAction(reactor.id, 'reaction');
+    return result;
+}
+
+/** The JSON for one rolled reaction attack: every number the prose shows. */
+export function reactionAttackData(r: CombatActionResult) {
+    return {
+        roll: r.attackRoll?.roll,
+        allRolls: (r.attackRoll as { allRolls?: number[] } | undefined)?.allRolls,
+        total: r.attackRoll?.total,
+        targetAc: r.attackRoll?.dc,
+        hit: r.success,
+        crit: !!r.attackRoll?.isCrit,
+        damage: r.damage ?? 0,
+        damageType: (r as { damageType?: string }).damageType,
+        targetHpAfter: r.target?.hpAfter,
+        ...(r.situational?.length ? { situational: r.situational } : {})
+    };
 }
 
 /**
@@ -692,8 +770,7 @@ Example (use real UUID from context for player character!):
                 hp: z.number().int().nonnegative(), // Allow 0 HP for dying characters
                 maxHp: z.number().int().positive(),
                 isEnemy: z.boolean().optional().describe('Whether this is an enemy (auto-detected if not set)'),
-                hasLairActions: z.boolean().optional()
-                    .describe('Adds a LAIR slot at initiative 20 to the turn order'),
+                ...ParticipantExtrasShape,
                 ac: z.number().int().min(0).optional()
                     .describe('Armor Class (used by attack resolution; defaults to attacker-side derivation if omitted)'),
                 conditions: z.array(ConditionInputSchema).default([])
@@ -711,7 +788,11 @@ Example (use real UUID from context for player character!):
                 regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds (defaults from the character row)'),
                 parts: z.array(PartSchema).optional().describe('Named parts with states (defaults from the character row)'),
                 unit: UnitSchema.optional().describe('A mortal unit as one token: models, hpPerModel, packed, attackBonus, tiers'),
-                intent: z.string().optional().describe('Telegraphed intent (clears when its turn ends)')
+                intent: z.string().optional().describe('Telegraphed intent (clears when its turn ends)'),
+                abilityScores: z.object({
+                    strength: z.number(), dexterity: z.number(), constitution: z.number(),
+                    intelligence: z.number(), wisdom: z.number(), charisma: z.number()
+                }).optional().describe('Ability scores, long keys (saves read them when the token has no character row)')
             })).min(1),
             terrain: z.object({
                 obstacles: z.array(z.string()).default([]).describe('Array of "x,y" strings for blocking tiles'),
@@ -782,12 +863,19 @@ Examples:
             outcome: z.enum(['hit', 'crit', 'miss']).optional().describe('A result the GM resolved at the table. The engine rolls no d20 (no nat 1/20 override) and applies damage exactly as posted: a number is never doubled; a dice string with crit doubles its dice only. Resistances, HP write-through and concentration still apply. hit/crit need damage.'),
             advantage: z.boolean().optional().describe('Roll 2d20 keep highest (Findings #31/#32)'),
             disadvantage: z.boolean().optional().describe('Roll 2d20 keep lowest'),
-            calledStrike: z.string().optional().describe("Table rules (called_strike): 'leg' or 'arm'. No roll penalty; a hit cripples that limb. Needs a target of your band or greater"),
+            calledStrike: z.string().optional().describe("Table rules (called_strike): 'leg', 'arm' or any named part of the target ('jaw', 'collar chain'). No roll penalty; a hit cripples that part (it keeps its kind). Needs a target of your band or greater"),
             preparedAsset: z.string().optional().describe('Table rules (prepared_asset): the rule name; reports miss / hit / catastrophic tier and the effect the GM names'),
             unaffectedLimb: z.boolean().optional().describe('The attacker uses a limb its crippling condition does not touch (skips that disadvantage)'),
             withPart: z.string().optional().describe("The attacker's named part used ('middle head'): crippled = disadvantage; dead or latched = refused"),
+            using: z.string().optional().describe("Named attack profile on the token or sheet ('grown blade'; unique prefix ok): fills attackBonus, damage, damageType and the part when omitted"),
+            weapon: z.string().optional().describe('Alias of using; also finds the part whose holds names this weapon'),
+            hand: z.enum(['mainhand', 'offhand']).optional().describe('Which hand swings: finds the part whose holds names the slot'),
             atPart: z.string().optional().describe('The target part aimed at: breached = advantage; a called strike cripples this part'),
+            ranged: z.boolean().optional().describe('A ranged attack (not within 5 ft): a prone target is disadvantage and paralysed/unconscious no auto-crit. Unset = from token positions, else melee'),
+            ignoreConditions: z.boolean().optional().describe('Skip the automatic advantage/disadvantage/auto-crit from standard conditions (raw roll)'),
             cleave: z.boolean().optional().describe('Cleave through a packed unit of a lower band: damage flows through models instead of stopping at one'),
+            legendaryCost: z.number().int().min(1).optional().describe("A legendary action: spends this many of the creature's legendary actions instead of its action (off its own turn only)"),
+            reaction: z.boolean().optional().describe('An attack as a reaction (opportunity attack, readied swing): spends the reaction instead of the action'),
             volley: z.object({ dice: z.string(), reason: z.string() }).optional().describe('Internal: set by combat_action volley'),
             declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit trail: printed in output, never re-applied'),
             declaredEffects: z.array(z.object({ name: z.string(), lane: z.string().optional() })).optional().describe('FINDINGS #60 RESOLVER v2: GM declares the conditional trait by name (+lane for multi-lane rows); engine computes the value (incl. valueFromPool) and APPLIES it to the attack bonus'),
@@ -839,7 +927,7 @@ Examples:
             encounterId: z.string().describe('The ID of the encounter'),
             actionDescription: z.string().describe('Description of the lair action'),
             targetIds: z.array(z.string()).optional().describe('IDs of affected participants (optional)'),
-            damage: z.number().int().min(0).optional().describe('Damage dealt by the lair action'),
+            damage: z.union([z.number().int().min(0), z.string().min(1)]).optional().describe("Damage dealt by the lair action: a number or dice ('2d10'), rolled once on the encounter's dice"),
             damageType: z.string().optional().describe('Type of damage (fire, cold, etc.)'),
             savingThrow: z.object({
                 ability: z.enum(['strength', 'dexterity', 'constitution', 'intelligence', 'wisdom', 'charisma']),
@@ -1194,62 +1282,30 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
 
     // Convert participants to proper format (preserve isEnemy, position, and resistances)
     const participants: CombatParticipant[] = parsed.participants.map(p => {
-        // Auto-lookup monster stats from presets
-        // This allows correct AC and damage calculation even if LLM omits it
-        let extraStats: Partial<CombatParticipant> = {};
-        const lowerName = p.name.toLowerCase();
-        
-        // Try precise match (e.g. "goblin")
-        let presetKey = Object.keys(CREATURE_PRESETS).find(k => k === lowerName);
-        
-        // Try fuzzy match: start of string (e.g. "goblin warrior" -> "goblin")
-        if (!presetKey) {
-            // Sort keys by length descending to match aggressive first ("giant rat" before "giant")
-            const keys = Object.keys(CREATURE_PRESETS).sort((a, b) => b.length - a.length);
-            presetKey = keys.find(k => lowerName.startsWith(k));
-        }
-        
-        // Try removing numbers (e.g. "goblin 1" -> "goblin")
-        if (!presetKey) {
-            const baseName = lowerName.replace(/ \d+$/, '');
-            presetKey = Object.keys(CREATURE_PRESETS).find(k => k === baseName);
-        }
-
-        const preset = presetKey ? CREATURE_PRESETS[presetKey] : undefined;
-
-        if (preset) {
-            extraStats = {
-                ac: preset.ac,
-                attackDamage: preset.defaultAttack?.damage,
-                attackBonus: preset.defaultAttack?.toHit
-            };
-        }
+        // Auto-lookup monster stats from presets so AC and damage resolve even
+        // when the LLM omits them. Only when the caller gave neither ac nor
+        // attackDamage: a hand-built statline is never overridden by a namesake.
+        const preset = p.ac === undefined && p.attackDamage === undefined ? matchPreset(p.name) : undefined;
 
         // FINDINGS #26: participants backed by a real character row inherit its
-        // AC when neither the caller nor a preset supplied one — an omitted `ac`
-        // silently defaulted to 10 at resolution while output looked correct
-        // (the soft-AC trap). Explicit ac still wins below; ad-hoc tokens with
-        // no row keep the heuristic.
+        // AC (and table-rules band, regeneration, parts, legendary counters,
+        // lair) when the caller did not supply them — an omitted `ac` silently
+        // defaulted to 10 at resolution while output looked correct (the
+        // soft-AC trap). Caller beats row beats preset, field by field.
         const row = p.id ? new CharacterRepository(getDb()).findById(p.id) : null;
-        if (p.ac === undefined && extraStats.ac === undefined && row?.ac !== undefined) {
-            extraStats.ac = row.ac;
-        }
-        // Table rules: band and regeneration default from the sheet.
-        const band = p.band ?? row?.band;
-        const regeneration = p.regeneration ?? row?.regeneration;
-        const parts = p.parts ?? row?.parts;
+        const extras = hydrateExtras(p, row as ExtrasRow | null, preset);
 
         const id = p.id || randomUUID();
         const participant = {
             // CRITICAL FIX: Auto-generate ID if not provided to prevent React key collisions
             id,
-            name: preset ? preset.name : p.name,
+            // The caller's name is kept ('Goblin 2' stays 'Goblin 2').
+            name: p.name,
             hp: p.hp,
             maxHp: p.maxHp,
             ...(p.initiative !== undefined ? { initiative: p.initiative } : {}),
             initiativeBonus: p.initiativeBonus ?? 0,
             isEnemy: p.isEnemy ?? false,
-            hasLairActions: p.hasLairActions ?? false,
             // Callers send names or character-row {name, ...} entries; the
             // engine and the encounter token schema need Condition objects.
             conditions: normalizeConditions(p.conditions, id),
@@ -1257,17 +1313,16 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             resistances: p.resistances,
             vulnerabilities: p.vulnerabilities,
             immunities: p.immunities,
-            ...(band ? { band } : {}),
-            ...(regeneration ? { regeneration } : {}),
-            ...(parts?.length ? { parts } : {}),
             ...(p.unit ? { unit: p.unit } : {}),
             ...(p.intent ? { intent: p.intent } : {}),
-            ...extraStats,
-            // Caller-supplied AC wins over the preset's default so explicit
-            // overrides (e.g., a goblin in chain mail) take effect.
-            ...(p.ac !== undefined ? { ac: p.ac } : {})
+            ...(p.abilityScores ? { abilityScores: p.abilityScores } : {}),
+            ...extras,
+            hasLairActions: extras.hasLairActions ?? false,
+            // Size and speed live on the participant itself, not only on the token.
+            size: extras.size ?? 'medium',
+            movementSpeed: extras.movementSpeed ?? 30
         } as CombatParticipant;
-        
+
         return participant;
     });
 
@@ -1331,6 +1386,10 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
     });
+    // F1: repo.create validates a hand-listed token map; save the whole engine
+    // state straight after so every participant field and the RNG position
+    // (rngState, refreshed by getState) are stored from the first write.
+    repo.saveState(encounterId, engine.getState()!);
 
     // Build response with BOTH text and JSON
     // Include sessionId in state JSON so frontend knows which session to query
@@ -1474,10 +1533,47 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         let attackBonus = parsed.attackBonus;
         let dc = parsed.dc;
         let damage: number | string | undefined = parsed.damage;
+        let damageType = parsed.damageType;
+        let ranged = parsed.ranged;
+        const outcome = parsed.outcome;
+
+        const currentState = engine.getState();
+        const actor = currentState?.participants.find(p => p.id === parsed.actorId);
+        const target = currentState?.participants.find(p => p.id === parsed.targetId);
+
+        // Named attack profiles (token, else sheet) and the part that swings.
+        // using/weapon picks a profile, which fills whatever the call omits;
+        // with nothing named and no bonus, the default (or sole) profile
+        // stands in for the STR/DEX guess below.
+        const profiles = actor?.attacks?.length ? actor.attacks : (new CharacterRepository(getDb()).findById(parsed.actorId)?.attacks ?? []);
+        const named = parsed.using ?? parsed.weapon;
+        const sourceOpts = { using: parsed.using, weapon: parsed.weapon, withPart: parsed.withPart, hand: parsed.hand };
+        let source = actor ? resolveAttackSource({ parts: actor.parts, attacks: profiles }, sourceOpts) : { notes: [] as string[] };
+        let defaulted = false;
+        if (actor && !source.profile && !named && parsed.attackBonus === undefined && !outcome) {
+            const fallback = profiles.find(a => a.default) ?? (profiles.length === 1 ? profiles[0] : undefined);
+            if (fallback) {
+                source = resolveAttackSource({ parts: actor.parts, attacks: profiles }, { ...sourceOpts, using: fallback.name });
+                defaulted = true;
+            }
+        }
+        const profile = source.profile;
+        if (profile) {
+            attackBonus ??= profile.attackBonus;
+            damage ??= profile.damage;
+            damageType ??= profile.damageType;
+            ranged ??= profile.ranged;
+        }
+        // The part the engine checks: a real withPart wins; a withPart that
+        // named a profile gives way to the profile's part; an unknown one is
+        // passed on so the engine refuses it, listing parts and profiles.
+        const withPartIsPart = !!(parsed.withPart && actor && findPart(actor, parsed.withPart));
+        const withPartWasProfile = !!(parsed.withPart && !withPartIsPart && !named && !defaulted && profile);
+        const withPart = parsed.withPart && !withPartIsPart && !withPartWasProfile ? parsed.withPart : source.part?.name;
+
         // A GM-resolved attack (outcome) skips every auto-fill below: no d20 is
         // rolled, so attack bonus and AC are unused, and the posted damage is
         // the total (0 means 0; no trait damage lane is added on top).
-        const outcome = parsed.outcome;
         if (outcome && outcome !== 'miss' && damage === undefined) {
             throw new Error(`outcome '${outcome}' needs the damage you rolled (a number, or dice to roll)`);
         }
@@ -1486,10 +1582,6 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             dc = dc ?? 0;
             damage = damage ?? 0;
         }
-
-        const currentState = engine.getState();
-        const actor = currentState?.participants.find(p => p.id === parsed.actorId);
-        const target = currentState?.participants.find(p => p.id === parsed.targetId);
 
         // 1. Attack Bonus - auto-calculate from multiple sources
         if (attackBonus === undefined) {
@@ -1547,8 +1639,13 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             attackLaneProblems = dres.problems;
         }
 
-        // 2. Target AC (DC)
-        if (!outcome && (dc === undefined || dc === 0)) {
+        // 2. Target AC (DC). Aiming at a part with its own AC (a chain, a
+        // shield) rolls against the part, and body AC bonuses do not apply.
+        const aimedArmour = parsed.atPart && target ? findPart(target, parsed.atPart) : undefined;
+        const partAc = !outcome && (dc === undefined || dc === 0) && aimedArmour?.ac !== undefined ? aimedArmour.ac : undefined;
+        if (partAc !== undefined) {
+            dc = partAc;
+        } else if (!outcome && (dc === undefined || dc === 0)) {
             if (target?.ac !== undefined) {
                 dc = target.ac;
             } else {
@@ -1566,7 +1663,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             }
         }
         const targetMechs = parsed.targetId ? loadAutoMechanics(resolverDb, parsed.targetId) : [];
-        dc = (dc ?? 0) + autoAcBonus(targetMechs, autoApplied);
+        dc = partAc !== undefined ? partAc : (dc ?? 0) + autoAcBonus(targetMechs, autoApplied);
 
         // 3. Damage - auto-calculate from multiple sources
         if (!outcome && (damage === undefined || damage === 0)) {
@@ -1626,10 +1723,26 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         }
         const damageLaneLabel = autoApplied.filter(a => a.type === 'damage_bonus').map(a => a.effect).join(' + ') || undefined;
 
-        // Validate Action Economy
-        const validation = engine.validateActionEconomy(parsed.actorId, 'action');
-        if (!validation.valid) {
-            throw new Error(validation.error);
+        // Validate Action Economy. A legendary action spends legendary
+        // actions and a reaction the reaction, so neither is off-turn misuse;
+        // any other attack is one swing of the Attack action (multiattack
+        // keeps the action open between swings).
+        if (parsed.legendaryCost !== undefined && parsed.reaction) {
+            throw new Error('An attack is a legendary action or a reaction, not both');
+        }
+        if (parsed.legendaryCost !== undefined) {
+            const problem = engine.legendaryActionProblem(parsed.actorId, parsed.legendaryCost)
+                ?? (engine.canTakeActions(parsed.actorId) ? undefined : 'Participant is incapacitated');
+            if (problem) throw new Error(problem);
+            turnWarning = undefined;
+        } else {
+            const validation = parsed.reaction
+                ? engine.validateActionEconomy(parsed.actorId, 'reaction')
+                : engine.validateAttackEconomy(parsed.actorId);
+            if (!validation.valid) {
+                throw new Error(validation.error);
+            }
+            if (parsed.reaction) turnWarning = undefined;
         }
 
         // Table rules: the world's called-strike and prepared-asset rules are
@@ -1644,7 +1757,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             strikeRule = loadRule(rulesDb, ruleWorld, 'called_strike');
             if (!strikeRule) throw new Error(`calledStrike needs an enabled called_strike rule in this encounter's world${ruleWorld ? '' : ' (the encounter has no world: create it with worldId)'}`);
             if (actor && target) {
-                const problem = calledStrikeProblem(strikeRule, ruleBands, actor, target, parsed.calledStrike.toLowerCase());
+                const problem = calledStrikeProblem(strikeRule, ruleBands, actor, target, parsed.calledStrike, parsed.atPart);
                 if (problem) throw new Error(problem);
             }
         }
@@ -1667,14 +1780,14 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             attackBonus!,
             dc!,
             damage!,
-            parsed.damageType,  // HIGH-002: Pass damage type for resistance calculation
+            damageType,  // HIGH-002: Pass damage type for resistance calculation
             parsed.advantage,
             parsed.disadvantage,
             damageLaneBonus || undefined,  // FINDINGS #70: resolver damage lane
             damageLaneLabel,
             outcome,
             parsed.unaffectedLimb,
-            { withPart: parsed.withPart, atPart: parsed.atPart, uncapped: !!(parsed.cleave || parsed.volley) }
+            { withPart, atPart: parsed.atPart, uncapped: !!(parsed.cleave || parsed.volley), ranged, ignoreConditions: parsed.ignoreConditions }
         );
 
         // Sync HP to character database after attack
@@ -1704,7 +1817,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 // RESOLVER v1: autoApply saving_throw_bonus (con-filtered) feeds the hold.
                 const conMechs = loadAutoMechanics(getDb(), parsed.targetId);
                 const conBonus = conMechs.filter(m => m.type === 'saving_throw_bonus' && (!m.condition || 'constitution'.includes(m.condition.toLowerCase()) || m.condition.toLowerCase().includes('con'))).reduce((s, m) => s + m.value, 0);
-                const concentrationCheck = checkConcentration(targetChar, result.damage, concentrationRepo, conBonus);
+                const concentrationCheck = checkConcentration(targetChar, result.damage, concentrationRepo, conBonus,
+                    () => engine.rollD20({ purpose: 'concentration', forId: parsed.targetId }));
                 if (concentrationCheck.broken) {
                     // Break concentration
                     breakConcentration(
@@ -1774,11 +1888,17 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         const targetNow = afterState?.participants.find(p => p.id === parsed.targetId);
         if (strikeRule && parsed.calledStrike && targetNow) {
             const limb = parsed.calledStrike.toLowerCase();
-            if (result.success) {
-                // The cripple lands on a named part (the one aimed at, or the
-                // limb), which the engine reads for speed and attacks.
-                const part = crippledPart(strikeRule, limb, parsed.atPart);
-                targetNow.parts = [...(targetNow.parts ?? []).filter(pt => pt.name.toLowerCase() !== part.name.toLowerCase()), part];
+            const landing = resolveCalledStrike(strikeRule, targetNow, parsed.calledStrike, parsed.atPart);
+            if (result.partHit?.broken) {
+                // The aimed part was severed by the hit: nothing left to cripple.
+                resultRec.calledStrike = { rule: strikeRule.name, limb, crippled: false, part: result.partHit.name, severed: true };
+                ruleLines.push(`RULE ${strikeRule.name}: ${targetNow.name}'s ${result.partHit.name} severed`);
+            } else if (result.success && !('problem' in landing)) {
+                // The cripple lands on a named part (the target's own, the one
+                // aimed at, or the limb), which the engine reads for speed and attacks.
+                const part = crippledPart(strikeRule, landing);
+                // Merged, not replaced: a latch, holds or ac on that part survive.
+                targetNow.parts = upsertPart(targetNow.parts ?? [], part);
                 if (charRepoFor(targetNow.id)) new CharacterRepository(getDb()).update(targetNow.id, { parts: targetNow.parts } as never);
                 resultRec.calledStrike = { rule: strikeRule.name, limb, crippled: true, part: part.name, notes: part.note };
                 ruleLines.push(`RULE ${strikeRule.name}: ${targetNow.name}'s ${part.name} crippled until repaired${part.note ? ` (${part.note})` : ''}`);
@@ -1787,7 +1907,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 ruleLines.push(`RULE ${strikeRule.name}: called strike at the ${limb} missed`);
             }
         }
-        if (actorNow && targetNow) {
+        // A hit on an armoured part never touched the body: no consequence.
+        if (actorNow && targetNow && !result.partHit) {
             for (const peerRule of loadRules(rulesDb, ruleWorld, 'peer_consequence')) {
                 const due = peerConsequence(peerRule, ruleBands, actorNow, targetNow, result);
                 if (!due) continue;
@@ -1803,7 +1924,12 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             ruleLines.push(`RULE ${prepared.rule}: ${prepared.tier.toUpperCase()}${prepared.margin !== undefined ? ` (margin ${prepared.margin >= 0 ? '+' : ''}${prepared.margin})` : ''}, ${prepared.note}`);
         }
 
+        for (const note of source.notes) ruleLines.push(`⚖️ ${note}`);
         for (const note of (result.situational ?? []).slice().reverse()) ruleLines.unshift(`⚖️ ${note}`);
+        if (profile) {
+            resultRec.attackProfile = { name: profile.name, attackBonus: profile.attackBonus, damage: profile.damage, ...(profile.damageType ? { damageType: profile.damageType } : {}), ...(source.part ? { part: source.part.name } : {}), ...(defaulted ? { default: true } : {}) };
+            ruleLines.unshift(`🗡 using ${profile.name} (${profile.attackBonus >= 0 ? '+' : ''}${profile.attackBonus}, ${profile.damage}${profile.damageType ? ` ${profile.damageType}` : ''})${source.part ? ` with ${source.part.name}` : ''}${defaulted ? ' [default profile]' : ''}`);
+        }
         if (parsed.volley) {
             resultRec.volley = parsed.volley;
             ruleLines.unshift(`VOLLEY ${parsed.volley.dice} (${parsed.volley.reason})`);
@@ -1812,6 +1938,24 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             const t = volleyTier(targetNow);
             resultRec.targetUnit = { models: t?.models, maxModels: t?.maxModels, volley: t?.dice ?? null };
             ruleLines.push(`UNIT ${targetNow.name}: ${describeUnit(targetNow)}`);
+        }
+
+        // Commit Action Economy: legendary actions, the reaction, or one
+        // attack of the Attack action.
+        if (parsed.legendaryCost !== undefined) {
+            const spent = engine.useLegendaryAction(parsed.actorId, parsed.legendaryCost);
+            resultRec.legendary = { cost: parsed.legendaryCost, remaining: spent.remaining };
+            ruleLines.push(`👑 legendary action (cost ${parsed.legendaryCost}): ${spent.remaining} left`);
+        } else if (parsed.reaction) {
+            engine.commitAction(parsed.actorId, 'reaction');
+            resultRec.reaction = true;
+            ruleLines.push('↩ reaction spent');
+        } else {
+            const swing = engine.commitAttack(parsed.actorId);
+            if (swing && swing.of > 1) {
+                resultRec.multiattack = swing;
+                ruleLines.push(`⚔ attack ${swing.made}/${swing.of}${swing.made < swing.of ? '' : ' (Attack action spent)'}`);
+            }
         }
 
         output = formatAttackResult(result);
@@ -1831,9 +1975,6 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             output += `▌ ⚠ ${resolverProblems.join(' | ')}\n`;
             (result as unknown as Record<string, unknown>).resolverProblems = resolverProblems;
         }
-        
-        // Commit Action Economy
-        engine.commitAction(parsed.actorId, 'action');
 
     } else if (parsed.action === 'heal') {
         if (parsed.amount === undefined) {
@@ -1930,104 +2071,154 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             (actor as any).position = parsed.targetPosition;
             output = formatMoveResult(actor.name, undefined, parsed.targetPosition, true, null);
         } else {
-            // HIGH-003: Check for opportunity attacks BEFORE moving
-            const opportunityAttackers = engine.getOpportunityAttackers(
-                parsed.actorId,
-                actorPos,
-                parsed.targetPosition
+            // Item 11: the move is validated first (blocked destination, no
+            // path, not enough movement), so a refused move provokes nothing.
+            // Then the path is walked and each reaction resolves at the step
+            // that set it off.
+            const obstacles = new Set<string>();
+
+            // Every square another participant fills is an obstacle (a
+            // large token fills 2x2 from its position, item 6).
+            for (const p of currentState.participants) {
+                if (p.id === parsed.actorId) continue;
+                for (const cell of footprintCells(p)) obstacles.add(`${cell.x},${cell.y}`);
+            }
+
+            // Add terrain obstacles if available
+            const terrain = (currentState as any).terrain;
+            if (terrain?.obstacles) {
+                for (const obs of terrain.obstacles) {
+                    obstacles.add(obs);
+                }
+            }
+
+            const opportunityAttacks: Array<Record<string, unknown>> = [];
+            const opportunityAttacksAvailable: Array<Record<string, unknown>> = [];
+            const readiedTriggered: Array<Record<string, unknown>> = [];
+            let moved = false;
+
+            // The mover's whole footprint at the destination must be clear.
+            // The path itself is found for the anchor square only.
+            const destBlocked = footprintCells(actor, parsed.targetPosition)
+                .some(cell => obstacles.has(`${cell.x},${cell.y}`));
+            const path = destBlocked ? null : new SpatialEngine().findPath(
+                { x: actorPos.x, y: actorPos.y },
+                { x: parsed.targetPosition.x, y: parsed.targetPosition.y },
+                obstacles
             );
+            // Calculate movement cost (5ft per step); path includes the start node.
+            const moveCost = path ? (path.length - 1) * 5 : 0;
+            // A condition added mid-turn (grappled, exhaustion 2) caps what is left.
+            const speedCap = engine.effectiveSpeed(actor) * (actor.hasDashed ? 2 : 1);
+            const currentMovement = Math.min((actor as any).movementRemaining ?? 30, speedCap); // Default 30 if undefined
 
-            // Execute any triggered opportunity attacks
-            let opportunityAttackOutput = '';
-            for (const attacker of opportunityAttackers) {
-                const oaResult = engine.executeOpportunityAttack(attacker.id, parsed.actorId);
-                opportunityAttackOutput += formatOpportunityAttackResult(oaResult) + '\n';
+            if (destBlocked) {
+                output = formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, 'Destination is blocked');
+            } else if (path === null) {
+                output = formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, 'No valid path - blocked by obstacles');
+            } else if (currentMovement < moveCost) {
+                output = formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, `Insufficient movement (Cost: ${moveCost}ft, Remaining: ${currentMovement}ft)`);
+            } else {
+                // Reactions along the path, in step order. At one step a
+                // readied action goes before the opportunity attack: the
+                // reactor chose it, and it spends the same reaction.
+                type Reaction =
+                    | { kind: 'readied'; reactor: CombatParticipant; stepIndex: number; readied: NonNullable<CombatParticipant['readied']> }
+                    | { kind: 'oa'; reactor: CombatParticipant; stepIndex: number };
+                const reactions: Reaction[] = [
+                    ...engine.getReadiedTriggers(parsed.actorId, path).map(t => ({ kind: 'readied' as const, ...t })),
+                    ...engine.getOpportunityAttackers(parsed.actorId, path).map(h => ({ kind: 'oa' as const, reactor: h.attacker, stepIndex: h.stepIndex }))
+                ].sort((a, b) => a.stepIndex - b.stepIndex || (a.kind === b.kind ? 0 : a.kind === 'readied' ? -1 : 1));
 
-                // If the mover is defeated by an opportunity attack, they can't complete the move
-                if (oaResult.defeated) {
-                    output = opportunityAttackOutput;
-                    output += `\n${actor.name} was defeated while attempting to move and cannot complete the movement!`;
+                const hpBefore = actor.hp;
+                let reactionOutput = '';
+                let fellAt: number | undefined;
+                for (const reaction of reactions) {
+                    const { reactor, stepIndex } = reaction;
+                    const at = { x: path[stepIndex].x, y: path[stepIndex].y };
+                    // A reaction earlier on this path may have spent this one.
+                    if (reactor.reactionUsed || !engine.canTakeReactions(reactor.id)) continue;
+                    // The mover stands where the reaction happens (conditions
+                    // within 5 ft and the grid read this square).
+                    actor.position = at;
+                    if (reaction.kind === 'readied') {
+                        const { readied } = reaction;
+                        if (!readied.attack) {
+                            // Not an attack: the GM resolves it with trigger_readied.
+                            readiedTriggered.push({ participantId: reactor.id, name: reactor.name, stepIndex, at, readied, fired: false });
+                            reactionOutput += `\n⏳ READIED: ${reactor.name} — ${readied.action} (${readied.trigger}) at (${at.x}, ${at.y}): call combat_manage trigger_readied {encounterId: '${parsed.encounterId}', participantId: '${reactor.id}'}\n`;
+                            continue;
+                        }
+                        let fired: CombatActionResult;
+                        try {
+                            fired = resolveReadiedAttack(engine, reactor, actor, readied.attack);
+                        } catch (err) {
+                            // A dead part or unknown profile: flagged, nothing spent.
+                            const problem = err instanceof Error ? err.message : String(err);
+                            readiedTriggered.push({ participantId: reactor.id, name: reactor.name, stepIndex, at, readied, fired: false, problem });
+                            reactionOutput += `\n⏳ READIED: ${reactor.name} — ${readied.action}: could not fire (${problem}); resolve with trigger_readied\n`;
+                            continue;
+                        }
+                        reactor.readied = undefined;
+                        readiedTriggered.push({ participantId: reactor.id, name: reactor.name, stepIndex, at, readied, fired: true, attack: reactionAttackData(fired) });
+                        reactionOutput += `\n⏳ READIED fires: ${reactor.name} — ${readied.action} (${readied.trigger}) at (${at.x}, ${at.y})\n${fired.detailedBreakdown}\n↩ reaction spent\n`;
+                        new CombatActionLogRepository(getDb()).log({
+                            encounterId: parsed.encounterId, round: currentState.round, turnIndex: currentState.currentTurnIndex,
+                            actorId: reactor.id, actorName: reactor.name, actionType: 'trigger_readied', targetIds: [actor.id],
+                            resultSummary: `${reactor.name}'s readied action fires: ${readied.action} (${readied.trigger}) — ${fired.message}`,
+                            resultDetail: fired.detailedBreakdown, damageDealt: fired.damage
+                        });
+                    } else if (isPlayerReactor(reactor)) {
+                        // A PC's reaction is the player's choice: offer the exact call.
+                        const call = { tool: 'combat_action', action: 'attack', encounterId: parsed.encounterId, actorId: reactor.id, targetId: actor.id, reaction: true };
+                        opportunityAttacksAvailable.push({ attackerId: reactor.id, attackerName: reactor.name, stepIndex, at, call });
+                        reactionOutput += `\n⚡ OPPORTUNITY ATTACK AVAILABLE: ${reactor.name} may strike ${actor.name} leaving reach at (${at.x}, ${at.y}); the player decides. combat_action attack {encounterId: '${parsed.encounterId}', actorId: '${reactor.id}', targetId: '${actor.id}', reaction: true}\n`;
+                        continue;
+                    } else {
+                        const oaResult = engine.executeOpportunityAttack(reactor.id, parsed.actorId);
+                        opportunityAttacks.push({ attackerId: reactor.id, attackerName: reactor.name, stepIndex, at, ...reactionAttackData(oaResult) });
+                        reactionOutput += formatOpportunityAttackResult(oaResult) + '\n';
+                    }
+                    // A mover who drops stops where it fell.
+                    if (actor.hp <= 0) { fellAt = stepIndex; break; }
+                }
+
+                if (fellAt !== undefined) {
+                    const fell = { x: path[fellAt].x, y: path[fellAt].y };
+                    actor.position = fell;
+                    (actor as any).movementRemaining = currentMovement - fellAt * 5;
+                    output = reactionOutput
+                        + (fellAt > 0 ? formatMoveResult(actor.name, actorPos, fell, true, null, fellAt) : '')
+                        + `\n${actor.name} was defeated while attempting to move and cannot complete the movement!`;
                     result = {
                         type: 'attack',
                         success: false,
                         actor: { id: actor.id, name: actor.name },
-                        target: { id: actor.id, name: actor.name, hpBefore: oaResult.target.hpBefore, hpAfter: oaResult.target.hpAfter, maxHp: actor.maxHp },
+                        target: { id: actor.id, name: actor.name, hpBefore, hpAfter: actor.hp, maxHp: actor.maxHp },
                         defeated: true,
-                        message: `${actor.name} defeated by opportunity attack`,
+                        message: `${actor.name} defeated by a reaction while moving`,
                         detailedBreakdown: output
                     };
-                    // Skip to saving state
-                    break;
-                }
-            }
-
-            // Only continue with move if not defeated
-            const updatedActor = currentState.participants.find(p => p.id === parsed.actorId);
-            if (updatedActor && updatedActor.hp > 0) {
-                // Build obstacle set from other participants and terrain
-                const obstacles = new Set<string>();
-
-                // Add other participant positions as obstacles
-                for (const p of currentState.participants) {
-                    if (p.id !== parsed.actorId && (p as any).position) {
-                        const pos = (p as any).position;
-                        obstacles.add(`${pos.x},${pos.y}`);
-                    }
-                }
-
-                // Add terrain obstacles if available
-                const terrain = (currentState as any).terrain;
-                if (terrain?.obstacles) {
-                    for (const obs of terrain.obstacles) {
-                        obstacles.add(obs);
-                    }
-                }
-
-                // Check if destination is blocked
-                const destKey = `${parsed.targetPosition.x},${parsed.targetPosition.y}`;
-                if (obstacles.has(destKey)) {
-                    output = opportunityAttackOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, 'Destination is blocked');
                 } else {
-                    // Use spatial engine to find path
-                    const spatial = new SpatialEngine();
-                    const path = spatial.findPath(
-                        { x: actorPos.x, y: actorPos.y },
-                        { x: parsed.targetPosition.x, y: parsed.targetPosition.y },
-                        obstacles
-                    );
-
-                    if (path === null) {
-                        // No valid path
-                        output = opportunityAttackOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, 'No valid path - blocked by obstacles');
-                    } else {
-                        // Calculate movement cost (5ft per step)
-                        // path includes start node, so steps = length - 1
-                        const moveCost = (path.length - 1) * 5;
-                        const currentMovement = (actor as any).movementRemaining ?? 30; // Default 30 if undefined
-
-                        if (currentMovement < moveCost) {
-                            output = opportunityAttackOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, `Insufficient movement (Cost: ${moveCost}ft, Remaining: ${currentMovement}ft)`);
-                        } else {
-                            // Move successful - update position and remaining movement
-                            (updatedActor as any).position = parsed.targetPosition;
-                            (updatedActor as any).movementRemaining = currentMovement - moveCost;
-                            
-                            output = opportunityAttackOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, true, null, path.length - 1);
-                        }
-                    }
+                    // Move successful - update position and remaining movement
+                    actor.position = parsed.targetPosition;
+                    (actor as any).movementRemaining = currentMovement - moveCost;
+                    moved = true;
+                    output = reactionOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, true, null, path.length - 1);
                 }
-
-                // Create result for consistency
-                result = {
-                    type: 'attack',
-                    success: output.includes('moved'),
-                    actor: { id: actor.id, name: actor.name },
-                    target: { id: actor.id, name: actor.name, hpBefore: actor.hp, hpAfter: updatedActor.hp, maxHp: actor.maxHp },
-                    defeated: updatedActor.hp <= 0,
-                    message: output.includes('moved') ? `${actor.name} moved` : `${actor.name} could not move`,
-                    detailedBreakdown: output
-                };
             }
+
+            // Create result for consistency
+            result ??= {
+                type: 'attack',
+                success: moved,
+                actor: { id: actor.id, name: actor.name },
+                target: { id: actor.id, name: actor.name, hpBefore: actor.hp, hpAfter: actor.hp, maxHp: actor.maxHp },
+                defeated: actor.hp <= 0,
+                message: moved ? `${actor.name} moved` : `${actor.name} could not move`,
+                detailedBreakdown: output
+            };
+            Object.assign(result as unknown as Record<string, unknown>, { opportunityAttacks, opportunityAttacksAvailable, readiedTriggered });
         }
 
         // Create dummy result if not set (for the case where no position was set initially)
@@ -2175,6 +2366,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             saved?: boolean;
             damageDealt?: number;
             damageModifier?: 'immune' | 'resistant' | 'vulnerable' | 'normal';
+            save?: ParticipantSaveResult;
         }[] = [];
         const damageType = resolution.damageType || 'force';
 
@@ -2205,26 +2397,17 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 let saveRoll: number | undefined;
                 let saveTotal: number | undefined;
                 let saved = false;
+                let targetSave: ParticipantSaveResult | undefined;
 
-                // Roll saving throw if spell requires it
+                // Roll saving throw if spell requires it: the sheet's ability
+                // modifier and save proficiency, on the encounter's seeded stream.
                 if (requiresSave) {
-                    saveRoll = Math.floor(Math.random() * 20) + 1;
-                    
-                    // Get save modifier from target's ability scores
-                    const abilityMap: Record<string, string> = {
-                        'dexterity': 'dex', 'dex': 'dex',
-                        'constitution': 'con', 'con': 'con',
-                        'wisdom': 'wis', 'wis': 'wis',
-                        'intelligence': 'int', 'int': 'int',
-                        'strength': 'str', 'str': 'str',
-                        'charisma': 'cha', 'cha': 'cha'
-                    };
-                    const abilityKey = abilityMap[saveType!.toLowerCase()] || 'dex';
-                    const abilityScore = targetParticipant.abilityScores?.[abilityKey as keyof typeof targetParticipant.abilityScores] ?? 10;
-                    const saveMod = Math.floor((abilityScore - 10) / 2);
-                    
-                    saveTotal = saveRoll + saveMod;
-                    saved = saveTotal >= spellSaveDC;
+                    targetSave = rollParticipantSave(engine, db, targetParticipant, saveType!, spellSaveDC, {
+                        purpose: `${toLongAbility(saveType!) ?? 'dexterity'} save vs ${spell.name}`
+                    });
+                    saveRoll = targetSave.natural;
+                    saveTotal = targetSave.total;
+                    saved = targetSave.saved;
 
                     if (saved) {
                         if (saveEffect === 'half') {
@@ -2269,13 +2452,15 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     saveTotal,
                     saved,
                     damageDealt,
-                    damageModifier
+                    damageModifier,
+                    save: targetSave
                 });
 
                 // Check concentration if target is concentrating
                 const targetChar = charRepo.findById(tid);
                 if (targetChar && concentrationRepo.isConcentrating(tid) && damageDealt > 0) {
-                    const concentrationCheck = checkConcentration(targetChar, damageDealt, concentrationRepo);
+                    const concentrationCheck = checkConcentration(targetChar, damageDealt, concentrationRepo, 0,
+                        () => engine.rollD20({ purpose: 'concentration', forId: tid }));
                     if (concentrationCheck.broken) {
                         breakConcentration(
                             { characterId: tid, reason: 'damage', damageAmount: damageDealt },
@@ -2362,6 +2547,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 if (dr.saveRoll !== undefined) {
                     const saveResult = dr.saved ? '✓ PASS' : '✗ FAIL';
                     output += `  • ${dr.name}: d20(${dr.saveRoll}) + ${(dr.saveTotal || 0) - dr.saveRoll} = ${dr.saveTotal} [${saveResult}]\n`;
+                    if (dr.save?.legendaryResisted) output += `    ⭐ Legendary resistance spent: the failed save becomes a success\n`;
+                    else if (dr.save?.legendaryResistanceAvailable) output += `    ⭐ Failed with ${dr.save.legendaryResistanceAvailable} legendary resistance(s) left: the GM may spend one\n`;
                     output += `    → ${dr.damageDealt} dmg${modTag(dr.damageModifier)} | ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
                 } else {
                     output += `  • ${dr.name}: ${dr.damageDealt} dmg${modTag(dr.damageModifier)} | ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
@@ -2377,6 +2564,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             output = formatSpellCastResult(actor.name, shown, primaryTarget, targetHpBefore);
             if (only.damageModifier && only.damageModifier !== 'normal') {
                 output += `\n🛡️ ${only.name} is ${only.damageModifier} to ${damageType}\n`;
+            }
+            if (only.save) {
+                output += `\n🎲 ${only.name} ${only.save.ability.toUpperCase()} save: d20(${only.save.rolls.join(',')}) ${only.save.modifier >= 0 ? '+' : '-'} ${Math.abs(only.save.modifier)} = ${only.save.total} vs DC ${spellSaveDC} [${only.save.parts.join(', ')}]\n`;
+                if (only.save.legendaryResisted) output += `⭐ Legendary resistance spent: the failed save becomes a success\n`;
+                else if (only.save.legendaryResistanceAvailable) output += `⭐ Failed with ${only.save.legendaryResistanceAvailable} legendary resistance(s) left: the GM may spend one\n`;
             }
         } else {
             output = `\n✨ ${actor.name} casts ${spell.name}!\n`;
@@ -2414,6 +2606,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             healAmount: resolution.healing,
             detailedBreakdown: output
         };
+        // Per-target saves ride the action JSON so the client sees each die and modifier.
+        const saves = damageResults.filter(dr => dr.save).map(dr => ({ id: dr.id, name: dr.name, ...dr.save! }));
+        if (saves.length) (result as { saves?: unknown }).saves = saves;
     } else {
         throw new Error(`Unknown action: ${parsed.action}`);
     }
@@ -2506,10 +2701,20 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             // Table rules: what the engine computed and the GM still names.
             consequenceDue: (r as { consequenceDue?: unknown }).consequenceDue,
             calledStrike: (r as { calledStrike?: unknown }).calledStrike,
+            partHit: r.partHit,
+            attackProfile: (r as { attackProfile?: unknown }).attackProfile,
             volley: (r as { volley?: unknown }).volley,
             situational: r.situational,
             targetUnit: (r as { targetUnit?: unknown }).targetUnit,
-            preparedEffectDue: (r as { preparedEffectDue?: unknown }).preparedEffectDue
+            preparedEffectDue: (r as { preparedEffectDue?: unknown }).preparedEffectDue,
+            multiattack: (r as { multiattack?: unknown }).multiattack,
+            legendary: (r as { legendary?: unknown }).legendary,
+            reaction: (r as { reaction?: unknown }).reaction,
+            saves: (r as { saves?: unknown }).saves,
+            // Item 11: reactions a move set off, each at the step it happened.
+            opportunityAttacks: (r as { opportunityAttacks?: unknown }).opportunityAttacks,
+            opportunityAttacksAvailable: (r as { opportunityAttacksAvailable?: unknown }).opportunityAttacksAvailable,
+            readiedTriggered: (r as { readiedTriggered?: unknown }).readiedTriggered
         } : undefined;
         output += `\n\n<!-- STATE_JSON\n${JSON.stringify({ ...stateJson, actionResult })}\nSTATE_JSON -->`;
     }
@@ -2822,6 +3027,95 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
     };
 }
 
+export interface AreaSaveOptions {
+    targetIds?: string[];
+    /** Flat damage, or dice ('8d6') rolled once for every target on the encounter stream. */
+    damage?: number | string;
+    damageType?: string;
+    savingThrow?: { ability: string; dc: number };
+    halfDamageOnSave?: boolean;
+}
+
+export interface AreaSaveTarget {
+    targetId: string;
+    targetName: string;
+    saveRoll?: number;
+    saveTotal?: number;
+    saved: boolean;
+    damageTaken: number;
+    hpAfter?: number;
+    defeated?: boolean;
+    legendaryResisted?: boolean;
+    legendaryResistanceAvailable?: number;
+}
+
+/**
+ * One effect on many targets, each with its own save: lair actions and
+ * limited abilities (a breath weapon) share it. Dice damage is rolled once,
+ * as 5e rolls a breath weapon once; every die and save goes through the
+ * engine so it is seeded and reaches roll_log. The caller saves the state.
+ */
+export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, purpose: string): { targets: AreaSaveTarget[]; damageRolled?: number; damageRolls?: number[]; lines: string[]; missing: string[] } {
+    const state = engine.getState()!;
+    const targets: AreaSaveTarget[] = [];
+    const lines: string[] = [];
+    const missing: string[] = [];
+    let damageRolled: number | undefined;
+    let damageRolls: number[] | undefined;
+    if (typeof opts.damage === 'string') {
+        const rolled = engine.rollDice(opts.damage, { purpose: `${purpose} damage` });
+        damageRolled = rolled.total;
+        damageRolls = rolled.rolls;
+    } else if (typeof opts.damage === 'number') {
+        damageRolled = opts.damage;
+    }
+    if (!opts.targetIds?.length || (damageRolled === undefined && !opts.savingThrow)) {
+        return { targets, damageRolled, damageRolls, lines, missing };
+    }
+    const halfOnSave = opts.halfDamageOnSave ?? true;
+    const type = opts.damageType?.toLowerCase();
+    const has = (list: string[] | undefined) => !!type && (list ?? []).some(x => x.toLowerCase() === type);
+    for (const targetId of opts.targetIds) {
+        const target = state.participants.find(p => p.id === targetId);
+        if (!target) { missing.push(targetId); lines.push(`⚠️ Target ${targetId} not found in encounter`); continue; }
+        let damageTaken = damageRolled ?? 0;
+        let saved = false;
+        let save: ParticipantSaveResult | undefined;
+        if (opts.savingThrow) {
+            // The sheet's modifier and save proficiency, on the seeded stream.
+            save = rollParticipantSave(engine, getDb(), target, opts.savingThrow.ability, opts.savingThrow.dc, {
+                purpose: `${purpose} save (${toLongAbility(opts.savingThrow.ability) ?? opts.savingThrow.ability})`
+            });
+            saved = save.saved;
+            if (saved) damageTaken = halfOnSave ? Math.floor(damageTaken / 2) : 0;
+        }
+        if (has(target.immunities)) damageTaken = 0;
+        else if (has(target.resistances)) damageTaken = Math.floor(damageTaken / 2);
+        else if (has(target.vulnerabilities)) damageTaken = damageTaken * 2;
+        if (damageTaken > 0) engine.applyDamage(targetId, damageTaken);
+        const after = engine.getState()!.participants.find(p => p.id === targetId);
+        targets.push({
+            targetId, targetName: target.name,
+            saveRoll: save?.natural, saveTotal: save?.total, saved, damageTaken,
+            hpAfter: after?.hp, defeated: after ? after.hp <= 0 : undefined,
+            ...(save?.legendaryResisted ? { legendaryResisted: true } : {}),
+            ...(save?.legendaryResistanceAvailable ? { legendaryResistanceAvailable: save.legendaryResistanceAvailable } : {})
+        });
+        let line = `🎯 ${target.name}`;
+        if (opts.savingThrow && save) {
+            const ability = save.ability.charAt(0).toUpperCase() + save.ability.slice(1);
+            line += ` - ${ability} Save: ${save.natural} + ${save.total - save.natural} = ${save.total} vs DC ${opts.savingThrow.dc}`;
+            line += saved ? ' ✓ SAVED' : ' ✗ FAILED';
+            line += save.legendaryResisted ? ' (legendary resistance)'
+                : save.legendaryResistanceAvailable ? ` (${save.legendaryResistanceAvailable} legendary resistance(s) left)` : '';
+        }
+        line += `\n   Damage: ${damageTaken}${opts.damageType ? ` ${opts.damageType}` : ''}`;
+        if (after) line += `\n   HP: ${after.hp}/${after.maxHp}${after.hp <= 0 ? ' 💀 DEFEATED' : ''}`;
+        lines.push(line);
+    }
+    return { targets, damageRolled, damageRolls, lines, missing };
+}
+
 /**
  * HIGH-006: Execute a lair action on initiative 20
  */
@@ -2844,97 +3138,29 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
     if (!engine.isLairActionPending()) {
         throw new Error('Cannot execute lair action: it is not the lair\'s turn (initiative 20)');
     }
+    // One lair action per round, recorded on the lair owner's token.
+    const owner = state.participants.find(p => p.id === state.lairOwnerId);
+    if (owner && owner.lairUsedRound === state.round) {
+        throw new Error(`Cannot execute lair action: the lair already used its action this round (round ${state.round}); advance_turn`);
+    }
 
     let output = `\n┌─────────────────────────────────────────┐\n`;
     output += `│ 🏰 LAIR ACTION (Initiative 20)\n`;
     output += `└─────────────────────────────────────────┘\n\n`;
     output += `${parsed.actionDescription}\n\n`;
 
-    const results: Array<{
-        targetId: string;
-        targetName: string;
-        saveRoll?: number;
-        saveTotal?: number;
-        saved: boolean;
-        damageTaken: number;
-    }> = [];
-
     // Apply damage to targets if specified
-    if (parsed.targetIds && parsed.targetIds.length > 0 && parsed.damage) {
-        for (const targetId of parsed.targetIds) {
-            const target = state.participants.find(p => p.id === targetId);
-            if (!target) {
-                output += `⚠️ Target ${targetId} not found in encounter\n`;
-                continue;
-            }
-
-            let damageTaken = parsed.damage;
-            let saved = false;
-            let saveRoll: number | undefined;
-            let saveTotal: number | undefined;
-
-            // Handle saving throw if specified
-            if (parsed.savingThrow) {
-                // Roll saving throw on the encounter's seeded stream
-                saveRoll = engine.rollD20({ purpose: `lair save (${parsed.savingThrow.ability})`, forId: targetId });
-                const abilityScore = target.abilityScores?.[parsed.savingThrow.ability] ?? 10;
-                const modifier = Math.floor((abilityScore - 10) / 2);
-                saveTotal = saveRoll + modifier;
-                saved = saveTotal >= parsed.savingThrow.dc;
-
-                if (saved && parsed.halfDamageOnSave) {
-                    damageTaken = Math.floor(parsed.damage / 2);
-                } else if (saved) {
-                    damageTaken = 0;
-                }
-            }
-
-            // Apply damage (considering resistances/immunities/vulnerabilities)
-            const damageType = parsed.damageType?.toLowerCase() || 'untyped';
-            if (target.immunities?.includes(damageType)) {
-                damageTaken = 0;
-            } else if (target.resistances?.includes(damageType)) {
-                damageTaken = Math.floor(damageTaken / 2);
-            } else if (target.vulnerabilities?.includes(damageType)) {
-                damageTaken = damageTaken * 2;
-            }
-
-            // Deal damage via engine
-            if (damageTaken > 0) {
-                engine.applyDamage(targetId, damageTaken);
-            }
-
-            results.push({
-                targetId,
-                targetName: target.name,
-                saveRoll,
-                saveTotal,
-                saved,
-                damageTaken
-            });
-
-            // Format result
-            output += `🎯 ${target.name}`;
-            if (parsed.savingThrow) {
-                const saveAbility = parsed.savingThrow.ability.charAt(0).toUpperCase() + parsed.savingThrow.ability.slice(1);
-                output += ` - ${saveAbility} Save: ${saveRoll} + ${Math.floor(((target.abilityScores?.[parsed.savingThrow.ability] ?? 10) - 10) / 2)} = ${saveTotal} vs DC ${parsed.savingThrow.dc}`;
-                output += saved ? ' ✓ SAVED' : ' ✗ FAILED';
-            }
-            output += `\n`;
-            output += `   Damage: ${damageTaken}${parsed.damageType ? ` ${parsed.damageType}` : ''}\n`;
-
-            const updatedTarget = engine.getState()!.participants.find(p => p.id === targetId);
-            if (updatedTarget) {
-                output += `   HP: ${updatedTarget.hp}/${updatedTarget.maxHp}`;
-                if (updatedTarget.hp <= 0) {
-                    output += ' 💀 DEFEATED';
-                }
-                output += '\n';
-            }
-        }
+    if (parsed.targetIds && parsed.targetIds.length > 0 && parsed.damage !== undefined && parsed.damage !== 0) {
+        const area = resolveAreaSave(engine, {
+            targetIds: parsed.targetIds, damage: parsed.damage, damageType: parsed.damageType,
+            savingThrow: parsed.savingThrow, halfDamageOnSave: parsed.halfDamageOnSave
+        }, 'lair');
+        if (typeof parsed.damage === 'string') output += `🎲 ${parsed.damage}: ${area.damageRolled}\n`;
+        output += area.lines.join('\n') + '\n';
     } else {
         output += `(No mechanical effect - narrative only)\n`;
     }
+    if (owner) owner.lairUsedRound = state.round;
 
     output += `\n→ Call advance_turn to proceed to the next combatant`;
 

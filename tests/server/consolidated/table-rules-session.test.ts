@@ -94,6 +94,11 @@ describe('milestone XP, tiny status, principles at boot', () => {
         expect(miss).toMatch(/not in the matched condition's source\. Nothing was written/);
     });
 
+    it('an ambiguous editConditions match names the candidates', async () => {
+        const text = (await handleCharacterManage({ action: 'update', characterId: 'luciel', editConditions: [{ match: 'e', pinned: true }] }, ctx as any)).content[0].text;
+        expect(text).toMatch(/'e' matches 3 conditions: 'bleeding', 'shaken', 'marked'; use more of the text\. Nothing was written/);
+    });
+
     it('the header strip has no empty segments without a clock', async () => {
         await importDay366();
         const res = (await handleCharacterManage({ action: 'get_status_block', characterId: 'luciel' }, ctx as any)).content[0].text;

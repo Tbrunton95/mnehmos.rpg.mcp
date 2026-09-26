@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { RichFormatter } from '../utils/formatter.js';
 import { getDb } from '../../storage/index.js';
+import { readWorldClock } from '../../engine/world-clock.js';
 import { SessionContext } from '../types.js';
 
 const ACTIONS = ['record', 'search', 'get', 'supersede', 'list'] as const;
@@ -21,7 +22,7 @@ const PrecedentInputSchema = z.object({
     scope: z.string().optional().describe("record: what it covers ('flight', 'Vigil', 'called strikes'). search: filter"),
     tags: z.array(z.string()).optional().describe('record: extra search tags'),
     context: z.string().optional().describe('record: where it came up (scene, fight, session)'),
-    day: z.number().optional().describe('record: in-fiction day, if it matters'),
+    day: z.number().optional().describe('record: in-fiction day (default: the world clock)'),
     query: z.string().optional().describe('search: text found in statement, scope, tags or context'),
     includeSuperseded: z.boolean().optional().describe('search / list: also show superseded precedents'),
     limit: z.number().int().min(1).max(100).optional(),
@@ -62,6 +63,8 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
     const input = PrecedentInputSchema.parse(args);
     const db = pdb();
     const now = new Date().toISOString();
+    // Item 14: an unstamped precedent takes the world day.
+    const day = input.day ?? readWorldClock(db, input.worldId)?.day ?? null;
     const find = (id?: string) => id ? db.prepare('SELECT * FROM precedents WHERE id = ? AND world_id = ?').get(id, input.worldId) as Row | undefined : undefined;
 
     switch (input.action) {
@@ -69,7 +72,7 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
             if (!input.statement || !input.kind) return { error: true, message: "record needs kind ('ruling' | 'invention') and statement" };
             const id = `prec-${randomUUID().slice(0, 8)}`;
             db.prepare('INSERT INTO precedents (id, world_id, kind, statement, scope, tags, context, day, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-                .run(id, input.worldId, input.kind, input.statement, input.scope ?? null, JSON.stringify(input.tags ?? []), input.context ?? null, input.day ?? null, now);
+                .run(id, input.worldId, input.kind, input.statement, input.scope ?? null, JSON.stringify(input.tags ?? []), input.context ?? null, day, now);
             return { success: true, actionType: 'record', precedent: view(find(id)!), message: `${input.kind} recorded: ${input.statement}` };
         }
         case 'search': case 'list': case 'find': {
@@ -95,7 +98,7 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
             if (!input.statement) return { error: true, message: 'supersede needs the new statement' };
             const id = `prec-${randomUUID().slice(0, 8)}`;
             db.prepare('INSERT INTO precedents (id, world_id, kind, statement, scope, tags, context, day, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-                .run(id, input.worldId, input.kind ?? old.kind, input.statement, input.scope ?? old.scope, JSON.stringify(input.tags ?? JSON.parse(old.tags)), input.context ?? null, input.day ?? null, now);
+                .run(id, input.worldId, input.kind ?? old.kind, input.statement, input.scope ?? old.scope, JSON.stringify(input.tags ?? JSON.parse(old.tags)), input.context ?? null, day, now);
             db.prepare('UPDATE precedents SET superseded_by = ? WHERE id = ?').run(id, old.id);
             return { success: true, actionType: 'supersede', replaced: view(find(old.id)!), precedent: view(find(id)!), message: `Superseded: ${old.statement} → ${input.statement}` };
         }

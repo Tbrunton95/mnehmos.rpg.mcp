@@ -242,7 +242,7 @@ type ItemInstance = { id: string; template_id: string; owner_character_id: strin
 // instance BEFORE the gates ran — a refused attach (wrong caliber, missing
 // part, occupied slot) left a row behind. Same law as #58's magazine: a
 // refused action writes nothing. Resolution and minting are now two verbs.
-function resolveInstance(db: ReturnType<typeof getDb>, characterId: string, templateOrInstanceId: string): { instance: ItemInstance | null; templateId: string } | { error: string } {
+export function resolveInstance(db: ReturnType<typeof getDb>, characterId: string, templateOrInstanceId: string): { instance: ItemInstance | null; templateId: string } | { error: string } {
     const asInstance = db.prepare('SELECT * FROM item_instances WHERE id = ?').get(templateOrInstanceId) as ItemInstance | undefined;
     if (asInstance) {
         if (asInstance.owner_character_id !== characterId) return { error: `Instance ${templateOrInstanceId} is not owned by ${characterId}` };
@@ -256,7 +256,16 @@ function resolveInstance(db: ReturnType<typeof getDb>, characterId: string, temp
     return { instance: existing ?? null, templateId: templateOrInstanceId };
 }
 
-function mintInstance(db: ReturnType<typeof getDb>, characterId: string, templateId: string): ItemInstance {
+/** Item 15: the pool on this owner that links the instance, if any. */
+function poolLinking(db: ReturnType<typeof getDb>, characterId: string, instanceId: string): string | null {
+    try {
+        const row = db.prepare('SELECT resource_pools FROM characters WHERE id = ?').get(characterId) as { resource_pools?: string | null } | undefined;
+        const pools = JSON.parse(row?.resource_pools || '{}') as Record<string, { itemInstanceId?: string }>;
+        return Object.entries(pools).find(([, p]) => p?.itemInstanceId === instanceId)?.[0] ?? null;
+    } catch { return null; }
+}
+
+export function mintInstance(db: ReturnType<typeof getDb>, characterId: string, templateId: string): ItemInstance {
     const tpl = db.prepare('SELECT properties FROM items WHERE id = ?').get(templateId) as { properties?: string } | undefined;
     const tplProps = tpl?.properties ? JSON.parse(tpl.properties) : {};
     const now = new Date().toISOString();
@@ -1028,6 +1037,14 @@ const definitions: Record<InventoryAction, ActionDefinition> = {
             if ('error' in resolved) return { error: true, actionType: 'adjust_charges', message: resolved.error };
             const tpl = itemRepo.findById(resolved.templateId);
             if (!tpl) return { error: true, actionType: 'adjust_charges', message: `Item template ${resolved.templateId} not found` };
+            // Item 15: an instance a pool links is the pool's mirror. Two
+            // writers would mean two truths, so the charge lane refuses it.
+            if (resolved.instance) {
+                const linkedPool = poolLinking(db, params.characterId, resolved.instance.id);
+                if (linkedPool) {
+                    return { error: true, actionType: 'adjust_charges', writes: 'none', linkedPool, message: `${tpl.name} mirrors the pool '${linkedPool}': change it with character_manage adjust_pool {characterId: '${params.characterId}', pool: '${linkedPool}', delta | value}. NOTHING was written.` };
+                }
+            }
             const tplProps = (tpl.properties || {}) as Record<string, unknown>;
             const tplBaseline = [tplProps.charges, tplProps.batteryHours, tplProps.uses].find(v => typeof v === 'number') as number | undefined;
             const instance = resolved.instance ?? mintInstance(db, params.characterId, resolved.templateId);

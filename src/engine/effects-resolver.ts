@@ -86,6 +86,8 @@ function resolveMechValue(m: { value?: unknown; valueFromPool?: unknown; valueFr
     return undefined;
 }
 
+const ADVANTAGE_TYPES = new Set(['advantage_on', 'disadvantage_on']);
+
 type RawMech = { type?: string; value?: unknown; condition?: string; autoApply?: boolean; valueFromPool?: unknown; valueFromProficiency?: unknown; hidePool?: boolean; skill?: string; save?: string; damageType?: string; lane?: string; note?: string };
 
 export function loadAutoMechanics(db: Database.Database, targetId: string): AutoMechanic[] {
@@ -102,7 +104,10 @@ export function loadAutoMechanics(db: Database.Database, targetId: string): Auto
             const mechs = JSON.parse(row.mechanics || '[]') as RawMech[];
             for (const m of mechs) {
                 if (!m || m.autoApply !== true || typeof m.type !== 'string') continue;
-                const value = resolveMechValue(m, pools, level);
+                // Wishlist item 10: advantage mechanics carry no number the
+                // resolver sums, so a missing or prose value still loads (as 0).
+                const isAdv = ADVANTAGE_TYPES.has(m.type);
+                const value = resolveMechValue(m, pools, level) ?? (isAdv ? 0 : undefined);
                 if (typeof value !== 'number') continue;
                 // Pool-derived values hide arithmetic UNLESS the row opts out.
                 const hidePool = m.valueFromPool ? m.hidePool !== false : m.hidePool === true;
@@ -129,10 +134,14 @@ export function applyDeclaredEffects(
     wantType: string,
     applied: AutoApplication[],
     domain?: string
-): { total: number; problems: string[] } {
+): { total: number; problems: string[]; advantage: string[]; disadvantage: string[] } {
     let total = 0;
     const problems: string[] = [];
-    if (!refs.length) return { total, problems };
+    // Wishlist item 10: declared advantage_on / disadvantage_on mechanics,
+    // labelled '<effect> (<condition>)'. Additive to the return shape.
+    const advantage: string[] = [];
+    const disadvantage: string[] = [];
+    if (!refs.length) return { total, problems, advantage, disadvantage };
     const pools = readPools(db, targetId);
     const level = readLevel(db, targetId);
     const byName = db.prepare(
@@ -145,6 +154,31 @@ export function applyDeclaredEffects(
         let mechs: RawMech[] = [];
         try { mechs = JSON.parse(row.mechanics || '[]') as RawMech[]; } catch { problems.push(`declared effect "${ref.name}" has malformed mechanics — nothing applied`); continue; }
         let candidates = mechs.filter(m => m && m.type === wantType);
+        // Wishlist item 10: a trait whose only fitting mechanic is advantage_on
+        // or disadvantage_on grants the advantage lane instead of a number. The
+        // same skill/save scope and lane filters apply; the condition stays the
+        // GM's fiction gate and only labels the source.
+        if (candidates.length === 0 && (wantType === 'skill_bonus' || wantType === 'saving_throw_bonus')) {
+            const advMechs = mechs.filter(m => m && ADVANTAGE_TYPES.has(m.type ?? ''));
+            if (advMechs.length) {
+                const scopeKey = (m: RawMech) => wantType === 'skill_bonus' ? m.skill : m.save;
+                let scoped = domain ? advMechs.filter(m => scopeKey(m) === undefined || domainMatch(scopeKey(m), domain)) : advMechs;
+                if (ref.lane) {
+                    const lane = ref.lane.toLowerCase();
+                    scoped = scoped.filter(m => (m.condition ?? '').toLowerCase().includes(lane) || (m.lane ?? '').toLowerCase() === lane);
+                }
+                if (scoped.length === 0) {
+                    const declaredScope = advMechs.map(scopeKey).filter(Boolean).join(' | ') || '(unscoped)';
+                    problems.push(`declared effect "${ref.name}": its advantage is scoped to "${declaredScope}"${ref.lane ? ` or another lane than "${ref.lane}"` : ''}, not "${domain}" — nothing applied`);
+                    continue;
+                }
+                for (const m of scoped) {
+                    const label = m.condition ? `${row.name} (${m.condition})` : row.name;
+                    (m.type === 'advantage_on' ? advantage : disadvantage).push(label);
+                }
+                continue;
+            }
+        }
         // FINDINGS #101: explicit scope keys (skill/save) are honored when the
         // call names its domain — a mechanic scoped to acrobatics refuses a
         // persuasion roll LOUDLY instead of summing silently.
@@ -186,7 +220,7 @@ export function applyDeclaredEffects(
         total += value;
         applied.push({ effect: row.name, type: wantType, value, detail: hidePool ? (m.condition ?? undefined) : (m.condition ?? undefined), declared: true });
     }
-    return { total, problems };
+    return { total, problems, advantage, disadvantage };
 }
 
 function domainMatch(condition: string | undefined, domain: string | undefined): boolean {
@@ -241,6 +275,21 @@ export function autoSaveBonus(mechs: AutoMechanic[], ability: string | undefined
         }
     }
     return total;
+}
+
+/** Wishlist item 10: autoApply advantage_on / disadvantage_on mechanics for a
+ *  save (scoped by `save`) or a skill (scoped by `skill`), falling back to
+ *  `condition` as the domain filter. Pushes the effect names into out. */
+export function autoAdvantage(
+    mechs: AutoMechanic[], kind: 'save' | 'skill', domain: string | undefined, out: { adv: string[]; dis: string[] }
+): void {
+    for (const m of mechs.filter(m => ADVANTAGE_TYPES.has(m.type))) {
+        // Scoped to the other kind of roll (a skill on a save, or a save on a skill check)
+        if ((kind === 'save' ? m.skill : m.save) !== undefined) continue;
+        const key = (kind === 'save' ? m.save : m.skill) ?? m.condition;
+        if (!domainMatch(key, domain)) continue;
+        (m.type === 'advantage_on' ? out.adv : out.dis).push(m.effectName);
+    }
 }
 
 /** Sum of autoApply skill_bonus mechanics (condition = skill filter). */

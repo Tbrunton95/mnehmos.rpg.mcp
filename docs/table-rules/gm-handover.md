@@ -64,20 +64,43 @@ When several steps must land together, send them as one `batch_manage execute_se
 | --- | --- |
 | Session start | `session_manage boot {worldId}` |
 | The table rolled dice | `combat_action attack {..., outcome, damage}` |
-| Strike at a joint of a peer | add `calledStrike: 'leg' \| 'arm'` and `atPart` |
+| Strike at a joint of a peer | add `calledStrike: 'leg' \| 'arm' \| '<any part it has>'` and `atPart` |
+| Swing a named attack | add `using: 'grown blade'` (or `weapon`); it fills bonus, damage, type and the part that swings |
+| Say what a part wields | `combat_manage set_part {part, state, holds: ['whip']}` |
+| Armour a chain, shield or plate | `combat_manage set_part {part, state, ac, hp? \| breakAt?}`, then attack with `atPart`: it hits the part, not the body; a break severs it |
 | Prepared weapon fires on its trigger | add `preparedAsset: 'prepared-anti-armour'` |
 | A head, limb or plate changes state | `combat_manage set_part {part, state}` |
+| A monster's full statline | `combat_manage create` / `add_participant` with `size`, `reach`, `attacksPerAction`, `attacks`, `abilities`, `legendaryActions`, `legendaryResistances`, `hasLairActions`, `cr` |
+| Save a monster to the world's bestiary | `table_rules define {worldId, kind: 'creature', name, spec}` (or `fromToken {encounterId, participantId}` / `fromCharacterId`) |
+| Spawn from the bestiary | `combat_manage spawn_quick_enemy {creature, count, worldId}` or `add_participant {encounterId, creature, count}` |
+| A recurring monster's statline, once | `character_manage update {characterId, ...}` with the same fields; tokens joined by id start with it |
+| Multiattack | `attacksPerAction: N` on the statline, then one `combat_action attack` per swing (`attack 1/2`, `2/2`) |
+| A legendary action off its turn | attack with `legendaryCost: N`; otherwise `combat_manage legendary_action {participantId, cost?, description}` |
+| Breath weapon or other limited ability | `combat_manage use_ability {participantId, ability, targetIds, damage: '12d6', damageType, savingThrow: {ability, dc}}`; recharge rolls itself at its turn start |
+| Lair action | `combat_manage lair_action {actionDescription, targetIds?, damage?: number \| dice, savingThrow?}` on the LAIR slot, once per round |
+| How hard is this fight? | `combat_manage budget {partyLevels \| partyId, creatures: [{creature, count}] \| encounterId}` (read-only) |
+| Spend a legendary resistance by hand | `combat_manage legendary_resistance {participantId, reason}` |
+| Opportunity attack or readied swing | NPC opportunity attacks roll on the move; a PC's comes back in `opportunityAttacksAvailable` with the call to make (`reaction: true` on the attack) |
+| Ready an attack that fires itself | `combat_action ready {readiedAction, trigger, on: 'enters_reach' \| 'leaves_reach', watch, attack: {using?}}`; free-text readied actions fire with `combat_manage trigger_readied {participantId, targetId?}` (spends the reaction, rolls a stored attack) |
+| Grab, pin, throw or finish unarmed | `combat_action grapple {encounterId, actorId, targetId, move}` (one attack; band and size disadvantage are automatic); `control: true` pins; `move: 'execute'` finishes a pinned lower-band foe; `move: 'break'` escapes the holder named in targetId |
+| A saving throw, with advantage from a condition or feature | `math_manage roll_saving_throw {characterId, ability, dc, advantageSources: ['VAUREK']}` (logged as `wis save (adv: VAUREK)`) |
+| A boss burns legendary resistance on failed saves by itself | add `autoLegendaryResistance: true` to its statline; without it, a failed save reports how many are left |
 | Squad fires / is suppressed | `combat_action volley`; `combat_manage set_unit` |
 | Cut through a packed lower-band squad | add `cleave: true` |
 | Enemy telegraphs | `combat_manage set_intent`; readied actions then `trigger_readied` |
 | HP is wrong | `combat_manage adjust_hp {value \| delta, reason}` |
-| Conditions mid-fight | `combat_manage add_condition` / `remove_condition` |
+| Conditions mid-fight | `combat_manage add_condition {condition \| name}` / `remove_condition {condition \| name \| conditionId}`; standard conditions set adv/dis/auto-crit themselves (`ranged`, `ignoreConditions` on attacks) |
+| Just the condition names | `character_manage get {characterId, fields: ['conditionNames']}` (or `fields: ['conditions.name', 'conditions.pinned']`) |
+| A plot thread grew too long | `narrative_manage archive {noteId, keepLast?: 2, preview?}` (older sections move to an archived note) |
+| House-format status block with a footer | `table_rules define {kind: 'status_block', name: 'tiny-status', spec: {conditionLayout: 'line', showMore: false, showLocation: false, showObjective: false, footer: ['knows:vaurek', 'scene.place', 'scene.pull']}}` |
 | Turn prose into a feature | `improvisation_manage feature_from_condition` / `edit_effect` |
 | A ruling or an invention | `precedent_manage record` / `search` |
 | Who knows a secret | `knowledge_manage record` / `learn` / `can_know` |
 | Debts and deferred prices | `ledger_manage create` |
 | Souls taken or spent | `character_manage adjust_pool {characterId, pool: 'souls', delta, reason}` |
+| A counter shown at boot (uses left, linked token) | `character_manage adjust_pool {characterId, pool, value, max, label, show: true, linkItem?}`, then `delta: -1` |
 | Souls owed to a god | `ledger_manage create {worldId, debtor, creditor, amount, currency: 'souls', dueDay, consequence}` |
-| Time passes | `world_manage update {worldId, environment}` |
+| Time passes | `world_manage advance {worldId, hours}` (or `minutes`, `days`); set the clock once with `world_manage update {worldId, environment: {day, time}}` |
+| Clocks and debts the clock reached | `character_manage process_scheduled {worldId}`, `ledger_manage process_due {worldId}` (no day needed) |
 | Did a timed-out call apply? | `session_manage op_status {forOpId}` |
 | Check a past roll | `session_manage rolls {forId \| encounterId \| forOpId}` |

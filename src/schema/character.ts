@@ -1,4 +1,4 @@
-import { PartSchema } from './token-extras.js';
+import { PartSchema, SizeCategorySchema, AttackProfileSchema, AbilitySchema } from './token-extras.js';
 import { z } from 'zod';
 import { CharacterTypeSchema } from './party.js';
 import {
@@ -45,6 +45,36 @@ export const CharacterOriginSchema = z.object({
 
 export type CharacterOrigin = z.infer<typeof CharacterOriginSchema>;
 
+/**
+ * One resource pool (item 15: counters). Every field is declared: a plain
+ * z.object strips what it does not name, and the adjust_pool history used to
+ * vanish on the next read that way (FINDINGS #111). A factory, so each schema
+ * that embeds a pool gets its own instance (an outer tool schema that reuses
+ * one zod instance twice publishes a $ref).
+ */
+export function resourcePoolSchema() {
+    return z.object({
+        current: z.number(),
+        max: z.number(),
+        lastRefilledAt: z.string().optional(),
+        label: z.string().optional().describe('Display name for the counter ("An\'ggrath\'s calls"); the key stays the id'),
+        note: z.string().optional().describe('What the counter is, or to whom it is owed'),
+        show: z.boolean().optional().describe('Show it in the boot digest and the status block'),
+        itemInstanceId: z.string().optional().describe('Linked item instance: the pool is authoritative and its charges mirror the pool'),
+        history: z.array(z.object({
+            at: z.string().optional(),
+            from: z.number().optional(),
+            to: z.number().optional(),
+            delta: z.number().optional(),
+            set: z.number().optional(),
+            reason: z.string().optional(),
+            witnesses: z.array(z.string()).optional(),
+        })).optional().describe('Last 20 moves that carried a reason or witnesses'),
+    });
+}
+
+export type ResourcePool = z.infer<ReturnType<typeof resourcePoolSchema>>;
+
 export const CharacterSchema = z.object({
     id: z.string(),
     name: z.string()
@@ -76,6 +106,17 @@ export const CharacterSchema = z.object({
     band: z.string().optional(),
     regeneration: z.number().int().min(0).optional(),
     parts: z.array(PartSchema).optional(),
+
+    // Combat profile: what a token made from this sheet starts with (size,
+    // reach, multiattack, named attacks, limited abilities, CR, automatic
+    // legendary resistance). Stored together in the combat_profile column.
+    size: SizeCategorySchema.optional(),
+    reach: z.number().int().min(0).optional(),
+    attacksPerAction: z.number().int().min(1).optional(),
+    attacks: z.array(AttackProfileSchema).optional(),
+    abilities: z.array(AbilitySchema).optional(),
+    cr: z.number().min(0).optional(),
+    autoLegendaryResistance: z.boolean().optional(),
 
     // Spellcasting fields (CRIT-002/006)
     // Flexible character class - allows any string (standard D&D classes or custom like "Chronomancer")
@@ -132,11 +173,7 @@ export const CharacterSchema = z.object({
     // §10.3 forward-compat: generalized resource pools.
     // Operator's attentional_capacity lives here (resourcePools.attentional_capacity).
     // Backwards-compatible — existing 5e characters keep spellSlots untouched.
-    resourcePools: z.record(z.string(), z.object({
-        current: z.number(),
-        max: z.number(),
-        lastRefilledAt: z.string().optional(),
-    })).optional().default({}),
+    resourcePools: z.record(z.string(), resourcePoolSchema()).optional().default({}),
 
     // Skill and Save Proficiencies — free strings by design: skill LISTS are
     // theme data (5e's eighteen, Cyberpunk's, WoD's...), not engine rules.

@@ -173,7 +173,8 @@ export class EncounterRepository {
         const lairOwner = participants.find((p: any) => p.hasLairActions);
         if (lairOwner) {
             // Insert LAIR at initiative 20 position
-            const lairIndex = sortedParticipants.findIndex((p: any) => (p.initiative ?? 0) <= 20);
+            // The lair loses ties: a creature that rolled 20 acts first.
+            const lairIndex = sortedParticipants.findIndex((p: any) => (p.initiative ?? 0) < 20);
             if (lairIndex === -1) {
                 turnOrder.push('LAIR');
             } else {

@@ -80,6 +80,22 @@ describe('combat HP write-through', () => {
         expect(repo.findById(heroId)!.hp).toBe(43);
     });
 
+    it('lair dice damage is rolled once and written through too', async () => {
+        const encounterId = await encounterAtLairTurn();
+        await handleExecuteLairAction({
+            encounterId,
+            actionDescription: 'Magma erupts',
+            targetIds: [heroId],
+            damage: '2d6',
+            damageType: 'fire'
+        }, mockCtx as any);
+        const hp = repo.findById(heroId)!.hp;
+        expect(hp).toBeGreaterThanOrEqual(38);
+        expect(hp).toBeLessThanOrEqual(48);
+        const state = extractStateJson((await handleGetEncounterState({ encounterId }, mockCtx as any)).content[0].text);
+        expect(state.participants.find((p: any) => p.id === heroId).hp).toBe(hp);
+    });
+
     it('does not overwrite an HP change made through character_manage between combat calls', async () => {
         const encounterId = await encounterAtLairTurn();
 
