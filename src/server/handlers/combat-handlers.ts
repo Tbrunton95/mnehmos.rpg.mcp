@@ -788,6 +788,8 @@ Examples:
             unaffectedLimb: z.boolean().optional().describe('The attacker uses a limb its crippling condition does not touch (skips that disadvantage)'),
             withPart: z.string().optional().describe("The attacker's named part used ('middle head'): crippled = disadvantage; dead or latched = refused"),
             atPart: z.string().optional().describe('The target part aimed at: breached = advantage; a called strike cripples this part'),
+            ranged: z.boolean().optional().describe('A ranged attack (not within 5 ft): a prone target is disadvantage and paralysed/unconscious no auto-crit. Unset = from token positions, else melee'),
+            ignoreConditions: z.boolean().optional().describe('Skip the automatic advantage/disadvantage/auto-crit from standard conditions (raw roll)'),
             cleave: z.boolean().optional().describe('Cleave through a packed unit of a lower band: damage flows through models instead of stopping at one'),
             volley: z.object({ dice: z.string(), reason: z.string() }).optional().describe('Internal: set by combat_action volley'),
             declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit trail: printed in output, never re-applied'),
@@ -1645,7 +1647,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             damageLaneLabel,
             outcome,
             parsed.unaffectedLimb,
-            { withPart: parsed.withPart, atPart: parsed.atPart, uncapped: !!(parsed.cleave || parsed.volley) }
+            { withPart: parsed.withPart, atPart: parsed.atPart, uncapped: !!(parsed.cleave || parsed.volley), ranged: parsed.ranged, ignoreConditions: parsed.ignoreConditions }
         );
 
         // Sync HP to character database after attack
@@ -1976,7 +1978,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                         // Calculate movement cost (5ft per step)
                         // path includes start node, so steps = length - 1
                         const moveCost = (path.length - 1) * 5;
-                        const currentMovement = (actor as any).movementRemaining ?? 30; // Default 30 if undefined
+                        // A condition added mid-turn (grappled, exhaustion 2) caps what is left.
+                        const speedCap = engine.effectiveSpeed(updatedActor) * (updatedActor.hasDashed ? 2 : 1);
+                        const currentMovement = Math.min((actor as any).movementRemaining ?? 30, speedCap); // Default 30 if undefined
 
                         if (currentMovement < moveCost) {
                             output = opportunityAttackOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, `Insufficient movement (Cost: ${moveCost}ft, Remaining: ${currentMovement}ft)`);

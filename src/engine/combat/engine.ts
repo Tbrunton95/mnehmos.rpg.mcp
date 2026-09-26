@@ -1,6 +1,6 @@
 import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile } from '../../schema/token-extras.js';
 import { CombatRNG, CheckResult } from './rng.js';
-import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS } from './conditions.js';
+import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS, conditionAttackModifiers, conditionSpeedFactor } from './conditions.js';
 
 import { SizeCategory, GridBounds } from '../../schema/encounter.js';
 
@@ -697,7 +697,9 @@ export class CombatEngine {
         unaffectedLimb?: boolean,
         // Named parts: the attacker's part used and the target part aimed at;
         // uncapped lifts the one-model cap on unit targets (cleave, volleys).
-        partOpts?: { withPart?: string; atPart?: string; uncapped?: boolean }
+        // ranged says the attack is not made within 5 ft (prone, auto-crit);
+        // ignoreConditions skips the standard-condition modifiers entirely.
+        partOpts?: { withPart?: string; atPart?: string; uncapped?: boolean; ranged?: boolean; ignoreConditions?: boolean }
     ): CombatActionResult {
         if (!this.state) throw new Error('No active combat');
 
@@ -754,6 +756,19 @@ export class CombatEngine {
             situational.push(`${hampering.map(c => c.type).join(', ')} (disadvantage)`);
         }
 
+        // The 5e standard conditions on both sides (allow-list only; homebrew
+        // tags never fire). Within 5 ft comes from the grid when both tokens
+        // are placed, else it is assumed unless the attack is ranged.
+        let autoCrit: string | undefined;
+        if (!partOpts?.ignoreConditions) {
+            const within5ft = partOpts?.ranged ? false
+                : (actor.position && target.position ? this.isAdjacent(actor.position, target.position) : true);
+            const mods = conditionAttackModifiers(actor, target, { within5ft, participants: this.state.participants });
+            if (mods.adv.length) { advantage = true; situational.push(...mods.adv); }
+            if (mods.dis.length) { disadvantage = true; situational.push(...mods.dis); }
+            autoCrit = mods.autoCrit;
+        }
+
         // Roll with full transparency — 5e semantics (Findings #32):
         // crit reads the natural die, never the margin.
         const attackRoll: CheckResult & { allRolls: number[]; resolved?: 'hit' | 'crit' | 'miss' } = resolved
@@ -766,6 +781,17 @@ export class CombatEngine {
                 allRolls: [], resolved
             }
             : this.tagged({ purpose: 'attack', forId: actorId, targetId }, () => this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage));
+        // Paralyzed or unconscious within 5 ft: a rolled hit is a crit. A
+        // GM-posted result lands exactly as posted, with a pointer instead.
+        if (autoCrit && attackRoll.isHit && !attackRoll.isCrit) {
+            if (resolved) {
+                situational.push(`${autoCrit} (posted as ${resolved}; post outcome:crit if so)`);
+            } else {
+                attackRoll.isCrit = true;
+                attackRoll.degree = 'critical-success';
+                situational.push(autoCrit);
+            }
+        }
 
         let damageDealt = 0;
         let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
@@ -1223,7 +1249,7 @@ export class CombatEngine {
 
     /**
      * Base speed after conditions whose metadata carries a speedFactor (a
-     * crippled leg halves it).
+     * crippled leg halves it) and the standard conditions' own speed.
      */
     effectiveSpeed(participant: CombatParticipant): number {
         // Held by another creature's latched part: it cannot move away.
@@ -1235,6 +1261,9 @@ export class CombatEngine {
         }, 1);
         // A crippled leg or wing halves speed (once, however many).
         if (participant.parts?.some(pt => pt.state === 'crippled' && (pt.kind === 'leg' || pt.kind === 'wing'))) factor *= 0.5;
+        // Standard conditions: grappled, restrained, stunned... root the
+        // creature; exhaustion 2 halves speed and 5 stops it.
+        factor *= conditionSpeedFactor(participant.conditions);
         return Math.floor(base * factor);
     }
 

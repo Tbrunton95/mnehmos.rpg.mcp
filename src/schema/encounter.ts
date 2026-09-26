@@ -42,7 +42,8 @@ export const ConditionInputSchema = z.union([
         source: z.string().optional(),
         sourceId: z.string().optional(),
         saveDC: z.number().optional().describe('Required with durationType save_ends'),
-        saveAbility: z.string().optional().describe('Ability name or abbreviation (con); required with durationType save_ends')
+        saveAbility: z.string().optional().describe('Ability name or abbreviation (con); required with durationType save_ends'),
+        level: z.number().int().min(1).max(6).optional().describe('Exhaustion level 1-6 (2 halves speed, 3+ disadvantage on attacks and saves, 5 speed 0)')
     }).strict().superRefine((c, ctx) => {
         if (!(c.type || c.name || '').trim()) {
             ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'condition object needs a name or type' });
