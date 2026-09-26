@@ -13,6 +13,7 @@
 import type Database from 'better-sqlite3';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import type { CombatEngine, CombatParticipant } from './engine.js';
+import { exhaustionLevel } from './conditions.js';
 
 export type AbilityLong = 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
 export type AbilityShort = 'str' | 'dex' | 'con' | 'int' | 'wis' | 'cha';
@@ -104,7 +105,7 @@ export function saveSourceFor(db: Database.Database | undefined, p: CombatPartic
 /**
  * Roll one participant's save on the encounter stream. Advantage and
  * disadvantage roll two dice and cancel when both are set; named sources go
- * into the roll's purpose. On a failed save a creature set to
+ * into the roll's purpose. Exhaustion 3 or more adds its own disadvantage. On a failed save a creature set to
  * autoLegendaryResistance spends one and succeeds; otherwise the remaining
  * count is reported so the GM can choose.
  */
@@ -119,7 +120,10 @@ export function rollParticipantSave(
     const long = toLongAbility(ability) ?? 'dexterity';
     const m = saveModifier(saveSourceFor(db, participant), long);
     const advSources = opts.advSources ?? [];
-    const disSources = opts.disSources ?? [];
+    const disSources = [...(opts.disSources ?? [])];
+    // Exhaustion 3 or more hampers saves as it does attacks (conditions.ts).
+    const exhaustion = exhaustionLevel(participant.conditions ?? []);
+    if (exhaustion >= 3) disSources.push(`exhaustion ${exhaustion}`);
     const adv = !!opts.advantage || advSources.length > 0;
     const dis = !!opts.disadvantage || disSources.length > 0;
     const tags: string[] = [];

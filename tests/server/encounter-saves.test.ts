@@ -146,6 +146,19 @@ describe('spell saves inside an encounter', () => {
         expect(charRepo.findById('wyrm')!.legendaryResistancesRemaining).toBe(2);
     });
 
+    it('exhaustion 3 or more rolls the save at disadvantage and says why', async () => {
+        const { encounterId, result } = await fireballAt({ id: 'ogre', name: 'Ogre', conditions: [{ name: 'exhaustion', level: 3 }] });
+        expect(result.saves[0].rolls).toHaveLength(2);
+        expect(result.saves[0].natural).toBe(Math.min(...result.saves[0].rolls));
+        const logged = queryRolls(getDb(), { encounterId, limit: 20 }).filter((r: any) => String(r.purpose).includes('dexterity save'));
+        expect(String((logged[0] as any).purpose)).toContain('exhaustion 3');
+    });
+
+    it('exhaustion below 3 leaves the save alone', async () => {
+        const { result } = await fireballAt({ id: 'ogre', name: 'Ogre', conditions: [{ name: 'exhaustion', level: 2 }] });
+        expect(result.saves[0].rolls).toHaveLength(1);
+    });
+
     it('reports an unspent legendary resistance on a failed save otherwise', async () => {
         vi.spyOn(CombatEngine.prototype, 'rollD20').mockReturnValue(1);
         const { result } = await fireballAt({ id: 'dragon', name: 'Dragon', legendaryResistances: 3 });
