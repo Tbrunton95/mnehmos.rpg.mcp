@@ -198,6 +198,7 @@ function buildStateJson(state: CombatState, encounterId: string, sessionId?: str
             attackDamage: p.attackDamage,
             attackBonus: p.attackBonus,
             ...(p.attacks?.length ? { attacks: p.attacks } : {}),
+            ...(p.abilities?.length ? { abilities: p.abilities } : {}),
             ...((p.attacksPerAction ?? 1) > 1 ? { attacksPerAction: p.attacksPerAction, attacksMade: p.attacksMade ?? 0 } : {}),
             ...(p.legendaryActions ? { legendaryActions: p.legendaryActions, legendaryActionsRemaining: p.legendaryActionsRemaining ?? 0 } : {}),
             ...(p.legendaryResistances ? { legendaryResistances: p.legendaryResistances, legendaryResistancesRemaining: p.legendaryResistancesRemaining ?? 0 } : {}),
@@ -228,11 +229,13 @@ function formatCombatStateText(state: CombatState): string {
     );
 
     const isEnemy = currentParticipant?.isEnemy ?? false;
+    const lairUp = state.turnOrder[state.currentTurnIndex] === 'LAIR';
+    const lairOwner = state.participants.find(p => p.id === state.lairOwnerId);
 
     // Header with round info
-    const turnIcon = isEnemy ? '👹' : '⚔️';
+    const turnIcon = lairUp ? '🏰' : isEnemy ? '👹' : '⚔️';
     let output = `\n┌─────────────────────────────────────────┐\n`;
-    output += `│ ${turnIcon} ROUND ${state.round} — ${currentParticipant?.name}'s Turn\n`;
+    output += `│ ${turnIcon} ROUND ${state.round} — ${lairUp ? 'LAIR (initiative 20)' : `${currentParticipant?.name}'s Turn`}\n`;
     output += `└─────────────────────────────────────────┘\n\n`;
 
     // Initiative order with clear formatting
@@ -240,6 +243,11 @@ function formatCombatStateText(state: CombatState): string {
     output += `───────────────────────────────────────────\n`;
     
     state.turnOrder.forEach((id: string, index: number) => {
+        if (id === 'LAIR') {
+            const used = lairOwner?.lairUsedRound === state.round;
+            output += `${index === state.currentTurnIndex ? '▶' : ' '} 🏰 ${'LAIR (init 20)'.padEnd(18)} ${lairOwner ? `owner: ${lairOwner.name}` : ''}${lairOwner && lairOwner.hp <= 0 ? ' (dead: skipped)' : used ? ' (used this round)' : ''}\n`;
+            return;
+        }
         const p = state.participants.find((part) => part.id === id);
         if (!p) return;
 
@@ -259,6 +267,7 @@ function formatCombatStateText(state: CombatState): string {
             (p.attacksPerAction ?? 1) > 1 ? `attacks ${p.attacksMade ?? 0}/${p.attacksPerAction}` : ''
         ].filter(Boolean);
         if (counters.length) output += `      👑 ${counters.join(' · ')}\n`;
+        if (p.abilities?.length) output += `      ✴ abilities: ${p.abilities.map(a => `${a.name}${a.recharge ? ` (recharge ${a.recharge}${a.recharge < 6 ? '-6' : ''})` : ''}${a.ready === false ? ' SPENT' : ''}`).join(', ')}\n`;
         if (p.attacks?.length) output += `      🗡 attacks: ${p.attacks.map(a => `${a.name} ${a.attackBonus >= 0 ? '+' : ''}${a.attackBonus}`).join(', ')}\n`;
         // Hurt parts, and armoured ones (own ac, hp or breakAt) even when intact.
         const hurt = (p.parts ?? []).filter(pt => pt.state !== 'intact' || pt.ac !== undefined || pt.hp !== undefined || pt.breakAt !== undefined);
@@ -280,7 +289,11 @@ function formatCombatStateText(state: CombatState): string {
         .map(p => `${p.name} (${p.id})`);
 
     // Action guidance
-    if (isEnemy && currentParticipant && currentParticipant.hp > 0) {
+    if (lairUp) {
+        output += lairOwner?.lairUsedRound === state.round
+            ? `🏰 LAIR ACTION USED this round → call advance_turn\n`
+            : `🏰 LAIR ACTION PENDING → combat_manage lair_action {encounterId, actionDescription, targetIds?, damage?, savingThrow?}, then advance\n`;
+    } else if (isEnemy && currentParticipant && currentParticipant.hp > 0) {
         output += `⚡ ENEMY TURN\n`;
         output += `   Available targets: ${validPlayerTargets.join(', ') || 'None'}\n`;
         output += `   → Execute attack, then call advance_turn\n`;
@@ -912,7 +925,7 @@ Examples:
             encounterId: z.string().describe('The ID of the encounter'),
             actionDescription: z.string().describe('Description of the lair action'),
             targetIds: z.array(z.string()).optional().describe('IDs of affected participants (optional)'),
-            damage: z.number().int().min(0).optional().describe('Damage dealt by the lair action'),
+            damage: z.union([z.number().int().min(0), z.string().min(1)]).optional().describe("Damage dealt by the lair action: a number or dice ('2d10'), rolled once on the encounter's dice"),
             damageType: z.string().optional().describe('Type of damage (fire, cold, etc.)'),
             savingThrow: z.object({
                 ability: z.enum(['strength', 'dexterity', 'constitution', 'intelligence', 'wisdom', 'charisma']),
@@ -3012,6 +3025,95 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
     };
 }
 
+export interface AreaSaveOptions {
+    targetIds?: string[];
+    /** Flat damage, or dice ('8d6') rolled once for every target on the encounter stream. */
+    damage?: number | string;
+    damageType?: string;
+    savingThrow?: { ability: string; dc: number };
+    halfDamageOnSave?: boolean;
+}
+
+export interface AreaSaveTarget {
+    targetId: string;
+    targetName: string;
+    saveRoll?: number;
+    saveTotal?: number;
+    saved: boolean;
+    damageTaken: number;
+    hpAfter?: number;
+    defeated?: boolean;
+    legendaryResisted?: boolean;
+    legendaryResistanceAvailable?: number;
+}
+
+/**
+ * One effect on many targets, each with its own save: lair actions and
+ * limited abilities (a breath weapon) share it. Dice damage is rolled once,
+ * as 5e rolls a breath weapon once; every die and save goes through the
+ * engine so it is seeded and reaches roll_log. The caller saves the state.
+ */
+export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, purpose: string): { targets: AreaSaveTarget[]; damageRolled?: number; damageRolls?: number[]; lines: string[]; missing: string[] } {
+    const state = engine.getState()!;
+    const targets: AreaSaveTarget[] = [];
+    const lines: string[] = [];
+    const missing: string[] = [];
+    let damageRolled: number | undefined;
+    let damageRolls: number[] | undefined;
+    if (typeof opts.damage === 'string') {
+        const rolled = engine.rollDice(opts.damage, { purpose: `${purpose} damage` });
+        damageRolled = rolled.total;
+        damageRolls = rolled.rolls;
+    } else if (typeof opts.damage === 'number') {
+        damageRolled = opts.damage;
+    }
+    if (!opts.targetIds?.length || (damageRolled === undefined && !opts.savingThrow)) {
+        return { targets, damageRolled, damageRolls, lines, missing };
+    }
+    const halfOnSave = opts.halfDamageOnSave ?? true;
+    const type = opts.damageType?.toLowerCase();
+    const has = (list: string[] | undefined) => !!type && (list ?? []).some(x => x.toLowerCase() === type);
+    for (const targetId of opts.targetIds) {
+        const target = state.participants.find(p => p.id === targetId);
+        if (!target) { missing.push(targetId); lines.push(`⚠️ Target ${targetId} not found in encounter`); continue; }
+        let damageTaken = damageRolled ?? 0;
+        let saved = false;
+        let save: ParticipantSaveResult | undefined;
+        if (opts.savingThrow) {
+            // The sheet's modifier and save proficiency, on the seeded stream.
+            save = rollParticipantSave(engine, getDb(), target, opts.savingThrow.ability, opts.savingThrow.dc, {
+                purpose: `${purpose} save (${toLongAbility(opts.savingThrow.ability) ?? opts.savingThrow.ability})`
+            });
+            saved = save.saved;
+            if (saved) damageTaken = halfOnSave ? Math.floor(damageTaken / 2) : 0;
+        }
+        if (has(target.immunities)) damageTaken = 0;
+        else if (has(target.resistances)) damageTaken = Math.floor(damageTaken / 2);
+        else if (has(target.vulnerabilities)) damageTaken = damageTaken * 2;
+        if (damageTaken > 0) engine.applyDamage(targetId, damageTaken);
+        const after = engine.getState()!.participants.find(p => p.id === targetId);
+        targets.push({
+            targetId, targetName: target.name,
+            saveRoll: save?.natural, saveTotal: save?.total, saved, damageTaken,
+            hpAfter: after?.hp, defeated: after ? after.hp <= 0 : undefined,
+            ...(save?.legendaryResisted ? { legendaryResisted: true } : {}),
+            ...(save?.legendaryResistanceAvailable ? { legendaryResistanceAvailable: save.legendaryResistanceAvailable } : {})
+        });
+        let line = `🎯 ${target.name}`;
+        if (opts.savingThrow && save) {
+            const ability = save.ability.charAt(0).toUpperCase() + save.ability.slice(1);
+            line += ` - ${ability} Save: ${save.natural} + ${save.total - save.natural} = ${save.total} vs DC ${opts.savingThrow.dc}`;
+            line += saved ? ' ✓ SAVED' : ' ✗ FAILED';
+            line += save.legendaryResisted ? ' (legendary resistance)'
+                : save.legendaryResistanceAvailable ? ` (${save.legendaryResistanceAvailable} legendary resistance(s) left)` : '';
+        }
+        line += `\n   Damage: ${damageTaken}${opts.damageType ? ` ${opts.damageType}` : ''}`;
+        if (after) line += `\n   HP: ${after.hp}/${after.maxHp}${after.hp <= 0 ? ' 💀 DEFEATED' : ''}`;
+        lines.push(line);
+    }
+    return { targets, damageRolled, damageRolls, lines, missing };
+}
+
 /**
  * HIGH-006: Execute a lair action on initiative 20
  */
@@ -3034,103 +3136,29 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
     if (!engine.isLairActionPending()) {
         throw new Error('Cannot execute lair action: it is not the lair\'s turn (initiative 20)');
     }
+    // One lair action per round, recorded on the lair owner's token.
+    const owner = state.participants.find(p => p.id === state.lairOwnerId);
+    if (owner && owner.lairUsedRound === state.round) {
+        throw new Error(`Cannot execute lair action: the lair already used its action this round (round ${state.round}); advance_turn`);
+    }
 
     let output = `\n┌─────────────────────────────────────────┐\n`;
     output += `│ 🏰 LAIR ACTION (Initiative 20)\n`;
     output += `└─────────────────────────────────────────┘\n\n`;
     output += `${parsed.actionDescription}\n\n`;
 
-    const results: Array<{
-        targetId: string;
-        targetName: string;
-        saveRoll?: number;
-        saveTotal?: number;
-        saved: boolean;
-        damageTaken: number;
-    }> = [];
-
     // Apply damage to targets if specified
-    if (parsed.targetIds && parsed.targetIds.length > 0 && parsed.damage) {
-        for (const targetId of parsed.targetIds) {
-            const target = state.participants.find(p => p.id === targetId);
-            if (!target) {
-                output += `⚠️ Target ${targetId} not found in encounter\n`;
-                continue;
-            }
-
-            let damageTaken = parsed.damage;
-            let saved = false;
-            let saveRoll: number | undefined;
-            let saveTotal: number | undefined;
-            let saveNote = '';
-
-            // Handle saving throw if specified
-            if (parsed.savingThrow) {
-                // Roll on the encounter's seeded stream with the sheet's
-                // modifier and save proficiency.
-                const save = rollParticipantSave(engine, getDb(), target, parsed.savingThrow.ability, parsed.savingThrow.dc, {
-                    purpose: `lair save (${parsed.savingThrow.ability})`
-                });
-                saveRoll = save.natural;
-                saveTotal = save.total;
-                saved = save.saved;
-                saveNote = save.legendaryResisted ? ' (legendary resistance)'
-                    : save.legendaryResistanceAvailable ? ` (${save.legendaryResistanceAvailable} legendary resistance(s) left)` : '';
-
-                if (saved && parsed.halfDamageOnSave) {
-                    damageTaken = Math.floor(parsed.damage / 2);
-                } else if (saved) {
-                    damageTaken = 0;
-                }
-            }
-
-            // Apply damage (considering resistances/immunities/vulnerabilities)
-            const damageType = parsed.damageType?.toLowerCase() || 'untyped';
-            if (target.immunities?.includes(damageType)) {
-                damageTaken = 0;
-            } else if (target.resistances?.includes(damageType)) {
-                damageTaken = Math.floor(damageTaken / 2);
-            } else if (target.vulnerabilities?.includes(damageType)) {
-                damageTaken = damageTaken * 2;
-            }
-
-            // Deal damage via engine
-            if (damageTaken > 0) {
-                engine.applyDamage(targetId, damageTaken);
-            }
-
-            results.push({
-                targetId,
-                targetName: target.name,
-                saveRoll,
-                saveTotal,
-                saved,
-                damageTaken
-            });
-
-            // Format result
-            output += `🎯 ${target.name}`;
-            if (parsed.savingThrow) {
-                const saveAbility = parsed.savingThrow.ability.charAt(0).toUpperCase() + parsed.savingThrow.ability.slice(1);
-                output += ` - ${saveAbility} Save: ${saveRoll} + ${(saveTotal ?? 0) - (saveRoll ?? 0)} = ${saveTotal} vs DC ${parsed.savingThrow.dc}`;
-                output += saved ? ' ✓ SAVED' : ' ✗ FAILED';
-                output += saveNote;
-            }
-            output += `\n`;
-            output += `   Damage: ${damageTaken}${parsed.damageType ? ` ${parsed.damageType}` : ''}\n`;
-
-            const updatedTarget = engine.getState()!.participants.find(p => p.id === targetId);
-            if (updatedTarget) {
-                output += `   HP: ${updatedTarget.hp}/${updatedTarget.maxHp}`;
-                if (updatedTarget.hp <= 0) {
-                    output += ' 💀 DEFEATED';
-                }
-                output += '\n';
-            }
-        }
+    if (parsed.targetIds && parsed.targetIds.length > 0 && parsed.damage !== undefined && parsed.damage !== 0) {
+        const area = resolveAreaSave(engine, {
+            targetIds: parsed.targetIds, damage: parsed.damage, damageType: parsed.damageType,
+            savingThrow: parsed.savingThrow, halfDamageOnSave: parsed.halfDamageOnSave
+        }, 'lair');
+        if (typeof parsed.damage === 'string') output += `🎲 ${parsed.damage}: ${area.damageRolled}\n`;
+        output += area.lines.join('\n') + '\n';
     } else {
         output += `(No mechanical effect - narrative only)\n`;
     }
+    if (owner) owner.lairUsedRound = state.round;
 
     output += `\n→ Call advance_turn to proceed to the next combatant`;
 

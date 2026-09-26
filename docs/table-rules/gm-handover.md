@@ -76,6 +76,9 @@ When several steps must land together, send them as one `batch_manage execute_se
 | A recurring monster's statline, once | `character_manage update {characterId, ...}` with the same fields; tokens joined by id start with it |
 | Multiattack | `attacksPerAction: N` on the statline, then one `combat_action attack` per swing (`attack 1/2`, `2/2`) |
 | A legendary action off its turn | attack with `legendaryCost: N`; otherwise `combat_manage legendary_action {participantId, cost?, description}` |
+| Breath weapon or other limited ability | `combat_manage use_ability {participantId, ability, targetIds, damage: '12d6', damageType, savingThrow: {ability, dc}}`; recharge rolls itself at its turn start |
+| Lair action | `combat_manage lair_action {actionDescription, targetIds?, damage?: number \| dice, savingThrow?}` on the LAIR slot, once per round |
+| How hard is this fight? | `combat_manage budget {partyLevels \| partyId, creatures: [{creature, count}] \| encounterId}` (read-only) |
 | Spend a legendary resistance by hand | `combat_manage legendary_resistance {participantId, reason}` |
 | Opportunity attack or readied swing | NPC opportunity attacks roll on the move; a PC's comes back in `opportunityAttacksAvailable` with the call to make (`reaction: true` on the attack) |
 | Ready an attack that fires itself | `combat_action ready {readiedAction, trigger, on: 'enters_reach' \| 'leaves_reach', watch, attack: {using?}}`; free-text readied actions fire with `combat_manage trigger_readied {participantId, targetId?}` (spends the reaction, rolls a stored attack) |

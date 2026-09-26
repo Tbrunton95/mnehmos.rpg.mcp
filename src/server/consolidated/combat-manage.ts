@@ -28,8 +28,11 @@ import {
     saveEncounterState,
     mirrorConditionToRow,
     resolveReadiedAttack,
-    reactionAttackData
+    reactionAttackData,
+    resolveAreaSave
 } from '../handlers/combat-handlers.js';
+import { budgetEncounter, describeParty, type BudgetMonster } from '../../engine/encounter-budget.js';
+import { toLongAbility } from '../../engine/combat/saves.js';
 import { listAllTemplates } from '../../data/creature-presets.js';
 import { resolveCreature, creatureToParticipant, resolveWorldId, loadRules } from '../../engine/table-rules.js';
 import { getDomainServices } from '../domain-services.js';
@@ -49,7 +52,7 @@ import { freshSeed } from '../../math/seed.js';
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_intent', 'trigger_readied', 'legendary_action', 'legendary_resistance', 'get_history', 'list'] as const;
+const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_intent', 'trigger_readied', 'legendary_action', 'legendary_resistance', 'use_ability', 'budget', 'get_history', 'list'] as const;
 type CombatManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -171,13 +174,43 @@ const LairActionSchema = z.object({
     encounterId: z.string().describe('The ID of the encounter'),
     actionDescription: z.string().describe('Description of the lair action'),
     targetIds: z.array(z.string()).optional(),
-    damage: z.number().int().min(0).optional(),
+    damage: z.union([z.number().int().min(0), z.string().min(1)]).optional().describe("A number or dice ('2d10'), rolled once"),
     damageType: z.string().optional(),
     savingThrow: z.object({
         ability: z.enum(['strength', 'dexterity', 'constitution', 'intelligence', 'wisdom', 'charisma']),
         dc: z.number().int().min(1).max(30)
     }).optional(),
     halfDamageOnSave: z.boolean().default(true)
+});
+
+const UseAbilitySchema = z.object({
+    action: z.literal('use_ability'),
+    encounterId: z.string(),
+    participantId: z.string(),
+    ability: z.string().min(1).describe("The ability's name on the token ('Fire Breath'), any case"),
+    targetIds: z.array(z.string()).optional(),
+    damage: z.union([z.number().int().min(0), z.string().min(1)]).optional().describe("A number or dice ('12d6'), rolled once for every target"),
+    damageType: z.string().optional(),
+    savingThrow: z.object({
+        ability: z.string().describe("'dex', 'Dexterity' or 'dexterity'"),
+        dc: z.number().int().min(1).max(30)
+    }).optional(),
+    halfDamageOnSave: z.boolean().default(true),
+    reason: z.string().optional()
+});
+
+const BudgetSchema = z.object({
+    action: z.literal('budget'),
+    encounterId: z.string().optional().describe("Rate a live encounter: its hostile tokens' cr, its allies' sheet levels"),
+    partyId: z.string().optional().describe('Party whose member levels to rate against'),
+    partyLevels: z.array(z.number().int().min(1).max(30)).optional().describe('Character levels, one per member'),
+    creatures: z.array(z.object({
+        creature: z.string().optional().describe('Bestiary creature or built-in preset name'),
+        cr: z.number().min(0).optional(),
+        xp: z.number().min(0).optional(),
+        count: z.number().int().min(1).optional()
+    })).optional().describe('Monsters to rate instead of an encounter: [{creature | cr | xp, count?}]'),
+    worldId: z.string().optional().describe('World whose bestiary resolves creature names')
 });
 
 const SpawnQuickEnemySchema = z.object({
@@ -370,24 +403,47 @@ function avgDice(expr?: string | number): number {
     return Math.round(total * 10) / 10;
 }
 
+/** Levels of the allies that have character sheets (tokens without one are skipped). */
+function allyLevels(allies: Array<{ id?: unknown }>): number[] {
+    const db = getDb();
+    const levels: number[] = [];
+    for (const a of allies) {
+        if (typeof a.id !== 'string') continue;
+        const row = db.prepare('SELECT level FROM characters WHERE id = ?').get(a.id) as { level: number } | undefined;
+        if (row) levels.push(row.level);
+    }
+    return levels;
+}
+
+/** Levels of a party's members (prisoners excluded). */
+function partyLevels(partyId: string): number[] {
+    const rows = getDb().prepare(
+        `SELECT pm.role, ch.level FROM party_members pm JOIN characters ch ON ch.id = pm.character_id WHERE pm.party_id = ?`
+    ).all(partyId) as Array<{ role: string; level: number }>;
+    return rows.filter(r => r.role !== 'prisoner').map(r => r.level);
+}
+
 /** T1.3 (Findings #34): surface the wall before the party hits it. */
 function threatReadout(participants: Array<Record<string, unknown>>, presetCr?: number, enemyCount?: number): string {
     const enemies = participants.filter(p => p.isEnemy);
     const allies = participants.filter(p => !p.isEnemy);
     const dpr = enemies.reduce((s, e) => s + avgDice(e.attackDamage as string | number | undefined), 0);
     const crTotal = presetCr !== undefined && enemyCount !== undefined ? presetCr * enemyCount : undefined;
-    const db = getDb();
-    let levelSum = 0, levelKnown = 0;
-    for (const a of allies) {
-        const row = db.prepare('SELECT level FROM characters WHERE id = ?').get(a.id as string) as { level: number } | undefined;
-        if (row) { levelSum += row.level; levelKnown++; }
-    }
+    const levels = allyLevels(allies);
+    const levelSum = levels.reduce((a, b) => a + b, 0);
     const allyHp = allies.reduce((s, a) => s + ((a.maxHp as number) || 0), 0);
+    // The DMG budget, when every hostile has a CR and some ally a level.
+    const crs = enemies.map(e => (typeof e.cr === 'number' ? e.cr : presetCr));
+    const budget = levels.length && enemies.length && crs.every(c => c !== undefined)
+        ? budgetEncounter({ partyLevels: levels, monsters: crs.map(cr => ({ cr })) })
+        : undefined;
     let line = `⚔️ THREAT: ${enemies.length} hostile${enemies.length === 1 ? '' : 's'}`;
     if (crTotal !== undefined) line += ` (~CR ${crTotal} total)`;
     if (dpr > 0) line += ` — est ${dpr} dmg/round`;
-    line += ` vs ${allies.length} allied (${allyHp} HP pooled${levelKnown ? `, levels ${levelSum}` : ''})`;
-    if ((crTotal !== undefined && levelKnown && crTotal > levelSum * 0.75) || (dpr > 0 && allyHp > 0 && dpr * 3 >= allyHp)) {
+    line += ` vs ${allies.length} allied (${allyHp} HP pooled${levels.length ? `, levels ${levelSum}` : ''})`;
+    if (budget) line += ` — ${budget.adjustedXp} XP adjusted: ${budget.difficulty.toUpperCase()} for ${describeParty(levels)}`;
+    const heavyByCr = budget ? budget.difficulty === 'deadly' : (crTotal !== undefined && levels.length > 0 && crTotal > levelSum * 0.75);
+    if (heavyByCr || (dpr > 0 && allyHp > 0 && dpr * 3 >= allyHp)) {
         line += `\n   ⚠️ HEAVY: this can drop the allied side in ~${dpr > 0 ? Math.max(1, Math.ceil(allyHp / dpr)) : '?'} rounds of average dice.`;
     }
     return line;
@@ -1384,6 +1440,97 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         aliases: ['use_legendary_resistance', 'legendary_save'],
         description: 'Spend a legendary resistance to turn a failed save into a success; mirrors the count to the sheet and logs'
     },
+    use_ability: {
+        schema: UseAbilitySchema,
+        handler: async (params: z.infer<typeof UseAbilitySchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'use_ability', message, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            // Read character_manage HP changes before the damage writes HP back.
+            syncParticipantHpFromDb(state);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            const ability = (p.abilities ?? []).find(a => a.name.toLowerCase() === params.ability.trim().toLowerCase());
+            if (!ability) {
+                const known = (p.abilities ?? []).map(a => a.name);
+                return refuse(`${p.name} has no ability '${params.ability}'${known.length ? `; it has ${known.join(', ')}` : ' (give it abilities: [{name, recharge?}])'}`);
+            }
+            if (ability.ready === false) {
+                return refuse(`${p.name}'s ${ability.name} is spent and not recharged (recharge ${ability.recharge ?? '?'}+ on a d6 at the start of its turn)`);
+            }
+            const economy = engine.validateActionEconomy(p.id, 'action');
+            if (!economy.valid) return refuse(`${p.name}: ${economy.error ?? 'action unavailable'}`);
+            if (params.savingThrow && !toLongAbility(params.savingThrow.ability)) return refuse(`Unknown save ability '${params.savingThrow.ability}'`);
+
+            engine.commitAction(p.id, 'action');
+            if (ability.recharge) ability.ready = false;
+            const area = resolveAreaSave(engine, {
+                targetIds: params.targetIds, damage: params.damage, damageType: params.damageType,
+                savingThrow: params.savingThrow, halfDamageOnSave: params.halfDamageOnSave
+            }, ability.name);
+            saveEncounterState(new EncounterRepository(getDb()), params.encounterId, state);
+            const summary = `${p.name} uses ${ability.name}${area.targets.length ? ` on ${area.targets.map(t => `${t.targetName} (${t.saved ? 'saved, ' : ''}${t.damageTaken})`).join(', ')}` : ''}${params.reason ? ` — ${params.reason}` : ''}`;
+            logConditionChange(params.encounterId, state, 'use_ability', p.id, summary, params.reason);
+            let message = `✴ ${p.name} uses ${ability.name}`;
+            if (typeof params.damage === 'string') message += ` (${params.damage}: ${area.damageRolled})`;
+            if (area.lines.length) message += '\n' + area.lines.join('\n');
+            if (ability.recharge) message += `\n${ability.name} is spent; it recharges on a d6 of ${ability.recharge}+ at the start of ${p.name}'s turn.`;
+            return {
+                success: true, actionType: 'use_ability', encounterId: params.encounterId, participantId: p.id,
+                ability: ability.name, ready: ability.ready !== false,
+                ...(area.damageRolled !== undefined ? { damageRolled: area.damageRolled } : {}),
+                ...(area.damageRolls ? { damageRolls: area.damageRolls } : {}),
+                targets: area.targets,
+                ...(area.missing.length ? { missingTargets: area.missing } : {}),
+                message
+            };
+        },
+        aliases: ['ability', 'breath_weapon', 'recharge_ability'],
+        description: "Use a limited ability (a breath weapon): spends the action, marks a recharge ability spent, and resolves damage and a save per target on the fight's dice"
+    },
+    budget: {
+        schema: BudgetSchema,
+        handler: async (params: z.infer<typeof BudgetSchema>) => {
+            const refuse = (message: string) => ({ error: true, actionType: 'budget', message, writes: 'none' });
+            const db = getDb();
+            let levels = params.partyLevels;
+            const monsters: BudgetMonster[] = [];
+            if (params.creatures?.length) {
+                const world = params.worldId ?? resolveWorldId(db, { encounterId: params.encounterId });
+                for (const c of params.creatures) {
+                    if (c.cr !== undefined || c.xp !== undefined) {
+                        monsters.push({ name: c.creature, cr: c.cr, xp: c.xp, count: c.count });
+                        continue;
+                    }
+                    if (!c.creature) return refuse('Each creature needs a name, cr or xp');
+                    const found = resolveCreature(db, world, c.creature);
+                    if (!found) return refuse(`Unknown creature "${c.creature}"`);
+                    monsters.push({ name: found.name, cr: found.spec.cr, xp: found.spec.xpValue, count: c.count });
+                }
+            }
+            if (params.encounterId && (!params.creatures?.length || !levels)) {
+                const state = new EncounterRepository(db).loadState(params.encounterId) as { participants: CombatParticipant[] } | null;
+                if (!state) return refuse(`Encounter ${params.encounterId} not found`);
+                const alive = state.participants.filter(p => p.hp > 0);
+                if (!params.creatures?.length) {
+                    for (const e of alive.filter(p => p.isEnemy)) monsters.push({ name: e.name, cr: e.cr, count: 1 });
+                }
+                if (!levels && !params.partyId) levels = allyLevels(alive.filter(p => !p.isEnemy));
+            }
+            if (!levels && params.partyId) levels = partyLevels(params.partyId);
+            if (!levels?.length) return refuse('budget needs partyLevels, a partyId, or an encounterId whose allies have character sheets with levels');
+            if (!monsters.length) return refuse('budget needs creatures [{creature | cr | xp, count?}] or an encounterId with hostile tokens');
+            const r = budgetEncounter({ partyLevels: levels, monsters });
+            return {
+                success: true, actionType: 'budget', writes: 'none', ...r,
+                message: `${r.monsterCount} monster(s), ${r.rawXp} XP × ${r.multiplier} = ${r.adjustedXp} XP adjusted: ${r.difficulty.toUpperCase()} for ${describeParty(levels)} (easy ${r.thresholds.easy}, medium ${r.thresholds.medium}, hard ${r.thresholds.hard}, deadly ${r.thresholds.deadly})${r.unrated.length ? `; no CR for ${r.unrated.join(', ')}` : ''}. Advisory only.`
+            };
+        },
+        aliases: ['difficulty', 'rate_encounter', 'xp_budget'],
+        description: 'Read-only: rate a fight by the 5e XP budget (CR to XP, group multiplier, party thresholds) for given levels, a party or a live encounter'
+    },
     get_history: {
         schema: GetHistorySchema,
         handler: async (params: z.infer<typeof GetHistorySchema>) => {
@@ -1569,9 +1716,11 @@ Aliases: start/begin→create, state/status→get, finish/stop→end, restore/re
 2. get - View current state
 3. advance - Move to next turn
 4. death_save - Roll death save for downed character
-5. lair_action - Execute boss lair action (LAIR turn only)
+5. lair_action - Execute boss lair action (LAIR turn only; once per round; damage takes dice; a creature that rolled 20 acts first)
    legendary_action {participantId, cost?, description} - a non-attack legendary action off its turn (attacks: combat_action attack with legendaryCost)
    legendary_resistance {participantId, reason} - turn a failed save into a success
+   use_ability {participantId, ability, targetIds?, damage?: number | dice, damageType?, savingThrow?: {ability, dc}} - a limited ability (breath weapon): spends the action, marks a recharge ability spent (it rolls a d6 at the start of its turn), saves per target
+   budget {partyLevels | partyId, creatures: [{creature | cr | xp, count?}] | encounterId} - read-only 5e XP budget: TRIVIAL/EASY/MEDIUM/HARD/DEADLY
 6. end - Finish combat
 
 For combat ACTIONS (attack, move, cast), use combat_action tool instead.
@@ -1596,7 +1745,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         participantId: z.string().optional().describe('remove_participant / adjust_hp: participant/token id'),
         value: z.number().optional().describe('adjust_hp: set HP to exactly this'),
         delta: z.number().optional().describe('adjust_hp: shift HP by this amount'),
-        reason: z.string().optional().describe('adjust_hp / legendary_resistance (required) / add_condition / remove_condition / legendary_action: why — logged'),
+        reason: z.string().optional().describe('adjust_hp / legendary_resistance (required) / add_condition / remove_condition / legendary_action / use_ability: why — logged'),
         condition: z.any().optional().describe('add_condition / remove_condition: a name ("prone") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?, level?}; remove also takes the object add_condition returned'),
         conditionId: z.string().optional().describe('remove_condition: one condition instance id'),
         replace: z.boolean().optional().describe('add_condition: drop existing conditions of the same type first'),
@@ -1650,10 +1799,13 @@ For CORPSES after combat, use corpse_manage tool.`,
         confirmBury: z.boolean().optional().describe('FINDINGS #102 (mirror): override the cold-boot guard — required to bury when nothing is in process memory'),
         worldId: z.string().optional().describe('FINDINGS #105 (mirror): create — stamp the encounter to a world (else derived from first claimed participant); list — STRICT world filter, scopes the ghost sweep'),
         actionDescription: z.string().optional().describe('Lair action description'),
-        targetIds: z.array(z.string()).optional().describe('Target IDs for lair action'),
-        damage: z.number().optional().describe('Lair action damage'),
+        targetIds: z.array(z.string()).optional().describe('lair_action / use_ability: target IDs'),
+        damage: z.union([z.number(), z.string()]).optional().describe("lair_action / use_ability: damage, a number or dice ('8d6') rolled once for every target"),
+        ability: z.string().optional().describe("use_ability: the ability's name on the token ('Fire Breath')"),
+        partyLevels: z.array(z.number()).optional().describe('budget: character levels, one per member'),
+        creatures: z.array(z.any()).optional().describe('budget: monsters to rate [{creature | cr | xp, count?}]'),
         damageType: z.string().optional().describe('Damage type'),
-        savingThrow: z.any().optional().describe('Saving throw for lair action'),
+        savingThrow: z.any().optional().describe('lair_action / use_ability: {ability, dc}'),
         halfDamageOnSave: z.boolean().optional().describe('Half damage on save'),
         // spawn_quick_enemy fields
         creature: z.string().optional().describe('spawn_quick_enemy / add_participant: a world bestiary creature (table_rules kind creature) or built-in template ("goblin", "orc:warrior")'),
@@ -1769,6 +1921,12 @@ export async function handleCombatManage(args: unknown, ctx: SessionContext): Pr
                 case 'legendary_action':
                 case 'legendary_resistance':
                     output = RichFormatter.header('Legendary', '👑');
+                    break;
+                case 'use_ability':
+                    output = RichFormatter.header('Ability', '✴');
+                    break;
+                case 'budget':
+                    output = RichFormatter.header('Encounter Budget', '⚖️');
                     break;
                 default:
                     output = RichFormatter.header('Combat', '⚔️');

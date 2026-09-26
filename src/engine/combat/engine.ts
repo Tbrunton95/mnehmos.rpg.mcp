@@ -269,7 +269,8 @@ export class CombatEngine {
         // Rebuild turn order, preserving any LAIR slot at its initiative-20 position.
         const newTurnOrder: string[] = merged.map(p => p.id);
         if (this.state.hasLairActions) {
-            const lairIndex = merged.findIndex(p => (p.initiative ?? 0) <= 20);
+            // The lair loses ties: a creature that rolled 20 acts first.
+            const lairIndex = merged.findIndex(p => (p.initiative ?? 0) < 20);
             if (lairIndex === -1) newTurnOrder.push('LAIR');
             else newTurnOrder.splice(lairIndex, 0, 'LAIR');
         }
@@ -328,8 +329,9 @@ export class CombatEngine {
         // If there's a lair owner, insert 'LAIR' at initiative 20
         if (hasLairActions) {
             // Find the right position for initiative 20
-            // LAIR goes after all creatures with initiative > 20, before those with initiative <= 20
-            const lairIndex = participantsWithInitiative.findIndex(p => (p.initiative ?? 0) <= 20);
+            // LAIR goes after all creatures with initiative >= 20 (the lair
+            // loses ties), before those below 20
+            const lairIndex = participantsWithInitiative.findIndex(p => (p.initiative ?? 0) < 20);
             if (lairIndex === -1) {
                 // All initiatives are above 20, add at end
                 turnOrder.push('LAIR');
@@ -1427,6 +1429,15 @@ export class CombatEngine {
             this.turnStartNotes.push(`${participant.name} regenerates ${participant.hp - before} HP (${before} → ${participant.hp}/${participant.maxHp})`);
         }
 
+        // Recharge: each spent ability with a recharge number rolls a d6 on
+        // the encounter stream; that number or more makes it ready again.
+        for (const ability of participant.abilities ?? []) {
+            if (!ability.recharge || ability.ready !== false) continue;
+            const d6 = this.tagged({ purpose: `recharge ${ability.name}`, forId: participant.id }, () => this.rng.roll('1d6'));
+            if (d6 >= ability.recharge) ability.ready = true;
+            this.turnStartNotes.push(`${participant.name}: ${ability.name} ${ability.ready ? 'recharges' : 'does not recharge'} (d6=${d6}, needs ${ability.recharge}+)`);
+        }
+
         for (const condition of [...participant.conditions]) {
             // Process ongoing effects
             if (condition.ongoingEffects) {
@@ -1541,8 +1552,7 @@ export class CombatEngine {
 
             // Exit if we found a living participant or exhausted all options
         } while (
-            newParticipant && 
-            newParticipant.hp <= 0 && 
+            ((newParticipant && newParticipant.hp <= 0) || this.lairOwnerDown()) &&
             iterations < maxIterations
         );
 
@@ -1559,6 +1569,13 @@ export class CombatEngine {
         });
 
         return newParticipant;
+    }
+
+    /** The LAIR slot is up but the creature that owns the lair is dead: skip it. */
+    private lairOwnerDown(): boolean {
+        if (!this.state || this.state.turnOrder[this.state.currentTurnIndex] !== 'LAIR') return false;
+        const owner = this.state.participants.find(p => p.id === this.state!.lairOwnerId);
+        return !!owner && owner.hp <= 0;
     }
 
     /**
