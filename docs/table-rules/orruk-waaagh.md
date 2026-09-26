@@ -21,6 +21,7 @@ This adds the following to the world:
 
   The two casters use world spells, so they need no slots.
 - **Bands.** Grot, Boy, Brute, Boss and Warboss, lowest first.
+  The rule is named `orruk-bands`. A world can hold it beside another band rule (day-366 brings `bands`). Where two bands are compared (growth per band above, peer consequences, called strikes, cleave, grapples and executions), the engine reads the first enabled band rule whose order holds both bands, so an Orruk fight uses the Orruk ladder. Two bands that share no ladder cannot be ranked: the per-band growth bonus is 0 and band checks treat them as unset.
 - **Four creatures.** Each is a statblock to fight and also a form to grow into.
 
   | Creature | CR | Size | HP | AC | Attacks | Band |

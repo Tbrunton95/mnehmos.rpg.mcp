@@ -20,7 +20,7 @@ import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../..
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
 import { PartSchema, UnitSchema, ParticipantExtrasShape, type Part, type ReadiedAttack } from '../../schema/token-extras.js';
 import { worldProgression } from '../../engine/progression.js';
-import { resolveWorldId, bandOrder, loadRule, loadRules, castingClassFor, findWorldRule, type TableRule } from '../../engine/table-rules.js';
+import { resolveWorldId, bandOrderFor, loadRule, loadRules, castingClassFor, findWorldRule, type TableRule } from '../../engine/table-rules.js';
 import { castWorldSpell, sheetSpecies } from './world-spell.js';
 import { creditGrowth } from '../growth.js';
 import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
@@ -1811,7 +1811,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // checked before the roll so a refused strike spends nothing.
         const rulesDb = getDb();
         const ruleWorld = resolveWorldId(rulesDb, { encounterId: parsed.encounterId, characterIds: [parsed.actorId, parsed.targetId ?? ''] });
-        const ruleBands = bandOrder(rulesDb, ruleWorld);
+        // The band ladder that holds both bands (a world may import several).
+        const ruleBands = bandOrderFor(rulesDb, ruleWorld, [actor?.band, target?.band]);
         let strikeRule: TableRule<'called_strike'> | undefined;
         let preparedRule: TableRule<'prepared_asset'> | undefined;
         if (parsed.calledStrike && target?.unit) throw new Error(`Called strikes are against a single opponent; ${target.name} is a unit`);

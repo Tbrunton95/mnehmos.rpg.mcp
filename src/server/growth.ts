@@ -5,7 +5,7 @@
  * grows is the player's choice.
  */
 import type Database from 'better-sqlite3';
-import { loadRules, findPool, bandOrder, type TableRule } from '../engine/table-rules.js';
+import { loadRules, findPool, bandOrderFor, type TableRule } from '../engine/table-rules.js';
 import { applyScheduledOps } from '../engine/scheduled-ops.js';
 import { CharacterRepository } from '../storage/repos/character.repo.js';
 
@@ -100,7 +100,8 @@ export function creditGrowth(
             const per = track.spec.perBandAbove;
             const attackerBand = opts.attackerBand ?? char.band;
             if (per && opts.victimBand && attackerBand) {
-                const order = bandOrder(db, worldId).map(b => b.toLowerCase());
+                // The ladder that holds both bands: a world may import several.
+                const order = bandOrderFor(db, worldId, [opts.victimBand, attackerBand]).map(b => b.toLowerCase());
                 const iv = order.indexOf(opts.victimBand.trim().toLowerCase());
                 const ia = order.indexOf(attackerBand.trim().toLowerCase());
                 if (iv >= 0 && ia >= 0) delta += per * Math.max(0, iv - ia + 1);

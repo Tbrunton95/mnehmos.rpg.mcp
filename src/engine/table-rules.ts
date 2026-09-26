@@ -539,6 +539,22 @@ export function bandOrder(db: Database.Database, worldId: string | null | undefi
     return loadRule(db, worldId, 'band')?.spec.order ?? DEFAULT_BAND_ORDER;
 }
 
+/**
+ * The band order that ranks these bands. A world can hold several band
+ * rules (day-366's 'bands' beside orruk-waaagh's 'orruk-bands'); the first
+ * by name may know neither band. Reads the first enabled band rule whose
+ * order contains every band given, else falls back to bandOrder.
+ */
+export function bandOrderFor(db: Database.Database, worldId: string | null | undefined, bands: Array<string | null | undefined>): string[] {
+    const want = bands.filter((b): b is string => !!b && !!b.trim()).map(b => b.trim().toLowerCase());
+    if (want.length) {
+        const holds = (order: string[]) => want.every(w => order.some(o => o.toLowerCase() === w));
+        const hit = loadRules(db, worldId, 'band').find(r => holds(r.spec.order));
+        if (hit) return hit.spec.order;
+    }
+    return bandOrder(db, worldId);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // BESTIARY: creature rules and the built-in presets as one statblock shape
 // ═══════════════════════════════════════════════════════════════════════════

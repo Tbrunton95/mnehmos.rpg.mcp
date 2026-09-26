@@ -120,6 +120,15 @@ describe('kill credit in combat', () => {
         const b = await fight({ id: 'gob2', name: 'Gob', band: 'Grot' });
         expect(b.r.growth).toBeUndefined();
     });
+
+    it('with several band rules, reads the band order that holds both bands', async () => {
+        // A second ladder that sorts first by name (as day-366's 'bands'
+        // beside orruk-bands would) and knows neither Boy nor Brute.
+        await rules({ action: 'define', kind: 'band', name: 'aaa-imperial', spec: { order: ['Mortal', 'Astartes', 'Primarch-class'] } });
+        new CharacterRepository(getDb()).update('wolf', { hp: 5, maxHp: 5 } as any);
+        const a = await fight({ id: 'wolf', name: 'Big Wolf', band: 'Brute' });
+        expect(a.r.growth).toMatchObject({ delta: 3, from: 8, to: 11 });
+    });
 });
 
 describe('after_battle perVictory', () => {

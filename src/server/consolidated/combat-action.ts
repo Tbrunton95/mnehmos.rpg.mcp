@@ -19,7 +19,7 @@ import { getDb } from '../../storage/index.js';
 import { CombatEngine } from '../../engine/combat/engine.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import type { CombatParticipant } from '../../engine/combat/engine.js';
-import { bandOrder, compareBands, resolveWorldId } from '../../engine/table-rules.js';
+import { bandOrderFor, compareBands, resolveWorldId } from '../../engine/table-rules.js';
 import { sizeRank } from '../../schema/encounter.js';
 import { READIED_TRIGGERS, ReadiedAttackSchema } from '../../schema/token-extras.js';
 import { loggedD20, loggedDice } from '../../math/logged-d20.js';
@@ -754,8 +754,10 @@ function grappleContext(args: Record<string, unknown>, ctx: SessionContext): Gra
     const actorTok = tokOf(actorId), targetTok = tokOf(targetId);
     if (!actorRow && !actorTok) return { error: true, writes: 'none', message: engine ? `No participant or character ${actorId}` : `No character ${actorId}` };
     if (!targetRow && !targetTok) return { error: true, writes: 'none', message: engine ? `No participant or character ${targetId}` : `No character ${targetId}` };
-    const order = bandOrder(db, resolveWorldId(db, { encounterId, characterIds: [actorId, targetId] }));
-    return { db, engine, actor: grappleSide(actorId, actorRow, actorTok), target: grappleSide(targetId, targetRow, targetTok), order };
+    const actor = grappleSide(actorId, actorRow, actorTok), target = grappleSide(targetId, targetRow, targetTok);
+    // The band ladder that holds both bands (a world may import several).
+    const order = bandOrderFor(db, resolveWorldId(db, { encounterId, characterIds: [actorId, targetId] }), [actor.band, target.band]);
+    return { db, engine, actor, target, order };
 }
 
 /**
