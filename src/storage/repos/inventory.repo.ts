@@ -246,43 +246,53 @@ export class InventoryRepository {
     }
 
     /**
-     * Remove currency from a character
-     * @returns true if successful, false if insufficient funds
+     * Remove currency from a character, converting denominations.
+     * 1 gold = 10 silver = 100 copper; gold is decimal to the cent (FINDINGS #111),
+     * so all arithmetic runs on integer copper units. Each named denomination is paid
+     * from itself first; any shortfall is paid from leftover copper, then silver, then
+     * gold, with change returned in silver/copper. No denomination ever goes negative.
+     * @returns true if successful, false if insufficient funds (nothing written)
      */
     removeCurrency(characterId: string, currency: { gold?: number; silver?: number; copper?: number }): boolean {
         const current = this.getCurrency(characterId);
-
-        // Convert everything to copper for comparison
-        const currentTotal = current.gold * 100 + current.silver * 10 + current.copper;
-        const removeTotal = (currency.gold ?? 0) * 100 + (currency.silver ?? 0) * 10 + (currency.copper ?? 0);
-
-        if (removeTotal > currentTotal) {
+        const have = toCopperUnits(current);
+        const need = toCopperUnits({ gold: currency.gold ?? 0, silver: currency.silver ?? 0, copper: currency.copper ?? 0 });
+        if (need.gold < 0 || need.silver < 0 || need.copper < 0) return false;
+        if (need.gold + need.silver + need.copper > have.gold + have.silver + have.copper) {
             return false;
         }
 
-        // Simple subtraction (doesn't auto-convert denominations)
-        const updated = {
-            gold: current.gold - (currency.gold ?? 0),
-            silver: current.silver - (currency.silver ?? 0),
-            copper: current.copper - (currency.copper ?? 0)
-        };
+        // 1. Pay each named denomination from itself.
+        let g = have.gold, s = have.silver, c = have.copper;
+        const payG = Math.min(g, need.gold); g -= payG;
+        const payS = Math.min(s, need.silver); s -= payS;
+        const payC = Math.min(c, need.copper); c -= payC;
+        let owed = (need.gold - payG) + (need.silver - payS) + (need.copper - payC);
 
-        // Handle negative values by borrowing
-        if (updated.copper < 0) {
-            const needed = Math.ceil(-updated.copper / 10);
-            updated.silver -= needed;
-            updated.copper += needed * 10;
+        // 2. Shortfall from leftover copper, then silver, then gold (making change).
+        if (owed > 0) {
+            const take = Math.min(c, owed); c -= take; owed -= take;
         }
-        if (updated.silver < 0) {
-            const needed = Math.ceil(-updated.silver / 10);
-            updated.gold -= needed;
-            updated.silver += needed * 10;
+        if (owed > 0 && s > 0) {
+            const coins = Math.min(s / 10, Math.ceil(owed / 10));
+            const value = Math.round(coins * 10);
+            s -= value;
+            if (value > owed) { c += value - owed; owed = 0; } else owed -= value;
         }
+        if (owed > 0 && g > 0) {
+            // Break whole gold pieces where possible; decimal gold is spent as-is.
+            const value = Math.min(g, Math.ceil(owed / 100) * 100);
+            g -= value;
+            if (value > owed) {
+                const change = value - owed;
+                s += Math.floor(change / 10) * 10;
+                c += change % 10;
+                owed = 0;
+            } else owed -= value;
+        }
+        if (owed > 0 || g < 0 || s < 0 || c < 0) return false; // unreachable given the total check
 
-        if (updated.gold < 0) {
-            return false; // Shouldn't happen if our total check was correct
-        }
-
+        const updated = fromCopperUnits({ gold: g, silver: s, copper: c });
         const stmt = this.db.prepare('UPDATE characters SET currency = ? WHERE id = ?');
         stmt.run(JSON.stringify(updated), characterId);
 
@@ -309,11 +319,19 @@ export class InventoryRepository {
      * Check if character has at least this much currency
      */
     hasCurrency(characterId: string, currency: { gold?: number; silver?: number; copper?: number }): boolean {
-        const current = this.getCurrency(characterId);
-        const currentTotal = current.gold * 100 + current.silver * 10 + current.copper;
-        const requiredTotal = (currency.gold ?? 0) * 100 + (currency.silver ?? 0) * 10 + (currency.copper ?? 0);
-        return currentTotal >= requiredTotal;
+        const have = toCopperUnits(this.getCurrency(characterId));
+        const need = toCopperUnits({ gold: currency.gold ?? 0, silver: currency.silver ?? 0, copper: currency.copper ?? 0 });
+        return have.gold + have.silver + have.copper >= need.gold + need.silver + need.copper;
     }
+}
+
+/** Each denomination expressed in integer copper (gold to the cent). */
+function toCopperUnits(c: { gold: number; silver: number; copper: number }): { gold: number; silver: number; copper: number } {
+    return { gold: Math.round(c.gold * 100), silver: Math.round(c.silver * 10), copper: Math.round(c.copper) };
+}
+
+function fromCopperUnits(c: { gold: number; silver: number; copper: number }): { gold: number; silver: number; copper: number } {
+    return { gold: Math.round(c.gold) / 100, silver: Math.round(c.silver) / 10, copper: c.copper };
 }
 
 interface InventoryRowFull {
