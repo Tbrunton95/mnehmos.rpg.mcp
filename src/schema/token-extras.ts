@@ -97,7 +97,10 @@ export const UnitSchema = z.object({
     tiers: z.array(UnitTierSchema).min(1).optional().describe('Highest first. Default 4d6 ≥75%, 3d6 ≥50%, 2d6 ≥25%, 1d6 below'),
     suppressed: z.boolean().optional(),
     inMelee: z.boolean().optional(),
-    brokenFormation: z.boolean().optional()
+    brokenFormation: z.boolean().optional(),
+    morale: z.number().int().optional().describe("The unit's morale, shown on a BREAK TEST DUE line (the GM rolls the test)"),
+    breakAt: z.number().gt(0).lt(1).optional().describe('Fraction of models: dropping through it owes a break test (default 0.5)'),
+    routed: z.boolean().optional().describe('Routed: cannot volley and owes no more break tests (set_unit)')
 });
 export type Unit = z.infer<typeof UnitSchema>;
 

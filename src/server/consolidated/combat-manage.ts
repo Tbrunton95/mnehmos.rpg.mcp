@@ -8,7 +8,7 @@
 import { PartSchema, UnitSchema, ReadiedSchema, ReadiedAttackSchema, PART_STATES, PART_KINDS, ParticipantExtrasShape, SizeCategorySchema } from '../../schema/token-extras.js';
 import { hydrateExtras, type ExtrasRow } from '../../engine/combat/participant-extras.js';
 import { upsertPart } from '../../engine/combat/parts.js';
-import { volleyTier, describeUnit } from '../../engine/combat/units.js';
+import { volleyTier, describeUnit, breakTestDue } from '../../engine/combat/units.js';
 import type { CombatParticipant } from '../../engine/combat/engine.js';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
@@ -313,6 +313,9 @@ const SetUnitSchema = z.object({
     inMelee: z.boolean().optional(),
     brokenFormation: z.boolean().optional(),
     packed: z.boolean().optional(),
+    routed: z.boolean().optional().describe('Routed after a failed break test: no volleys, no further break tests. false rallies it'),
+    morale: z.number().int().optional().describe('The morale shown on BREAK TEST DUE'),
+    breakAt: z.number().gt(0).lt(1).optional().describe('Fraction of models whose crossing owes a break test (default 0.5)'),
     reason: z.string().optional()
 });
 
@@ -1132,6 +1135,8 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             if (params.revive && after > 0) p.isDead = false;
             p.hp = after;
 
+            // Item 12: a unit carried through its breakAt owes a break test.
+            const breakTest = p.unit ? breakTestDue(p, before) : null;
             saveEncounterState(new EncounterRepository(getDb()), params.encounterId, state);
             getDomainServices().combatActionLog.log({
                 encounterId: params.encounterId,
@@ -1154,7 +1159,8 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 defeated: after <= 0,
                 deathSaves: { successes: p.deathSaveSuccesses ?? 0, failures: p.deathSaveFailures ?? 0 },
                 reason: params.reason,
-                message: `${p.name}: HP ${before} → ${after}/${p.maxHp} (GM correction: ${params.reason})`
+                ...(breakTest ? { breakTest } : {}),
+                message: `${p.name}: HP ${before} → ${after}/${p.maxHp} (GM correction: ${params.reason})${breakTest ? `\n${breakTest.line}` : ''}`
             };
         },
         aliases: ['set_hp', 'fix_hp', 'correct_hp', 'hp_correction'],
@@ -1305,7 +1311,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             const p = state.participants.find(x => x.id === params.participantId);
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
             if (!p.unit) return refuse(`${p.name} is not a unit token (create it with unit: {models, hpPerModel, ...})`);
-            for (const k of ['suppressed', 'inMelee', 'brokenFormation', 'packed'] as const) {
+            for (const k of ['suppressed', 'inMelee', 'brokenFormation', 'packed', 'routed', 'morale', 'breakAt'] as const) {
                 if (params[k] !== undefined) (p.unit as Record<string, unknown>)[k] = params[k];
             }
             new EncounterRepository(getDb()).saveState(params.encounterId, state);
@@ -1314,7 +1320,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             return { success: true, actionType: 'set_unit', encounterId: params.encounterId, participantId: p.id, unit: p.unit, volley: tier, message: `${p.name}: ${describeUnit(p)}` };
         },
         aliases: ['unit', 'suppress', 'formation'],
-        description: 'Set a unit token\'s suppressed / inMelee / brokenFormation / packed flags; reports the volley tier'
+        description: 'Set a unit token\'s suppressed / inMelee / brokenFormation / packed flags, and routed / morale / breakAt for break tests; reports the volley tier'
     },
     set_intent: {
         schema: SetIntentSchema,
@@ -1777,7 +1783,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         kind: z.enum(PART_KINDS).optional().describe('set_part: head | arm | leg | wing | torso | system | other'),
         latchedTo: z.object({ participantId: z.string(), part: z.string().optional() }).optional().describe('set_part latched: who it holds'),
         holds: z.array(z.string()).optional().describe("set_part: weapons or slots the part wields ('axe', 'mainhand')"),
-        breakAt: z.number().int().optional().describe('set_part: one aimed hit dealing at least this much severs the part'),
+        breakAt: z.number().optional().describe('set_part: one aimed hit dealing at least this much severs the part (integer). set_unit: fraction of models (0-1, exclusive) whose crossing owes a break test (default 0.5)'),
         note: z.string().optional().describe('set_part / trigger_readied: note'),
         targetId: z.string().optional().describe("trigger_readied: who the readied attack strikes (default: its watch, when that names a participant)"),
         attack: z.any().optional().describe('trigger_readied: {using?, attackBonus?, damage?, damageType?, withPart?}, the attack to roll over the stored one'),
@@ -1787,6 +1793,8 @@ For CORPSES after combat, use corpse_manage tool.`,
         inMelee: z.boolean().optional().describe('set_unit'),
         brokenFormation: z.boolean().optional().describe('set_unit'),
         packed: z.boolean().optional().describe('set_unit'),
+        routed: z.boolean().optional().describe('set_unit: routed after a failed break test (no volleys); false rallies'),
+        morale: z.number().int().optional().describe('set_unit: the morale shown on BREAK TEST DUE'),
         intent: z.string().nullable().optional().describe('set_intent: telegraphed intent (null clears); clears when its turn ends'),
         readied: ReadiedSchema.nullable().optional().describe("set_intent: {action, trigger, on?: enters_reach | leaves_reach, watch?: id | name | 'enemy' | 'any', attack?: {using?, attackBonus?, damage?, damageType?, withPart?}}; stays until it fires or trigger_readied (null clears). With on and attack it fires itself on a move"),
         isEnemy: z.boolean().optional().describe('Hostile flag (add_participant)'),

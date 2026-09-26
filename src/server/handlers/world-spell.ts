@@ -19,6 +19,7 @@ import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { checkConcentration, breakConcentration } from '../../engine/magic/concentration.js';
 import type { Character } from '../../schema/character.js';
+import { breakTestDue, type BreakTest } from '../../engine/combat/units.js';
 
 type SpellSpec = RuleSpec<'spell'>;
 type CastingRollSpec = NonNullable<SpellSpec['castingRoll']>;
@@ -214,6 +215,7 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
     // ── Effects ──
     const effects: EffectResult[] = [];
     const notes: string[] = [];
+    const breakTests: BreakTest[] = [];
     if (lands) {
         const fallbackDc = casting?.total ?? (char ? (char.spellSaveDC || calculateSpellSaveDC(char)) : 10);
         const concentrationRepo = new ConcentrationRepository(db);
@@ -247,6 +249,10 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
                     out.defeated = out.hpAfter <= 0;
                     out.damage = dmg;
                     out.damageModifier = typed.modifier;
+                    if (after?.unit) {
+                        const due = breakTestDue(after, out.hpBefore);
+                        if (due) breakTests.push(due);
+                    }
                     if (dmg > 0) {
                         const tc = charRepo.findById(tp.id);
                         if (tc) {
@@ -334,6 +340,7 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
     }
     if (unbind) output += `🚫 ${unbind.name} tries to unbind: ${unbind.dice} (${unbind.rolls.join('+')}) = ${unbind.total} vs ${casting!.total} [${unbind.unbound ? 'UNBOUND' : 'FAILS'}]\n`;
     for (const e of effects) if (e.line) output += `${e.line}\n`;
+    for (const due of breakTests) output += `▌ ${due.line}\n`;
     if (notes.length) output += `(${notes.join('; ')})\n`;
     if (miscast) output += `\n⚠️ MISCAST (${String(miscast.on)}): ${String(miscast.message ?? miscast.text ?? '')}\n`;
     const totalDamage = effects.reduce((a, e) => a + (e.damage ?? 0), 0);
@@ -368,5 +375,6 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
     if (saves.length) (result as { saves?: unknown }).saves = saves;
     const conditionsApplied = effects.filter(e => e.condition).map(e => ({ id: e.targetId, name: e.name, condition: e.condition }));
     if (conditionsApplied.length) (result as { conditionsApplied?: unknown }).conditionsApplied = conditionsApplied;
+    if (breakTests.length) (result as { breakTests?: unknown }).breakTests = breakTests;
     return { output, result };
 }

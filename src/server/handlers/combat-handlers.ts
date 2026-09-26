@@ -23,7 +23,7 @@ import { worldProgression } from '../../engine/progression.js';
 import { resolveWorldId, bandOrder, loadRule, loadRules, castingClassFor, findWorldRule, type TableRule } from '../../engine/table-rules.js';
 import { castWorldSpell } from './world-spell.js';
 import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
-import { volleyTier, describeUnit } from '../../engine/combat/units.js';
+import { volleyTier, describeUnit, breakTestDue, type BreakTest } from '../../engine/combat/units.js';
 import { upsertPart, findPart, resolveAttackSource } from '../../engine/combat/parts.js';
 import { compareBands } from '../../engine/table-rules.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
@@ -1997,6 +1997,12 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             const t = volleyTier(targetNow);
             resultRec.targetUnit = { models: t?.models, maxModels: t?.maxModels, volley: t?.dice ?? null };
             ruleLines.push(`UNIT ${targetNow.name}: ${describeUnit(targetNow)}`);
+            // Item 12: a unit carried through its breakAt owes a break test.
+            const due = result.target ? breakTestDue(targetNow, result.target.hpBefore) : null;
+            if (due) {
+                resultRec.breakTests = [due];
+                ruleLines.push(due.line);
+            }
         }
 
         // Commit Action Economy: legendary actions, the reaction, or one
@@ -2473,6 +2479,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             ? (resolution.damageRolled ?? resolution.damage ?? 0)
             : (resolution.damage ?? 0);
 
+        // Item 12: units the spell carried through their breakAt.
+        const breakTests: BreakTest[] = [];
+
         // Apply damage/healing to ALL targets
         if (baseDamage > 0 && allTargetIds.length > 0) {
             const db = getDb();
@@ -2523,6 +2532,10 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 const updatedTarget = freshState?.participants.find(p => p.id === tid);
                 const hpAfter = updatedTarget?.hp ?? 0;
                 const defeated = hpAfter <= 0;
+                if (updatedTarget?.unit) {
+                    const due = breakTestDue(updatedTarget, hpBefore);
+                    if (due) breakTests.push(due);
+                }
 
                 // Sync HP to character database after spell damage
                 if (damageDealt > 0 && updatedTarget) {
@@ -2704,6 +2717,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             : (requiresSave ? baseDamage : (resolution.damage || 0));
         if (spellAttackSituational.length) output += `\n(${spellAttackSituational.join('; ')})\n`;
         if (conditionLines.length) output += `\n${conditionLines.join('\n')}\n`;
+        for (const due of breakTests) output += `\n▌ ${due.line}\n`;
         output += `\n[SPELL: ${spell.name}, SLOT: ${effectiveSlotLevel > 0 ? effectiveSlotLevel : 'cantrip'}, DMG: ${reportedDamage}, HEAL: ${resolution.healing || 0}]`;
 
         // Commit Action Economy
@@ -2733,6 +2747,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         const saves = damageResults.filter(dr => dr.save).map(dr => ({ id: dr.id, name: dr.name, ...dr.save! }));
         if (saves.length) (result as { saves?: unknown }).saves = saves;
         if (conditionsApplied.length) (result as { conditionsApplied?: unknown }).conditionsApplied = conditionsApplied;
+        if (breakTests.length) (result as { breakTests?: unknown }).breakTests = breakTests;
         if (spellAttackSituational.length) result.situational = spellAttackSituational;
     } else {
         throw new Error(`Unknown action: ${parsed.action}`);
@@ -2838,6 +2853,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             saves: (r as { saves?: unknown }).saves,
             conditionsApplied: (r as { conditionsApplied?: unknown }).conditionsApplied,
             worldSpell: (r as { worldSpell?: unknown }).worldSpell,
+            breakTests: (r as { breakTests?: unknown }).breakTests,
             // Item 11: reactions a move set off, each at the step it happened.
             opportunityAttacks: (r as { opportunityAttacks?: unknown }).opportunityAttacks,
             opportunityAttacksAvailable: (r as { opportunityAttacksAvailable?: unknown }).opportunityAttacksAvailable,

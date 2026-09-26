@@ -360,6 +360,7 @@ const definitions: Record<CombatAction, ActionDefinition> = {
             const unitTok = engine?.getState()?.participants.find(p => p.id === params.actorId);
             if (!engine || !unitTok) return { error: true, actionType: 'volley', message: `Encounter ${params.encounterId} or unit ${params.actorId} not found` };
             if (!unitTok.unit) return { error: true, actionType: 'volley', message: `${unitTok.name} is not a unit token (add unit: {models, hpPerModel, ...})` };
+            if (unitTok.unit.routed) return { error: true, writes: 'none', actionType: 'volley', message: `${unitTok.name} is routed and cannot volley (rally it with combat_manage set_unit {routed: false})` };
             const tier = volleyTier(unitTok)!;
             if (!tier.dice) return { error: true, actionType: 'volley', message: `${unitTok.name} has no models left to fire` };
             // One d20 against AC with the unit's attack bonus; on a hit the

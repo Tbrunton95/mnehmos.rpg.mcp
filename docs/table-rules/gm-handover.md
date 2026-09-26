@@ -83,6 +83,7 @@ When several steps must land together, send them as one `batch_manage execute_se
 | A world's own class, species, background, skill | `table_rules define {kind: char_class \| species \| background \| skill, name, spec}`; `character_manage create` reads them first; `options {worldId}`; `casting: {as: 'wizard'}` casts SRD spells as a wizard |
 | Levels past 20, a custom XP table or curve | `table_rules define {kind: progression, spec: {maxLevel: null \| N, xpThresholds?, profBonus?, mode?}}` |
 | A world's own spell (warp, winds of magic) | `table_rules define {kind: spell, spec: {castingRoll: {target}, cost?, effects, miscast?: {on, table}, contestedBy?: 'unbind'}}`; `combat_action cast_spell {spellName, targetId, unbinderId?}` |
+| A unit breaks and runs | watch for BREAK TEST DUE; `combat_manage set_unit {participantId, routed: true}` on a failed test (`morale`, `breakAt` set there too; `routed: false` rallies) |
 | Loot a body | `corpse_manage generate_loot {corpseId, creatureType}` (logged; `seed` replays) |
 | Spawn from the bestiary | `combat_manage spawn_quick_enemy {creature, count, worldId}` or `add_participant {encounterId, creature, count}` |
 | A recurring monster's statline, once | `character_manage update {characterId, ...}` with the same fields; tokens joined by id start with it |
