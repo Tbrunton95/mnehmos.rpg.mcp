@@ -377,6 +377,9 @@ export interface StatusInput {
     // Item 15: pools the GM marked show: true, one row each.
     counters?: Array<{ name: string; current: number; max: number }>;
     location?: string; objective?: string; moreConditions?: number;
+    // Item 18: house-format knobs from the status_block rule.
+    conditionLayout?: 'rows' | 'line'; conditionLabel?: string; showMore?: boolean;
+    footer?: string[];
 }
 /**
  * Close a strip and its rows into one box: the strip's rule and the bottom
@@ -404,12 +407,18 @@ export function renderStatusBlock(d: StatusInput): string {
         for (const c of d.counters ?? []) rows.push([L(`${c.name.toUpperCase()} `), V(`${c.current}/${c.max}`)]);
         if (d.location) rows.push([L('AT  '), V(d.location)]);
         if (d.objective) rows.push([L('OBJ '), V(d.objective)]);
-        // One condition a row: a long name never runs the frame off the edge.
-        for (const c of d.conditions ?? []) {
-            rows.push([V(typeof c === 'string' ? c : `${c.name}${c.duration ? ` (${c.duration}d)` : ''}`)]);
+        const names = (d.conditions ?? []).map(c => typeof c === 'string' ? c : `${c.name}${c.duration ? ` (${c.duration}d)` : ''}`);
+        if (d.conditionLayout === 'line') {
+            // The house format: one labelled row, 'COND A · B'.
+            if (names.length) rows.push([L(`${d.conditionLabel ?? 'COND'} `), V(names.join(` ${g.sep} `))]);
+        } else {
+            // One condition a row: a long name never runs the frame off the edge.
+            for (const n of names) rows.push([V(n)]);
         }
-        if (d.moreConditions) rows.push([L(`+${d.moreConditions} more`)]);
-        return framed(renderStrip({ callsign: callsign(d.characterName ?? '???'), badge: d.badge }), emit(rows));
+        if (d.moreConditions && d.showMore !== false) rows.push([L(`+${d.moreConditions} more`)]);
+        const box = framed(renderStrip({ callsign: callsign(d.characterName ?? '???'), badge: d.badge }), emit(rows));
+        // The footer rides under the frame, outside it.
+        return d.footer?.length ? `${box}${d.footer.join(` ${g.sep} `)}\n` : box;
     }
     let out = renderStrip({ callsign: callsign(d.characterName ?? '???'), day: d.day, time: d.time, rads: d.rads, badge: d.badge });
     const rows: Cell[][] = [];

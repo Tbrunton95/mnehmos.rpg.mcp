@@ -34,6 +34,7 @@ import { provisionStartingEquipment } from '../../services/starting-equipment.se
 import { CLASS_DATA, getSpellSlots, isSpellcaster } from '../../data/class-starting-data.js';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { CorpseRepository } from '../../storage/repos/corpse.repo.js';
+import { SceneRepository } from '../../storage/repos/scene.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { RichFormatter } from '../utils/formatter.js';
 import {
@@ -352,6 +353,53 @@ const GetStatusBlockSchema = z.object({
     sessionId: z.string().optional()
 });
 
+// Item 18: the status block's footer, one string per segment, resolved from
+// data so the banner stays a pure render of the JSON. A segment with nothing
+// behind it (no scene, no such key, no facts) is left out.
+function statusFooter(db: ReturnType<typeof getDb>, segments: string[], at: { characterId: string; worldId: string | null; location?: string; objective?: string }): string[] {
+    let scene: { placeLabel: string | null; engineState: Record<string, unknown> } | null | undefined;
+    const latestScene = () => {
+        if (scene === undefined) {
+            try { scene = new SceneRepository(db).findLatestForParticipant(at.characterId, at.worldId ?? undefined); } catch { scene = null; }
+        }
+        return scene;
+    };
+    const titled = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+    const out: string[] = [];
+    for (const seg of segments) {
+        if (seg === 'location') { if (at.location) out.push(at.location); continue; }
+        if (seg === 'objective') { if (at.objective) out.push(at.objective); continue; }
+        if (seg === 'scene.place') { const p = latestScene()?.placeLabel; if (p) out.push(p); continue; }
+        if (seg.startsWith('scene.')) {
+            const key = seg.slice(6);
+            const state = latestScene()?.engineState ?? {};
+            const hit = Object.keys(state).find(k => k.toLowerCase() === key.toLowerCase());
+            if (hit !== undefined && state[hit] !== null && state[hit] !== undefined && state[hit] !== '') {
+                out.push(`${titled(key.replace(/[_-]+/g, ' '))}: ${typeof state[hit] === 'object' ? JSON.stringify(state[hit]) : String(state[hit])}`);
+            }
+            continue;
+        }
+        if (seg.startsWith('knows:')) {
+            // n = facts in this world whose key starts with the prefix; k = the
+            // ones this character holds. 'Vaurek (2 of 4)', or just the label
+            // when all are known.
+            const [prefix, given] = seg.slice(6).split('|');
+            const label = given?.trim() || titled(prefix.replace(/[-_:. ]+$/, '').replace(/[-_]+/g, ' '));
+            try {
+                const like = `${prefix.toLowerCase().replace(/[\\%_]/g, c => `\\${c}`)}%`;
+                const n = (db.prepare(`SELECT COUNT(*) AS n FROM knowledge_facts WHERE world_id = ? AND LOWER(key) LIKE ? ESCAPE '\\'`).get(at.worldId, like) as { n: number }).n;
+                if (!n) continue;
+                const k = (db.prepare(`SELECT COUNT(*) AS n FROM knowledge_facts f JOIN knowledge_holders h ON h.fact_id = f.id
+                                        WHERE f.world_id = ? AND LOWER(f.key) LIKE ? ESCAPE '\\' AND h.knower_id = ?`).get(at.worldId, like, at.characterId) as { n: number }).n;
+                out.push(k === n ? label : `${label} (${k} of ${n})`);
+            } catch { /* no knowledge tables yet */ }
+            continue;
+        }
+        out.push(seg);
+    }
+    return out;
+}
+
 // FINDINGS #64: the 00-schema status block, every value from a read this
 // call. NAMED pool reads only — psi is never read into this payload, so
 // the renderer cannot leak it even by a future caller's mistake.
@@ -426,6 +474,12 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
         // block is tiny on the wire too. The full text stays on get.
         const conditions = conditionsForDisplay(char.conditions || [], tiny.spec.maxConditions)
             .map(c => ({ name: c.name ?? '', ...(c.duration !== undefined ? { duration: c.duration } : {}), ...(c.pinned ? { pinned: true } : {}) }));
+        // Item 18: the house knobs. Each is echoed only when set, so a block
+        // without them reads exactly as before.
+        const spec = tiny.spec;
+        const footer = spec.footer?.length ? statusFooter(db, spec.footer, { characterId: args.characterId, worldId, location, objective }) : undefined;
+        if (spec.showLocation === false) location = undefined;
+        if (spec.showObjective === false) objective = undefined;
         return {
             success: true,
             actionType: 'get_status_block',
@@ -442,6 +496,10 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
             objective,
             conditions,
             moreConditions: Math.max(0, (char.conditions || []).length - conditions.length),
+            ...(spec.conditionLayout ? { conditionLayout: spec.conditionLayout } : {}),
+            ...(spec.conditionLabel ? { conditionLabel: spec.conditionLabel } : {}),
+            ...(spec.showMore === false ? { showMore: false } : {}),
+            ...(footer?.length ? { footer } : {}),
             message: `${char.name}: HP ${char.hp}/${char.maxHp}`
         };
     }

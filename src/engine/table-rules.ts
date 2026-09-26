@@ -51,7 +51,24 @@ export const RuleSpecSchemas = {
         compact: z.boolean().default(true),
         maxConditions: z.number().int().min(0).max(10).default(2),
         /** The one resource pool the tiny block shows (e.g. 'corruption'). Only a named pool is ever shown. */
-        corePool: z.string().optional()
+        corePool: z.string().optional(),
+        // Item 18: the house format. Unset, each reproduces the default block.
+        /** 'rows' (default): one condition a row. 'line': one labelled row, 'COND A · B'. */
+        conditionLayout: z.enum(['rows', 'line']).optional(),
+        /** Label on the 'line' layout's row (default 'COND'). */
+        conditionLabel: z.string().optional(),
+        /** false drops the '+N more' row. */
+        showMore: z.boolean().optional(),
+        /** false drops the AT row. */
+        showLocation: z.boolean().optional(),
+        /** false drops the OBJ row. */
+        showObjective: z.boolean().optional(),
+        /**
+         * A free line under the frame, segments joined by ' · ': 'scene.place',
+         * 'scene.<engineState key>', 'knows:<key prefix>' (or 'knows:<prefix>|Label')
+         * as 'Label (k of n)', 'location', 'objective'. Anything else prints as written.
+         */
+        footer: z.array(z.string()).optional()
     }).passthrough(),
     principle: z.object({
         text: z.string().min(1)

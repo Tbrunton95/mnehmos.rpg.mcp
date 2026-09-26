@@ -92,6 +92,7 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Conditions mid-fight | `combat_manage add_condition {condition \| name}` / `remove_condition {condition \| name \| conditionId}`; standard conditions set adv/dis/auto-crit themselves (`ranged`, `ignoreConditions` on attacks) |
 | Just the condition names | `character_manage get {characterId, fields: ['conditionNames']}` (or `fields: ['conditions.name', 'conditions.pinned']`) |
 | A plot thread grew too long | `narrative_manage archive {noteId, keepLast?: 2, preview?}` (older sections move to an archived note) |
+| House-format status block with a footer | `table_rules define {kind: 'status_block', name: 'tiny-status', spec: {conditionLayout: 'line', showMore: false, showLocation: false, showObjective: false, footer: ['knows:vaurek', 'scene.place', 'scene.pull']}}` |
 | Turn prose into a feature | `improvisation_manage feature_from_condition` / `edit_effect` |
 | A ruling or an invention | `precedent_manage record` / `search` |
 | Who knows a secret | `knowledge_manage record` / `learn` / `can_know` |
