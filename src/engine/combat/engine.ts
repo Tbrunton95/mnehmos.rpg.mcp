@@ -285,7 +285,9 @@ export class CombatEngine {
         this.state.turnOrder = newTurnOrder;
         if (newIndex >= 0) this.state.currentTurnIndex = newIndex;
 
-        return this.state;
+        // Callers persist this state directly: it carries the RNG position
+        // after the initiative rolls (getState refreshes it).
+        return this.getState()!;
     }
 
     startEncounter(participants: CombatParticipant[]): CombatState {
@@ -359,7 +361,9 @@ export class CombatEngine {
             state: this.state
         });
 
-        return this.state;
+        // Callers persist this state directly: it carries the RNG position
+        // after the initiative rolls (getState refreshes it).
+        return this.getState()!;
     }
 
     /**
