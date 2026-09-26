@@ -195,6 +195,19 @@ describe('the Waaagh! call: combat_manage battle_cry', () => {
         expect((await manage({ action: 'battle_cry', participantId: 'boy', ability: 'Waaagh!', attackAdvantage: true })).r.error).toBe(true);
         expect(tok('boy').buffs ?? []).toEqual([]);
     });
+
+    it("off the caller's turn: an action or bonus cost is refused, a free call stands and says so", async () => {
+        await setup(lineup());
+        await manage({ action: 'advance' }); // boy's turn
+        const paid = await manage({ action: 'battle_cry', participantId: 'grimgor', ability: 'Waaagh!', attackAdvantage: true, actionCost: 'bonus', match: { species: 'Orruk' } });
+        expect(paid.r.error).toBe(true);
+        expect(paid.r.message).toMatch(/not Grimgor's turn/);
+        expect(tok('boy').buffs ?? []).toEqual([]);
+        expect(tok('grimgor').abilities[0].ready).not.toBe(false);
+        const free = await manage({ action: 'battle_cry', participantId: 'grimgor', attackAdvantage: true, match: { species: 'Orruk' } });
+        expect(free.r).toMatchObject({ success: true, offTurn: true });
+        expect(tok('boy').buffs).toHaveLength(1);
+    });
 });
 
 describe('mob rule', () => {

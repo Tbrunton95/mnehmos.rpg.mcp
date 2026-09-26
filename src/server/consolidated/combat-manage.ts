@@ -217,7 +217,7 @@ const BattleCrySchema = z.object({
     speedBonus: z.number().int().optional().describe('Feet added to speed'),
     moraleBonus: z.number().int().optional().describe("Added to a unit's morale on a break test"),
     ability: z.string().optional().describe("An ability on the caller's token it spends ('Waaagh!'): must be ready; a recharge ability rolls to come back at the start of its turn"),
-    actionCost: z.enum(['action', 'bonus', 'none']).default('none').describe("What it costs the caller's turn (default none)"),
+    actionCost: z.enum(['action', 'bonus', 'none']).default('none').describe("What it costs the caller's turn (default none: a free action, allowed out of turn; action or bonus only on the caller's turn)"),
     reason: z.string().optional()
 });
 
@@ -1544,6 +1544,16 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 }
                 if (ability.ready === false) return refuse(`${p.name}'s ${ability.name} is spent and not recharged (recharge ${ability.recharge ?? '?'}+ on a d6 at the start of its turn).`);
             }
+            // A cry that costs an action or bonus action is made on the
+            // caller's own turn: off it, those flags would be spent and then
+            // reset at its turn start, a free cry in disguise. actionCost
+            // 'none' (the default) is a free action and may ring out of turn.
+            const activeId = state.turnOrder[state.currentTurnIndex];
+            const offTurn = !!activeId && activeId !== p.id;
+            if (offTurn && params.actionCost !== 'none') {
+                const active = activeId === 'LAIR' ? 'the lair' : state.participants.find(x => x.id === activeId)?.name ?? activeId;
+                return refuse(`It is not ${p.name}'s turn (${active} is acting): a battle cry with actionCost '${params.actionCost}' is made on the caller's turn. Use actionCost 'none' for a free cry.`);
+            }
             if (params.actionCost !== 'none') {
                 const economy = engine.validateActionEconomy(p.id, params.actionCost);
                 if (!economy.valid) return refuse(`${p.name}: ${economy.error ?? `${params.actionCost} unavailable`}.`);
@@ -1564,7 +1574,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 const had = r.buffs?.find(b => b.name.toLowerCase() === buff.name.toLowerCase());
                 r.buffs = [...(r.buffs ?? []).filter(b => b !== had), { ...buff }];
                 // Speed on the caller's own turn reaches the movement it has left.
-                if (r.id === p.id && buff.speedBonus && r.movementRemaining !== undefined) {
+                if (r.id === p.id && !offTurn && buff.speedBonus && r.movementRemaining !== undefined) {
                     r.movementRemaining += buff.speedBonus - (had?.speedBonus ?? 0);
                 }
             }
@@ -1577,6 +1587,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             return {
                 success: true, actionType: 'battle_cry', encounterId: params.encounterId, participantId: p.id,
                 buff, recipients: recipients.map(r => ({ id: r.id, name: r.name })),
+                ...(offTurn ? { offTurn: true, note: `called off ${p.name}'s turn as a free action (actionCost none)` } : {}),
                 ...(ability ? { ability: { name: ability.name, ready: ability.ready !== false } } : {}),
                 message: `📣 ${summary}${ability?.recharge ? `\n${ability.name} is spent; it recharges on a d6 of ${ability.recharge}+ at the start of ${p.name}'s turn.` : ''}`
             };
@@ -1814,7 +1825,7 @@ Aliases: start/begin→create, state/status→get, finish/stop→end, restore/re
    legendary_action {participantId, cost?, description} - a non-attack legendary action off its turn (attacks: combat_action attack with legendaryCost)
    legendary_resistance {participantId, reason} - turn a failed save into a success
    use_ability {participantId, ability, targetIds?, damage?: number | dice, damageType?, savingThrow?: {ability, dc}} - a limited ability (breath weapon): spends the action, marks a recharge ability spent (it rolls a d6 at the start of its turn), saves per target
-   battle_cry {participantId, name?: 'Waaagh!', range?: 60, match?: {species?, band?, tag?, nameIncludes?}, rounds?: 1, attackAdvantage?, damageBonus?: number | dice, speedBonus?, moraleBonus?, ability?, actionCost?} - buffs the caller and matching allies in range until the start of the caller's next turn
+   battle_cry {participantId, name?: 'Waaagh!', range?: 60, match?: {species?, band?, tag?, nameIncludes?}, rounds?: 1, attackAdvantage?, damageBonus?: number | dice, speedBonus?, moraleBonus?, ability?, actionCost?} - buffs the caller and matching allies in range until the start of the caller's next turn; actionCost action|bonus only on the caller's turn, none (default) is free and may be called out of turn
    budget {partyLevels | partyId, creatures: [{creature | cr | xp, count?}] | encounterId} - read-only 5e XP budget: TRIVIAL/EASY/MEDIUM/HARD/DEADLY
 6. end - Finish combat
 
