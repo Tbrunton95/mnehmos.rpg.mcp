@@ -20,7 +20,7 @@ import { getMeta, setMeta } from '../../storage/data-migrations.js';
 import { lookupOperation } from '../operation-guard.js';
 import { queryRolls } from '../../storage/roll-log.js';
 import { buildBootPacket, renderBootPacket } from '../boot-packet.js';
-import { readWorldClock } from '../../engine/world-clock.js';
+import { readWorldClock, clockWarning } from '../../engine/world-clock.js';
 
 /** Engine changes this database has not been shown yet. */
 function unseenChangelog(): ChangelogEntry[] {
@@ -490,6 +490,11 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
             if (worldClock) {
                 context.world.day = worldClock.day;
                 if (worldClock.time) context.world.time = worldClock.time;
+                // Items 14/15: records dated after the clock, advisory.
+                try {
+                    const warning = clockWarning(db, world.id);
+                    if (warning) context.world.clockWarning = warning;
+                } catch { /* advisory only */ }
             }
 
             // Get current location if party has position
