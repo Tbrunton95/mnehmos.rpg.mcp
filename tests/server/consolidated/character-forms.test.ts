@@ -106,6 +106,16 @@ describe('character_manage set_form', () => {
         expect(sheet()).toMatchObject({ hp: 30, maxHp: 30, ac: 15 });
     });
 
+    it("levelling in a form grows the character's own sheet, kept for the revert", async () => {
+        await char({ action: 'set_form', characterId: 'vex', form: 'Daemon Prince' });
+        const up = await char({ action: 'level_up', characterId: 'vex', hpIncrease: 7 });
+        expect(up).toMatchObject({ newLevel: 7, hpIncrease: 7, newMaxHp: 37 });
+        expect(sheet()).toMatchObject({ level: 7, maxHp: 180, hp: 90 });
+        expect(sheet().form.base).toMatchObject({ maxHp: 37 });
+        await char({ action: 'set_form', characterId: 'vex', form: 'base', hpMode: 'full' });
+        expect(sheet()).toMatchObject({ level: 7, hp: 37, maxHp: 37 });
+    });
+
     it('a built-in preset is a form; an unknown form and base without a form are refused', async () => {
         const r = await char({ action: 'set_form', characterId: 'vex', form: 'goblin' });
         expect(r).toMatchObject({ success: true, form: 'Goblin', maxHp: 7, source: 'preset' });

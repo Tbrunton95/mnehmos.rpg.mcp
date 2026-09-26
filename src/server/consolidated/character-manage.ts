@@ -2185,7 +2185,12 @@ async function handleLevelUp(args: z.infer<typeof LevelUpSchema>): Promise<objec
     if (capProblem) throw new Error(capProblem);
 
     const levelsGained = targetLevel - currentLevel;
-    const hpRule = levelUpHitPointRule(char, levelsGained);
+    // Item 2: in a form, the level grows the character's own sheet (the base
+    // snapshot), read on its own CON; the worn statblock keeps its HP, and
+    // set_form 'base' brings the gain back.
+    const form = (char as { form?: { name: string; since?: string; base: Record<string, unknown> } }).form;
+    const baseStats = form && form.base.stats && typeof form.base.stats === 'object' ? form.base.stats as typeof char.stats : char.stats;
+    const hpRule = levelUpHitPointRule({ ...char, stats: baseStats }, levelsGained);
     // Omitted HP uses the engine's deterministic average progression. Treat an
     // explicit zero the same way: zero is not a legal ordinary D&D level-up
     // increment, and silently persisting it was the defect this action exposed.
@@ -2195,11 +2200,23 @@ async function handleLevelUp(args: z.infer<typeof LevelUpSchema>): Promise<objec
     const hpProvenance = args.hpIncrease && args.hpIncrease > 0
         ? { mode: 'explicit' as const, levelsGained, hpIncrease }
         : hpRule;
-    const updates: Record<string, unknown> = {
-        level: targetLevel,
-        maxHp: (char.maxHp || 0) + hpIncrease,
-        hp: (char.hp || 0) + hpIncrease,
-    };
+    const updates: Record<string, unknown> = form
+        ? {
+            level: targetLevel,
+            form: {
+                ...form,
+                base: {
+                    ...form.base,
+                    maxHp: (Number(form.base.maxHp) || 0) + hpIncrease,
+                    hp: (Number(form.base.hp ?? form.base.maxHp) || 0) + hpIncrease
+                }
+            }
+        }
+        : {
+            level: targetLevel,
+            maxHp: (char.maxHp || 0) + hpIncrease,
+            hp: (char.hp || 0) + hpIncrease,
+        };
 
     // Recompute spell slots for the new level. Without this, level_up would
     // not grant the new caster slots a player earned with the level. Mirrors
@@ -2221,8 +2238,9 @@ async function handleLevelUp(args: z.infer<typeof LevelUpSchema>): Promise<objec
         newLevel: targetLevel,
         hpIncrease,
         hpProvenance,
-        newMaxHp: updates.maxHp ?? char.maxHp,
+        newMaxHp: form ? (updates.form as { base: { maxHp: number } }).base.maxHp : updates.maxHp ?? char.maxHp,
         spellSlots: updates.spellSlots,
+        ...(form ? { form: form.name, formNote: `In the form of ${form.name}: the HP gain goes to ${char.name}'s own sheet (restored by set_form 'base'); the form keeps ${char.hp}/${char.maxHp}` } : {}),
         message: `Leveled up to ${targetLevel}!`
     };
 }
