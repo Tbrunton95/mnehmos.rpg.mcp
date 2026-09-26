@@ -24,7 +24,12 @@ export function familyMember(spec: PoolFamilySpec, pool: string): string | undef
 function jealousyOf(spec: PoolFamilySpec, gainer: string): Array<{ rival: string; fraction: number }> {
     const key = Object.keys(spec.jealousy).find(k => k.toLowerCase() === gainer.toLowerCase());
     if (!key) return [];
-    return Object.entries(spec.jealousy[key]).map(([rival, fraction]) => ({ rival, fraction }));
+    // Only the family's own pools grow jealous: a rival named outside
+    // `pools` (a typo, 'gold') is never moved or clamped by the family.
+    return Object.entries(spec.jealousy[key]).flatMap(([rival, fraction]) => {
+        const member = familyMember(spec, rival);
+        return member ? [{ rival: member, fraction }] : [];
+    });
 }
 
 /**

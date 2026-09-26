@@ -52,6 +52,13 @@ describe('applyFamilyDelta', () => {
         expect(out.Slaanesh.history.at(-1)).toMatchObject({ from: 4, to: 2, reason: expect.stringMatching(/jealous.*Khorne/i) });
     });
 
+    it('jealousy never reaches a pool outside the family', () => {
+        const leaky = { name: 'Gods', spec: parseRuleSpec('pool_family', { ...GODS, jealousy: { Khorne: { gold: 1, Slaanesh: 0.5 } } }) };
+        const { pools: out, moves } = applyFamilyDelta({ Khorne: { current: 2, max: 20 }, Slaanesh: { current: 4, max: 20 }, gold: { current: 5, max: 100 } }, leaky, 'Khorne', 4, 'skulls');
+        expect(out.gold).toEqual({ current: 5, max: 100 });
+        expect(moves.map(m => m.pool)).toEqual(['Khorne', 'Slaanesh']);
+    });
+
     it('a loss moves no rival; the family floor and max clamp', () => {
         const a = applyFamilyDelta({ Khorne: { current: 2, max: 20 }, Slaanesh: { current: 4, max: 20 } }, fam, 'Khorne', -30, 'shamed');
         expect(a.pools.Khorne.current).toBe(-10);
