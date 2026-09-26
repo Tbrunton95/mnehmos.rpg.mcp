@@ -57,3 +57,32 @@ export function pickFields(result: Record<string, unknown>, fields: string[]): R
     }
     return out;
 }
+
+type Reply = { content?: Array<{ type: string; text: string }> };
+
+/**
+ * Apply output_mode / fields to a tool reply. The data comes from the
+ * reply's `<!-- X_JSON -->` embed; a tool that replies with bare JSON (no
+ * embed, text starting with '{') is read as-is, so fields and summary work
+ * there too. Anything else — prose, a parse failure — comes back untouched.
+ */
+export function shapeReply<R extends Reply>(res: R, opts: { mode?: unknown; fields?: string[] }): R {
+    const { mode, fields } = opts;
+    const wantJson = mode === 'json' && !fields;
+    const wantSummary = mode === 'summary' || !!fields;
+    const text = res?.content?.[0]?.text;
+    if (!(wantJson || wantSummary) || !text) return res;
+    const m = text.match(/<!--\s*([A-Z_]*JSON)\s*\n?([\s\S]*?)\n?\1\s*-->/);
+    const body = m ? m[2].trim() : text.trimStart().startsWith('{') ? text.trim() : null;
+    if (body === null) return res;
+    if (wantJson) return m ? { ...res, content: [{ type: 'text', text: body }] } : res;
+    // summary: the result's small fields only; big lists become counts.
+    try {
+        const parsed = JSON.parse(body);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            const shaped = fields ? pickFields(parsed, fields) : summarizeResult(parsed);
+            return { ...res, content: [{ type: 'text', text: JSON.stringify(shaped) }] };
+        }
+    } catch { /* not JSON: fall through to the full reply */ }
+    return res;
+}

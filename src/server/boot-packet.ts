@@ -12,6 +12,7 @@ import { CustomEffectsRepository } from '../storage/repos/custom-effects.repo.js
 import { CharacterRepository } from '../storage/repos/character.repo.js';
 import { loadRule, findPool, conditionsForDisplay, shownCounters } from '../engine/table-rules.js';
 import { recentPrecedents } from './consolidated/precedent-manage.js';
+import { NOTE_SOFT_CAP, splitSections } from './consolidated/narrative-manage.js';
 import { readWorldClock } from '../engine/world-clock.js';
 import type { Character } from '../schema/character.js';
 
@@ -22,13 +23,24 @@ export interface BootPacket {
     time?: string;
     characters: Array<Record<string, unknown>>;
     clocks: Array<Record<string, unknown>>;
-    threads: Array<{ id: string; text: string }>;
+    /** A grown thread reads as its first line, then its newest section; `long` past the soft cap. */
+    threads: Array<{ id: string; text: string; chars?: number; long?: true }>;
     telegraphs: Array<{ encounterId: string; name: string; intent?: string; readied?: string }>;
     journal: Array<{ type: string; text: string; at: string }>;
     precedents: Array<{ kind: string; statement: string; scope: string | null }>;
 }
 
 const clip = (s: string, n: number) => s.length > n ? `${s.slice(0, n)}…` : s;
+
+// Item 17: the first 160 chars of a thread that grew by append are its
+// oldest words. Show where it started and where it is now.
+function threadDigest(content: string): string {
+    const { head, sections } = splitSections(content);
+    if (!sections.length) return clip(content, 160);
+    const last = sections[sections.length - 1];
+    const body = last.raw.replace(/^\n\n── \[[^\]\n]+\] ──\n?/, '').trim();
+    return `${clip(head.trim().split('\n')[0], 100)} … latest [${last.stamp}]: ${clip(body, 160)}`;
+}
 
 function tryAll<T>(fn: () => T[]): T[] {
     try { return fn(); } catch { return []; }
@@ -100,7 +112,7 @@ export function buildBootPacket(worldId: string, characterIds?: string[], journa
 
     const threads = tryAll(() => (db.prepare(`SELECT id, content FROM narrative_notes WHERE world_id = ? AND type = 'plot_thread' AND status = 'active'
                                              ORDER BY updated_at DESC LIMIT 8`).all(worldId) as Array<{ id: string; content: string }>)
-        .map(r => ({ id: r.id, text: clip(r.content, 160) })));
+        .map(r => ({ id: r.id, text: threadDigest(r.content), ...(r.content.length > NOTE_SOFT_CAP ? { chars: r.content.length, long: true as const } : {}) })));
 
     const telegraphs = tryAll(() => (db.prepare("SELECT id, tokens FROM encounters WHERE status = 'active' AND world_id = ?").all(worldId) as Array<{ id: string; tokens: string }>)
         .flatMap(e => (JSON.parse(e.tokens) as Array<{ name: string; intent?: string; readied?: { action: string; trigger: string } }>)

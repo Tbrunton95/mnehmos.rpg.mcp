@@ -1,5 +1,6 @@
 import { handleImprovisationManage } from '../../../src/server/consolidated/improvisation-manage.js';
 import { handleCharacterManage } from '../../../src/server/consolidated/character-manage.js';
+import { handleNarrativeManage } from '../../../src/server/consolidated/narrative-manage.js';
 import { handleSessionManage } from '../../../src/server/consolidated/session-manage.js';
 import { handlePrecedentManage } from '../../../src/server/consolidated/precedent-manage.js';
 import { handleCombatManage } from '../../../src/server/consolidated/combat-manage.js';
@@ -78,6 +79,32 @@ describe('boot packet', () => {
         expect(p.telegraphs[0]).toMatchObject({ name: "An'ggrath", intent: 'closes the thirty metres and takes the wing' });
         expect(p.precedents[0].statement).toMatch(/Flight is the Warp's/);
         expect(text).toMatch(/◇ Warp-sight \[on_spell_cast \(when he looks\)\] cost: 1 RESOLVE per scene/);
+    });
+});
+
+describe('boot threads', () => {
+    it('show the head of a grown thread and its latest section, never an archive', async () => {
+        const nm = async (a: Record<string, unknown>) => json(await handleNarrativeManage(a, ctx as any));
+        const { noteId } = await nm({ action: 'add', worldId: W, type: 'plot_thread', content: 'The Vaurek quarters.\nFour pieces, scattered by the Mouth.' });
+        await nm({ action: 'append', noteId, day: 360, content: 'First quarter found under the Brass Gate.' });
+        await nm({ action: 'append', noteId, day: 366, content: 'Second quarter taken from the Ithraes vault.' });
+        const t = json(await handleSessionManage({ action: 'boot', worldId: W }, ctx as any)).threads;
+        expect(t).toHaveLength(1);
+        expect(t[0].text).toBe('The Vaurek quarters. … latest [Day 366]: Second quarter taken from the Ithraes vault.');
+        expect(t[0].long).toBeUndefined();
+
+        await nm({ action: 'append', noteId, day: 367, content: 'z'.repeat(8000) });
+        await nm({ action: 'archive', noteId, keepLast: 1 });
+        const again = json(await handleSessionManage({ action: 'boot', worldId: W }, ctx as any)).threads;
+        expect(again).toHaveLength(1);
+        expect(again[0]).toMatchObject({ id: noteId, long: true });
+        expect(again[0].chars).toBeGreaterThan(8000);
+        expect(again[0].text).toMatch(/^The Vaurek quarters\. … latest \[Day 367\]: z+…$/);
+    });
+
+    it('a thread with no sections keeps its first 160 chars', async () => {
+        await handleNarrativeManage({ action: 'add', worldId: W, type: 'plot_thread', content: 'The Oath of the Ninth binds Luciel.' }, ctx as any);
+        expect(json(await handleSessionManage({ action: 'boot', worldId: W }, ctx as any)).threads[0].text).toBe('The Oath of the Ninth binds Luciel.');
     });
 });
 

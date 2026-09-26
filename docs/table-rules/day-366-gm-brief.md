@@ -48,6 +48,7 @@ At the start of every session, call `session_manage boot {worldId}` and read all
 - Record every ruling and every invention with `precedent_manage record {worldId, kind: 'ruling' | 'invention', statement, scope}`. Search precedents before ruling on anything that may have come up before.
 - Before an NPC states a fact, ask `knowledge_manage can_know {worldId, key, knowerId}`. When someone learns something, record the road: `learn {key, knowerId, how: witnessed | told | position | deduced | read | rumour, fromId}`. A secret can only be told by someone who knows it.
 - Move each long prose condition into a feature with `improvisation_manage feature_from_condition {characterId, match, triggers?, cost?, mechanics?}`, and edit one clause with `edit_effect {effectId, descriptionReplace: {find, with}}`. The boot packet then lists it with its trigger and cost.
+- Grow a plot thread with `narrative_manage append {noteId, content}`. When a reply warns the note is past 8000 characters, run `narrative_manage archive {noteId}` (keeps the head and the last two sections; `preview: true` first if unsure). Boot shows each thread's first line and its latest section.
 - Ask for only what you need with `fields: ['hp', 'conditions']` on any call. Dotted names reach into lists: `fields: ['conditions.name']`; `character_manage get {characterId, fields: ['conditionNames']}` is the condition index without the source text. An ambiguous `editConditions` match lists the names it hit.
 
 ## A refusal is a rule, not an error

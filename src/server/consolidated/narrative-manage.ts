@@ -21,7 +21,7 @@ import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/a
 // CONSTANTS & ENUMS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['add', 'batch_add', 'search', 'update', 'get', 'delete', 'get_context', 'append'] as const;
+const ACTIONS = ['add', 'batch_add', 'search', 'update', 'get', 'delete', 'get_context', 'append', 'archive'] as const;
 type NarrativeAction = typeof ACTIONS[number];
 
 const NOTE_TYPE_VALUES = [
@@ -84,6 +84,40 @@ const SessionLogMetadata = z.object({
     xp_awarded: z.number().optional(),
     player_count: z.number().optional()
 });
+
+// Item 17: a note past this many characters still saves, but the reply warns
+// and names the archive call. Every read of a long thread pays for its size.
+export const NOTE_SOFT_CAP = 8000;
+
+function noteSize(content: string): { size: { chars: number; softCap: number; over: boolean }; warning?: string } {
+    const over = content.length > NOTE_SOFT_CAP;
+    return {
+        size: { chars: content.length, softCap: NOTE_SOFT_CAP, over },
+        ...(over ? { warning: `${content.length} chars (soft cap ${NOTE_SOFT_CAP}): narrative_manage archive {noteId, keepLast: 2} moves the older sections to an archived note.` } : {})
+    };
+}
+
+// The section header handleAppend writes: '\n\n── [stamp] ──\n'. The
+// lookahead leaves the newline in place so an archive marker (a header with
+// no body) parses as a section with an empty body.
+const SECTION_HEADER = /\n\n── \[([^\]\n]+)\] ──(?=\n|$)/g;
+const ARCHIVE_MARKER = /^archived \d+ sections? /;
+
+/** Split a grown note into its head (preamble plus archive markers) and its dated sections, raw. */
+export function splitSections(content: string): { head: string; sections: Array<{ stamp: string; raw: string }> } {
+    const hits = [...content.matchAll(SECTION_HEADER)];
+    if (!hits.length) return { head: content, sections: [] };
+    let head = content.slice(0, hits[0].index);
+    const sections: Array<{ stamp: string; raw: string }> = [];
+    hits.forEach((m, i) => {
+        const raw = content.slice(m.index, i + 1 < hits.length ? hits[i + 1].index : content.length);
+        // A marker left by an earlier archive belongs to the head: it is
+        // never archived again, and only real sections count.
+        if (ARCHIVE_MARKER.test(m[1]) && sections.length === 0) head += raw;
+        else sections.push({ stamp: m[1], raw });
+    });
+    return { head, sections };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DATABASE HELPER
@@ -272,6 +306,7 @@ async function handleAdd(args: z.infer<typeof AddSchema>): Promise<object> {
         success: true,
         noteId: id,
         type: args.type,
+        ...noteSize(args.content),
         message: `Created ${args.type} note: "${args.content.substring(0, 50)}${args.content.length > 50 ? '...' : ''}"`
     };
 }
@@ -459,7 +494,61 @@ async function handleAppend(args: z.infer<typeof AppendSchema>): Promise<object>
         clockSource,
         appendedChars: args.content.length,
         totalChars: newContent.length,
+        ...noteSize(newContent),
         message: `Section [${stamp}] appended — the file grows (${newContent.length} chars total)`
+    };
+}
+
+// Item 17: ARCHIVE — a thread that grew past the soft cap keeps its head and
+// its newest sections; the older ones move, whole and in order, to a new
+// note with status 'archived' (boot and get_context skip archived notes).
+const ArchiveSchema = z.object({
+    action: z.literal('archive'),
+    noteId: z.string().describe('Note to trim'),
+    keepLast: z.number().int().min(0).optional().default(2).describe('Newest sections to keep on the live note (default 2)'),
+    preview: z.boolean().optional().describe('Count what would move; write nothing')
+});
+
+async function handleArchive(args: z.infer<typeof ArchiveSchema>): Promise<object> {
+    const db = ensureDb();
+    const existing = db.prepare('SELECT * FROM narrative_notes WHERE id = ?').get(args.noteId) as NarrativeNoteRow | undefined;
+    if (!existing) return { error: true, message: `Note ${args.noteId} not found. Nothing was written.` };
+    const { head, sections } = splitSections(existing.content);
+    const move = sections.slice(0, Math.max(0, sections.length - args.keepLast));
+    const keep = sections.slice(move.length);
+    if (!move.length) {
+        return { error: true, noteId: args.noteId, sections: sections.length, message: `Note has ${sections.length} sections; keepLast ${args.keepLast} leaves nothing to archive. Nothing was written.` };
+    }
+    const from = move[0].stamp, to = move[move.length - 1].stamp;
+    if (args.preview) {
+        return { success: true, preview: true, noteId: args.noteId, sections: sections.length, archive: move.length, keep: keep.length, from, to, charsBefore: existing.content.length, message: `Would archive ${move.length} sections (${from}..${to}) and keep ${keep.length}. Nothing was written.` };
+    }
+    const archiveId = uuidv4();
+    const now = new Date().toISOString();
+    const marker = `\n\n── [archived ${move.length} sections ${from}..${to} → note ${archiveId}] ──`;
+    const liveContent = head + marker + keep.map(k => k.raw).join('');
+    const archiveContent = `Archive of note ${args.noteId}: ${move.length} sections, ${from}..${to}.` + move.map(m => m.raw).join('');
+    const liveMeta = JSON.parse(existing.metadata || '{}');
+    liveMeta.archives = [...(Array.isArray(liveMeta.archives) ? liveMeta.archives : []), archiveId];
+    db.transaction(() => {
+        db.prepare(`
+            INSERT INTO narrative_notes (id, world_id, type, content, metadata, visibility, tags, entity_id, entity_type, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'archived', ?, ?)
+        `).run(archiveId, existing.world_id, existing.type, archiveContent, JSON.stringify({ archiveOf: args.noteId, sections: move.length, from, to }),
+            existing.visibility, existing.tags, existing.entity_id, existing.entity_type, now, now);
+        db.prepare('UPDATE narrative_notes SET content = ?, metadata = ?, updated_at = ? WHERE id = ?').run(liveContent, JSON.stringify(liveMeta), now, args.noteId);
+    })();
+    return {
+        success: true,
+        actionType: 'archive',
+        noteId: args.noteId,
+        archiveNoteId: archiveId,
+        archived: move.length,
+        kept: keep.length,
+        from,
+        to,
+        ...noteSize(liveContent),
+        message: `Archived ${move.length} sections (${from}..${to}) to note ${archiveId}; ${keep.length} kept (${liveContent.length} chars now)`
     };
 }
 
@@ -526,6 +615,7 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     return {
         success: true,
         noteId: args.noteId,
+        ...noteSize(args.content ?? existing.content),
         // FINDINGS #61: was joining raw SQL fragments ("status = ?") — unbound
         // placeholders leaking into user-facing text. Field names only.
         message: `Updated note. Changed: ${updates.slice(0, -1).map(u => u.split(' =')[0]).join(', ')}`
@@ -699,8 +789,14 @@ const definitions: Record<NarrativeAction, ActionDefinition> = {
     append: {
         schema: AppendSchema,
         handler: handleAppend,
-        aliases: ['grow', 'add_section', 'log_entry'],
+        aliases: ['grow', 'add_section', 'append_section', 'log_entry'],
         description: 'FINDINGS #96: append a dated section to a note — bestiary pages, case files, field notes GROW instead of being rewritten. {noteId, content, day?}'
+    },
+    archive: {
+        schema: ArchiveSchema,
+        handler: handleArchive,
+        aliases: ['archive_sections', 'split'],
+        description: 'Move the older appended sections of a long note to an archived note, keeping the head and the last keepLast (default 2). {noteId, keepLast?, preview?}'
     },
     get: {
         schema: GetSchema,
@@ -748,6 +844,8 @@ export const NarrativeManageTool = {
 2. add - Create a single note during play when something notable happens
 3. get_context - Inject into system prompt for informed storytelling
 4. update - Mark plot_threads as 'resolved' when completed
+5. append - Grow a thread by a dated section {noteId, content, day?}
+6. archive - A note past ${NOTE_SOFT_CAP} chars: move old sections out {noteId, keepLast?: 2, preview?}
 
 ⚡ BATCH FIRST: When cataloguing session events, plot threads, or foreshadowing at once,
    use batch_add with a notes[] array instead of making multiple add calls.
@@ -761,11 +859,11 @@ export const NarrativeManageTool = {
 - dm_only: Only DM sees (default) - secrets, NPC true motivations
 - player_visible: Can be shown to players - session logs, known lore
 
-Actions: add, batch_add, search, update, get, delete, get_context
-Aliases: add_many/bulk_add/log_session→batch_add, create→add, find→search, context→get_context`,
+Actions: add, batch_add, search, update, get, delete, get_context, append, archive
+Aliases: add_many/bulk_add/log_session→batch_add, create→add, find→search, context→get_context, append_section/add_section→append`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
-        action: z.string().describe('Action: add, batch_add, search, update, get, delete, get_context, append (#96)'),
+        action: z.string().describe('Action: add, batch_add, search, update, get, delete, get_context, append (#96), archive'),
         worldId: z.string().optional().describe('World ID (required for add, search, get_context)'),
         noteId: z.string().optional().describe('Note ID (required for get, update, delete, append)'),
         day: z.union([z.number(), z.string()]).optional().describe('append: in-fiction date stamp for the section header (#96)'),
@@ -793,7 +891,9 @@ Aliases: add_many/bulk_add/log_session→batch_add, create→add, find→search,
         includeTypes: z.array(noteTypeSchema()).optional(),
         maxPerType: z.number().optional(),
         statusFilter: z.array(noteStatusSchema()).optional(),
-        forPlayer: z.boolean().optional()
+        forPlayer: z.boolean().optional(),
+        keepLast: z.number().optional().describe('archive: newest sections to keep on the live note (default 2)'),
+        preview: z.boolean().optional().describe('archive: count what would move; write nothing')
     })
 };
 

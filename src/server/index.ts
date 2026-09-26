@@ -9,7 +9,7 @@ import { withOperation } from './operation-guard.js';
  * - On-demand schema loading
  */
 
-import { summarizeResult, pickFields } from './output-mode.js';
+import { shapeReply } from './output-mode.js';
 import { config as loadDotenv } from 'dotenv';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -170,26 +170,11 @@ function buildServer(pubsub: PubSub, auditLogger: AuditLogger): McpServer {
     async (args: Record<string, unknown>, extra: unknown) => {
       const mode = args?.output_mode ?? args?.outputMode;
       const fields = Array.isArray(args?.fields) ? (args.fields as unknown[]).map(String) : undefined;
-      const wantJson = mode === 'json' && !fields;
-      const wantSummary = mode === 'summary' || !!fields;
       if (args) { delete args.output_mode; delete args.outputMode; delete args.fields; }
       const res = await handler(args, extra);
-      if ((wantJson || wantSummary) && res?.content?.[0]?.text) {
-        const text = res.content[0].text;
-        const m = text.match(/<!--\s*([A-Z_]*JSON)\s*\n?([\s\S]*?)\n?\1\s*-->/);
-        if (m) {
-          if (wantJson) return { ...res, content: [{ type: 'text', text: m[2].trim() }] };
-          // summary: the result's small fields only; big lists become counts.
-          try {
-            const parsed = JSON.parse(m[2].trim());
-            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-              const shaped = fields ? pickFields(parsed, fields) : summarizeResult(parsed);
-              return { ...res, content: [{ type: 'text', text: JSON.stringify(shaped) }] };
-            }
-          } catch { /* not JSON: fall through to the full reply */ }
-        }
-      }
-      return res;
+      // Item 17: shapeReply also reads bare-JSON replies (narrative_manage),
+      // which have no embed and were returned whole before.
+      return shapeReply(res, { mode, fields });
     };
 
   for (const [toolName, entry] of Object.entries(registry)) {
