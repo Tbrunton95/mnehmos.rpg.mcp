@@ -77,6 +77,7 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Spend a legendary resistance by hand | `combat_manage legendary_resistance {participantId, reason}` |
 | Opportunity attack or readied swing | add `reaction: true` to the attack |
 | Grab, pin, throw or finish unarmed | `combat_action grapple {encounterId, actorId, targetId, move}` (one attack; band and size disadvantage are automatic); `control: true` pins; `move: 'execute'` finishes a pinned lower-band foe; `move: 'break'` escapes the holder named in targetId |
+| A saving throw, with advantage from a condition or feature | `math_manage roll_saving_throw {characterId, ability, dc, advantageSources: ['VAUREK']}` (logged as `wis save (adv: VAUREK)`) |
 | A boss burns legendary resistance on failed saves by itself | add `autoLegendaryResistance: true` to its statline; without it, a failed save reports how many are left |
 | Squad fires / is suppressed | `combat_action volley`; `combat_manage set_unit` |
 | Cut through a packed lower-band squad | add `cleave: true` |
