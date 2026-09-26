@@ -779,6 +779,16 @@ function runMigrations(db: Database.Database) {
     db.exec(`ALTER TABLE parties ADD COLUMN current_poi TEXT;`);
   }
 
+  // Item 7: the warband. Loyalty (0-10, NULL reads 5), wage, pay mode and a
+  // unit's model count on each membership.
+  const memberColumns = db.prepare("PRAGMA table_info(party_members)").all() as { name: string }[];
+  for (const [col, type] of [['loyalty', 'INTEGER'], ['wage', 'REAL'], ['pay_mode', 'TEXT'], ['unit_models', 'INTEGER']] as const) {
+    if (!memberColumns.some(c => c.name === col)) {
+      console.error(`[Migration] Adding ${col} column to party_members table`);
+      db.exec(`ALTER TABLE party_members ADD COLUMN ${col} ${type};`);
+    }
+  }
+
   // Set safe default positions for existing parties (map center)
   db.exec(`
     UPDATE parties

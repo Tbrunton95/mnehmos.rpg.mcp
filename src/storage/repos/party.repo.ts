@@ -35,6 +35,10 @@ interface PartyMemberRow {
     share_percentage: number;
     joined_at: string;
     notes: string | null;
+    loyalty?: number | null;
+    wage?: number | null;
+    pay_mode?: string | null;
+    unit_models?: number | null;
 }
 
 // Row returned from the join query with character data
@@ -224,9 +228,9 @@ export class PartyRepository {
 
         const stmt = this.db.prepare(`
             INSERT INTO party_members (id, party_id, character_id, role, is_active, 
-                position, share_percentage, joined_at, notes)
+                position, share_percentage, joined_at, notes, loyalty, wage, pay_mode, unit_models)
             VALUES (@id, @partyId, @characterId, @role, @isActive, 
-                @position, @sharePercentage, @joinedAt, @notes)
+                @position, @sharePercentage, @joinedAt, @notes, @loyalty, @wage, @payMode, @unitModels)
         `);
 
         stmt.run({
@@ -239,6 +243,10 @@ export class PartyRepository {
             sharePercentage: validated.sharePercentage,
             joinedAt: validated.joinedAt,
             notes: validated.notes || null,
+            loyalty: validated.loyalty ?? null,
+            wage: validated.wage ?? null,
+            payMode: validated.payMode ?? null,
+            unitModels: validated.unitModels ?? null,
         });
 
         return validated;
@@ -271,7 +279,8 @@ export class PartyRepository {
         const stmt = this.db.prepare(`
             UPDATE party_members SET 
                 role = ?, is_active = ?, position = ?, 
-                share_percentage = ?, notes = ?
+                share_percentage = ?, notes = ?,
+                loyalty = ?, wage = ?, pay_mode = ?, unit_models = ?
             WHERE party_id = ? AND character_id = ?
         `);
 
@@ -281,6 +290,10 @@ export class PartyRepository {
             updated.position ?? null,
             updated.sharePercentage,
             updated.notes || null,
+            updated.loyalty ?? null,
+            updated.wage ?? null,
+            updated.payMode ?? null,
+            updated.unitModels ?? null,
             pid,
             cid
         );
@@ -368,6 +381,7 @@ export class PartyRepository {
             SELECT 
                 pm.id, pm.party_id, pm.character_id, pm.role, pm.is_active, 
                 pm.position, pm.share_percentage, pm.joined_at, pm.notes,
+                pm.loyalty, pm.wage, pm.pay_mode, pm.unit_models,
                 c.id as char_id, c.name as char_name, c.stats, c.hp, c.max_hp, 
                 c.ac, c.level, c.behavior, c.character_type, c.race, c.character_class
             FROM party_members pm
@@ -391,6 +405,10 @@ export class PartyRepository {
             sharePercentage: row.share_percentage,
             joinedAt: row.joined_at,
             notes: row.notes ?? undefined,
+            ...(row.loyalty != null ? { loyalty: row.loyalty } : {}),
+            ...(row.wage != null ? { wage: row.wage } : {}),
+            ...(row.pay_mode != null ? { payMode: row.pay_mode as 'wage' | 'share' | 'none' } : {}),
+            ...(row.unit_models != null ? { unitModels: row.unit_models } : {}),
             character: {
                 id: row.char_id,
                 name: row.char_name,
@@ -577,6 +595,10 @@ export class PartyRepository {
             sharePercentage: row.share_percentage,
             joinedAt: row.joined_at,
             notes: row.notes ?? undefined,
+            ...(row.loyalty != null ? { loyalty: row.loyalty } : {}),
+            ...(row.wage != null ? { wage: row.wage } : {}),
+            ...(row.pay_mode != null ? { payMode: row.pay_mode } : {}),
+            ...(row.unit_models != null ? { unitModels: row.unit_models } : {}),
         });
     }
 }

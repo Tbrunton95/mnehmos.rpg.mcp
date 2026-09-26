@@ -33,6 +33,8 @@ import {
     PartyStatusSchema,
     PartyContext
 } from '../../schema/party.js';
+import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
+import { handleKill } from './character-manage.js';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { RichFormatter } from '../utils/formatter.js';
 
@@ -44,11 +46,30 @@ const ACTIONS = [
     'create', 'get', 'list', 'update', 'delete',
     'add_member', 'remove_member', 'update_member', 'set_leader', 'set_active', 'get_members',
     'get_context', 'get_unassigned',
-    'move', 'get_position', 'get_in_region'
+    'move', 'get_position', 'get_in_region',
+    'muster', 'pay', 'after_battle'
 ] as const;
 type PartyAction = typeof ACTIONS[number];
 
 const memberRoleSchema = () => z.enum(['leader', 'member', 'companion', 'hireling', 'prisoner', 'mount']);
+// Item 7: the warband fields, as factories so inner and outer never share an instance.
+const loyaltySchema = () => z.number().int().min(0).max(10).describe('Loyalty 0-10 (unset reads 5): paid +1, unpaid -1, victory +1, defeat -1');
+const wageSchema = () => z.number().min(0).describe('Gold owed each pay (payMode wage)');
+const payModeSchema = () => z.enum(['wage', 'share', 'none']).describe('wage: paid wage first; share: split what is left by sharePercentage; none: never paid (default: wage when a wage is set, else none)');
+const unitModelsSchema = () => z.number().int().min(0).describe('Models in the unit this member stands for; losing the last one kills it');
+const recruitSchema = () => z.object({
+    characterId: z.string(),
+    role: memberRoleSchema().optional(),
+    loyalty: loyaltySchema().optional(),
+    wage: wageSchema().optional(),
+    payMode: payModeSchema().optional(),
+    unitModels: unitModelsSchema().optional()
+});
+const casualtySchema = () => z.object({
+    characterId: z.string(),
+    models: z.number().int().min(0).optional().describe('Models the unit lost'),
+    dead: z.boolean().optional().describe('The member died (a unit also dies at 0 models)')
+});
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DATABASE HELPER
@@ -121,7 +142,11 @@ const AddMemberSchema = z.object({
     characterId: z.string(),
     role: memberRoleSchema().optional().default('member'),
     position: z.number().int().optional(),
-    notes: z.string().optional()
+    notes: z.string().optional(),
+    loyalty: loyaltySchema().optional(),
+    wage: wageSchema().optional(),
+    payMode: payModeSchema().optional(),
+    unitModels: unitModelsSchema().optional()
 });
 
 const RemoveMemberSchema = z.object({
@@ -137,7 +162,31 @@ const UpdateMemberSchema = z.object({
     role: memberRoleSchema().optional(),
     position: z.number().int().optional(),
     sharePercentage: z.number().int().min(0).max(100).optional(),
-    notes: z.string().optional()
+    notes: z.string().optional(),
+    loyalty: loyaltySchema().optional(),
+    wage: wageSchema().optional(),
+    payMode: payModeSchema().optional(),
+    unitModels: unitModelsSchema().optional()
+});
+
+const MusterSchema = z.object({
+    action: z.literal('muster'),
+    partyId: z.string()
+});
+
+const PaySchema = z.object({
+    action: z.literal('pay'),
+    partyId: z.string(),
+    payerId: z.string().optional().describe('Whose purse pays (default: the party leader)'),
+    amount: z.number().min(0).optional().describe('Gold to pay out in all: wages first, the rest split as shares. Omit to pay wages only')
+});
+
+const AfterBattleSchema = z.object({
+    action: z.literal('after_battle'),
+    partyId: z.string(),
+    victory: z.boolean().describe('true: survivors +1 loyalty; false: -1'),
+    casualties: z.array(casualtySchema()).optional(),
+    recruits: z.array(recruitSchema()).optional().describe('Characters who join after the battle (not moved by its loyalty)')
 });
 
 const SetLeaderSchema = z.object({
@@ -350,7 +399,11 @@ async function handleAddMember(args: z.infer<typeof AddMemberSchema>): Promise<o
         position: args.position,
         sharePercentage: 100,
         joinedAt: now,
-        notes: args.notes
+        notes: args.notes,
+        ...(args.loyalty !== undefined ? { loyalty: args.loyalty } : {}),
+        ...(args.wage !== undefined ? { wage: args.wage } : {}),
+        ...(args.payMode !== undefined ? { payMode: args.payMode } : {}),
+        ...(args.unitModels !== undefined ? { unitModels: args.unitModels } : {})
     };
 
     partyRepo.addMember(member);
@@ -391,6 +444,141 @@ async function handleUpdateMember(args: z.infer<typeof UpdateMemberSchema>): Pro
         ...updated,
         success: true,
         message: 'Member updated successfully'
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Item 7: THE WARBAND — muster, pay, after_battle
+// ═══════════════════════════════════════════════════════════════════════════
+
+const DEFAULT_LOYALTY = 5;
+const loyaltyOf = (m: PartyMember) => m.loyalty ?? DEFAULT_LOYALTY;
+const payModeOf = (m: PartyMember) => m.payMode ?? (m.wage != null && m.wage > 0 ? 'wage' : 'none');
+const clampLoyalty = (n: number) => Math.min(10, Math.max(0, n));
+
+async function handleMuster(args: z.infer<typeof MusterSchema>): Promise<object> {
+    const { partyRepo, charRepo } = ensureDb();
+    const party = partyRepo.findById(args.partyId);
+    if (!party) throw new Error(`Party not found: ${args.partyId}`);
+    const members = partyRepo.findMembersByParty(party.id).map(m => {
+        const c = charRepo.findById(m.characterId);
+        return {
+            characterId: m.characterId, name: c?.name ?? m.characterId, role: m.role,
+            hp: c ? `${c.hp}/${c.maxHp}` : undefined,
+            loyalty: loyaltyOf(m), payMode: payModeOf(m),
+            ...(m.wage != null ? { wage: m.wage } : {}),
+            ...(m.unitModels != null ? { unitModels: m.unitModels } : {}),
+            sharePercentage: m.sharePercentage,
+            ...(loyaltyOf(m) === 0 ? { wavering: true } : {})
+        };
+    });
+    const wagesDue = members.filter(m => m.payMode === 'wage').reduce((s, m) => s + (m.wage ?? 0), 0);
+    const models = members.reduce((s, m) => s + (m.unitModels ?? 0), 0);
+    return {
+        success: true, actionType: 'muster', partyId: party.id, partyName: party.name,
+        members, count: members.length, wagesDue, models,
+        message: `${party.name} musters ${members.length} (${models} models in units); wages due ${wagesDue} gold${members.some(m => m.wavering) ? `; wavering: ${members.filter(m => m.wavering).map(m => m.name).join(', ')}` : ''}`
+    };
+}
+
+async function handlePay(args: z.infer<typeof PaySchema>): Promise<object> {
+    const { db, partyRepo, charRepo } = ensureDb();
+    const party = partyRepo.findById(args.partyId);
+    if (!party) throw new Error(`Party not found: ${args.partyId}`);
+    const members = partyRepo.findMembersByParty(party.id);
+    const payerId = args.payerId ? (charRepo.findById(args.payerId)?.id ?? null) : (members.find(m => m.role === 'leader')?.characterId ?? null);
+    if (!payerId) throw new Error(args.payerId ? `Payer not found: ${args.payerId}. Nothing was paid.` : `${party.name} has no leader to pay from: pass payerId. Nothing was paid.`);
+    const inv = new InventoryRepository(db);
+    const paid: Array<Record<string, unknown>> = [];
+    const unpaid: Array<Record<string, unknown>> = [];
+    let budget = args.amount ?? Infinity;
+    const payees = members.filter(m => m.characterId !== payerId);
+    const settle = (m: PartyMember, gold: number, as: 'wage' | 'share') => {
+        const name = charRepo.findById(m.characterId)?.name ?? m.characterId;
+        const ok = gold > 0 && gold <= budget && inv.transferCurrency(payerId, m.characterId, { gold });
+        const loyalty = clampLoyalty(loyaltyOf(m) + (ok ? 1 : -1));
+        partyRepo.updateMember(party.id, m.characterId, { loyalty });
+        if (ok) { budget -= gold; paid.push({ characterId: m.characterId, name, gold, as, loyalty }); }
+        else unpaid.push({ characterId: m.characterId, name, owed: gold, as, loyalty });
+    };
+    const pay = db.transaction(() => {
+        for (const m of payees.filter(p => payModeOf(p) === 'wage')) settle(m, m.wage ?? 0, 'wage');
+        if (args.amount !== undefined) {
+            const sharers = payees.filter(p => payModeOf(p) === 'share');
+            const weight = sharers.reduce((s, p) => s + p.sharePercentage, 0);
+            const pot = Math.max(0, budget);
+            for (const m of sharers) settle(m, weight > 0 ? Math.floor(pot * m.sharePercentage / weight) : 0, 'share');
+        }
+    });
+    pay();
+    const purse = inv.getCurrency(payerId).gold;
+    return {
+        success: true, actionType: 'pay', partyId: party.id, payerId, paid, unpaid,
+        ...(args.amount === undefined ? { sharesSkipped: 'no amount given: wages only' } : {}),
+        payerGoldLeft: purse,
+        message: `${party.name} paid: ${paid.map(p => `${String(p.name)} ${String(p.gold)}g (${String(p.as)})`).join(', ') || 'nobody'}${unpaid.length ? `; UNPAID: ${unpaid.map(u => String(u.name)).join(', ')} (loyalty -1)` : ''}. Payer has ${purse} gold left.`
+    };
+}
+
+async function handleAfterBattle(args: z.infer<typeof AfterBattleSchema>): Promise<object> {
+    const { partyRepo, charRepo } = ensureDb();
+    const party = partyRepo.findById(args.partyId);
+    if (!party) throw new Error(`Party not found: ${args.partyId}`);
+    // Validate everything before any write.
+    const casualties = (args.casualties ?? []).map(c => ({ c, m: partyRepo.findMember(party.id, c.characterId) }));
+    const strangers = casualties.filter(x => !x.m).map(x => x.c.characterId);
+    if (strangers.length) throw new Error(`Not in ${party.name}: ${strangers.join(', ')}. Nothing was written.`);
+    for (const r of args.recruits ?? []) {
+        if (!charRepo.findById(r.characterId)) throw new Error(`Recruit not found: ${r.characterId}. Nothing was written.`);
+        if (partyRepo.findMember(party.id, r.characterId)) throw new Error(`Recruit ${r.characterId} is already in ${party.name}. Nothing was written.`);
+    }
+
+    const killed: Array<Record<string, unknown>> = [];
+    const losses: Array<Record<string, unknown>> = [];
+    const dead = new Set<string>();
+    for (const { c, m } of casualties) {
+        const member = m!;
+        const name = charRepo.findById(member.characterId)?.name ?? member.characterId;
+        let left = member.unitModels ?? null;
+        if (c.models && left !== null) {
+            left = Math.max(0, left - c.models);
+            partyRepo.updateMember(party.id, member.characterId, { unitModels: left });
+            losses.push({ characterId: member.characterId, name, models: c.models, unitModels: left });
+        }
+        if (c.dead || left === 0) {
+            const k = await handleKill({ action: 'kill', characterId: member.characterId, cause: `fell in battle with ${party.name}` }) as Record<string, unknown>;
+            partyRepo.removeMember(party.id, member.characterId);
+            dead.add(member.characterId);
+            killed.push({ characterId: member.characterId, name, ...(k.corpseId ? { corpseId: k.corpseId } : {}), ...(k.error ? { killError: k.message } : {}) });
+        }
+    }
+    const step = args.victory ? 1 : -1;
+    const loyalty: Array<Record<string, unknown>> = [];
+    for (const m of partyRepo.findMembersByParty(party.id)) {
+        if (dead.has(m.characterId)) continue;
+        const to = clampLoyalty(loyaltyOf(m) + step);
+        partyRepo.updateMember(party.id, m.characterId, { loyalty: to });
+        loyalty.push({ characterId: m.characterId, from: loyaltyOf(m), to, ...(to === 0 ? { wavering: true } : {}) });
+    }
+    const recruited: Array<Record<string, unknown>> = [];
+    const now = new Date().toISOString();
+    for (const r of args.recruits ?? []) {
+        const c = charRepo.findById(r.characterId)!;
+        partyRepo.addMember({
+            id: randomUUID(), partyId: party.id, characterId: c.id, role: r.role ?? 'member', isActive: false,
+            sharePercentage: 100, joinedAt: now,
+            ...(r.loyalty !== undefined ? { loyalty: r.loyalty } : {}),
+            ...(r.wage !== undefined ? { wage: r.wage } : {}),
+            ...(r.payMode !== undefined ? { payMode: r.payMode } : {}),
+            ...(r.unitModels !== undefined ? { unitModels: r.unitModels } : {})
+        });
+        recruited.push({ characterId: c.id, name: c.name, role: r.role ?? 'member' });
+    }
+    partyRepo.touchParty(party.id);
+    return {
+        success: true, actionType: 'after_battle', partyId: party.id, victory: args.victory,
+        losses, killed, loyalty, recruited,
+        message: `${party.name} after ${args.victory ? 'victory' : 'defeat'}: ${killed.length} dead${killed.length ? ` (${killed.map(k => String(k.name)).join(', ')})` : ''}, ${losses.reduce((s, l) => s + Number(l.models), 0)} models lost; survivors loyalty ${step > 0 ? '+1' : '-1'}${recruited.length ? `; ${recruited.length} recruited` : ''}${loyalty.some(l => l.wavering) ? '; some are wavering (loyalty 0)' : ''}.`
     };
 }
 
@@ -690,6 +878,24 @@ const definitions: Record<PartyAction, ActionDefinition> = {
         handler: handleGetInRegion,
         aliases: ['nearby', 'in_area', 'find_parties'],
         description: 'Get parties in a region'
+    },
+    muster: {
+        schema: MusterSchema,
+        handler: handleMuster,
+        aliases: ['warband', 'rollcall'],
+        description: 'Item 7: the roster with loyalty (unset reads 5), pay mode, wage and unit models; wages due'
+    },
+    pay: {
+        schema: PaySchema,
+        handler: handlePay,
+        aliases: ['pay_wages', 'payday', 'wages'],
+        description: 'Pay wages first, then (with amount) shares by sharePercentage, from payerId or the leader; paid +1 loyalty, unpaid -1'
+    },
+    after_battle: {
+        schema: AfterBattleSchema,
+        handler: handleAfterBattle,
+        aliases: ['battle_aftermath', 'aftermath', 'casualties'],
+        description: 'Book casualties (models lost; the dead or a unit at 0 models are killed and struck off), survivors ±1 loyalty by victory, recruits join'
     }
 };
 
@@ -722,7 +928,13 @@ export const PartyManageTool = {
 - get_position: Query current party location
 - get_in_region: Find nearby parties
 
-Actions: create, get, list, update, delete, add_member, remove_member, update_member, set_leader, set_active, get_members, get_context, get_unassigned, move, get_position, get_in_region
+⚔️ WARBAND:
+- add_member / update_member take loyalty (0-10, unset reads 5), wage, payMode (wage | share | none) and unitModels
+- muster: roster with loyalty, pay and models
+- pay {partyId, payerId?, amount?}: wages first, then shares; paid +1 loyalty, unpaid -1
+- after_battle {partyId, victory, casualties?: [{characterId, models?, dead?}], recruits?}: the dead are killed and struck off, survivors ±1 loyalty, recruits join
+
+Actions: create, get, list, update, delete, add_member, remove_member, update_member, set_leader, set_active, get_members, get_context, get_unassigned, move, get_position, get_in_region, muster, pay, after_battle
 Aliases: new/form->create, join/recruit->add_member, leader->set_leader, active/pov->set_active, roster->get_members, travel/goto->move`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
@@ -753,7 +965,17 @@ Aliases: new/form->create, join/recruit->add_member, leader->set_leader, active/
         poiId: z.string().optional(),
         x: z.number().int().optional(),
         y: z.number().int().optional(),
-        radiusSquares: z.number().int().optional()
+        radiusSquares: z.number().int().optional(),
+        // Item 7 (mirror law): warband fields
+        loyalty: loyaltySchema().optional(),
+        wage: wageSchema().optional(),
+        payMode: payModeSchema().optional(),
+        unitModels: unitModelsSchema().optional(),
+        payerId: z.string().optional().describe('pay: whose purse pays (default: the leader)'),
+        amount: z.number().min(0).optional().describe('pay: gold to pay out in all; wages first, the rest as shares'),
+        victory: z.boolean().optional().describe('after_battle: won (+1 loyalty) or lost (-1)'),
+        casualties: z.array(casualtySchema()).optional().describe('after_battle: [{characterId, models?, dead?}]'),
+        recruits: z.array(recruitSchema()).optional().describe('after_battle: [{characterId, role?, loyalty?, wage?, payMode?, unitModels?}]')
     })
 };
 
