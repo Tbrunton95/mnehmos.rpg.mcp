@@ -132,27 +132,46 @@ export const RuleSpecSchemas = {
             /** Another roll_table rule rolled after this entry. */
             chain: z.string().optional()
         }).passthrough()).min(1)
-    }).passthrough().superRefine((spec, ctx) => {
-        const ranged = spec.entries.filter(e => e.min !== undefined);
-        if (ranged.length && ranged.length !== spec.entries.length) {
-            ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries'], message: 'entries are all weighted (weight) or all ranged (min/max); do not mix them' });
-            return;
-        }
-        spec.entries.forEach((e, i) => {
-            if (e.min === undefined && e.max !== undefined) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', i, 'min'], message: 'max needs min' });
-            if (e.min !== undefined && e.weight !== undefined) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', i], message: 'an entry takes weight or min/max, not both' });
-            if (e.min !== undefined && e.max !== undefined && e.max < e.min) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', i, 'max'], message: 'max is below min' });
-        });
-        if (ranged.length) {
-            const spans = ranged.map((e, i) => ({ i, lo: e.min!, hi: e.max ?? e.min! })).sort((a, b) => a.lo - b.lo);
-            for (let k = 1; k < spans.length; k++) {
-                if (spans[k].lo <= spans[k - 1].hi) {
-                    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', spans[k].i], message: `ranges overlap (${spans[k - 1].lo}-${spans[k - 1].hi} and ${spans[k].lo}-${spans[k].hi})` });
-                }
+    }).passthrough().superRefine(refineRollTable),
+    /**
+     * A family of rival pools (the gods' favour). adjust_pool {family} moves
+     * a member; a gain makes each jealous rival lose round(gain × fraction).
+     * floor (may be negative) and max clamp the family's pools.
+     */
+    pool_family: z.object({
+        pools: z.array(z.string().min(1)).min(1),
+        max: z.number().optional(),
+        floor: z.number().optional(),
+        /** jealousy[gainer][rival] = fraction of the gain the rival loses. */
+        jealousy: z.record(z.string(), z.record(z.string(), z.number().min(0))).default({}),
+        /** What an offering is worth: an item name, 'kill', or a deed. */
+        offering_values: z.record(z.string(), z.number()).default({})
+    }).passthrough()
+} as const;
+
+function refineRollTable(
+    spec: { entries: Array<{ min?: number; max?: number; weight?: number }> },
+    ctx: z.RefinementCtx
+): void {
+    const ranged = spec.entries.filter(e => e.min !== undefined);
+    if (ranged.length && ranged.length !== spec.entries.length) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries'], message: 'entries are all weighted (weight) or all ranged (min/max); do not mix them' });
+        return;
+    }
+    spec.entries.forEach((e, i) => {
+        if (e.min === undefined && e.max !== undefined) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', i, 'min'], message: 'max needs min' });
+        if (e.min !== undefined && e.weight !== undefined) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', i], message: 'an entry takes weight or min/max, not both' });
+        if (e.min !== undefined && e.max !== undefined && e.max < e.min) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', i, 'max'], message: 'max is below min' });
+    });
+    if (ranged.length) {
+        const spans = ranged.map((e, i) => ({ i, lo: e.min!, hi: e.max ?? e.min! })).sort((a, b) => a.lo - b.lo);
+        for (let k = 1; k < spans.length; k++) {
+            if (spans[k].lo <= spans[k - 1].hi) {
+                ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', spans[k].i], message: `ranges overlap (${spans[k - 1].lo}-${spans[k - 1].hi} and ${spans[k].lo}-${spans[k].hi})` });
             }
         }
-    })
-} as const;
+    }
+}
 
 /**
  * Kinds that are the world's data (a bestiary, tables, spells, character

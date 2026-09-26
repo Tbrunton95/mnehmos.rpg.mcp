@@ -14,6 +14,8 @@
 
 import { loadRule, resolveWorldId, findPool, worldLexicon, conditionsForDisplay, shownCounters } from '../../engine/table-rules.js';
 import { readWorldClock, dayClock, SET_CLOCK_HINT } from '../../engine/world-clock.js';
+import { scheduledWriteOpSchema, applyScheduledOps, type ScheduledWriteOp } from '../../engine/scheduled-ops.js';
+import { applyFamilyDelta, familyMember, type FamilyMove } from '../../engine/pool-family.js';
 import { z } from 'zod';
 import { ParticipantExtrasShape, SizeCategorySchema } from '../../schema/token-extras.js';
 import { randomUUID } from 'crypto';
@@ -269,7 +271,9 @@ const AdjustPoolSchema = z.object({
     label: z.string().optional().describe("Display name for the counter (\"An'ggrath's calls\"); shown at boot and on the status block"),
     note: z.string().optional().describe('What the counter is, or to whom it is owed'),
     show: z.boolean().optional().describe('true: list it in the boot digest and the status block; false hides it again'),
-    linkItem: z.string().optional().describe("Item template or instance id the character owns (a token, a charm). The pool is authoritative: the item's charges mirror it on every write, and inventory_manage adjust_charges on it is refused")
+    linkItem: z.string().optional().describe("Item template or instance id the character owns (a token, a charm). The pool is authoritative: the item's charges mirror it on every write, and inventory_manage adjust_charges on it is refused"),
+    family: z.string().optional().describe("A pool_family rule (the gods' favour): the pool moves inside its family, so a gain makes jealous rivals lose and the family's floor/max clamp. Delta only; returns rivals[]"),
+    worldId: z.string().optional().describe("family: the world whose pool_family rule to read (default: the character's)")
 });
 
 const ListSchema = z.object({
@@ -297,15 +301,7 @@ const DeleteSchema = z.object({
 // write_audit through characterRepo.update — the audit outranks memory (#51).
 const mendJsonIfString = (v: unknown) => { if (typeof v === 'string') { try { return JSON.parse(v); } catch { return v; } } return v; };
 
-const ScheduledWriteOpSchema = z.object({
-    op: z.enum(['adjust_pool', 'adjust_hp', 'adjust_max_hp', 'add_condition', 'remove_condition']),
-    pool: z.string().optional().describe('Pool name (adjust_pool)'),
-    delta: z.number().optional().describe('Delta (adjust_pool / adjust_hp / adjust_max_hp)'),
-    max: z.number().optional().describe('Pool max update (adjust_pool)'),
-    name: z.string().optional().describe('Condition name (add_condition / remove_condition)'),
-    duration: z.number().optional().describe('Condition duration (add_condition)'),
-    source: z.string().optional().describe('Condition source (add_condition; default "mend clock")')
-});
+const ScheduledWriteOpSchema = scheduledWriteOpSchema();
 
 const ScheduleChangeSchema = z.object({
     action: z.literal('schedule_change'),
@@ -1278,7 +1274,7 @@ const KillSchema = z.object({
     currency: z.record(z.number()).optional().describe('Currency on the corpse (e.g. {gold: 150})')
 });
 
-async function handleKill(args: z.infer<typeof KillSchema>): Promise<object> {
+export async function handleKill(args: z.input<typeof KillSchema>): Promise<object> {
     const { db, characterRepo } = ensureDb();
     const char = characterRepo.findById(args.characterId);
     if (!char) return { error: true, message: `Character ${args.characterId} not found`, writes: 'none' };
@@ -1336,7 +1332,7 @@ async function handleKill(args: z.infer<typeof KillSchema>): Promise<object> {
     };
 }
 
-async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise<object> {
+export async function handleAdjustPool(args: z.input<typeof AdjustPoolSchema>): Promise<object> {
     const { characterRepo } = ensureDb();
     const char = characterRepo.findById(args.characterId);
     if (!char) throw new Error(`Character ${args.characterId} not found`);
@@ -1369,6 +1365,20 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
         const inst = (resolved.instance ?? mintInstance(db, char.id, resolved.templateId)) as { id: string; charges?: number | null; charges_max?: number | null };
         linked = { instanceId: inst.id, charges: typeof inst.charges === 'number' ? inst.charges : null, chargesMax: typeof inst.charges_max === 'number' ? inst.charges_max : null };
     }
+    // Item 3: favour families. The pool moves inside its family: the family's
+    // floor and max clamp, and a gain makes each jealous rival lose.
+    if (args.family) {
+        const { db } = ensureDb();
+        if (args.value !== undefined) return { error: true, actionType: 'adjust_pool', message: 'family moves take delta, not value: a set has no gain to be jealous of.', writes: 'none' };
+        if (args.removePool) return { error: true, actionType: 'adjust_pool', message: 'removePool does not take family.', writes: 'none' };
+        const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] });
+        const rule = loadRule(db, worldId, 'pool_family', args.family);
+        if (!rule) return { error: true, actionType: 'adjust_pool', message: `No pool_family '${args.family}' in ${worldId ? `world ${worldId}` : 'this world'}. Nothing was written.`, writes: 'none' };
+        const member = familyMember(rule.spec, args.pool);
+        if (!member) return { error: true, actionType: 'adjust_pool', message: `'${args.pool}' is not in family '${rule.name}' (${rule.spec.pools.join(', ')}). Nothing was written.`, writes: 'none' };
+        return adjustFamilyPool(char, pools, { name: rule.name, spec: rule.spec }, member, args);
+    }
+
     const fresh = !(args.pool in pools);
     const existing: ResourcePool = pools[args.pool] || { current: fresh && linked?.charges != null ? linked.charges : 0, max: args.max ?? linked?.chargesMax ?? 100 };
     const max = args.max ?? existing.max;
@@ -1379,7 +1389,7 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
     }
     const current = args.value !== undefined
         ? Math.min(max, Math.max(0, args.value))
-        : Math.min(max, Math.max(0, before + args.delta));
+        : Math.min(max, Math.max(0, before + (args.delta ?? 0)));
     pools[args.pool] = {
         ...existing, current, max,
         ...(args.label !== undefined ? { label: args.label } : {}),
@@ -1422,6 +1432,63 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
         ...(p.show !== undefined ? { show: p.show } : {}),
         ...(item ? { item } : {}),
         message: `${args.pool}: ${before} -> ${current} (of ${max})${args.value !== undefined ? ' [set]' : ''}${args.witnesses?.length ? ` — witnessed by ${args.witnesses.length}` : ''}${item ? ` · ${item.name} charges ${item.charges}/${item.max}` : ''}`
+    };
+}
+
+/** adjust_pool {family}: the family move, then label/note/show/link on the named pool. */
+function adjustFamilyPool(
+    char: { id: string; name: string },
+    pools: Record<string, ResourcePool>,
+    family: { name: string; spec: import('../../engine/pool-family.js').PoolFamilySpec },
+    member: string,
+    args: z.input<typeof AdjustPoolSchema>
+): object {
+    const { db, characterRepo } = ensureDb();
+    const withMax = { ...pools };
+    const own = findPool(withMax, member);
+    if (own && args.max !== undefined) withMax[own.key] = { ...own.pool, max: args.max };
+    const delta = args.delta ?? 0;
+    const { pools: moved, moves } = applyFamilyDelta(withMax as Record<string, ResourcePool & { [k: string]: unknown }>, family, member, delta, args.reason ?? `family ${family.name}`, { witnesses: args.witnesses });
+    const main = moves[0];
+    let linkedId: string | undefined;
+    if (args.linkItem) {
+        const resolved = resolveInstance(db, char.id, args.linkItem);
+        if ('error' in resolved) return { error: true, actionType: 'adjust_pool', message: `linkItem: ${resolved.error}. Nothing was written.`, writes: 'none' };
+        linkedId = (resolved.instance ?? mintInstance(db, char.id, resolved.templateId) as { id: string }).id;
+    }
+    const p = moved[main.pool] = {
+        ...moved[main.pool],
+        ...(args.label !== undefined ? { label: args.label } : {}),
+        ...(args.note !== undefined ? { note: args.note } : {}),
+        ...(args.show !== undefined ? { show: args.show } : {}),
+        ...(linkedId ? { itemInstanceId: linkedId } : {})
+    } as ResourcePool;
+    characterRepo.update(char.id, { resourcePools: moved } as Partial<import('../../schema/character.js').Character>);
+    const touched = Object.fromEntries(moves.map(m => [m.pool, moved[m.pool] as ResourcePool]));
+    const items = mirrorLinkedCharges(char.id, touched);
+    const item = items.find(i => i.pool === main.pool);
+    const rivals: FamilyMove[] = moves.slice(1).map(({ rival: _r, ...m }) => m);
+    return {
+        success: true,
+        actionType: 'adjust_pool',
+        characterId: char.id,
+        characterName: char.name,
+        pool: main.pool,
+        family: family.name,
+        before: main.from,
+        mode: 'delta',
+        delta,
+        current: main.to,
+        max: p.max,
+        clamped: main.from + delta !== main.to,
+        rivals,
+        ...(args.witnesses?.length ? { witnesses: args.witnesses } : {}),
+        ...(args.reason ? { reason: args.reason } : {}),
+        ...(p.label ? { label: p.label } : {}),
+        ...(p.note ? { note: p.note } : {}),
+        ...(p.show !== undefined ? { show: p.show } : {}),
+        ...(item ? { item } : {}),
+        message: `${main.pool}: ${main.from} -> ${main.to} (of ${p.max})${rivals.length ? ` · jealous: ${rivals.map(r => `${r.pool} ${r.from} -> ${r.to}`).join(', ')}` : ''}${item ? ` · ${item.name} charges ${item.charges}/${item.max}` : ''}`
     };
 }
 
@@ -1478,76 +1545,10 @@ function ensureScheduleTable(db: ReturnType<typeof getDb>): void {
     try { db.exec('ALTER TABLE scheduled_state_changes ADD COLUMN world_id TEXT'); } catch { /* column exists */ }
 }
 
-type ScheduledWriteOp = z.infer<typeof ScheduledWriteOpSchema>;
 type ScheduleRow = { id: number; character_id: string; fires_at_day: number; writes: string; note: string | null; fired: number; fired_at: string | null; created_at: string; recur_every_days: number | null; is_event?: number | null; world_id?: string | null };
 
-// FINDINGS #73: op application EXTRACTED — one arithmetic shared by
-// process_scheduled and schedule_change fireNow, so a named one-off lands in
-// the same ledger with the same math as the recurring clocks. Kroshka's
-// exertion adds stop being scattered manual pokes.
-function applyScheduledOps(
-    char: { hp: number; maxHp: number },
-    ops: ScheduledWriteOp[]
-): { applied: string[]; updates: Record<string, unknown> } {
-    const applied: string[] = [];
-    const pools = { ...((char as { resourcePools?: Record<string, { current: number; max: number; lastRefilledAt?: string }> }).resourcePools || {}) };
-    let conditions = [...(((char as { conditions?: Array<{ name: string; duration?: number; source?: string }> }).conditions) || [])];
-    let hp = char.hp, maxHp = char.maxHp;
-    let poolsTouched = false, condsTouched = false, hpTouched = false, maxHpTouched = false;
-    for (const op of ops) {
-        switch (op.op) {
-            case 'adjust_pool': {
-                if (!op.pool) { applied.push('⚠ adjust_pool op missing pool name — skipped'); break; }
-                const existing = pools[op.pool] || { current: 0, max: op.max ?? 100 };
-                const pmax = op.max ?? existing.max;
-                const before = existing.current;
-                const current = Math.min(pmax, Math.max(0, before + (op.delta ?? 0)));
-                pools[op.pool] = { ...existing, current, max: pmax };
-                poolsTouched = true;
-                applied.push(`${op.pool}: ${before} → ${current} (of ${pmax})`);
-                break;
-            }
-            case 'adjust_hp': {
-                const before = hp;
-                hp = Math.min(maxHp, Math.max(0, hp + (op.delta ?? 0)));
-                if (hp !== before) hpTouched = true;
-                applied.push(`hp: ${before} → ${hp}`);
-                break;
-            }
-            case 'adjust_max_hp': {
-                const beforeM = maxHp;
-                maxHp = Math.max(1, maxHp + (op.delta ?? 0));
-                if (hp > maxHp) { hp = maxHp; hpTouched = true; }
-                if (maxHp !== beforeM) maxHpTouched = true;
-                applied.push(`maxHp: ${beforeM} → ${maxHp}`);
-                break;
-            }
-            case 'add_condition': {
-                if (!op.name) { applied.push('⚠ add_condition op missing name — skipped'); break; }
-                if (conditions.some(c => c.name === op.name)) { applied.push(`condition "${op.name}" already present — skipped`); break; }
-                conditions.push({ name: op.name, ...(op.duration !== undefined ? { duration: op.duration } : {}), source: op.source ?? 'mend clock' });
-                condsTouched = true;
-                applied.push(`+condition ${op.name}`);
-                break;
-            }
-            case 'remove_condition': {
-                if (!op.name) { applied.push('⚠ remove_condition op missing name — skipped'); break; }
-                const beforeLen = conditions.length;
-                conditions = conditions.filter(c => c.name !== op.name);
-                if (conditions.length !== beforeLen) { condsTouched = true; applied.push(`−condition ${op.name}`); }
-                else applied.push(`condition "${op.name}" not present — skipped`);
-                break;
-            }
-        }
-    }
-    if (ops.length === 0) applied.push('⚠ writes JSON empty or malformed — nothing applied');
-    const updates: Record<string, unknown> = {};
-    if (poolsTouched) updates.resourcePools = pools;
-    if (condsTouched) updates.conditions = conditions;
-    if (hpTouched) updates.hp = hp;
-    if (maxHpTouched) updates.maxHp = maxHp;
-    return { applied, updates };
-}
+// FINDINGS #73: op application lives in engine/scheduled-ops.ts, shared by
+// process_scheduled, schedule_change fireNow, table entries and offerings.
 
 async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>): Promise<object> {
     const { db, characterRepo } = ensureDb();
@@ -2237,6 +2238,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         label: z.string().optional().describe('adjust_pool (mirror): display name for the counter'),
         show: z.boolean().optional().describe('adjust_pool (mirror): list the counter at boot and on the status block'),
         linkItem: z.string().optional().describe('adjust_pool (mirror): item template or instance id whose charges mirror the pool'),
+        family: z.string().optional().describe("adjust_pool: a pool_family rule — the pool moves inside its family (jealous rivals lose on a gain); returns rivals[]"),
         firesAtHour: z.number().optional().describe('schedule_change: hour of the fires-at day (0–24)'),
         firesInHours: z.number().optional().describe('schedule_change: fires N hours from currentDay(+currentTime)'),
         limit: z.number().int().optional().describe('list #93: cap returned rows'),
