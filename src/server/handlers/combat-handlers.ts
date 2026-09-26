@@ -773,7 +773,11 @@ Example (use real UUID from context for player character!):
                 regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds (defaults from the character row)'),
                 parts: z.array(PartSchema).optional().describe('Named parts with states (defaults from the character row)'),
                 unit: UnitSchema.optional().describe('A mortal unit as one token: models, hpPerModel, packed, attackBonus, tiers'),
-                intent: z.string().optional().describe('Telegraphed intent (clears when its turn ends)')
+                intent: z.string().optional().describe('Telegraphed intent (clears when its turn ends)'),
+                abilityScores: z.object({
+                    strength: z.number(), dexterity: z.number(), constitution: z.number(),
+                    intelligence: z.number(), wisdom: z.number(), charisma: z.number()
+                }).optional().describe('Ability scores, long keys (saves read them when the token has no character row)')
             })).min(1),
             terrain: z.object({
                 obstacles: z.array(z.string()).default([]).describe('Array of "x,y" strings for blocking tiles'),
@@ -1296,6 +1300,7 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             immunities: p.immunities,
             ...(p.unit ? { unit: p.unit } : {}),
             ...(p.intent ? { intent: p.intent } : {}),
+            ...(p.abilityScores ? { abilityScores: p.abilityScores } : {}),
             ...extras,
             hasLairActions: extras.hasLairActions ?? false,
             // Size and speed live on the participant itself, not only on the token.

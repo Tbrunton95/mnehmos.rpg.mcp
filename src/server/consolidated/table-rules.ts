@@ -13,6 +13,9 @@ import { getDb } from '../../storage/index.js';
 import { SessionContext } from '../types.js';
 import { RULE_KINDS, RuleKind, parseRuleSpec, listRules, TableRule, findPool } from '../../engine/table-rules.js';
 import { RULE_PRESETS } from '../../data/table-rules/day-366.js';
+import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
+import { CharacterRepository } from '../../storage/repos/character.repo.js';
+import type { CombatParticipant } from '../../engine/combat/engine.js';
 
 const ACTIONS = ['define', 'get', 'list', 'enable', 'disable', 'delete', 'import'] as const;
 
@@ -32,6 +35,9 @@ const TableRulesInputSchema = z.object({
     enabled: z.boolean().optional().describe('define: start enabled (default true)'),
     preset: z.string().optional().describe(`import: a bundled rule set (${Object.keys(RULE_PRESETS).join(', ')})`),
     rules: z.array(RuleEntrySchema).optional().describe('import: rules given inline, [{kind, name, spec}]'),
+    fromToken: z.object({ encounterId: z.string(), participantId: z.string() }).optional()
+        .describe('define kind creature: capture the statline of a live combat token; spec is merged on top'),
+    fromCharacterId: z.string().optional().describe('define kind creature: capture the statline of a character sheet; spec is merged on top'),
     sessionId: z.string().optional()
 });
 
@@ -67,7 +73,12 @@ function upsert(input: { worldId: string; kind: string; name: string; spec?: Rec
     const spec = parseRuleSpec(input.kind as RuleKind, input.spec ?? {});
     const db = getDb();
     const now = new Date().toISOString();
-    const existing = db.prepare('SELECT id FROM table_rules WHERE world_id = ? AND name = ?').get(input.worldId, input.name) as { id: string } | undefined;
+    const existing = db.prepare('SELECT id, kind, name FROM table_rules WHERE world_id = ? AND lower(name) = lower(?)').get(input.worldId, input.name) as { id: string; kind: string; name: string } | undefined;
+    // Names are unique per world across kinds: a define never silently turns
+    // an enforced rule into a bestiary entry (or back).
+    if (existing && existing.kind !== input.kind) {
+        throw new Error(`'${existing.name}' is already a ${existing.kind} rule in this world; delete it first or pick another name`);
+    }
     if (existing) {
         db.prepare('UPDATE table_rules SET kind = ?, spec = ?, enabled = ?, updated_at = ? WHERE id = ?')
             .run(input.kind, JSON.stringify(spec), input.enabled === false ? 0 : 1, now, existing.id);
@@ -76,6 +87,53 @@ function upsert(input: { worldId: string; kind: string; name: string; spec?: Rec
     db.prepare('INSERT INTO table_rules (id, world_id, kind, name, spec, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
         .run(randomUUID(), input.worldId, input.kind, input.name, JSON.stringify(spec), input.enabled === false ? 0 : 1, now, now);
     return { created: true };
+}
+
+/** Statline keys a captured creature keeps (token and sheet share the names). */
+const CAPTURE_KEYS = [
+    'ac', 'initiativeBonus', 'size', 'reach', 'movementSpeed', 'attackBonus', 'attackDamage', 'attackDamageType',
+    'attacksPerAction', 'attacks', 'abilities', 'legendaryActions', 'legendaryResistances', 'autoLegendaryResistance',
+    'hasLairActions', 'cr', 'resistances', 'vulnerabilities', 'immunities', 'regeneration', 'band', 'parts', 'unit'
+] as const;
+
+const SHORT_STATS = { strength: 'str', dexterity: 'dex', constitution: 'con', intelligence: 'int', wisdom: 'wis', charisma: 'cha' } as const;
+
+/**
+ * A creature statline from a live token or a character sheet. Full health:
+ * hp is the max, since the entry is a template for the next fight.
+ */
+function captureCreature(input: Input): Record<string, unknown> {
+    const db = getDb();
+    let src: Record<string, unknown>;
+    let stats: Record<string, number> | undefined;
+    let name: string;
+    if (input.fromToken) {
+        const state = new EncounterRepository(db).loadState(input.fromToken.encounterId);
+        if (!state) throw new Error(`Encounter ${input.fromToken.encounterId} not found`);
+        const token = (state.participants as CombatParticipant[]).find(p => p.id === input.fromToken!.participantId);
+        if (!token) throw new Error(`Participant ${input.fromToken.participantId} not in encounter ${input.fromToken.encounterId}`);
+        src = token as unknown as Record<string, unknown>;
+        name = token.name;
+        if (token.abilityScores) {
+            stats = Object.fromEntries(Object.entries(SHORT_STATS).map(([l, s]) => [s, (token.abilityScores as Record<string, number>)[l]]));
+        }
+    } else {
+        const row = new CharacterRepository(db).findById(input.fromCharacterId!);
+        if (!row || row.id !== input.fromCharacterId) throw new Error(`Character ${input.fromCharacterId} not found`);
+        src = row as unknown as Record<string, unknown>;
+        name = row.name;
+        stats = row.stats as Record<string, number>;
+        if (stats?.dex !== undefined) src = { ...src, initiativeBonus: Math.floor((stats.dex - 10) / 2) };
+    }
+    const out: Record<string, unknown> = { displayName: name, hp: src.maxHp ?? src.hp, maxHp: src.maxHp ?? src.hp };
+    for (const key of CAPTURE_KEYS) {
+        const v = src[key];
+        if (v === undefined || v === null) continue;
+        if (Array.isArray(v) && v.length === 0) continue;
+        out[key] = v;
+    }
+    if (stats) out.stats = stats;
+    return out;
 }
 
 function findRule(worldId: string, name?: string): TableRule | undefined {
@@ -90,7 +148,12 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
     switch (input.action) {
         case 'define': case 'set': case 'upsert': {
             if (!input.kind || !input.name) return { error: true, message: 'define needs kind and name' };
-            const { created } = upsert({ worldId: input.worldId, kind: input.kind, name: input.name, spec: input.spec, enabled: input.enabled });
+            let spec = input.spec;
+            if (input.fromToken || input.fromCharacterId) {
+                if (input.kind !== 'creature') return { error: true, message: 'fromToken and fromCharacterId capture a creature: pass kind creature' };
+                spec = { ...captureCreature(input), ...(input.spec ?? {}) };
+            }
+            const { created } = upsert({ worldId: input.worldId, kind: input.kind, name: input.name, spec, enabled: input.enabled });
             const rule = findRule(input.worldId, input.name)!;
             const warning = rule.kind === 'status_block' ? missingPoolWarning(input.worldId, (rule.spec as { corePool?: unknown }).corePool) : undefined;
             return { success: true, actionType: 'define', created, rule: view(rule), ...(warning ? { warning } : {}), message: `${created ? 'Defined' : 'Updated'} ${rule.kind} rule '${rule.name}'` };
@@ -176,6 +239,8 @@ Kinds:
 - status_block {compact, maxConditions, corePool}: tiny status blocks; corePool names the one resource pool shown (any case).
 - lexicon {currency, badge, questFailLine}: the world's words for fixed labels (currency on the gold field, the status block's header badge, the quest-failed line). Without one a world reads RU, ПДА and "The Zone doesn't wait."
 - principle {text}: reference text shown at session boot, never enforced.
+- creature {hp, ac, displayName?, maxHp?, stats?, initiativeBonus?, attackBonus/attackDamage or attacks[], attacksPerAction?, abilities?, size?, movementSpeed?, cr?, band?, regeneration?, parts?, unit?, resistances?, traits?, legendary counts, hasLairActions?}: the world's bestiary. Spawn with combat_manage spawn_quick_enemy {creature, worldId} or add_participant {creature, count}; a world entry beats a built-in preset of the same name. define can capture one: fromToken {encounterId, participantId} or fromCharacterId, with spec merged on top. Boot counts these as the bestiary; they are never enforced.
+A name is unique per world across kinds: define refuses to change an existing rule's kind.
 import {worldId, preset: 'day-366'} loads the Day 366 table rules. worldId REQUIRED on every call.`,
     inputSchema: TableRulesInputSchema,
     // Every action shares the one input schema; the switch dispatcher validates per action.

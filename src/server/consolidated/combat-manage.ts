@@ -30,7 +30,8 @@ import {
     resolveReadiedAttack,
     reactionAttackData
 } from '../handlers/combat-handlers.js';
-import { expandCreatureTemplate, listAllTemplates } from '../../data/creature-presets.js';
+import { listAllTemplates } from '../../data/creature-presets.js';
+import { resolveCreature, creatureToParticipant, resolveWorldId, loadRules } from '../../engine/table-rules.js';
 import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
@@ -187,7 +188,8 @@ const SpawnQuickEnemySchema = z.object({
     encounterId: z.string().optional().describe('Add to existing encounter (creates new if omitted)'),
     seed: z.string().optional().describe('Seed for deterministic combat (auto-generated if omitted)'),
     includeParty: z.boolean().optional().describe('T1.2 (Findings #34): include the active party as PC-side participants in the NEW encounter'),
-    partyId: z.string().optional().describe('Party to include (defaults to the only party if exactly one exists)')
+    partyId: z.string().optional().describe('Party to include (defaults to the only party if exactly one exists)'),
+    worldId: z.string().optional().describe("The world whose bestiary (table_rules kind creature) is searched before the built-in presets; defaults to the encounter's world. Stamped on a new encounter")
 });
 
 const AddParticipantSchema = z.object({
@@ -199,8 +201,10 @@ const AddParticipantSchema = z.object({
     maxHp: z.number().int().optional(),
     ac: z.number().int().optional(),
     initiativeBonus: z.number().int().optional(),
-    isEnemy: z.boolean().optional().default(false),
+    isEnemy: z.boolean().optional().describe('Hostile flag (default false; true for a creature)'),
     position: z.object({ x: z.number(), y: z.number() }).optional(),
+    creature: z.string().optional().describe("A bestiary creature (table_rules kind creature in the encounter's world) or built-in preset; explicit params override its statline"),
+    count: z.number().int().min(1).max(10).optional().describe('creature: how many tokens (numbered names when more than one)'),
     importRowConditions: z.boolean().optional().describe('Copy the character sheet\'s conditions onto the new token (remove them later with remove_condition)'),
     band: z.string().optional().describe('Table rules: power band (defaults from the character row)'),
     regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds (defaults from the character row)'),
@@ -704,10 +708,12 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         handler: async (params: z.infer<typeof SpawnQuickEnemySchema>, ctx?: SessionContext) => {
             if (!ctx) throw new Error('No session context');
 
-            // Expand creature template
-            const preset = expandCreatureTemplate(params.creature);
-            if (!preset) {
-                const available = listAllTemplates();
+            // The world's bestiary first, then the built-in presets.
+            const db = getDb();
+            const worldId = params.worldId ?? resolveWorldId(db, { encounterId: params.encounterId });
+            const creature = resolveCreature(db, worldId, params.creature);
+            if (!creature) {
+                const available = [...loadRules(db, worldId, 'creature').map(r => r.name), ...listAllTemplates()];
                 return {
                     error: true,
                     actionType: 'spawn_quick_enemy',
@@ -716,42 +722,25 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     hint: `Try one of: ${available.slice(0, 5).join(', ')}...`
                 };
             }
+            const spec = creature.spec;
 
-            // Build participants from preset
+            // Build participants from the statblock
             const count = params.count || 1;
-            const participants = [];
+            const participants: Array<Record<string, any>> = [];
             // Spread a group so footprints never overlap (a huge creature fills 3x3).
-            const step = Math.max(2, SIZE_TABLE[preset.size ?? 'medium'].squares + 1);
+            const step = Math.max(2, SIZE_TABLE[spec.size ?? 'medium'].squares + 1);
 
             for (let i = 0; i < count; i++) {
-                const id = `enemy-${randomUUID().slice(0, 8)}`;
                 const basePos = params.position || { x: 10, y: 10 };
                 const pos = count > 1
                     ? { x: basePos.x + (i % 3) * step, y: basePos.y + Math.floor(i / 3) * step }
                     : basePos;
-
-                participants.push({
-                    id,
-                    name: count > 1 ? `${preset.name} ${i + 1}` : preset.name,
-                    initiativeBonus: Math.floor((preset.stats.dex - 10) / 2),
-                    hp: preset.hp,
-                    maxHp: preset.maxHp,
-                    ac: preset.ac,
-                    attackDamage: preset.defaultAttack?.damage,
-                    attackBonus: preset.defaultAttack?.toHit,
-                    ...(preset.defaultAttack?.damageType ? { attackDamageType: preset.defaultAttack.damageType } : {}),
-                    ...(preset.attacksPerAction ? { attacksPerAction: preset.attacksPerAction } : {}),
-                    // Item 6: the preset's size and speed reach the token (reach, footprint, grapple limits).
-                    size: preset.size ?? 'medium',
-                    movementSpeed: preset.speed ?? 30,
-                    ...(preset.cr !== undefined ? { cr: preset.cr } : {}),
-                    isEnemy: true,
-                    conditions: [],
+                participants.push(creatureToParticipant(spec, {
+                    id: `enemy-${randomUUID().slice(0, 8)}`,
+                    name: count > 1 ? `${creature.name} ${i + 1}` : creature.name,
                     position: pos,
-                    resistances: preset.resistances || [],
-                    vulnerabilities: preset.vulnerabilities || [],
-                    immunities: preset.immunities || []
-                });
+                    isEnemy: true
+                }));
             }
 
             // If encounterId is supplied, append the new enemies to that
@@ -820,16 +809,16 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                             name: p.name,
                             hp: p.hp,
                             maxHp: p.maxHp,
-                            ac: preset.ac,
+                            ac: spec.ac,
                             position: p.position,
-                            attack: preset.defaultAttack
+                            attack: creature.defaultAttack
                         })),
                         turnOrder: state.turnOrder,
                         // currentTurnIndex indexes turnOrder, NOT participants —
                         // those arrays can diverge when LAIR is in the order.
                         currentTurn: state.turnOrder[state.currentTurnIndex],
                         readyForCombat: true,
-                        hint: `Added ${count} ${preset.name}(s) to existing encounter. Initiative re-sorted.`
+                        hint: `Added ${count} ${creature.name}(s) to existing encounter. Initiative re-sorted.`
                     };
                 }
                 // encounterId given but neither in memory nor in DB — return
@@ -869,7 +858,16 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             };
 
             const result = await handleCreateEncounter(createParams, ctx);
-            const resultData = extractResultData(result, 'spawn_quick_enemy');
+            const resultData = extractResultData(result, 'spawn_quick_enemy') as Record<string, unknown>;
+            // Stamp the world the way create does: the named world, or the one
+            // whose bestiary the creature came from.
+            const stampedWorld = params.worldId ?? (creature.source === 'world' ? worldId : null);
+            if (stampedWorld && typeof resultData.encounterId === 'string') {
+                try {
+                    try { db.exec('ALTER TABLE encounters ADD COLUMN world_id TEXT'); } catch { /* exists */ }
+                    db.prepare('UPDATE encounters SET world_id = ? WHERE id = ?').run(stampedWorld, resultData.encounterId);
+                } catch { /* stamping is best-effort */ }
+            }
 
             // Enhance with spawn info
             return {
@@ -882,18 +880,20 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     name: p.name,
                     hp: p.hp,
                     maxHp: p.maxHp,
-                    ac: preset.ac,
+                    ac: spec.ac,
                     position: p.position,
-                    attack: preset.defaultAttack
+                    attack: creature.defaultAttack
                 })),
                 creatureStats: {
-                    name: preset.name,
-                    hp: preset.hp,
-                    ac: preset.ac,
-                    cr: preset.cr,
-                    traits: preset.traits
+                    name: creature.name,
+                    hp: spec.maxHp ?? spec.hp,
+                    ac: spec.ac,
+                    cr: spec.cr,
+                    traits: spec.traits,
+                    source: creature.source
                 },
-                threat: threatReadout(participants as unknown as Array<Record<string, unknown>>, preset.cr, count),
+                ...(stampedWorld ? { worldId: stampedWorld } : {}),
+                threat: threatReadout(participants as unknown as Array<Record<string, unknown>>, spec.cr, count),
                 readyForCombat: true,
                 hint: 'Use combat_action to attack, combat_map to render grid'
             };
@@ -935,6 +935,40 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     ...hydrateExtras(params, row as ExtrasRow),
                     ac: params.ac ?? row.ac,
                     unit: params.unit
+                };
+            } else if (params.creature) {
+                // A bestiary statblock, with any explicit param over it.
+                const db = getDb();
+                const creature = resolveCreature(db, resolveWorldId(db, { encounterId: params.encounterId }), params.creature);
+                if (!creature) {
+                    return { error: true, actionType: 'add_participant', message: `Unknown creature "${params.creature}": not in this world's bestiary (table_rules kind creature) or the built-in presets`, writes: 'none' };
+                }
+                const count = params.count ?? 1;
+                const base = params.name ?? creature.name;
+                const overrides = {
+                    ...(params.hp !== undefined ? { hp: params.hp } : {}),
+                    ...(params.maxHp !== undefined ? { maxHp: params.maxHp } : {}),
+                    ...(params.initiativeBonus !== undefined ? { initiativeBonus: params.initiativeBonus } : {}),
+                    ...(params.unit ? { unit: params.unit } : {}),
+                    ...hydrateExtras(params)
+                };
+                const made: Array<Record<string, unknown>> = Array.from({ length: count }, (_, i) => ({
+                    ...creatureToParticipant(creature.spec, {
+                        id: `token-${randomUUID().slice(0, 8)}`,
+                        name: count > 1 ? `${base} ${i + 1}` : base,
+                        position: params.position ? { x: params.position.x + i * 2, y: params.position.y } : undefined,
+                        isEnemy: params.isEnemy ?? true
+                    }),
+                    ...overrides
+                }));
+                const res = await appendToEncounter(ctx, params.encounterId, made);
+                if (!res.ok) return { error: true, actionType: 'add_participant', message: res.message };
+                const view = (p: Record<string, unknown>) => ({ id: p.id, name: p.name, hp: p.hp, ac: p.ac, isEnemy: p.isEnemy });
+                return {
+                    success: true, actionType: 'add_participant', encounterId: params.encounterId,
+                    creature: creature.name, source: creature.source,
+                    participant: view(made[0]), participants: made.map(view),
+                    message: `${made.map(p => p.name).join(', ')} join${count === 1 ? 's' : ''} the encounter (${made[0].isEnemy ? 'HOSTILE' : 'allied'}, ${creature.source === 'world' ? 'bestiary' : 'preset'} ${creature.name}) — initiative rolled, state persisted.`
                 };
             } else {
                 if (!params.name || params.hp === undefined || params.maxHp === undefined) {
@@ -1528,6 +1562,7 @@ Aliases: start/begin→create, state/status→get, finish/stop→end, restore/re
 ⚔️ QUICK START:
 - spawn_quick_enemy: Instantly create combat with preset creatures (goblin, orc, skeleton, etc.)
   Example: { action: "spawn_quick_enemy", creature: "goblin", count: 3 }
+  The world's bestiary (table_rules kind creature) comes first: { action: "spawn_quick_enemy", creature: "Chaos Spawn", count: 2, worldId }. add_participant {encounterId, creature, count} adds from it mid-fight.
 
 ⚔️ FULL WORKFLOW:
 1. create - Start encounter with custom participants and terrain
@@ -1621,8 +1656,8 @@ For CORPSES after combat, use corpse_manage tool.`,
         savingThrow: z.any().optional().describe('Saving throw for lair action'),
         halfDamageOnSave: z.boolean().optional().describe('Half damage on save'),
         // spawn_quick_enemy fields
-        creature: z.string().optional().describe('Creature template (e.g., "goblin", "orc:warrior")'),
-        count: z.number().optional().describe('Number of enemies to spawn (1-10)'),
+        creature: z.string().optional().describe('spawn_quick_enemy / add_participant: a world bestiary creature (table_rules kind creature) or built-in template ("goblin", "orc:warrior")'),
+        count: z.number().optional().describe('spawn_quick_enemy / add_participant creature: how many (1-10)'),
         position: z.object({ x: z.number(), y: z.number() }).optional().describe('Starting position')
     })
 };

@@ -40,19 +40,24 @@ function renderChangelog(entries: ChangelogEntry[]): string {
  * A world's table rules for session boot: the enforced rules by name and
  * kind, and the principles as text (reference only, never enforced).
  */
-function tableRulesAtBoot(worldId: string | undefined | null): { enforced: Array<{ name: string; kind: string }>; principles: string[] } | undefined {
+function tableRulesAtBoot(worldId: string | undefined | null): { enforced: Array<{ name: string; kind: string }>; principles: string[]; bestiary?: number } | undefined {
     if (!worldId) return undefined;
     const rules = listRules(getDb(), worldId).filter(r => r.enabled);
     if (!rules.length) return undefined;
+    // Creatures are the world's bestiary: statblocks to spawn, not rules the
+    // engine enforces, so boot counts them rather than listing them.
+    const bestiary = rules.filter(r => r.kind === 'creature').length;
     return {
-        enforced: rules.filter(r => r.kind !== 'principle').map(r => ({ name: r.name, kind: r.kind })),
-        principles: rules.filter(r => r.kind === 'principle').map(r => String((r.spec as { text?: string }).text ?? ''))
+        enforced: rules.filter(r => r.kind !== 'principle' && r.kind !== 'creature').map(r => ({ name: r.name, kind: r.kind })),
+        principles: rules.filter(r => r.kind === 'principle').map(r => String((r.spec as { text?: string }).text ?? '')),
+        ...(bestiary ? { bestiary } : {})
     };
 }
 
-function renderTableRules(t: { enforced: Array<{ name: string; kind: string }>; principles: string[] }): string {
+function renderTableRules(t: { enforced: Array<{ name: string; kind: string }>; principles: string[]; bestiary?: number }): string {
     let out = RichFormatter.section('📜 Table Rules');
     if (t.enforced.length) out += `Enforced: ${t.enforced.map(r => `${r.name} [${r.kind}]`).join(', ')}\n`;
+    if (t.bestiary) out += `Bestiary: ${t.bestiary} creature${t.bestiary === 1 ? '' : 's'} (table_rules list kind creature)\n`;
     for (const p of t.principles) out += `• ${p}\n`;
     return out;
 }

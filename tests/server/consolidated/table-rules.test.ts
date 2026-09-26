@@ -71,6 +71,20 @@ describe('table_rules', () => {
         expect(r.error).toBe(true);
         expect((await call({ action: 'list' })).count).toBe(0);
     });
+
+    it('refuses a define that would change an existing name to another kind', async () => {
+        await call({ action: 'define', kind: 'progression', name: 'Spawn' });
+        const r = await call({ action: 'define', kind: 'creature', name: 'spawn', spec: { hp: 10, ac: 10 } });
+        expect(r.error).toBe(true);
+        expect(r.message).toMatch(/already a progression rule/);
+        expect(loadRule(getDb(), W, 'progression')!.name).toBe('Spawn');
+    });
+
+    it('a creature needs hp and ac', async () => {
+        const r = await call({ action: 'define', kind: 'creature', name: 'Blob', spec: { hp: 10 } });
+        expect(r.error).toBe(true);
+        expect(r.message).toMatch(/ac/);
+    });
 });
 
 describe('band helpers', () => {

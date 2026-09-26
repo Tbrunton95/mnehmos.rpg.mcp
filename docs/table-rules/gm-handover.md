@@ -71,6 +71,8 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Prepared weapon fires on its trigger | add `preparedAsset: 'prepared-anti-armour'` |
 | A head, limb or plate changes state | `combat_manage set_part {part, state}` |
 | A monster's full statline | `combat_manage create` / `add_participant` with `size`, `reach`, `attacksPerAction`, `attacks`, `abilities`, `legendaryActions`, `legendaryResistances`, `hasLairActions`, `cr` |
+| Save a monster to the world's bestiary | `table_rules define {worldId, kind: 'creature', name, spec}` (or `fromToken {encounterId, participantId}` / `fromCharacterId`) |
+| Spawn from the bestiary | `combat_manage spawn_quick_enemy {creature, count, worldId}` or `add_participant {encounterId, creature, count}` |
 | A recurring monster's statline, once | `character_manage update {characterId, ...}` with the same fields; tokens joined by id start with it |
 | Multiattack | `attacksPerAction: N` on the statline, then one `combat_action attack` per swing (`attack 1/2`, `2/2`) |
 | A legendary action off its turn | attack with `legendaryCost: N`; otherwise `combat_manage legendary_action {participantId, cost?, description}` |
