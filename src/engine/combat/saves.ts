@@ -147,6 +147,14 @@ export function rollParticipantSave(
                 result.saved = true;
                 result.legendaryResisted = true;
                 parts.push(`legendary resistance (${spent.remaining} left)`);
+                // Resistances last the day, so the sheet keeps the count (as
+                // the legendary_resistance verb does); the next fight hydrates from it.
+                if (db) {
+                    const repo = new CharacterRepository(db);
+                    if (repo.findById(participant.id)?.id === participant.id) {
+                        repo.update(participant.id, { legendaryResistancesRemaining: spent.remaining });
+                    }
+                }
             }
         } else if (remaining > 0) {
             result.legendaryResistanceAvailable = remaining;

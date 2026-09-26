@@ -132,6 +132,20 @@ describe('spell saves inside an encounter', () => {
         expect(remainingLR('dragon')).toBe(2);
     });
 
+    it('an automatic legendary resistance on a sheet-backed creature is spent on the sheet too', async () => {
+        charRepo.create({
+            id: 'wyrm', name: 'Wyrm', stats: { str: 20, dex: 10, con: 20, int: 10, wis: 10, cha: 10 },
+            hp: 100, maxHp: 100, ac: 18, level: 10, legendaryResistances: 3, legendaryResistancesRemaining: 3,
+            autoLegendaryResistance: true, createdAt: now(), updatedAt: now()
+        } as any);
+        vi.spyOn(CombatEngine.prototype, 'rollD20').mockReturnValue(1);
+        const { result } = await fireballAt({ id: 'wyrm', name: 'Wyrm' });
+        expect(result.saves[0]).toMatchObject({ saved: true, legendaryResisted: true });
+        expect(remainingLR('wyrm')).toBe(2);
+        // Resistances last the day: the next fight hydrates from the sheet.
+        expect(charRepo.findById('wyrm')!.legendaryResistancesRemaining).toBe(2);
+    });
+
     it('reports an unspent legendary resistance on a failed save otherwise', async () => {
         vi.spyOn(CombatEngine.prototype, 'rollD20').mockReturnValue(1);
         const { result } = await fireballAt({ id: 'dragon', name: 'Dragon', legendaryResistances: 3 });
