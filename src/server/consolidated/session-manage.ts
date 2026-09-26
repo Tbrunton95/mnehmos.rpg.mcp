@@ -14,7 +14,7 @@ import { PartyRepository } from '../../storage/repos/party.repo.js';
 import { QuestRepository } from '../../storage/repos/quest.repo.js';
 import { WorldRepository } from '../../storage/repos/world.repo.js';
 import { SessionContext } from '../types.js';
-import { listRules } from '../../engine/table-rules.js';
+import { listRules, DATA_KINDS } from '../../engine/table-rules.js';
 import { CHANGELOG, type ChangelogEntry } from '../../data/changelog.js';
 import { getMeta, setMeta } from '../../storage/data-migrations.js';
 import { lookupOperation } from '../operation-guard.js';
@@ -41,24 +41,31 @@ function renderChangelog(entries: ChangelogEntry[]): string {
  * A world's table rules for session boot: the enforced rules by name and
  * kind, and the principles as text (reference only, never enforced).
  */
-function tableRulesAtBoot(worldId: string | undefined | null): { enforced: Array<{ name: string; kind: string }>; principles: string[]; bestiary?: number } | undefined {
+type BootRules = { enforced: Array<{ name: string; kind: string }>; principles: string[]; bestiary?: number; data?: Record<string, number> };
+
+function tableRulesAtBoot(worldId: string | undefined | null): BootRules | undefined {
     if (!worldId) return undefined;
     const rules = listRules(getDb(), worldId).filter(r => r.enabled);
     if (!rules.length) return undefined;
-    // Creatures are the world's bestiary: statblocks to spawn, not rules the
-    // engine enforces, so boot counts them rather than listing them.
+    // Data kinds (the bestiary, tables, spells, character options) are the
+    // world's content, not rules the engine enforces: boot counts them.
     const bestiary = rules.filter(r => r.kind === 'creature').length;
+    const data: Record<string, number> = {};
+    for (const r of rules) if (DATA_KINDS.has(r.kind)) data[r.kind] = (data[r.kind] ?? 0) + 1;
     return {
-        enforced: rules.filter(r => r.kind !== 'principle' && r.kind !== 'creature').map(r => ({ name: r.name, kind: r.kind })),
+        enforced: rules.filter(r => r.kind !== 'principle' && !DATA_KINDS.has(r.kind)).map(r => ({ name: r.name, kind: r.kind })),
         principles: rules.filter(r => r.kind === 'principle').map(r => String((r.spec as { text?: string }).text ?? '')),
-        ...(bestiary ? { bestiary } : {})
+        ...(bestiary ? { bestiary } : {}),
+        ...(Object.keys(data).length ? { data } : {})
     };
 }
 
-function renderTableRules(t: { enforced: Array<{ name: string; kind: string }>; principles: string[]; bestiary?: number }): string {
+function renderTableRules(t: BootRules): string {
     let out = RichFormatter.section('📜 Table Rules');
     if (t.enforced.length) out += `Enforced: ${t.enforced.map(r => `${r.name} [${r.kind}]`).join(', ')}\n`;
     if (t.bestiary) out += `Bestiary: ${t.bestiary} creature${t.bestiary === 1 ? '' : 's'} (table_rules list kind creature)\n`;
+    const other = Object.entries(t.data ?? {}).filter(([k]) => k !== 'creature');
+    if (other.length) out += `Data: ${other.map(([k, n]) => `${k} ${n}`).join(', ')} (table_rules list kind <kind>)\n`;
     for (const p of t.principles) out += `• ${p}\n`;
     return out;
 }

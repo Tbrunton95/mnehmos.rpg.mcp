@@ -4,7 +4,7 @@
  */
 import { buildConsolidatedRegistry, mirrorAuditMissing } from '../../src/server/consolidated-registry.js';
 
-const TOUCHED = ['combat_action', 'combat_manage', 'character_manage', 'math_manage', 'world_manage', 'narrative_manage'];
+const TOUCHED = ['combat_action', 'combat_manage', 'character_manage', 'math_manage', 'world_manage', 'narrative_manage', 'table_rules', 'corpse_manage', 'spatial_manage', 'party_manage', 'improvisation_manage'];
 
 describe('mirror audit', () => {
     it('has no drift on the tools the wishlist touches', () => {

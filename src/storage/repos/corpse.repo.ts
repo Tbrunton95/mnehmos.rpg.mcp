@@ -1,5 +1,7 @@
 import Database from 'better-sqlite3';
 import { v4 as uuid } from 'uuid';
+import seedrandom from 'seedrandom';
+import { freshSeed } from '../../math/seed.js';
 import {
     Corpse,
     CorpseState,
@@ -371,16 +373,29 @@ export class CorpseRepository {
     /**
      * Generate loot for a corpse based on creature type
      */
-    generateLoot(corpseId: string, creatureType: string, cr?: number): {
+    generateLoot(corpseId: string, creatureType: string, cr?: number, opts: { seed?: string } = {}): {
         itemsAdded: Array<{ name: string; quantity: number }>;
         currency: { gold: number; silver: number; copper: number };
         harvestable: Array<{ resourceType: string; quantity: number }>;
         persisted: number;
         unresolved: string[];
+        /** The seed the loot rolled from: the same seed replays the same loot. */
+        seed: string;
+        /** Every die drawn, in order, for the roll log (a drop chance is a d100). */
+        draws: Array<{ purpose: string; sides: number; value: number }>;
     } {
+        // Seeded, never Math.random: the handler logs the draws with the seed.
+        const seed = opts.seed ?? freshSeed('corpse-loot');
+        const rng = seedrandom(seed);
+        const draws: Array<{ purpose: string; sides: number; value: number }> = [];
+        const die = (sides: number, purpose: string): number => {
+            const value = Math.floor(rng() * sides) + 1;
+            draws.push({ purpose, sides, value });
+            return value;
+        };
         const corpse = this.findById(corpseId);
         if (!corpse || corpse.lootGenerated) {
-            return { itemsAdded: [], currency: { gold: 0, silver: 0, copper: 0 }, harvestable: [], persisted: 0, unresolved: [] };
+            return { itemsAdded: [], currency: { gold: 0, silver: 0, copper: 0 }, harvestable: [], persisted: 0, unresolved: [], seed, draws };
         }
 
         // Find matching loot table
@@ -388,7 +403,7 @@ export class CorpseRepository {
         if (!lootTable) {
             // Mark as generated but empty
             this.markLootGenerated(corpseId);
-            return { itemsAdded: [], currency: { gold: 0, silver: 0, copper: 0 }, harvestable: [], persisted: 0, unresolved: [] };
+            return { itemsAdded: [], currency: { gold: 0, silver: 0, copper: 0 }, harvestable: [], persisted: 0, unresolved: [], seed, draws };
         }
 
         const itemsAdded: Array<{ name: string; quantity: number }> = [];
@@ -396,7 +411,7 @@ export class CorpseRepository {
 
         // Process guaranteed drops
         for (const drop of lootTable.guaranteedDrops) {
-            const qty = this.rollQuantity(drop.quantity.min, drop.quantity.max);
+            const qty = this.rollQuantity(drop.quantity.min, drop.quantity.max, die);
             if (qty > 0 && drop.itemName) {
                 itemsAdded.push({ name: drop.itemName, quantity: qty });
                 // Would need to create item in items table and add to corpse_inventory
@@ -405,8 +420,9 @@ export class CorpseRepository {
 
         // Process random drops
         for (const drop of lootTable.randomDrops) {
-            if (Math.random() <= drop.weight) {
-                const qty = this.rollQuantity(drop.quantity.min, drop.quantity.max);
+            // A drop chance is a d100 at or under weight × 100.
+            if (die(100, `drop ${drop.itemName ?? 'item'}`) <= drop.weight * 100) {
+                const qty = this.rollQuantity(drop.quantity.min, drop.quantity.max, die);
                 if (qty > 0 && drop.itemName) {
                     itemsAdded.push({ name: drop.itemName, quantity: qty });
                 }
@@ -416,19 +432,19 @@ export class CorpseRepository {
         // Process currency
         let gold = 0, silver = 0, copper = 0;
         if (lootTable.currencyRange) {
-            gold = this.rollQuantity(lootTable.currencyRange.gold.min, lootTable.currencyRange.gold.max);
+            gold = this.rollQuantity(lootTable.currencyRange.gold.min, lootTable.currencyRange.gold.max, die);
             if (lootTable.currencyRange.silver) {
-                silver = this.rollQuantity(lootTable.currencyRange.silver.min, lootTable.currencyRange.silver.max);
+                silver = this.rollQuantity(lootTable.currencyRange.silver.min, lootTable.currencyRange.silver.max, die);
             }
             if (lootTable.currencyRange.copper) {
-                copper = this.rollQuantity(lootTable.currencyRange.copper.min, lootTable.currencyRange.copper.max);
+                copper = this.rollQuantity(lootTable.currencyRange.copper.min, lootTable.currencyRange.copper.max, die);
             }
         }
 
         // Process harvestable resources
         if (lootTable.harvestableResources) {
             for (const resource of lootTable.harvestableResources) {
-                const qty = this.rollQuantity(resource.quantity.min, resource.quantity.max);
+                const qty = this.rollQuantity(resource.quantity.min, resource.quantity.max, die);
                 if (qty > 0) {
                     harvestable.push({ resourceType: resource.resourceType, quantity: qty });
                 }
@@ -468,7 +484,7 @@ export class CorpseRepository {
 
         this.markLootGenerated(corpseId, { gold, silver, copper });
 
-        return { itemsAdded, currency: { gold, silver, copper }, harvestable, persisted, unresolved };
+        return { itemsAdded, currency: { gold, silver, copper }, harvestable, persisted, unresolved, seed, draws };
     }
 
     /**
@@ -756,11 +772,12 @@ export class CorpseRepository {
     // HELPER METHODS
     // ============================================================
 
-    private rollQuantity(min: number, max: number): number {
+    private rollQuantity(min: number, max: number, die: (sides: number, purpose: string) => number): number {
         // Guard: non-finite bounds (string/undefined params) previously
         // produced NaN loops downstream. Zero drops beat a hung server.
         if (!Number.isFinite(min) || !Number.isFinite(max) || max < min) return 0;
-        return Math.floor(Math.random() * (max - min + 1)) + min;
+        if (min === max) return min;
+        return die(max - min + 1, `quantity ${min}-${max}`) + min - 1;
     }
 
     private rowToCorpse(row: CorpseRow): Corpse {

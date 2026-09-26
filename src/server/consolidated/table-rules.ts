@@ -11,13 +11,15 @@ import { randomUUID } from 'crypto';
 import { RichFormatter } from '../utils/formatter.js';
 import { getDb } from '../../storage/index.js';
 import { SessionContext } from '../types.js';
-import { RULE_KINDS, RuleKind, parseRuleSpec, listRules, TableRule, findPool } from '../../engine/table-rules.js';
+import { RULE_KINDS, RuleKind, parseRuleSpec, listRules, TableRule, findPool, type RuleSpec } from '../../engine/table-rules.js';
+import { rollTable, type TableRoll } from '../../engine/roll-table.js';
+import { loggedRoller, type DiceRoller } from '../../math/logged-d20.js';
 import { RULE_PRESETS } from '../../data/table-rules/day-366.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import type { CombatParticipant } from '../../engine/combat/engine.js';
 
-const ACTIONS = ['define', 'get', 'list', 'enable', 'disable', 'delete', 'import'] as const;
+const ACTIONS = ['define', 'get', 'list', 'enable', 'disable', 'delete', 'import', 'roll'] as const;
 
 const RuleEntrySchema = z.object({
     kind: z.string(),
@@ -38,6 +40,11 @@ const TableRulesInputSchema = z.object({
     fromToken: z.object({ encounterId: z.string(), participantId: z.string() }).optional()
         .describe('define kind creature: capture the statline of a live combat token; spec is merged on top'),
     fromCharacterId: z.string().optional().describe('define kind creature: capture the statline of a character sheet; spec is merged on top'),
+    characterId: z.string().optional().describe('roll: who the roll is for (logged; their modifierPool feeds the modifier)'),
+    modifier: z.number().int().optional().describe('roll: added to the dice before the entry is read (clamped to the table)'),
+    modifierPool: z.string().optional().describe("roll: the character's pool whose current ÷ poolDivisor adds to the roll (default: the table's modifierPool)"),
+    apply: z.boolean().optional().describe('roll: apply the entry to characterId (default true when characterId is given; false previews)'),
+    seed: z.string().optional().describe('roll: replay exact dice. Leave out for a fresh roll'),
     sessionId: z.string().optional()
 });
 
@@ -141,6 +148,66 @@ function findRule(worldId: string, name?: string): TableRule | undefined {
     return listRules(getDb(), worldId).find(r => r.name.toLowerCase() === name.toLowerCase());
 }
 
+/** Chained tables stop after this many. */
+const CHAIN_DEPTH = 5;
+
+interface ChainedRoll { table: string; depth: number; rolled: Omit<TableRoll, 'entry' | 'index' | 'rollId' | 'seed'>; entry: TableRoll['entry'] & { index: number }; rollId?: string }
+
+function rollView(r: TableRoll) {
+    const { entry: _e, index: _i, rollId: _r, seed: _s, ...rolled } = r;
+    return rolled;
+}
+
+/**
+ * Roll a world's roll_table, then any tables its entries chain to (depth 5).
+ * The first table takes the modifier; chained tables roll plain.
+ */
+function rollNamedTable(worldId: string, input: Input, roller: DiceRoller): Record<string, unknown> {
+    const rule = findRule(worldId, input.name);
+    if (!rule) return { error: true, message: `No rule '${input.name}' in this world` };
+    if (rule.kind !== 'roll_table') return { error: true, message: `'${rule.name}' is a ${rule.kind} rule, not a roll_table` };
+    const spec = rule.spec as RuleSpec<'roll_table'>;
+    const notes: string[] = [];
+
+    let modifier = input.modifier ?? 0;
+    const poolName = input.modifierPool ?? spec.modifierPool;
+    let poolBonus: { pool: string; current: number; divisor: number; bonus: number } | undefined;
+    if (poolName && input.characterId) {
+        const char = new CharacterRepository(getDb()).findById(input.characterId);
+        if (!char) return { error: true, message: `Character ${input.characterId} not found` };
+        const found = findPool(char.resourcePools as Record<string, { current: number }> | undefined, poolName);
+        if (found) {
+            const bonus = Math.floor(found.pool.current / spec.poolDivisor);
+            poolBonus = { pool: found.key, current: found.pool.current, divisor: spec.poolDivisor, bonus };
+            modifier += bonus;
+        } else notes.push(`${char.name} has no pool '${poolName}': it adds 0`);
+    }
+
+    const first = rollTable(spec, roller, { modifier, tag: `table ${rule.name}` });
+    const chained: ChainedRoll[] = [];
+    let next = first.entry.chain;
+    let depth = 1;
+    while (next) {
+        if (depth > CHAIN_DEPTH) { notes.push(`chain stopped at depth ${CHAIN_DEPTH} (next: '${next}')`); break; }
+        const target = findRule(worldId, next);
+        if (!target || target.kind !== 'roll_table') { notes.push(`chain to '${next}' skipped: no roll_table of that name`); break; }
+        const r = rollTable(target.spec as RuleSpec<'roll_table'>, roller, { tag: `table ${target.name}` });
+        chained.push({ table: target.name, depth, rolled: rollView(r), entry: { ...r.entry, index: r.index }, ...(r.rollId ? { rollId: r.rollId } : {}) });
+        next = r.entry.chain;
+        depth++;
+    }
+    const text = [first.entry.text, ...chained.map(c => c.entry.text)].join(' → ');
+    return {
+        success: true, actionType: 'roll', table: rule.name,
+        ...(input.characterId ? { characterId: input.characterId } : {}),
+        rolled: rollView(first), entry: { ...first.entry, index: first.index },
+        ...(poolBonus ? { poolBonus } : {}),
+        chained, text, rollId: first.rollId, seed: first.seed,
+        ...(notes.length ? { note: notes.join('; ') } : {}),
+        message: `${rule.name}: ${first.dice}${first.modifier ? ` ${first.modifier >= 0 ? '+' : '-'} ${Math.abs(first.modifier)}` : ''} = ${first.total}${first.clamped ? ' (clamped)' : ''} → ${text}`
+    };
+}
+
 async function route(args: unknown): Promise<Record<string, unknown>> {
     const input: Input = TableRulesInputSchema.parse(args);
     const db = getDb();
@@ -179,6 +246,11 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
             if (!rule) return { error: true, message: `No rule '${input.name}' in this world` };
             db.prepare('DELETE FROM table_rules WHERE id = ?').run(rule.id);
             return { success: true, actionType: 'delete', name: rule.name, message: `'${rule.name}' deleted` };
+        }
+        case 'roll': case 'roll_table': {
+            if (!input.name) return { error: true, message: 'roll needs name (a roll_table rule)' };
+            const roller = loggedRoller(db, { forId: input.characterId, tool: 'table_rules', seed: input.seed });
+            return rollNamedTable(input.worldId, input, roller);
         }
         case 'import': {
             let entries = input.rules;
@@ -240,6 +312,8 @@ Kinds:
 - lexicon {currency, badge, questFailLine}: the world's words for fixed labels (currency on the gold field, the status block's header badge, the quest-failed line). Without one a world reads RU, ПДА and "The Zone doesn't wait."
 - principle {text}: reference text shown at session boot, never enforced.
 - creature {hp, ac, displayName?, maxHp?, stats?, initiativeBonus?, attackBonus/attackDamage or attacks[], attacksPerAction?, abilities?, size?, movementSpeed?, cr?, band?, regeneration?, parts?, unit?, resistances?, traits?, legendary counts, hasLairActions?}: the world's bestiary. Spawn with combat_manage spawn_quick_enemy {creature, worldId} or add_participant {creature, count}; a world entry beats a built-in preset of the same name. define can capture one: fromToken {encounterId, participantId} or fromCharacterId, with spec merged on top. Boot counts these as the bestiary; they are never enforced.
+- roll_table {entries: [{weight | min/max, text, chain?}], dice?, modifierPool?, poolDivisor}: a random table (omens, miscasts, the Eye of the Gods). Weights read as cumulative ranges from 1; the default die is 1d<total weight> or 1d<highest max>. Data, never enforced.
+roll {worldId, name, characterId?, modifier?, modifierPool?, seed?}: rolls a roll_table on seeded, logged dice. The modifier (plus the character's modifierPool ÷ poolDivisor) shifts the total, clamped to the table; an entry's chain rolls the next table (5 deep). Returns rolled, entry, chained, text and rollId.
 A name is unique per world across kinds: define refuses to change an existing rule's kind.
 import {worldId, preset: 'day-366'} loads the Day 366 table rules. worldId REQUIRED on every call.`,
     inputSchema: TableRulesInputSchema,

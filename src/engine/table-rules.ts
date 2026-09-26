@@ -112,8 +112,56 @@ export const RuleSpecSchemas = {
         unit: UnitSchema.optional(),
         xpValue: z.number().min(0).optional(),
         traits: z.array(z.string()).default([])
-    }).passthrough()
+    }).passthrough(),
+    /**
+     * A random table (the Eye of the Gods, a miscast table, omens, weather).
+     * Entries are all weighted (cumulative ranges from 1) or all ranged
+     * (min..max on the die). table_rules roll rolls it; data, never enforced.
+     */
+    roll_table: z.object({
+        /** Default: 1d<total weight>, or 1d<highest max>. */
+        dice: z.string().optional(),
+        /** A character pool whose current value, ÷ poolDivisor (floored), adds to the roll. */
+        modifierPool: z.string().optional(),
+        poolDivisor: z.number().gt(0).default(1),
+        entries: z.array(z.object({
+            min: z.number().int().optional(),
+            max: z.number().int().optional(),
+            weight: z.number().int().positive().optional(),
+            text: z.string().min(1),
+            /** Another roll_table rule rolled after this entry. */
+            chain: z.string().optional()
+        }).passthrough()).min(1)
+    }).passthrough().superRefine((spec, ctx) => {
+        const ranged = spec.entries.filter(e => e.min !== undefined);
+        if (ranged.length && ranged.length !== spec.entries.length) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries'], message: 'entries are all weighted (weight) or all ranged (min/max); do not mix them' });
+            return;
+        }
+        spec.entries.forEach((e, i) => {
+            if (e.min === undefined && e.max !== undefined) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', i, 'min'], message: 'max needs min' });
+            if (e.min !== undefined && e.weight !== undefined) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', i], message: 'an entry takes weight or min/max, not both' });
+            if (e.min !== undefined && e.max !== undefined && e.max < e.min) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', i, 'max'], message: 'max is below min' });
+        });
+        if (ranged.length) {
+            const spans = ranged.map((e, i) => ({ i, lo: e.min!, hi: e.max ?? e.min! })).sort((a, b) => a.lo - b.lo);
+            for (let k = 1; k < spans.length; k++) {
+                if (spans[k].lo <= spans[k - 1].hi) {
+                    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', spans[k].i], message: `ranges overlap (${spans[k - 1].lo}-${spans[k - 1].hi} and ${spans[k].lo}-${spans[k].hi})` });
+                }
+            }
+        }
+    })
 } as const;
+
+/**
+ * Kinds that are the world's data (a bestiary, tables, spells, character
+ * options), not rules the engine enforces: boot counts them instead of
+ * listing them as enforced. Some kinds here arrive in later releases.
+ */
+export const DATA_KINDS: ReadonlySet<string> = new Set([
+    'creature', 'roll_table', 'pool_family', 'spell', 'skill', 'species', 'char_class', 'background'
+]);
 
 export type RuleKind = keyof typeof RuleSpecSchemas;
 export const RULE_KINDS = Object.keys(RuleSpecSchemas) as RuleKind[];
