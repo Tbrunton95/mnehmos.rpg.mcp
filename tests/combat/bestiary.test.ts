@@ -92,6 +92,12 @@ describe('spawn_quick_enemy {creature, worldId}', () => {
         expect(r.creatureStats).toMatchObject({ name: 'Chaos Spawn', hp: 120, ac: 12, cr: 8 });
     });
 
+    it('the state view shows the regeneration and CR the spawn carries', async () => {
+        const r = await manage({ action: 'spawn_quick_enemy', creature: 'Chaos Spawn', count: 1, worldId: W });
+        const view = (await manage({ action: 'get', encounterId: r.encounterId })).participants.find((p: any) => p.isEnemy);
+        expect(view).toMatchObject({ regeneration: 10, cr: 8, band: 'Monster/Lord' });
+    });
+
     it('built-in presets still spawn as before', async () => {
         const r = await manage({ action: 'spawn_quick_enemy', creature: 'goblin', count: 1 });
         expect(r.error).toBeFalsy();

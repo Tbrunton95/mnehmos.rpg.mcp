@@ -204,6 +204,8 @@ function buildStateJson(state: CombatState, encounterId: string, sessionId?: str
             ...(p.legendaryResistances ? { legendaryResistances: p.legendaryResistances, legendaryResistancesRemaining: p.legendaryResistancesRemaining ?? 0 } : {}),
             // Table state the GM reads each round
             ...(p.band ? { band: p.band } : {}),
+            ...(p.regeneration ? { regeneration: p.regeneration } : {}),
+            ...(p.cr !== undefined ? { cr: p.cr } : {}),
             ...(p.parts?.length ? { parts: p.parts } : {}),
             ...(p.unit ? { unit: { ...p.unit, ...unitView(p) } } : {}),
             ...(p.intent ? { intent: p.intent } : {}),
