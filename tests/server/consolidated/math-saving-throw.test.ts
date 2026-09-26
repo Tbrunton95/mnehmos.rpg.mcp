@@ -94,7 +94,16 @@ describe('math_manage roll_saving_throw', () => {
         expect(miss.resolverProblems.join(' ')).toMatch(/Khorne.*matches nothing/);
         const amb = json(await math({ action: 'roll_saving_throw', characterId: 'kessa', ability: 'wis', disadvantageSources: ['shaken'] }));
         expect(amb.rolls).toHaveLength(1);
-        expect(amb.resolverProblems.join(' ')).toMatch(/shaken.*matches 2/);
+        expect(amb.resolverProblems.join(' ')).toMatch(/shaken.*matches 2.*by prefix/);
+    });
+
+    it('an exact name beats a longer name that contains it', async () => {
+        effect('kessa', 'Blessed', [{ type: 'custom_trigger', value: 'blessed' }]);
+        effect('kessa', 'Blessed by Nurgle', [{ type: 'custom_trigger', value: 'rot' }]);
+        const r = json(await math({ action: 'roll_saving_throw', characterId: 'kessa', ability: 'wis', advantageSources: ['Blessed'] }));
+        expect(r.advantageSources).toEqual(['Blessed']);
+        expect(r.rolls).toHaveLength(2);
+        expect(r.resolverProblems).toBeUndefined();
     });
 
     it('autoApply and declared advantage effects compose into the roll', async () => {
