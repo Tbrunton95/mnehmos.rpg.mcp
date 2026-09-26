@@ -131,6 +131,7 @@ describe('combat_manage add_condition / remove_condition', () => {
 });
 
 import { handleCombatAction } from '../../../src/server/consolidated/combat-action.js';
+import { CombatEngine } from '../../../src/engine/combat/engine.js';
 
 describe('grapple with an encounterId', () => {
     beforeEach(() => { closeDb(); getDb(':memory:'); clearCombatState(); });
@@ -146,11 +147,14 @@ describe('grapple with an encounterId', () => {
             { id: 'luciel', name: 'Luciel', hp: 50, maxHp: 50, initiative: 20 },
             { id: 'foe', name: 'Foe', hp: 50, maxHp: 50, initiative: 5, isEnemy: true }
         ] });
-        // Attacker rolls 20, defender rolls 1: the takedown lands.
-        vi.spyOn(Math, 'random').mockReturnValueOnce(0.99).mockReturnValueOnce(0.0);
+        // Attacker rolls 20, defender rolls 1 on the fight's dice: the takedown lands.
+        vi.spyOn(CombatEngine.prototype, 'rollD20').mockReturnValueOnce(20).mockReturnValueOnce(1);
         const res = await handleCombatAction({ action: 'grapple', move: 'takedown', encounterId: created.encounterId, actorId: 'luciel', targetId: 'foe' }, ctx as any);
         expect(res.content[0].text).toMatch(/encounterTokensUpdated/);
         expect(tokenConditions(created.encounterId, 'foe').map(c => c.type).sort()).toEqual(['grappled', 'prone']);
         expect(repo.findById('foe')!.conditions.map((c: any) => c.name).sort()).toEqual(['Grappled', 'Prone']);
+        // The grapple spent Luciel's attack.
+        const row = getDb().prepare('SELECT tokens FROM encounters WHERE id = ?').get(created.encounterId) as { tokens: string };
+        expect(JSON.parse(row.tokens).find((t: any) => t.id === 'luciel').actionUsed).toBe(true);
     });
 });

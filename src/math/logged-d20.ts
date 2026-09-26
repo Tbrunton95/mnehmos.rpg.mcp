@@ -39,3 +39,22 @@ export function loggedD20(
     }, opts.tool);
     return { ...roll, rollId };
 }
+
+/** `count` seeded dice of `sides` (surface damage outside an encounter), logged. */
+export function loggedDice(
+    db: Database.Database,
+    tag: { purpose: string; forId?: string; targetId?: string },
+    count: number,
+    sides: number,
+    tool?: string
+): { rolls: number[]; total: number; seed: string; rollId?: string } {
+    const seed = freshSeed(tag.purpose.replace(/\s+/g, '-'));
+    const rng = seedrandom(seed);
+    const rolls = Array.from({ length: count }, () => Math.floor(rng() * sides) + 1);
+    const total = rolls.reduce((a, b) => a + b, 0);
+    const rollId = logRoll(db, {
+        purpose: tag.purpose, forId: tag.forId, targetId: tag.targetId, expression: `${count}d${sides}`,
+        dice: rolls.map(value => ({ sides, value })), result: total, replay: seed
+    }, tool);
+    return { rolls, total, seed, rollId };
+}

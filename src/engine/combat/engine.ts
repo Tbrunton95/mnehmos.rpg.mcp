@@ -432,6 +432,11 @@ export class CombatEngine {
         return this.tagged(tag, () => this.rng.d20(0));
     }
 
+    /** Roll any dice ('2d6') on the encounter's stream, tagged for roll_log. */
+    rollDice(notation: string, tag: import('./rng.js').RollTag): import('./rng.js').DamageResult {
+        return this.tagged(tag, () => this.rng.rollDamageDetailed(notation));
+    }
+
     /** Roll under a tag so the audit log says who the dice were for and why. */
     private tagged<T>(tag: import('./rng.js').RollTag, fn: () => T): T {
         const prev = this.rng.tag;
