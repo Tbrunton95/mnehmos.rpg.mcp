@@ -20,7 +20,8 @@ import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../..
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
 import { PartSchema, UnitSchema, ParticipantExtrasShape, type Part, type ReadiedAttack } from '../../schema/token-extras.js';
 import { worldProgression } from '../../engine/progression.js';
-import { resolveWorldId, bandOrder, loadRule, loadRules, castingClassFor, type TableRule } from '../../engine/table-rules.js';
+import { resolveWorldId, bandOrder, loadRule, loadRules, castingClassFor, findWorldRule, type TableRule } from '../../engine/table-rules.js';
+import { castWorldSpell } from './world-spell.js';
 import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
 import { volleyTier, describeUnit } from '../../engine/combat/units.js';
 import { upsertPart, findPart, resolveAttackSource } from '../../engine/combat/parts.js';
@@ -926,7 +927,9 @@ Examples:
             spellName: z.string().optional()
                 .describe('CRIT-006: Name of the spell to cast (must exist in spell database)'),
             slotLevel: z.number().int().min(1).max(9).optional()
-                .describe('CRIT-006: Spell slot level to use (for upcasting)')
+                .describe('CRIT-006: Spell slot level to use (for upcasting)'),
+            unbinderId: z.string().optional()
+                .describe("Item 9: a participant who tries to unbind a world spell (table_rules spell with contestedBy: 'unbind'): rolls the casting dice, a higher total stops it")
         })
     },
     ADVANCE_TURN: {
@@ -1566,7 +1569,25 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         return 'action';
     };
 
-    if (parsed.action === 'attack') {
+    // Item 9: a world's own spell of this name casts on its rule, not the SRD.
+    let worldSpell: { rule: TableRule<'spell'>; worldId: string } | undefined;
+    if (parsed.action === 'cast_spell' && parsed.spellName) {
+        const worldId = resolveWorldId(getDb(), { encounterId: parsed.encounterId, characterIds: [parsed.actorId] });
+        const rule = findWorldRule(getDb(), worldId, 'spell', parsed.spellName);
+        if (rule && worldId) worldSpell = { rule, worldId };
+    }
+
+    if (worldSpell) {
+        const targetIds = parsed.targetIds?.length
+            ? parsed.targetIds
+            : parsed.targetId ? parsed.targetId.split(',').map(t => t.trim()).filter(Boolean) : [];
+        const cast = await castWorldSpell({
+            engine, db: getDb(), rule: worldSpell.rule, worldId: worldSpell.worldId,
+            actorId: parsed.actorId, targetIds, unbinderId: parsed.unbinderId, damage: parsed.damage
+        });
+        output = cast.output;
+        result = cast.result;
+    } else if (parsed.action === 'attack') {
         // Validation & Auto-Calculation
         let attackBonus = parsed.attackBonus;
         let dc = parsed.dc;
@@ -2816,6 +2837,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             reaction: (r as { reaction?: unknown }).reaction,
             saves: (r as { saves?: unknown }).saves,
             conditionsApplied: (r as { conditionsApplied?: unknown }).conditionsApplied,
+            worldSpell: (r as { worldSpell?: unknown }).worldSpell,
             // Item 11: reactions a move set off, each at the step it happened.
             opportunityAttacks: (r as { opportunityAttacks?: unknown }).opportunityAttacks,
             opportunityAttacksAvailable: (r as { opportunityAttacksAvailable?: unknown }).opportunityAttacksAvailable,

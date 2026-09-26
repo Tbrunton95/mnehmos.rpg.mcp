@@ -204,6 +204,52 @@ export const RuleSpecSchemas = {
         /** What an offering is worth: an item name, 'kill', or a deed. */
         offering_values: z.record(z.string(), z.number()).default({})
     }).passthrough(),
+    /**
+     * A world spell (item 9): cast_spell of this name rolls a casting roll
+     * (default 2d6) against a target instead of spending a slot. cost moves
+     * the caster's pools (signed; a spend it cannot pay is refused), effects
+     * land on the targets (or the caster), a contested spell can be unbound
+     * (combat_action unbinderId), and a miscast table rolls on a double, a
+     * failure or a fumble (every die a 1).
+     */
+    spell: z.object({
+        displayName: z.string().optional(),
+        castingRoll: z.object({
+            dice: z.string().min(1).default('2d6'),
+            modifier: z.number().int().default(0),
+            /** The caster's ability modifier adds to the roll. */
+            ability: abilityShort().optional(),
+            /** The total the casting roll must reach. */
+            target: z.number().int()
+        }).passthrough().optional(),
+        contestedBy: z.literal('unbind').optional(),
+        /** Signed pool moves on the caster, paid whether or not the cast succeeds. */
+        cost: z.array(z.object({ pool: z.string().min(1), delta: z.number() }).passthrough()).default([]),
+        /** Feet, edge to edge; checked when both tokens are placed. */
+        range: z.number().min(0).optional(),
+        castingTime: z.enum(['action', 'bonus', 'reaction']).optional(),
+        effects: z.array(z.object({
+            type: z.enum(['damage', 'healing', 'condition', 'pool']),
+            dice: z.string().optional(),
+            damageType: z.string().optional(),
+            condition: z.string().optional(),
+            /** Rounds (condition). */
+            duration: z.number().int().min(1).optional(),
+            /** dc omitted = the casting total. */
+            save: z.object({ ability: abilityShort(), dc: z.number().int().optional() }).passthrough().optional(),
+            saveEffect: z.enum(['half', 'none']).default('none'),
+            pool: z.string().optional(),
+            delta: z.number().optional(),
+            target: z.enum(['target', 'caster']).default('target')
+        }).passthrough().superRefine((e, ctx) => {
+            if ((e.type === 'damage' || e.type === 'healing') && !e.dice) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['dice'], message: `a ${e.type} effect needs dice` });
+            if (e.type === 'condition' && !e.condition) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['condition'], message: 'a condition effect needs condition' });
+            if (e.type === 'pool' && (!e.pool || e.delta === undefined)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['pool'], message: 'a pool effect needs pool and delta' });
+        })).default([]),
+        miscast: z.object({ on: z.enum(['double', 'fail', 'fumble']), table: z.string().min(1) }).passthrough().optional(),
+        /** false: only a caster whose knownSpells lists it can cast it. */
+        known: z.boolean().default(true)
+    }).passthrough(),
     /** A world skill: the ability it rolls with. Skill checks and stunts read it. */
     skill: z.object({
         ability: abilityShort(),

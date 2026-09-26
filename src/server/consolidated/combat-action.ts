@@ -104,7 +104,8 @@ const CastSpellSchema = z.object({
     spellName: z.string(),
     targetId: z.string().optional(),
     targetIds: z.array(z.string()).optional(),
-    slotLevel: z.number().int().min(1).max(9).optional()
+    slotLevel: z.number().int().min(1).max(9).optional(),
+    unbinderId: z.string().optional().describe("A world spell with contestedBy: 'unbind': this participant rolls the casting dice; a higher total stops it")
 });
 
 const VolleySchema = z.object({
@@ -343,7 +344,8 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                 spellName: params.spellName,
                 targetId: params.targetId,
                 targetIds: params.targetIds,
-                slotLevel: params.slotLevel
+                slotLevel: params.slotLevel,
+                unbinderId: params.unbinderId
             }, ctx);
             return extractResultData(result, 'cast_spell');
         },
@@ -655,6 +657,7 @@ Internal opposed check (Athletics vs better of Athletics/Acrobatics) on the figh
         amount: z.number().optional().describe('Healing amount'),
         spellName: z.string().optional().describe('Spell name'),
         slotLevel: z.number().optional().describe('Spell slot level'),
+        unbinderId: z.string().optional().describe("cast_spell (mirror): a participant who tries to unbind a world spell (contestedBy: 'unbind')"),
         readiedAction: z.string().optional().describe('Description of readied action'),
         trigger: z.string().optional().describe('Trigger for readied action'),
         on: z.enum(['enters_reach', 'leaves_reach']).optional().describe('ready (mirror): enters_reach | leaves_reach, the engine fires it on a move'),
