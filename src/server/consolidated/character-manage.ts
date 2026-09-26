@@ -2027,6 +2027,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
         // #67 mirror law: kill params.
         cause: z.string().optional().describe('kill: what killed it — canon for the wall map'),
+        sessionId: z.string().optional().describe('get_status_block: session id (mirror; unused by the read)'),
         createCorpse: z.boolean().optional().describe('kill: false = death without a body (default true)'),
         encounterId: z.string().optional().describe('kill: encounter the corpse lands in'),
         position: z.object({ x: z.number(), y: z.number() }).optional().describe('kill: corpse position'),

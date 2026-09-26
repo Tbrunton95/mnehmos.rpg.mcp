@@ -5,7 +5,9 @@
  * advance_turn, roll_death_save, execute_lair_action
  */
 
-import { PartSchema, UnitSchema, ReadiedSchema, PART_STATES, PART_KINDS } from '../../schema/token-extras.js';
+import { PartSchema, UnitSchema, ReadiedSchema, PART_STATES, PART_KINDS, ParticipantExtrasShape, SizeCategorySchema } from '../../schema/token-extras.js';
+import { hydrateExtras, type ExtrasRow } from '../../engine/combat/participant-extras.js';
+import { upsertPart } from '../../engine/combat/parts.js';
 import { volleyTier, describeUnit } from '../../engine/combat/units.js';
 import type { CombatParticipant } from '../../engine/combat/engine.js';
 import { z } from 'zod';
@@ -81,7 +83,8 @@ const ParticipantSchema = z.object({
     regeneration: z.number().int().min(0).optional(),
     parts: z.array(PartSchema).optional(),
     unit: UnitSchema.optional(),
-    intent: z.string().optional()
+    intent: z.string().optional(),
+    ...ParticipantExtrasShape
 });
 
 /**
@@ -200,7 +203,8 @@ const AddParticipantSchema = z.object({
     band: z.string().optional().describe('Table rules: power band (defaults from the character row)'),
     regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds (defaults from the character row)'),
     parts: z.array(PartSchema).optional().describe('Named parts with states (defaults from the character row)'),
-    unit: UnitSchema.optional().describe('A mortal unit as one token')
+    unit: UnitSchema.optional().describe('A mortal unit as one token'),
+    ...ParticipantExtrasShape
 });
 
 const AddConditionSchema = z.object({
@@ -877,7 +881,6 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 participant = {
                     id: row.id, name: params.name ?? row.name,
                     hp: params.hp ?? row.hp, maxHp: params.maxHp ?? row.maxHp,
-                    ac: params.ac ?? row.ac,
                     initiativeBonus: params.initiativeBonus ?? Math.floor(((stats?.dex ?? 10) - 10) / 2),
                     isEnemy: params.isEnemy ?? false,
                     // Sheet conditions join only on request: rows and tokens are
@@ -889,9 +892,10 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     resistances: (row as { resistances?: string[] }).resistances || [],
                     vulnerabilities: (row as { vulnerabilities?: string[] }).vulnerabilities || [],
                     immunities: (row as { immunities?: string[] }).immunities || [],
-                    band: params.band ?? row.band,
-                    regeneration: params.regeneration ?? row.regeneration,
-                    parts: params.parts ?? row.parts,
+                    // Table rules, size, attack profiles, legendary counters and
+                    // lair: the caller's value, else the sheet's.
+                    ...hydrateExtras(params, row as ExtrasRow),
+                    ac: params.ac ?? row.ac,
                     unit: params.unit
                 };
             } else {
@@ -900,13 +904,14 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 }
                 participant = {
                     id: `token-${randomUUID().slice(0, 8)}`, name: params.name,
-                    hp: params.hp, maxHp: params.maxHp, ac: params.ac ?? 10,
+                    hp: params.hp, maxHp: params.maxHp,
                     initiativeBonus: params.initiativeBonus ?? 0,
                     isEnemy: params.isEnemy ?? false, conditions: [],
                     position: params.position ?? { x: 0, y: 0 },
                     resistances: [], vulnerabilities: [], immunities: [],
-                    band: params.band, regeneration: params.regeneration,
-                    parts: params.parts, unit: params.unit
+                    ...hydrateExtras(params),
+                    ac: params.ac ?? 10,
+                    unit: params.unit
                 };
             }
             const res = await appendToEncounter(ctx, params.encounterId, [participant]);
@@ -1101,20 +1106,22 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             const p = state.participants.find(x => x.id === params.participantId);
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
             if (params.state === 'latched') {
-                if (!params.latchedTo) return refuse('latched needs latchedTo {participantId, part?}');
-                if (!state.participants.some(x => x.id === params.latchedTo!.participantId)) return refuse(`latchedTo ${params.latchedTo.participantId} is not in this encounter`);
+                const held = (p.parts ?? []).find(x => x.name.toLowerCase() === params.part.toLowerCase());
+                // A part already latched keeps its hold when only the note or kind changes.
+                if (!params.latchedTo && !(held?.state === 'latched' && held.latchedTo)) return refuse('latched needs latchedTo {participantId, part?}');
+                if (params.latchedTo && !state.participants.some(x => x.id === params.latchedTo!.participantId)) return refuse(`latchedTo ${params.latchedTo.participantId} is not in this encounter`);
             }
-            const parts = [...(p.parts ?? [])];
-            const idx = parts.findIndex(x => x.name.toLowerCase() === params.part.toLowerCase());
-            const prev = idx >= 0 ? parts[idx] : undefined;
-            const next = {
-                name: prev?.name ?? params.part,
+            const prev = (p.parts ?? []).find(x => x.name.toLowerCase() === params.part.toLowerCase());
+            // Merge, never replace: holds, ac, hp and any later part field
+            // survive a state change. Leaving 'latched' releases the hold.
+            const parts = upsertPart(p.parts ?? [], {
+                name: params.part,
                 kind: params.kind ?? prev?.kind ?? 'other',
                 state: params.state,
-                ...(params.state === 'latched' ? { latchedTo: params.latchedTo } : {}),
-                ...((params.note ?? prev?.note) ? { note: params.note ?? prev?.note } : {})
-            } as NonNullable<typeof p.parts>[number];
-            if (idx >= 0) parts[idx] = next; else parts.push(next);
+                latchedTo: params.state === 'latched' ? (params.latchedTo ?? prev?.latchedTo) : undefined,
+                ...(params.note !== undefined ? { note: params.note } : {})
+            });
+            const next = parts.find(x => x.name.toLowerCase() === params.part.toLowerCase())!;
             p.parts = parts;
             new EncounterRepository(getDb()).saveState(params.encounterId, state);
             const mirrored = params.mirrorToCharacter ? mirrorPartsToRow(p.id, parts) : false;
@@ -1407,7 +1414,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
         encounterId: z.string().optional().describe('Encounter ID (required for most actions)'),
         seed: z.string().optional().describe('Seed for new encounter (create only)'),
-        participants: z.array(z.any()).optional().describe("Array of participants (create only). Shape per entry: { id: <character UUID — always the UUID>, name, hp, maxHp, initiativeBonus?: number (default 0, #103), ac?: number (falls back to attacker-side derivation), isEnemy?: boolean, position?: {x,y} }"),
+        participants: z.array(z.any()).optional().describe("Array of participants (create only). Shape per entry: { id: <character UUID — always the UUID>, name, hp, maxHp, initiativeBonus?: number (default 0, #103), ac?: number (falls back to attacker-side derivation), isEnemy?: boolean, position?: {x,y}, plus optional statline: size, reach, movementSpeed, attackBonus, attackDamage, attackDamageType, attacksPerAction, attacks [{name, attackBonus, damage, damageType?, part?, reachFt?, default?}], abilities [{name, recharge?}], legendaryActions, legendaryResistances, legendaryResistancesRemaining, autoLegendaryResistance, hasLairActions, cr, band, regeneration, parts, unit, intent }"),
         terrain: z.any().optional().describe('Terrain configuration (create only)'),
         characterId: z.string().optional().describe('Character ID (death_save, add_participant)'),
         // FINDINGS #34 mirror block — add_participant + includeParty params
@@ -1431,6 +1438,22 @@ For CORPSES after combat, use corpse_manage tool.`,
         regeneration: z.number().int().min(0).optional().describe('add_participant: HP healed at the start of each of its rounds (defaults from the character row)'),
         revive: z.boolean().optional().describe('adjust_hp: allow raising a dead participant'),
         parts: z.array(PartSchema).optional().describe('add_participant: named parts (defaults from the character row)'),
+        // Participant extras (add_participant; create takes them per participant)
+        size: SizeCategorySchema.optional().describe('add_participant: tiny | small | medium | large | huge | gargantuan'),
+        reach: z.number().optional().describe('add_participant: melee reach in feet'),
+        movementSpeed: z.number().optional().describe('add_participant: speed in feet (default 30)'),
+        attackBonus: z.number().optional().describe('add_participant: default attack bonus'),
+        attackDamage: z.string().optional().describe("add_participant: default attack damage ('1d6+2')"),
+        attackDamageType: z.string().optional().describe('add_participant: damage type of the default attack'),
+        attacksPerAction: z.number().optional().describe('add_participant: multiattack, attacks per Attack action'),
+        attacks: z.array(z.any()).optional().describe('add_participant: named attack profiles [{name, attackBonus, damage, damageType?, part?, reachFt?, default?}]'),
+        abilities: z.array(z.any()).optional().describe('add_participant: limited abilities [{name, recharge?, ready?}]'),
+        legendaryActions: z.number().optional().describe('add_participant: legendary actions per round'),
+        legendaryResistances: z.number().optional().describe('add_participant: legendary resistances per day'),
+        legendaryResistancesRemaining: z.number().optional().describe('add_participant: legendary resistances left'),
+        autoLegendaryResistance: z.boolean().optional().describe('add_participant: spend a legendary resistance on a failed save automatically'),
+        hasLairActions: z.boolean().optional().describe('add_participant: adds a LAIR slot at initiative 20'),
+        cr: z.number().optional().describe('add_participant: challenge rating'),
         unit: UnitSchema.optional().describe('add_participant: a mortal unit {models, hpPerModel, packed, attackBonus, tiers}'),
         part: z.string().optional().describe('set_part / remove_part: part name'),
         state: z.enum(PART_STATES).optional().describe('set_part: intact | crippled | dead | latched | breached'),

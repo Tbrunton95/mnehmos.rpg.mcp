@@ -67,6 +67,7 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Strike at a joint of a peer | add `calledStrike: 'leg' \| 'arm'` and `atPart` |
 | Prepared weapon fires on its trigger | add `preparedAsset: 'prepared-anti-armour'` |
 | A head, limb or plate changes state | `combat_manage set_part {part, state}` |
+| A monster's full statline | `combat_manage create` / `add_participant` with `size`, `reach`, `attacksPerAction`, `attacks`, `abilities`, `legendaryActions`, `legendaryResistances`, `hasLairActions`, `cr` |
 | Squad fires / is suppressed | `combat_action volley`; `combat_manage set_unit` |
 | Cut through a packed lower-band squad | add `cleave: true` |
 | Enemy telegraphs | `combat_manage set_intent`; readied actions then `trigger_readied` |

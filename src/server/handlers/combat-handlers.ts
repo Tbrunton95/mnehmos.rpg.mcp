@@ -18,10 +18,11 @@ import { SessionContext } from '../types.js';
 // CRIT-006: Import spellcasting validation and resolution
 import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
-import { PartSchema, UnitSchema } from '../../schema/token-extras.js';
+import { PartSchema, UnitSchema, ParticipantExtrasShape } from '../../schema/token-extras.js';
 import { resolveWorldId, bandOrder, loadRule, loadRules, type TableRule } from '../../engine/table-rules.js';
 import { peerConsequence, calledStrikeProblem, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
 import { volleyTier, describeUnit } from '../../engine/combat/units.js';
+import { upsertPart } from '../../engine/combat/parts.js';
 import { compareBands } from '../../engine/table-rules.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
@@ -29,7 +30,7 @@ import { CombatActionLogRepository } from '../../storage/repos/combat-action-log
 import { startConcentration, checkConcentration, breakConcentration } from '../../engine/magic/concentration.js';
 import type { Character } from '../../schema/character.js';
 import { getPatternGenerator, PATTERN_DESCRIPTIONS } from '../terrain-patterns.js';
-import { CREATURE_PRESETS } from '../../data/creature-presets.js';
+import { hydrateExtras, matchPreset, type ExtrasRow } from '../../engine/combat/participant-extras.js';
 
 // Global combat state (in-memory for MVP)
 let pubsub: PubSub | null = null;
@@ -692,8 +693,7 @@ Example (use real UUID from context for player character!):
                 hp: z.number().int().nonnegative(), // Allow 0 HP for dying characters
                 maxHp: z.number().int().positive(),
                 isEnemy: z.boolean().optional().describe('Whether this is an enemy (auto-detected if not set)'),
-                hasLairActions: z.boolean().optional()
-                    .describe('Adds a LAIR slot at initiative 20 to the turn order'),
+                ...ParticipantExtrasShape,
                 ac: z.number().int().min(0).optional()
                     .describe('Armor Class (used by attack resolution; defaults to attacker-side derivation if omitted)'),
                 conditions: z.array(ConditionInputSchema).default([])
@@ -1194,62 +1194,30 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
 
     // Convert participants to proper format (preserve isEnemy, position, and resistances)
     const participants: CombatParticipant[] = parsed.participants.map(p => {
-        // Auto-lookup monster stats from presets
-        // This allows correct AC and damage calculation even if LLM omits it
-        let extraStats: Partial<CombatParticipant> = {};
-        const lowerName = p.name.toLowerCase();
-        
-        // Try precise match (e.g. "goblin")
-        let presetKey = Object.keys(CREATURE_PRESETS).find(k => k === lowerName);
-        
-        // Try fuzzy match: start of string (e.g. "goblin warrior" -> "goblin")
-        if (!presetKey) {
-            // Sort keys by length descending to match aggressive first ("giant rat" before "giant")
-            const keys = Object.keys(CREATURE_PRESETS).sort((a, b) => b.length - a.length);
-            presetKey = keys.find(k => lowerName.startsWith(k));
-        }
-        
-        // Try removing numbers (e.g. "goblin 1" -> "goblin")
-        if (!presetKey) {
-            const baseName = lowerName.replace(/ \d+$/, '');
-            presetKey = Object.keys(CREATURE_PRESETS).find(k => k === baseName);
-        }
-
-        const preset = presetKey ? CREATURE_PRESETS[presetKey] : undefined;
-
-        if (preset) {
-            extraStats = {
-                ac: preset.ac,
-                attackDamage: preset.defaultAttack?.damage,
-                attackBonus: preset.defaultAttack?.toHit
-            };
-        }
+        // Auto-lookup monster stats from presets so AC and damage resolve even
+        // when the LLM omits them. Only when the caller gave neither ac nor
+        // attackDamage: a hand-built statline is never overridden by a namesake.
+        const preset = p.ac === undefined && p.attackDamage === undefined ? matchPreset(p.name) : undefined;
 
         // FINDINGS #26: participants backed by a real character row inherit its
-        // AC when neither the caller nor a preset supplied one — an omitted `ac`
-        // silently defaulted to 10 at resolution while output looked correct
-        // (the soft-AC trap). Explicit ac still wins below; ad-hoc tokens with
-        // no row keep the heuristic.
+        // AC (and table-rules band, regeneration, parts, legendary counters,
+        // lair) when the caller did not supply them — an omitted `ac` silently
+        // defaulted to 10 at resolution while output looked correct (the
+        // soft-AC trap). Caller beats row beats preset, field by field.
         const row = p.id ? new CharacterRepository(getDb()).findById(p.id) : null;
-        if (p.ac === undefined && extraStats.ac === undefined && row?.ac !== undefined) {
-            extraStats.ac = row.ac;
-        }
-        // Table rules: band and regeneration default from the sheet.
-        const band = p.band ?? row?.band;
-        const regeneration = p.regeneration ?? row?.regeneration;
-        const parts = p.parts ?? row?.parts;
+        const extras = hydrateExtras(p, row as ExtrasRow | null, preset);
 
         const id = p.id || randomUUID();
         const participant = {
             // CRITICAL FIX: Auto-generate ID if not provided to prevent React key collisions
             id,
-            name: preset ? preset.name : p.name,
+            // The caller's name is kept ('Goblin 2' stays 'Goblin 2').
+            name: p.name,
             hp: p.hp,
             maxHp: p.maxHp,
             ...(p.initiative !== undefined ? { initiative: p.initiative } : {}),
             initiativeBonus: p.initiativeBonus ?? 0,
             isEnemy: p.isEnemy ?? false,
-            hasLairActions: p.hasLairActions ?? false,
             // Callers send names or character-row {name, ...} entries; the
             // engine and the encounter token schema need Condition objects.
             conditions: normalizeConditions(p.conditions, id),
@@ -1257,17 +1225,15 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             resistances: p.resistances,
             vulnerabilities: p.vulnerabilities,
             immunities: p.immunities,
-            ...(band ? { band } : {}),
-            ...(regeneration ? { regeneration } : {}),
-            ...(parts?.length ? { parts } : {}),
             ...(p.unit ? { unit: p.unit } : {}),
             ...(p.intent ? { intent: p.intent } : {}),
-            ...extraStats,
-            // Caller-supplied AC wins over the preset's default so explicit
-            // overrides (e.g., a goblin in chain mail) take effect.
-            ...(p.ac !== undefined ? { ac: p.ac } : {})
+            ...extras,
+            hasLairActions: extras.hasLairActions ?? false,
+            // Size and speed live on the participant itself, not only on the token.
+            size: extras.size ?? 'medium',
+            movementSpeed: extras.movementSpeed ?? 30
         } as CombatParticipant;
-        
+
         return participant;
     });
 
@@ -1331,6 +1297,10 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
     });
+    // F1: repo.create validates a hand-listed token map; save the whole engine
+    // state straight after so every participant field and the RNG position
+    // (rngState, refreshed by getState) are stored from the first write.
+    repo.saveState(encounterId, engine.getState()!);
 
     // Build response with BOTH text and JSON
     // Include sessionId in state JSON so frontend knows which session to query
@@ -1778,7 +1748,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 // The cripple lands on a named part (the one aimed at, or the
                 // limb), which the engine reads for speed and attacks.
                 const part = crippledPart(strikeRule, limb, parsed.atPart);
-                targetNow.parts = [...(targetNow.parts ?? []).filter(pt => pt.name.toLowerCase() !== part.name.toLowerCase()), part];
+                // Merged, not replaced: a latch, holds or ac on that part survive.
+                targetNow.parts = upsertPart(targetNow.parts ?? [], part);
                 if (charRepoFor(targetNow.id)) new CharacterRepository(getDb()).update(targetNow.id, { parts: targetNow.parts } as never);
                 resultRec.calledStrike = { rule: strikeRule.name, limb, crippled: true, part: part.name, notes: part.note };
                 ruleLines.push(`RULE ${strikeRule.name}: ${targetNow.name}'s ${part.name} crippled until repaired${part.note ? ` (${part.note})` : ''}`);

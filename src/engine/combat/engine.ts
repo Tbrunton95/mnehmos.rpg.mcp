@@ -1,4 +1,4 @@
-import type { Part, Unit, Readied } from '../../schema/token-extras.js';
+import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile } from '../../schema/token-extras.js';
 import { CombatRNG, CheckResult } from './rng.js';
 import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS } from './conditions.js';
 
@@ -86,6 +86,15 @@ export interface CombatParticipant {
     attackDamage?: string;     // Default attack damage (e.g., "1d6+2")
     attackDamageType?: string; // Damage type of the default attack (resistances on opportunity attacks)
     attackBonus?: number;      // Default attack bonus used if none provided
+    // PARTICIPANT EXTRAS (token-extras.ts ParticipantExtrasShape)
+    reach?: number;                  // Melee reach in feet (default from size)
+    attacksPerAction?: number;       // Multiattack: attacks one Attack action allows
+    attacksMade?: number;            // Attacks made with this turn's Attack action
+    attacks?: AttackProfile[];       // Named attack profiles (axe, whip), each with its part
+    abilities?: AbilityProfile[];    // Limited abilities (recharge 5-6)
+    autoLegendaryResistance?: boolean; // Spend a legendary resistance on a failed save automatically
+    cr?: number;                     // Challenge rating
+    lairUsedRound?: number;          // Round the lair action was last used (lair owner only)
 }
 
 /**
@@ -224,6 +233,9 @@ export class CombatEngine {
             ...p,
             initiative: this.tagged({ purpose: 'initiative', forId: p.id }, () => this.rng.d20(p.initiativeBonus)),
             isEnemy: p.isEnemy ?? this.detectIsEnemy(p.id, p.name),
+            // Legendary counters start full; a spent resistance (from the sheet) stays spent.
+            legendaryActionsRemaining: p.legendaryActions ?? p.legendaryActionsRemaining,
+            legendaryResistancesRemaining: p.legendaryResistancesRemaining ?? p.legendaryResistances,
             movementRemaining: p.movementSpeed ?? 30,
             actionUsed: false,
             bonusActionUsed: false,
@@ -242,6 +254,13 @@ export class CombatEngine {
             if (bi !== ai) return bi - ai;
             return a.id.localeCompare(b.id);
         });
+
+        // A lair owner joining a fight that had no lair brings the LAIR slot.
+        const lairJoiner = withInit.find(p => p.hasLairActions);
+        if (lairJoiner && !this.state.hasLairActions) {
+            this.state.hasLairActions = true;
+            this.state.lairOwnerId = lairJoiner.id;
+        }
 
         // Rebuild turn order, preserving any LAIR slot at its initiative-20 position.
         const newTurnOrder: string[] = merged.map(p => p.id);
@@ -274,7 +293,8 @@ export class CombatEngine {
                 isEnemy: p.isEnemy ?? this.detectIsEnemy(p.id, p.name),
                 // Initialize legendary actions remaining to max if applicable
                 legendaryActionsRemaining: p.legendaryActions ?? p.legendaryActionsRemaining,
-                legendaryResistancesRemaining: p.legendaryResistances ?? p.legendaryResistancesRemaining,
+                // Resistances are per day: a spent one (from the sheet) is not refilled by a new fight.
+                legendaryResistancesRemaining: p.legendaryResistancesRemaining ?? p.legendaryResistances,
                 // Initialize resources
                 movementRemaining: p.movementSpeed ?? 30,
                 actionUsed: false,

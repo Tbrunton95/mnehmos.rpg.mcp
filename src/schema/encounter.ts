@@ -1,4 +1,5 @@
-import { PartSchema, UnitSchema, ReadiedSchema } from './token-extras.js';
+import { PartSchema, UnitSchema, ReadiedSchema, SizeCategorySchema, AttackProfileSchema, AbilitySchema } from './token-extras.js';
+import type { SizeCategory } from './token-extras.js';
 import { z } from 'zod';
 import { DurationType, parseAbility, parseDurationType } from '../engine/combat/conditions.js';
 
@@ -117,18 +118,11 @@ export const DEFAULT_GRID_BOUNDS: GridBounds = {
 
 /**
  * Size category for creatures (affects occupied squares)
- * Based on D&D 5e size categories
+ * Based on D&D 5e size categories. Defined beside the token extras so there
+ * is one enum instance; re-exported here for existing importers.
  */
-export const SizeCategorySchema = z.enum([
-    'tiny',      // 2.5ft, shares space
-    'small',     // 5ft, 1 square
-    'medium',    // 5ft, 1 square
-    'large',     // 10ft, 2x2 squares
-    'huge',      // 15ft, 3x3 squares
-    'gargantuan' // 20ft+, 4x4+ squares
-]);
-
-export type SizeCategory = z.infer<typeof SizeCategorySchema>;
+export { SizeCategorySchema };
+export type { SizeCategory };
 
 /**
  * Get the grid footprint (squares occupied) for a size category
@@ -189,8 +183,21 @@ export const TokenSchema = z.object({
     parts: z.array(PartSchema).optional(),
     unit: UnitSchema.optional(),
     intent: z.string().optional(),
-    readied: ReadiedSchema.optional()
-});
+    readied: ReadiedSchema.optional(),
+    // Participant extras (token-extras.ts ParticipantExtrasShape)
+    reach: z.number().optional(),
+    attackDamageType: z.string().optional(),
+    attacksPerAction: z.number().optional(),
+    attacks: z.array(AttackProfileSchema).optional(),
+    abilities: z.array(AbilitySchema).optional(),
+    legendaryActions: z.number().optional(),
+    legendaryResistances: z.number().optional(),
+    legendaryResistancesRemaining: z.number().optional(),
+    autoLegendaryResistance: z.boolean().optional(),
+    cr: z.number().optional()
+// Tokens are engine participants; a field not listed here must still
+// survive a parse (create used to strip everything off this list).
+}).passthrough();
 
 export type Token = z.infer<typeof TokenSchema>;
 

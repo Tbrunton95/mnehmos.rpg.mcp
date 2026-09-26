@@ -32,7 +32,8 @@ export function buildConsolidatedRegistry(): ToolRegistry {
  * Until outer schemas are auto-generated, audit them at every boot and
  * shout about drift where it cannot be missed.
  */
-function runBootMirrorAudit(registry: ToolRegistry): void {
+export function mirrorAuditMissing(registry: ToolRegistry): Record<string, string[]> {
+    const drift: Record<string, string[]> = {};
     for (const [name, entry] of Object.entries(registry)) {
         const outerShape = (entry.schema as { shape?: Record<string, unknown> }).shape;
         const actionSchemas = entry.actionSchemas as Record<string, { schema?: { shape?: Record<string, unknown> } }> | undefined;
@@ -46,9 +47,14 @@ function runBootMirrorAudit(registry: ToolRegistry): void {
                 if (k !== 'action' && !outerKeys.has(k)) missing.add(k);
             }
         }
-        if (missing.size > 0) {
-            console.error(`[MIRROR AUDIT] ${name}: outer inputSchema missing inner params: ${[...missing].sort().join(', ')} — clients WILL strip these (Findings #14/#27/#33)`);
-        }
+        if (missing.size > 0) drift[name] = [...missing].sort();
+    }
+    return drift;
+}
+
+function runBootMirrorAudit(registry: ToolRegistry): void {
+    for (const [name, missing] of Object.entries(mirrorAuditMissing(registry))) {
+        console.error(`[MIRROR AUDIT] ${name}: outer inputSchema missing inner params: ${missing.join(', ')} — clients WILL strip these (Findings #14/#27/#33)`);
     }
 }
 
