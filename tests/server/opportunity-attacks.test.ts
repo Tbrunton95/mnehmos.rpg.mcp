@@ -410,6 +410,11 @@ describe('HIGH-003: Opportunity Attacks', () => {
             // If the attack hits, there should be damage info
             // The exact outcome depends on the dice roll, but the mechanics should be there
             expect(text).toMatch(/d20|Attack Roll|damage/i);
+            // Item 11: every number of the reaction is data in the envelope.
+            const oa = extractStateJson(text).actionResult.opportunityAttacks;
+            expect(oa).toHaveLength(1);
+            expect(oa[0]).toMatchObject({ attackerId: 'goblin-1', stepIndex: 0, at: { x: 1, y: 0 } });
+            expect(oa[0].targetHpAfter).toBe(30 - oa[0].damage);
         });
     });
 });

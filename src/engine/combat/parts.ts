@@ -36,7 +36,7 @@ export function upsertPart(parts: Part[], next: Partial<Part> & { name: string }
 }
 
 /** A profile by exact name, then by unique prefix; undefined when neither. */
-function matchProfile(profiles: AttackProfile[], name: string): AttackProfile | undefined {
+export function matchProfile(profiles: AttackProfile[], name: string): AttackProfile | undefined {
     const key = norm(name);
     const exact = profiles.find(a => norm(a.name) === key);
     if (exact) return exact;

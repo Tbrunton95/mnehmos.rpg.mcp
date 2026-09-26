@@ -101,8 +101,24 @@ export const UnitSchema = z.object({
 });
 export type Unit = z.infer<typeof UnitSchema>;
 
+/** Triggers the engine can see for itself during a move. */
+export const READIED_TRIGGERS = ['enters_reach', 'leaves_reach'] as const;
+
+/** The attack a readied action makes when it fires; omitted fields come from the token. */
+export const ReadiedAttackSchema = z.object({
+    using: z.string().optional().describe('Named attack profile on the token'),
+    attackBonus: z.number().int().optional(),
+    damage: z.union([z.number(), z.string()]).optional(),
+    damageType: z.string().optional(),
+    withPart: z.string().optional().describe('The part that makes the attack')
+});
+export type ReadiedAttack = z.infer<typeof ReadiedAttackSchema>;
+
 export const ReadiedSchema = z.object({
     action: z.string().min(1),
-    trigger: z.string().min(1)
+    trigger: z.string().min(1),
+    on: z.enum(READIED_TRIGGERS).optional().describe('enters_reach | leaves_reach: the engine watches moves for it. Unset = free text, fired by hand with trigger_readied'),
+    watch: z.string().optional().describe("Who sets it off: a participant id or name, 'enemy' (default) or 'any'"),
+    attack: ReadiedAttackSchema.optional().describe('{using?, attackBonus?, damage?, damageType?, withPart?}: with this the readied attack fires itself as a reaction')
 });
 export type Readied = z.infer<typeof ReadiedSchema>;

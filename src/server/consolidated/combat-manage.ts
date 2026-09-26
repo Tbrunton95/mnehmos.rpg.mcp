@@ -5,7 +5,7 @@
  * advance_turn, roll_death_save, execute_lair_action
  */
 
-import { PartSchema, UnitSchema, ReadiedSchema, PART_STATES, PART_KINDS, ParticipantExtrasShape, SizeCategorySchema } from '../../schema/token-extras.js';
+import { PartSchema, UnitSchema, ReadiedSchema, ReadiedAttackSchema, PART_STATES, PART_KINDS, ParticipantExtrasShape, SizeCategorySchema } from '../../schema/token-extras.js';
 import { hydrateExtras, type ExtrasRow } from '../../engine/combat/participant-extras.js';
 import { upsertPart } from '../../engine/combat/parts.js';
 import { volleyTier, describeUnit } from '../../engine/combat/units.js';
@@ -26,7 +26,9 @@ import {
     getOrLoadEngine,
     syncParticipantHpFromDb,
     saveEncounterState,
-    mirrorConditionToRow
+    mirrorConditionToRow,
+    resolveReadiedAttack,
+    reactionAttackData
 } from '../handlers/combat-handlers.js';
 import { expandCreatureTemplate, listAllTemplates } from '../../data/creature-presets.js';
 import { getDomainServices } from '../domain-services.js';
@@ -282,14 +284,16 @@ const SetIntentSchema = z.object({
     encounterId: z.string(),
     participantId: z.string(),
     intent: z.string().nullable().optional().describe('Telegraphed intent; clears when its turn ends. null clears now'),
-    readied: ReadiedSchema.nullable().optional().describe('{action, trigger}: stays across turns until trigger_readied. null clears')
+    readied: ReadiedSchema.nullable().optional().describe('{action, trigger, on?, watch?, attack?}: stays across turns until it fires (on + attack: on a move, as a reaction) or trigger_readied. null clears')
 });
 
 const TriggerReadiedSchema = z.object({
     action: z.literal('trigger_readied'),
     encounterId: z.string(),
     participantId: z.string(),
-    note: z.string().optional().describe('What happened when it fired')
+    note: z.string().optional().describe('What happened when it fired'),
+    targetId: z.string().optional().describe("Who the readied attack strikes (default: the readied action's watch, when it names a participant)"),
+    attack: ReadiedAttackSchema.optional().describe('{using?, attackBonus?, damage?, damageType?, withPart?}: the attack to roll, over the stored one')
 });
 
 const LegendaryActionSchema = z.object({
@@ -1256,14 +1260,42 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             const p = state.participants.find(x => x.id === params.participantId);
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
             if (!p.readied) return refuse(`${p.name} has no readied action`);
+            // A readied action is the reactor's reaction (item 11).
+            if (!engine.canTakeReactions(p.id)) return refuse(`${p.name} cannot take reactions (down, or a condition such as stunned or incapacitated)`);
+            if (p.reactionUsed) return refuse(`${p.name} has already used its reaction this round`);
             const fired = p.readied;
+            const spec = params.attack ?? fired.attack;
+            let attack: ReturnType<typeof resolveReadiedAttack> | undefined;
+            if (spec) {
+                // The stored attack rolls in this call, on the encounter's dice.
+                const lc = (s: string) => s.trim().toLowerCase();
+                const watched = fired.watch ? state.participants.find(x => x.id !== p.id && (lc(x.id) === lc(fired.watch!) || lc(x.name) === lc(fired.watch!))) : undefined;
+                const targetId = params.targetId ?? watched?.id;
+                if (!targetId) return refuse(`${p.name}'s readied attack needs targetId (who it strikes)`);
+                const target = state.participants.find(x => x.id === targetId);
+                if (!target) return refuse(`Target ${targetId} not in this encounter`);
+                try {
+                    attack = resolveReadiedAttack(engine, p, target, spec);
+                } catch (err) {
+                    return refuse(err instanceof Error ? err.message : String(err));
+                }
+            } else {
+                engine.commitAction(p.id, 'reaction');
+            }
             p.readied = undefined;
-            new EncounterRepository(getDb()).saveState(params.encounterId, state);
-            logConditionChange(params.encounterId, state, 'trigger_readied', p.id, `${p.name}'s readied action fires: ${fired.action} (${fired.trigger})${params.note ? ` — ${params.note}` : ''}`, params.note);
-            return { success: true, actionType: 'trigger_readied', encounterId: params.encounterId, participantId: p.id, fired, message: `${p.name}: ${fired.action} fires (${fired.trigger}). Resolve it now with combat_action.` };
+            saveEncounterState(new EncounterRepository(getDb()), params.encounterId, state);
+            logConditionChange(params.encounterId, state, 'trigger_readied', p.id, `${p.name}'s readied action fires: ${fired.action} (${fired.trigger})${attack ? ` — ${attack.message}` : ''}${params.note ? ` — ${params.note}` : ''}`, params.note);
+            const attackData = attack ? { targetId: attack.target?.id, ...reactionAttackData(attack) } : undefined;
+            return {
+                success: true, actionType: 'trigger_readied', encounterId: params.encounterId, participantId: p.id, fired, reaction: true,
+                ...(attackData ? { attack: attackData } : {}),
+                message: attack
+                    ? `${p.name}: ${fired.action} fires (${fired.trigger}); reaction spent.\n${attack.detailedBreakdown}`
+                    : `${p.name}: ${fired.action} fires (${fired.trigger}); reaction spent. Resolve its effect now (an attack: pass attack {…} and targetId here next time to roll it in one call).`
+            };
         },
         aliases: ['fire_readied', 'readied_fires'],
-        description: 'A readied action\'s trigger happened: clear it, log it, then resolve the action'
+        description: 'A readied action\'s trigger happened: spends the reaction, rolls its stored attack (targetId) in the same call, clears and logs it'
     },
     legendary_action: {
         schema: LegendaryActionSchema,
@@ -1563,6 +1595,8 @@ For CORPSES after combat, use corpse_manage tool.`,
         holds: z.array(z.string()).optional().describe("set_part: weapons or slots the part wields ('axe', 'mainhand')"),
         breakAt: z.number().int().optional().describe('set_part: one aimed hit dealing at least this much severs the part'),
         note: z.string().optional().describe('set_part / trigger_readied: note'),
+        targetId: z.string().optional().describe("trigger_readied: who the readied attack strikes (default: its watch, when that names a participant)"),
+        attack: z.any().optional().describe('trigger_readied: {using?, attackBonus?, damage?, damageType?, withPart?}, the attack to roll over the stored one'),
         cost: z.number().optional().describe('legendary_action: legendary actions it costs (default 1)'),
         description: z.string().optional().describe("legendary_action: what the creature does ('wing attack')"),
         suppressed: z.boolean().optional().describe('set_unit'),
@@ -1570,7 +1604,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         brokenFormation: z.boolean().optional().describe('set_unit'),
         packed: z.boolean().optional().describe('set_unit'),
         intent: z.string().nullable().optional().describe('set_intent: telegraphed intent (null clears); clears when its turn ends'),
-        readied: ReadiedSchema.nullable().optional().describe('set_intent: {action, trigger}, stays until trigger_readied (null clears)'),
+        readied: ReadiedSchema.nullable().optional().describe("set_intent: {action, trigger, on?: enters_reach | leaves_reach, watch?: id | name | 'enemy' | 'any', attack?: {using?, attackBonus?, damage?, damageType?, withPart?}}; stays until it fires or trigger_readied (null clears). With on and attack it fires itself on a move"),
         isEnemy: z.boolean().optional().describe('Hostile flag (add_participant)'),
         xpAward: z.number().optional().describe('XP credited on end'),
         xpRecipients: z.array(z.string()).optional().describe('XP recipient character IDs'),

@@ -1,5 +1,5 @@
 import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile } from '../../schema/token-extras.js';
-import { findPart as findNamedPart } from './parts.js';
+import { findPart as findNamedPart, matchProfile } from './parts.js';
 import { CombatRNG, CheckResult } from './rng.js';
 import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS, conditionAttackModifiers, conditionSpeedFactor } from './conditions.js';
 
@@ -724,8 +724,9 @@ export class CombatEngine {
         // Named parts: the attacker's part used and the target part aimed at;
         // uncapped lifts the one-model cap on unit targets (cleave, volleys).
         // ranged says the attack is not made within 5 ft (prone, auto-crit);
-        // ignoreConditions skips the standard-condition modifiers entirely.
-        partOpts?: { withPart?: string; atPart?: string; uncapped?: boolean; ranged?: boolean; ignoreConditions?: boolean }
+        // ignoreConditions skips the standard-condition modifiers entirely;
+        // opportunity tags the rolls and the event as an opportunity attack.
+        partOpts?: { withPart?: string; atPart?: string; uncapped?: boolean; ranged?: boolean; ignoreConditions?: boolean; opportunity?: boolean }
     ): CombatActionResult {
         if (!this.state) throw new Error('No active combat');
 
@@ -818,7 +819,7 @@ export class CombatEngine {
                 isHit: resolved !== 'miss', isCrit: resolved === 'crit',
                 allRolls: [], resolved
             }
-            : this.tagged({ purpose: 'attack', forId: actorId, targetId }, () => this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage));
+            : this.tagged({ purpose: partOpts?.opportunity ? 'opportunity attack' : 'attack', forId: actorId, targetId }, () => this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage));
         // Paralyzed or unconscious within 5 ft: a rolled hit is a crit. A
         // GM-posted result lands exactly as posted, with a pointer instead.
         if (autoCrit && attackRoll.isHit && !attackRoll.isCrit) {
@@ -838,7 +839,7 @@ export class CombatEngine {
         let baseDamageVal = 0;
         let damageBreakdownStr = '';
 
-        const rolled = this.tagged({ purpose: 'damage', forId: actorId, targetId }, () => this.rollAttackDamage(damage, attackRoll.isHit && attackRoll.isCrit));
+        const rolled = this.tagged({ purpose: partOpts?.opportunity ? 'opportunity damage' : 'damage', forId: actorId, targetId }, () => this.rollAttackDamage(damage, attackRoll.isHit && attackRoll.isCrit));
         baseDamageVal = rolled.total;
         const capturedDamageRolls = rolled.rolls;
         damageBreakdownStr = rolled.breakdown;
@@ -929,7 +930,7 @@ export class CombatEngine {
         }
 
         this.emitter?.publish('combat', {
-            type: 'attack_executed',
+            type: partOpts?.opportunity ? 'opportunity_attack' : 'attack_executed',
             result: {
                 actor: actor.name,
                 target: target.name,
@@ -1722,24 +1723,34 @@ export class CombatEngine {
      * attacker's melee reach? Measured edge to edge between footprints, so a
      * large creature threatens from every square it fills.
      */
-    isWithinReach(attacker: CombatParticipant, target: CombatParticipant, targetAt?: { x: number; y: number }): boolean {
+    isWithinReach(attacker: CombatParticipant, target: CombatParticipant, targetAt?: { x: number; y: number }, reachFt?: number): boolean {
         const squares = edgeDistanceSquares(attacker, target, { b: targetAt });
-        return squares * 5 <= effectiveReachFt(attacker);
+        return squares * 5 <= (reachFt ?? effectiveReachFt(attacker));
     }
 
     /**
-     * HIGH-003: Get adjacent enemies that could make opportunity attacks
-     * @param moverId - The creature that is moving
-     * @param fromPos - Starting position
-     * @param toPos - Target position
-     * @returns Array of participants who can make opportunity attacks
+     * HIGH-003 / item 11: who gets an opportunity attack on this move.
+     *
+     * With a path (start first, as findPath returns it) every step is checked:
+     * a reactor swings at the first step i where the mover is in its reach at
+     * path[i] and out of it at path[i+1], so a path that skirts an enemy
+     * provokes even when both ends are clear of it. Reactors that cannot take
+     * reactions (stunned, paralysed, unconscious) or already spent theirs are
+     * skipped. The (from, to) form checks the two squares only and returns
+     * the attackers, as it always has.
      */
+    getOpportunityAttackers(moverId: string, path: Array<{ x: number; y: number }>): Array<{ attacker: CombatParticipant; stepIndex: number }>;
+    getOpportunityAttackers(moverId: string, fromPos: { x: number; y: number }, toPos: { x: number; y: number }): CombatParticipant[];
     getOpportunityAttackers(
         moverId: string,
-        fromPos: { x: number; y: number },
-        toPos: { x: number; y: number }
-    ): CombatParticipant[] {
-        if (!this.state) return [];
+        pathOrFrom: Array<{ x: number; y: number }> | { x: number; y: number },
+        toPos?: { x: number; y: number }
+    ): Array<{ attacker: CombatParticipant; stepIndex: number }> | CombatParticipant[] {
+        if (!Array.isArray(pathOrFrom)) {
+            return this.getOpportunityAttackers(moverId, [pathOrFrom, toPos!]).map(h => h.attacker);
+        }
+        const path = pathOrFrom;
+        if (!this.state || path.length < 2) return [];
 
         const mover = this.state.participants.find(p => p.id === moverId);
         if (!mover) return [];
@@ -1747,40 +1758,78 @@ export class CombatEngine {
         // If mover has disengaged, no opportunity attacks are provoked
         if (mover.hasDisengaged) return [];
 
-        const attackers: CombatParticipant[] = [];
+        const attackers: Array<{ attacker: CombatParticipant; stepIndex: number }> = [];
 
         for (const p of this.state.participants) {
-            // Skip self
+            // Skip self, the defeated, allies, spent reactions and unplaced tokens
             if (p.id === moverId) continue;
-
-            // Skip defeated participants
             if (p.hp <= 0) continue;
-
-            // Skip same faction (allies don't attack each other)
-            if (p.isEnemy === mover.isEnemy) continue;
-
-            // Skip if reaction already used
+            if (!!p.isEnemy === !!mover.isEnemy) continue;
             if (p.reactionUsed) continue;
-
-            // Skip if no position
             if (!p.position) continue;
+            // Stunned, paralysed, unconscious and the like cannot react.
+            if (!this.canTakeReactions(p.id)) continue;
 
             // Leaving the reactor's reach (size and reach aware) provokes.
-            const wasInReach = this.isWithinReach(p, mover, fromPos);
-            const stillInReach = this.isWithinReach(p, mover, toPos);
-
-            if (wasInReach && !stillInReach) {
-                attackers.push(p);
-            }
+            const step = this.firstReachChange(p, mover, path, 'leaves_reach');
+            if (step !== undefined) attackers.push({ attacker: p, stepIndex: step });
         }
 
-        return attackers;
+        return attackers.sort((a, b) => a.stepIndex - b.stepIndex);
     }
 
     /**
-     * HIGH-003: Execute an opportunity attack
-     * Uses simplified attack: d20 + attacker's initiative bonus vs target's initiative + 10
-     * Damage is fixed at 1d6 + 2 for simplicity
+     * The first step of a path where the mover enters or leaves a reactor's
+     * reach. Leaving counts at the square it leaves from (path[i]); entering
+     * at the square it enters (path[i+1]).
+     */
+    private firstReachChange(
+        reactor: CombatParticipant, mover: CombatParticipant,
+        path: Array<{ x: number; y: number }>, on: 'enters_reach' | 'leaves_reach', reachFt?: number
+    ): number | undefined {
+        for (let i = 0; i + 1 < path.length; i++) {
+            const was = this.isWithinReach(reactor, mover, path[i], reachFt);
+            const now = this.isWithinReach(reactor, mover, path[i + 1], reachFt);
+            if (on === 'leaves_reach' && was && !now) return i;
+            if (on === 'enters_reach' && !was && now) return i + 1;
+        }
+        return undefined;
+    }
+
+    /**
+     * Item 11: readied actions this move sets off. A readied action with
+     * `on` (enters_reach / leaves_reach) fires when its watched creature
+     * (a participant id or name, 'enemy' by default, or 'any') crosses the
+     * reactor's reach, measured with the readied attack's profile reach
+     * when it names one. Reactors that cannot react are skipped.
+     */
+    getReadiedTriggers(moverId: string, path: Array<{ x: number; y: number }>): Array<{ reactor: CombatParticipant; stepIndex: number; readied: Readied }> {
+        if (!this.state || path.length < 2) return [];
+        const mover = this.state.participants.find(p => p.id === moverId);
+        if (!mover) return [];
+        const hits: Array<{ reactor: CombatParticipant; stepIndex: number; readied: Readied }> = [];
+        for (const p of this.state.participants) {
+            const readied = p.readied;
+            if (!readied?.on || p.id === moverId || !p.position) continue;
+            if (p.reactionUsed || !this.canTakeReactions(p.id)) continue;
+            const watch = (readied.watch ?? 'enemy').trim().toLowerCase();
+            const watched = watch === 'any'
+                || (watch === 'enemy' && !!p.isEnemy !== !!mover.isEnemy)
+                || watch === mover.id.toLowerCase() || watch === mover.name.toLowerCase();
+            if (!watched) continue;
+            const profile = readied.attack?.using && p.attacks?.length ? matchProfile(p.attacks, readied.attack.using) : undefined;
+            const step = this.firstReachChange(p, mover, path, readied.on, profile?.reachFt ?? undefined);
+            if (step !== undefined) hits.push({ reactor: p, stepIndex: step, readied });
+        }
+        return hits.sort((a, b) => a.stepIndex - b.stepIndex);
+    }
+
+    /**
+     * HIGH-003: Execute an opportunity attack with the attacker's default
+     * attack against the target's AC. It rolls like any attack: standard
+     * conditions on both sides (a prone mover within 5 ft is hit with
+     * advantage, a paralysed one takes a crit), Dodge, Help and the one-model
+     * cap on units. Spends the attacker's reaction.
      */
     executeOpportunityAttack(
         attackerId: string,
@@ -1794,89 +1843,34 @@ export class CombatEngine {
         if (!attacker) throw new Error(`Attacker ${attackerId} not found`);
         if (!target) throw new Error(`Target ${targetId} not found`);
 
-        // Mark reaction as used
-        attacker.reactionUsed = true;
-
-        // The attacker's own default attack and the target's AC, falling back
-        // to ability scores, then to the old heuristics for bare tokens.
+        // The attacker's own default attack (or its default profile) and the
+        // target's AC, falling back to ability scores, then to the old
+        // heuristics for bare tokens.
         const mod = (score?: number) => Math.floor(((score ?? 10) - 10) / 2);
-        const attackBonus = attacker.attackBonus
+        const profile = attacker.attackBonus === undefined
+            ? attacker.attacks?.find(a => a.default) ?? (attacker.attacks?.length === 1 ? attacker.attacks[0] : undefined)
+            : undefined;
+        const attackBonus = attacker.attackBonus ?? profile?.attackBonus
             ?? (attacker.abilityScores
                 ? Math.max(mod(attacker.abilityScores.strength), mod(attacker.abilityScores.dexterity)) + 2
                 : attacker.initiativeBonus + 2);
+        const damage = profile && attacker.attackDamage === undefined ? profile.damage : attacker.attackDamage ?? '1d6+2';
+        const damageType = profile && attacker.attackDamage === undefined ? profile.damageType : attacker.attackDamageType;
         const targetAC = target.ac
             ?? (target.abilityScores ? 10 + mod(target.abilityScores.dexterity)
                 : 10 + (target.initiativeBonus > 0 ? Math.floor(target.initiativeBonus / 2) : 0));
 
-        const hpBefore = target.hp;
-        // 5e: crit on the natural 20 only, never on the margin.
-        const attackRoll = this.tagged({ purpose: 'opportunity attack', forId: attackerId, targetId }, () => this.rng.rollAttackD20(attackBonus, targetAC));
+        const result = this.executeAttack(attackerId, targetId, attackBonus, targetAC, damage, damageType,
+            false, false, undefined, undefined, undefined, undefined, { opportunity: true });
 
-        let damageDealt = 0;
-        let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
-        if (attackRoll.isHit) {
-            const rolled = this.tagged({ purpose: 'opportunity damage', forId: attackerId, targetId }, () => this.rollAttackDamage(attacker.attackDamage ?? '1d6+2', attackRoll.isCrit));
-            const modResult = this.calculateDamageWithModifiers(rolled.total, attacker.attackDamageType, target);
-            damageDealt = modResult.finalDamage;
-            damageModifier = modResult.modifier;
-            target.hp = Math.max(0, target.hp - damageDealt);
-        }
+        // Mark reaction as used
+        attacker.reactionUsed = true;
 
-        const defeated = target.hp <= 0;
-
-        // Build detailed breakdown
-        let breakdown = `⚡ OPPORTUNITY ATTACK by ${attacker.name}!\n`;
-        breakdown += `🎲 Attack Roll: d20(${attackRoll.roll}) + ${attackBonus} = ${attackRoll.total} vs AC ${targetAC}\n`;
-
-        if (attackRoll.isNat20) {
-            breakdown += `   ⭐ NATURAL 20!\n`;
-        } else if (attackRoll.isNat1) {
-            breakdown += `   💀 NATURAL 1!\n`;
-        }
-
-        breakdown += `   ${attackRoll.isHit ? '✅ HIT' : '❌ MISS'}`;
-
-        if (attackRoll.isHit) {
-            breakdown += attackRoll.isCrit ? ' (CRITICAL!)' : '';
-            breakdown += `\n\n💥 Damage: ${damageDealt}${attackRoll.isCrit ? ' (crit)' : ''}\n`;
-            breakdown += `   ${target.name}: ${hpBefore} → ${target.hp}/${target.maxHp} HP`;
-            if (defeated) {
-                breakdown += ` [DEFEATED]`;
-            }
-        }
-
-        const message = attackRoll.isHit
-            ? `OPPORTUNITY ATTACK HIT! ${attacker.name} strikes ${target.name} for ${damageDealt} damage`
+        result.detailedBreakdown = `⚡ OPPORTUNITY ATTACK by ${attacker.name}!\n${result.detailedBreakdown}`;
+        result.message = result.success
+            ? `OPPORTUNITY ATTACK HIT! ${attacker.name} strikes ${target.name} for ${result.damage} damage${result.defeated ? ' [DEFEATED]' : ''}`
             : `OPPORTUNITY ATTACK MISS! ${attacker.name}'s attack misses ${target.name}`;
-
-        this.emitter?.publish('combat', {
-            type: 'opportunity_attack',
-            result: {
-                attacker: attacker.name,
-                target: target.name,
-                roll: attackRoll.roll,
-                total: attackRoll.total,
-                ac: targetAC,
-                hit: attackRoll.isHit,
-                crit: attackRoll.isCrit,
-                damage: damageDealt,
-                targetHp: target.hp
-            }
-        });
-
-        return {
-            type: 'attack',
-            actor: { id: attacker.id, name: attacker.name },
-            target: { id: target.id, name: target.name, hpBefore, hpAfter: target.hp, maxHp: target.maxHp },
-            attackRoll,
-            damage: damageDealt,
-            damageType: attacker.attackDamageType,
-            damageModifier: damageModifier === 'normal' ? undefined : damageModifier,
-            success: attackRoll.isHit,
-            defeated,
-            message,
-            detailedBreakdown: breakdown
-        };
+        return result;
     }
 
     /**

@@ -18,7 +18,7 @@ import { SessionContext } from '../types.js';
 // CRIT-006: Import spellcasting validation and resolution
 import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
-import { PartSchema, UnitSchema, ParticipantExtrasShape, type Part } from '../../schema/token-extras.js';
+import { PartSchema, UnitSchema, ParticipantExtrasShape, type Part, type ReadiedAttack } from '../../schema/token-extras.js';
 import { resolveWorldId, bandOrder, loadRule, loadRules, type TableRule } from '../../engine/table-rules.js';
 import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
 import { volleyTier, describeUnit } from '../../engine/combat/units.js';
@@ -463,6 +463,54 @@ function formatDisengageResult(actorName: string): string {
     output += `Movement this turn will not provoke opportunity attacks.\n`;
     output += `\n→ Call advance_turn to proceed (or move first)`;
     return output;
+}
+
+/**
+ * Item 11: a reactor the players run (on the heroes' side, with a PC
+ * character row). Its opportunity attacks are offered, never rolled for it.
+ */
+function isPlayerReactor(p: CombatParticipant): boolean {
+    if (p.isEnemy) return false;
+    const row = new CharacterRepository(getDb()).findById(p.id);
+    return !!row && (row.characterType ?? 'pc') === 'pc';
+}
+
+/**
+ * Item 11: resolve a stored attack spec (a readied action's attack) as a
+ * reaction on the encounter's dice. Omitted fields come from the named
+ * profile, then the token's default attack; the target's AC from its token,
+ * then its sheet. Spends the reaction; the caller checks it was available
+ * and saves the state.
+ */
+export function resolveReadiedAttack(engine: CombatEngine, reactor: CombatParticipant, target: CombatParticipant, spec: ReadiedAttack): CombatActionResult {
+    const profiles = reactor.attacks?.length ? reactor.attacks : (new CharacterRepository(getDb()).findById(reactor.id)?.attacks ?? []);
+    const source = resolveAttackSource({ parts: reactor.parts, attacks: profiles }, { using: spec.using, withPart: spec.withPart });
+    const profile = source.profile;
+    const attackBonus = spec.attackBonus ?? profile?.attackBonus ?? reactor.attackBonus ?? reactor.initiativeBonus + 2;
+    const damage = spec.damage ?? profile?.damage ?? reactor.attackDamage ?? '1d6';
+    const damageType = spec.damageType ?? profile?.damageType ?? reactor.attackDamageType;
+    const ac = target.ac ?? new CharacterRepository(getDb()).findById(target.id)?.ac ?? 10;
+    const withPart = spec.withPart && findPart(reactor, spec.withPart) ? spec.withPart : source.part?.name;
+    const result = engine.executeAttack(reactor.id, target.id, attackBonus, ac, damage, damageType,
+        false, false, undefined, undefined, undefined, undefined, { withPart, ranged: profile?.ranged });
+    engine.commitAction(reactor.id, 'reaction');
+    return result;
+}
+
+/** The JSON for one rolled reaction attack: every number the prose shows. */
+export function reactionAttackData(r: CombatActionResult) {
+    return {
+        roll: r.attackRoll?.roll,
+        allRolls: (r.attackRoll as { allRolls?: number[] } | undefined)?.allRolls,
+        total: r.attackRoll?.total,
+        targetAc: r.attackRoll?.dc,
+        hit: r.success,
+        crit: !!r.attackRoll?.isCrit,
+        damage: r.damage ?? 0,
+        damageType: (r as { damageType?: string }).damageType,
+        targetHpAfter: r.target?.hpAfter,
+        ...(r.situational?.length ? { situational: r.situational } : {})
+    };
 }
 
 /**
@@ -2003,107 +2051,154 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             (actor as any).position = parsed.targetPosition;
             output = formatMoveResult(actor.name, undefined, parsed.targetPosition, true, null);
         } else {
-            // HIGH-003: Check for opportunity attacks BEFORE moving
-            const opportunityAttackers = engine.getOpportunityAttackers(
-                parsed.actorId,
-                actorPos,
-                parsed.targetPosition
+            // Item 11: the move is validated first (blocked destination, no
+            // path, not enough movement), so a refused move provokes nothing.
+            // Then the path is walked and each reaction resolves at the step
+            // that set it off.
+            const obstacles = new Set<string>();
+
+            // Every square another participant fills is an obstacle (a
+            // large token fills 2x2 from its position, item 6).
+            for (const p of currentState.participants) {
+                if (p.id === parsed.actorId) continue;
+                for (const cell of footprintCells(p)) obstacles.add(`${cell.x},${cell.y}`);
+            }
+
+            // Add terrain obstacles if available
+            const terrain = (currentState as any).terrain;
+            if (terrain?.obstacles) {
+                for (const obs of terrain.obstacles) {
+                    obstacles.add(obs);
+                }
+            }
+
+            const opportunityAttacks: Array<Record<string, unknown>> = [];
+            const opportunityAttacksAvailable: Array<Record<string, unknown>> = [];
+            const readiedTriggered: Array<Record<string, unknown>> = [];
+            let moved = false;
+
+            // The mover's whole footprint at the destination must be clear.
+            // The path itself is found for the anchor square only.
+            const destBlocked = footprintCells(actor, parsed.targetPosition)
+                .some(cell => obstacles.has(`${cell.x},${cell.y}`));
+            const path = destBlocked ? null : new SpatialEngine().findPath(
+                { x: actorPos.x, y: actorPos.y },
+                { x: parsed.targetPosition.x, y: parsed.targetPosition.y },
+                obstacles
             );
+            // Calculate movement cost (5ft per step); path includes the start node.
+            const moveCost = path ? (path.length - 1) * 5 : 0;
+            // A condition added mid-turn (grappled, exhaustion 2) caps what is left.
+            const speedCap = engine.effectiveSpeed(actor) * (actor.hasDashed ? 2 : 1);
+            const currentMovement = Math.min((actor as any).movementRemaining ?? 30, speedCap); // Default 30 if undefined
 
-            // Execute any triggered opportunity attacks
-            let opportunityAttackOutput = '';
-            for (const attacker of opportunityAttackers) {
-                const oaResult = engine.executeOpportunityAttack(attacker.id, parsed.actorId);
-                opportunityAttackOutput += formatOpportunityAttackResult(oaResult) + '\n';
+            if (destBlocked) {
+                output = formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, 'Destination is blocked');
+            } else if (path === null) {
+                output = formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, 'No valid path - blocked by obstacles');
+            } else if (currentMovement < moveCost) {
+                output = formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, `Insufficient movement (Cost: ${moveCost}ft, Remaining: ${currentMovement}ft)`);
+            } else {
+                // Reactions along the path, in step order. At one step a
+                // readied action goes before the opportunity attack: the
+                // reactor chose it, and it spends the same reaction.
+                type Reaction =
+                    | { kind: 'readied'; reactor: CombatParticipant; stepIndex: number; readied: NonNullable<CombatParticipant['readied']> }
+                    | { kind: 'oa'; reactor: CombatParticipant; stepIndex: number };
+                const reactions: Reaction[] = [
+                    ...engine.getReadiedTriggers(parsed.actorId, path).map(t => ({ kind: 'readied' as const, ...t })),
+                    ...engine.getOpportunityAttackers(parsed.actorId, path).map(h => ({ kind: 'oa' as const, reactor: h.attacker, stepIndex: h.stepIndex }))
+                ].sort((a, b) => a.stepIndex - b.stepIndex || (a.kind === b.kind ? 0 : a.kind === 'readied' ? -1 : 1));
 
-                // If the mover is defeated by an opportunity attack, they can't complete the move
-                if (oaResult.defeated) {
-                    output = opportunityAttackOutput;
-                    output += `\n${actor.name} was defeated while attempting to move and cannot complete the movement!`;
+                const hpBefore = actor.hp;
+                let reactionOutput = '';
+                let fellAt: number | undefined;
+                for (const reaction of reactions) {
+                    const { reactor, stepIndex } = reaction;
+                    const at = { x: path[stepIndex].x, y: path[stepIndex].y };
+                    // A reaction earlier on this path may have spent this one.
+                    if (reactor.reactionUsed || !engine.canTakeReactions(reactor.id)) continue;
+                    // The mover stands where the reaction happens (conditions
+                    // within 5 ft and the grid read this square).
+                    actor.position = at;
+                    if (reaction.kind === 'readied') {
+                        const { readied } = reaction;
+                        if (!readied.attack) {
+                            // Not an attack: the GM resolves it with trigger_readied.
+                            readiedTriggered.push({ participantId: reactor.id, name: reactor.name, stepIndex, at, readied, fired: false });
+                            reactionOutput += `\n⏳ READIED: ${reactor.name} — ${readied.action} (${readied.trigger}) at (${at.x}, ${at.y}): call combat_manage trigger_readied {encounterId: '${parsed.encounterId}', participantId: '${reactor.id}'}\n`;
+                            continue;
+                        }
+                        let fired: CombatActionResult;
+                        try {
+                            fired = resolveReadiedAttack(engine, reactor, actor, readied.attack);
+                        } catch (err) {
+                            // A dead part or unknown profile: flagged, nothing spent.
+                            const problem = err instanceof Error ? err.message : String(err);
+                            readiedTriggered.push({ participantId: reactor.id, name: reactor.name, stepIndex, at, readied, fired: false, problem });
+                            reactionOutput += `\n⏳ READIED: ${reactor.name} — ${readied.action}: could not fire (${problem}); resolve with trigger_readied\n`;
+                            continue;
+                        }
+                        reactor.readied = undefined;
+                        readiedTriggered.push({ participantId: reactor.id, name: reactor.name, stepIndex, at, readied, fired: true, attack: reactionAttackData(fired) });
+                        reactionOutput += `\n⏳ READIED fires: ${reactor.name} — ${readied.action} (${readied.trigger}) at (${at.x}, ${at.y})\n${fired.detailedBreakdown}\n↩ reaction spent\n`;
+                        new CombatActionLogRepository(getDb()).log({
+                            encounterId: parsed.encounterId, round: currentState.round, turnIndex: currentState.currentTurnIndex,
+                            actorId: reactor.id, actorName: reactor.name, actionType: 'trigger_readied', targetIds: [actor.id],
+                            resultSummary: `${reactor.name}'s readied action fires: ${readied.action} (${readied.trigger}) — ${fired.message}`,
+                            resultDetail: fired.detailedBreakdown, damageDealt: fired.damage
+                        });
+                    } else if (isPlayerReactor(reactor)) {
+                        // A PC's reaction is the player's choice: offer the exact call.
+                        const call = { tool: 'combat_action', action: 'attack', encounterId: parsed.encounterId, actorId: reactor.id, targetId: actor.id, reaction: true };
+                        opportunityAttacksAvailable.push({ attackerId: reactor.id, attackerName: reactor.name, stepIndex, at, call });
+                        reactionOutput += `\n⚡ OPPORTUNITY ATTACK AVAILABLE: ${reactor.name} may strike ${actor.name} leaving reach at (${at.x}, ${at.y}); the player decides. combat_action attack {encounterId: '${parsed.encounterId}', actorId: '${reactor.id}', targetId: '${actor.id}', reaction: true}\n`;
+                        continue;
+                    } else {
+                        const oaResult = engine.executeOpportunityAttack(reactor.id, parsed.actorId);
+                        opportunityAttacks.push({ attackerId: reactor.id, attackerName: reactor.name, stepIndex, at, ...reactionAttackData(oaResult) });
+                        reactionOutput += formatOpportunityAttackResult(oaResult) + '\n';
+                    }
+                    // A mover who drops stops where it fell.
+                    if (actor.hp <= 0) { fellAt = stepIndex; break; }
+                }
+
+                if (fellAt !== undefined) {
+                    const fell = { x: path[fellAt].x, y: path[fellAt].y };
+                    actor.position = fell;
+                    (actor as any).movementRemaining = currentMovement - fellAt * 5;
+                    output = reactionOutput
+                        + (fellAt > 0 ? formatMoveResult(actor.name, actorPos, fell, true, null, fellAt) : '')
+                        + `\n${actor.name} was defeated while attempting to move and cannot complete the movement!`;
                     result = {
                         type: 'attack',
                         success: false,
                         actor: { id: actor.id, name: actor.name },
-                        target: { id: actor.id, name: actor.name, hpBefore: oaResult.target.hpBefore, hpAfter: oaResult.target.hpAfter, maxHp: actor.maxHp },
+                        target: { id: actor.id, name: actor.name, hpBefore, hpAfter: actor.hp, maxHp: actor.maxHp },
                         defeated: true,
-                        message: `${actor.name} defeated by opportunity attack`,
+                        message: `${actor.name} defeated by a reaction while moving`,
                         detailedBreakdown: output
                     };
-                    // Skip to saving state
-                    break;
-                }
-            }
-
-            // Only continue with move if not defeated
-            const updatedActor = currentState.participants.find(p => p.id === parsed.actorId);
-            if (updatedActor && updatedActor.hp > 0) {
-                // Build obstacle set from other participants and terrain
-                const obstacles = new Set<string>();
-
-                // Every square another participant fills is an obstacle (a
-                // large token fills 2x2 from its position, item 6).
-                for (const p of currentState.participants) {
-                    if (p.id === parsed.actorId) continue;
-                    for (const cell of footprintCells(p)) obstacles.add(`${cell.x},${cell.y}`);
-                }
-
-                // Add terrain obstacles if available
-                const terrain = (currentState as any).terrain;
-                if (terrain?.obstacles) {
-                    for (const obs of terrain.obstacles) {
-                        obstacles.add(obs);
-                    }
-                }
-
-                // The mover's whole footprint at the destination must be clear.
-                // The path itself is found for the anchor square only.
-                const destBlocked = footprintCells(updatedActor, parsed.targetPosition)
-                    .some(cell => obstacles.has(`${cell.x},${cell.y}`));
-                if (destBlocked) {
-                    output = opportunityAttackOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, 'Destination is blocked');
                 } else {
-                    // Use spatial engine to find path
-                    const spatial = new SpatialEngine();
-                    const path = spatial.findPath(
-                        { x: actorPos.x, y: actorPos.y },
-                        { x: parsed.targetPosition.x, y: parsed.targetPosition.y },
-                        obstacles
-                    );
-
-                    if (path === null) {
-                        // No valid path
-                        output = opportunityAttackOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, 'No valid path - blocked by obstacles');
-                    } else {
-                        // Calculate movement cost (5ft per step)
-                        // path includes start node, so steps = length - 1
-                        const moveCost = (path.length - 1) * 5;
-                        // A condition added mid-turn (grappled, exhaustion 2) caps what is left.
-                        const speedCap = engine.effectiveSpeed(updatedActor) * (updatedActor.hasDashed ? 2 : 1);
-                        const currentMovement = Math.min((actor as any).movementRemaining ?? 30, speedCap); // Default 30 if undefined
-
-                        if (currentMovement < moveCost) {
-                            output = opportunityAttackOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, false, `Insufficient movement (Cost: ${moveCost}ft, Remaining: ${currentMovement}ft)`);
-                        } else {
-                            // Move successful - update position and remaining movement
-                            (updatedActor as any).position = parsed.targetPosition;
-                            (updatedActor as any).movementRemaining = currentMovement - moveCost;
-                            
-                            output = opportunityAttackOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, true, null, path.length - 1);
-                        }
-                    }
+                    // Move successful - update position and remaining movement
+                    actor.position = parsed.targetPosition;
+                    (actor as any).movementRemaining = currentMovement - moveCost;
+                    moved = true;
+                    output = reactionOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, true, null, path.length - 1);
                 }
-
-                // Create result for consistency
-                result = {
-                    type: 'attack',
-                    success: output.includes('moved'),
-                    actor: { id: actor.id, name: actor.name },
-                    target: { id: actor.id, name: actor.name, hpBefore: actor.hp, hpAfter: updatedActor.hp, maxHp: actor.maxHp },
-                    defeated: updatedActor.hp <= 0,
-                    message: output.includes('moved') ? `${actor.name} moved` : `${actor.name} could not move`,
-                    detailedBreakdown: output
-                };
             }
+
+            // Create result for consistency
+            result ??= {
+                type: 'attack',
+                success: moved,
+                actor: { id: actor.id, name: actor.name },
+                target: { id: actor.id, name: actor.name, hpBefore: actor.hp, hpAfter: actor.hp, maxHp: actor.maxHp },
+                defeated: actor.hp <= 0,
+                message: moved ? `${actor.name} moved` : `${actor.name} could not move`,
+                detailedBreakdown: output
+            };
+            Object.assign(result as unknown as Record<string, unknown>, { opportunityAttacks, opportunityAttacksAvailable, readiedTriggered });
         }
 
         // Create dummy result if not set (for the case where no position was set initially)
@@ -2595,7 +2690,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             multiattack: (r as { multiattack?: unknown }).multiattack,
             legendary: (r as { legendary?: unknown }).legendary,
             reaction: (r as { reaction?: unknown }).reaction,
-            saves: (r as { saves?: unknown }).saves
+            saves: (r as { saves?: unknown }).saves,
+            // Item 11: reactions a move set off, each at the step it happened.
+            opportunityAttacks: (r as { opportunityAttacks?: unknown }).opportunityAttacks,
+            opportunityAttacksAvailable: (r as { opportunityAttacksAvailable?: unknown }).opportunityAttacksAvailable,
+            readiedTriggered: (r as { readiedTriggered?: unknown }).readiedTriggered
         } : undefined;
         output += `\n\n<!-- STATE_JSON\n${JSON.stringify({ ...stateJson, actionResult })}\nSTATE_JSON -->`;
     }

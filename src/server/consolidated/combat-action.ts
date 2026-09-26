@@ -21,6 +21,7 @@ import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import type { CombatParticipant } from '../../engine/combat/engine.js';
 import { bandOrder, compareBands, resolveWorldId } from '../../engine/table-rules.js';
 import { sizeRank } from '../../schema/encounter.js';
+import { READIED_TRIGGERS, ReadiedAttackSchema } from '../../schema/token-extras.js';
 import { loggedD20, loggedDice } from '../../math/logged-d20.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -144,7 +145,10 @@ const ReadySchema = z.object({
     encounterId: z.string(),
     actorId: z.string(),
     readiedAction: z.string().describe('Description of the readied action'),
-    trigger: z.string().describe('Trigger condition for the readied action')
+    trigger: z.string().describe('Trigger condition for the readied action'),
+    on: z.enum(READIED_TRIGGERS).optional().describe('enters_reach | leaves_reach: the engine watches moves and fires it. Unset = fired by hand with combat_manage trigger_readied'),
+    watch: z.string().optional().describe("Who sets it off: a participant id or name, 'enemy' (default) or 'any'"),
+    attack: ReadiedAttackSchema.optional().describe('{using?, attackBonus?, damage?, damageType?, withPart?}: the attack it makes; with on set it fires itself as a reaction')
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -497,15 +501,37 @@ const definitions: Record<CombatAction, ActionDefinition> = {
         schema: ReadySchema,
         handler: async (params: z.infer<typeof ReadySchema>, ctx?: SessionContext) => {
             if (!ctx) throw new Error('No session context');
-            // Ready holds an action for a trigger
+            // Ready holds an action for a trigger: it is written on the token
+            // (so a move can set it off) and spends the action. An action
+            // already spent warns rather than refuses (item 11, one release).
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return { error: true, actionType: 'ready', message: `Encounter ${params.encounterId} not found.` };
+            const p = state.participants.find(x => x.id === params.actorId);
+            if (!p) return { error: true, actionType: 'ready', actorId: params.actorId, message: `Participant ${params.actorId} not in this encounter` };
+            const economy = engine.validateActionEconomy(p.id, 'action');
+            engine.commitAction(p.id, 'action');
+            p.readied = {
+                action: params.readiedAction,
+                trigger: params.trigger,
+                ...(params.on ? { on: params.on } : {}),
+                ...(params.watch ? { watch: params.watch } : {}),
+                ...(params.attack ? { attack: params.attack } : {})
+            };
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            const fires = params.on
+                ? ` It fires itself when ${params.watch ?? 'an enemy'} ${params.on === 'enters_reach' ? 'enters' : 'leaves'} ${p.name}'s reach${params.attack ? ' (attack rolled as a reaction)' : ' (flagged for trigger_readied)'}.`
+                : ' Fire it with combat_manage trigger_readied.';
             return {
                 success: true,
                 actionType: 'ready',
                 actorId: params.actorId,
                 readiedAction: params.readiedAction,
                 trigger: params.trigger,
-                effect: `Readied action: "${params.readiedAction}" when "${params.trigger}"`,
-                message: `${params.actorId} readies an action.`
+                readied: p.readied,
+                ...(economy.valid ? {} : { warning: `${economy.error}; readied anyway` }),
+                effect: `Readied action: "${params.readiedAction}" when "${params.trigger}".${fires}`,
+                message: `${p.name} readies an action.`
             };
         },
         aliases: ['prepare', 'hold', 'wait']
@@ -581,10 +607,11 @@ Validates spell, rolls damage, applies effects, handles saves - all automatic.
 - move - Move to a position (use available movement)
 - dash - Double movement speed for the turn
 - disengage - Move without provoking opportunity attacks
+  (a move provokes along its whole path, after it is validated; NPC reactors roll, a PC reactor is offered in opportunityAttacksAvailable with the exact attack {reaction: true} call)
 
 🛡️ DEFENSIVE:
 - dodge - Attacks against you roll at disadvantage until your next turn (engine-applied; DEX-save advantage is on the GM)
-- ready - Prepare an action with a trigger
+- ready - Prepare an action with a trigger (spends the action). on: enters_reach | leaves_reach + watch + attack {…} makes the engine fire it as a reaction during a move; without attack it is flagged for combat_manage trigger_readied
 
 Aliases: hit/strike→attack, cast/spell→cast_spell, sprint→dash, evade→dodge.
 
@@ -630,6 +657,9 @@ Internal opposed check (Athletics vs better of Athletics/Acrobatics) on the figh
         slotLevel: z.number().optional().describe('Spell slot level'),
         readiedAction: z.string().optional().describe('Description of readied action'),
         trigger: z.string().optional().describe('Trigger for readied action'),
+        on: z.enum(['enters_reach', 'leaves_reach']).optional().describe('ready (mirror): enters_reach | leaves_reach, the engine fires it on a move'),
+        watch: z.string().optional().describe("ready (mirror): who sets it off: participant id or name, 'enemy' (default) or 'any'"),
+        attack: z.any().optional().describe('ready (mirror): {using?, attackBonus?, damage?, damageType?, withPart?}, the attack it makes as a reaction'),
         move: z.enum(['clinch', 'takedown', 'throw', 'slam', 'control', 'break', 'execute']).optional().describe("FINDINGS #99 grapple: the move. clinch→Clinched · takedown/slam→Prone+Grappled · throw→Prone · control→Restrained · break→clears the ACTOR's holds from targetId · execute→a posted crit (damage, default its HP) on a lower-band foe this actor pinned"),
         control: z.boolean().optional().describe('grapple: pin instead of hurt — a win leaves the target Grappled + Restrained and throw/slam roll no surface damage'),
         surface: z.string().optional().describe("FINDINGS #99 grapple throw/slam: what they land on — earth/floor d4, concrete/wall/table d6, edge/glass/rebar d8. Free text, pattern-matched"),
@@ -1020,6 +1050,7 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
                         'Action': parsed.readiedAction,
                         'Trigger': parsed.trigger
                     });
+                    if (parsed.warning) output += `⚠️ ${parsed.warning}\n`;
                     break;
                 default:
                     output = RichFormatter.header('Combat Action', '⚔️');
