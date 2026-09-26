@@ -20,6 +20,7 @@ import { getMeta, setMeta } from '../../storage/data-migrations.js';
 import { lookupOperation } from '../operation-guard.js';
 import { queryRolls } from '../../storage/roll-log.js';
 import { buildBootPacket, renderBootPacket } from '../boot-packet.js';
+import { readWorldClock } from '../../engine/world-clock.js';
 
 /** Engine changes this database has not been shown yet. */
 function unseenChangelog(): ChangelogEntry[] {
@@ -477,6 +478,12 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
                 name: world.name,
                 currentTime: (world.environment as any)?.timeOfDay || 'day'
             };
+            // Item 14: the stored clock itself, beside the legacy timeOfDay.
+            const worldClock = readWorldClock(db, world.id);
+            if (worldClock) {
+                context.world.day = worldClock.day;
+                if (worldClock.time) context.world.time = worldClock.time;
+            }
 
             // Get current location if party has position
             if (input.partyId) {
@@ -494,7 +501,7 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
             // writes === '[]' so this works on any schema vintage.
             try {
                 const env = (world.environment ?? {}) as Record<string, unknown>;
-                const day = typeof env.day === 'number' ? env.day
+                const day = worldClock ? worldClock.day
                     : typeof env.currentDay === 'number' ? env.currentDay
                         : (() => { const m = String(env.date ?? '').match(/(\d+(?:\.\d+)?)/); return m ? Number(m[1]) : null; })();
                 // FINDINGS #97 (SALT leak #2, session half): the ⏰ section scopes to

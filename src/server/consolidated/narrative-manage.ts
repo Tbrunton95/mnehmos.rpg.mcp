@@ -14,6 +14,7 @@ import { z } from 'zod';
 import { v4 as uuidv4 } from 'uuid';
 import { SessionContext } from '../types.js';
 import { getDb } from '../../storage/index.js';
+import { readWorldClock, clockLabel } from '../../engine/world-clock.js';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -432,16 +433,20 @@ const AppendSchema = z.object({
     action: z.literal('append'),
     noteId: z.string().describe('Note to grow'),
     content: z.string().min(1).describe('The new section — appended, never replacing'),
-    day: z.union([z.number(), z.string()]).optional().describe('In-fiction date stamp for the section header, e.g. 12 or "Day 12, dusk"')
+    day: z.union([z.number(), z.string()]).optional().describe('In-fiction date stamp for the section header, e.g. 12 or "Day 12, dusk". Default: the world clock')
 });
 
 async function handleAppend(args: z.infer<typeof AppendSchema>): Promise<object> {
     const db = ensureDb();
     const existing = db.prepare('SELECT * FROM narrative_notes WHERE id = ?').get(args.noteId) as NarrativeNoteRow | undefined;
     if (!existing) return { error: true, message: `Note ${args.noteId} not found — nothing appended` };
+    // Item 14: no day passed means the note's world clock stamps the
+    // section; only a world without a clock falls back to the real date.
+    const clock = args.day === undefined ? readWorldClock(db, existing.world_id) : null;
+    const clockSource = args.day !== undefined ? 'param' : clock ? 'world' : 'date';
     const stamp = args.day !== undefined
         ? (/^\d+(\.\d+)?$/.test(String(args.day)) ? `Day ${args.day}` : String(args.day))
-        : new Date().toISOString().slice(0, 10);
+        : clock ? clockLabel(clock) : new Date().toISOString().slice(0, 10);
     const section = `\n\n── [${stamp}] ──\n${args.content}`;
     const newContent = existing.content + section;
     db.prepare('UPDATE narrative_notes SET content = ?, updated_at = ? WHERE id = ?').run(newContent, new Date().toISOString(), args.noteId);
@@ -451,6 +456,7 @@ async function handleAppend(args: z.infer<typeof AppendSchema>): Promise<object>
         noteId: args.noteId,
         type: existing.type,
         stamp,
+        clockSource,
         appendedChars: args.content.length,
         totalChars: newContent.length,
         message: `Section [${stamp}] appended — the file grows (${newContent.length} chars total)`

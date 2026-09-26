@@ -96,6 +96,7 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Debts and deferred prices | `ledger_manage create` |
 | Souls taken or spent | `character_manage adjust_pool {characterId, pool: 'souls', delta, reason}` |
 | Souls owed to a god | `ledger_manage create {worldId, debtor, creditor, amount, currency: 'souls', dueDay, consequence}` |
-| Time passes | `world_manage update {worldId, environment}` |
+| Time passes | `world_manage advance {worldId, hours}` (or `minutes`, `days`); set the clock once with `world_manage update {worldId, environment: {day, time}}` |
+| Clocks and debts the clock reached | `character_manage process_scheduled {worldId}`, `ledger_manage process_due {worldId}` (no day needed) |
 | Did a timed-out call apply? | `session_manage op_status {forOpId}` |
 | Check a past roll | `session_manage rolls {forId \| encounterId \| forOpId}` |

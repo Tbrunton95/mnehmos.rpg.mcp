@@ -17,12 +17,13 @@ import { getWorldManager } from '../state/world-manager.js';
 import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
 import { persistGeneratedWorldEntities } from '../../services/generated-world-persistence.service.js';
+import { readWorldClock, clockAt, clockAfter } from '../../engine/world-clock.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'list', 'delete', 'update', 'generate', 'get_state', 'snapshot', 'restore', 'list_snapshots', 'delete_snapshot', 'audit'] as const;
+const ACTIONS = ['create', 'get', 'list', 'delete', 'update', 'generate', 'get_state', 'snapshot', 'restore', 'list_snapshots', 'delete_snapshot', 'audit', 'advance'] as const;
 type WorldManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -325,30 +326,29 @@ async function handleDelete(args: z.infer<typeof DeleteSchema>): Promise<object>
 }
 
 async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object> {
+    return writeEnvironment(args.id, args.environment, 'update');
+}
+
+/**
+ * The one write path for the world clock: update and advance both land here,
+ * so elapsedHours, regeneration and the time_passed note never diverge.
+ */
+function writeEnvironment(worldId: string, patch: Partial<z.infer<typeof WorldEnvironmentSchema>>, actionType: 'update' | 'advance'): Record<string, unknown> {
     const worldRepo = getWorldRepo();
     // FINDINGS #88: elapsedHours — the world clock and the emission timer must
     // never disagree. The PRIOR clock is read before the write; the delta is
     // returned so the chair passes the ENGINE's number to secret_manage
     // check_conditions instead of hand-computing hours a second time.
-    const parseClock = (env: { day?: number; time?: string } | undefined): number | null => {
-        if (!env || typeof env.day !== 'number') return null;
-        let frac = 0;
-        if (typeof env.time === 'string') {
-            const m = env.time.match(/^(\d{1,2}):(\d{2})$/);
-            if (m) frac = (parseInt(m[1], 10) * 60 + parseInt(m[2], 10)) / 1440;
-        }
-        return env.day + frac;
-    };
-    const prior = worldRepo.findById(args.id) as { environment?: { day?: number; time?: string } } | null;
-    const priorClock = parseClock(prior?.environment);
-    const updated = worldRepo.updateEnvironment(args.id, args.environment);
+    const prior = worldRepo.findById(worldId) as { environment?: { day?: number; time?: string } } | null;
+    const priorClock = clockAt(prior?.environment);
+    const updated = worldRepo.updateEnvironment(worldId, patch);
 
     if (!updated) {
-        return { error: true, message: `World not found: ${args.id}` };
+        return { error: true, message: `World not found: ${worldId}` };
     }
 
     // Read the merged clock so a time-only update still yields elapsed hours.
-    const newClock = parseClock(updated.environment as { day?: number; time?: string });
+    const newClock = clockAt(updated.environment as { day?: number; time?: string });
     const elapsedHours = priorClock !== null && newClock !== null ? Math.round((newClock - priorClock) * 24 * 100) / 100 : null;
 
     // Table rules: regeneration runs out of combat too. A minute is ten
@@ -359,7 +359,7 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
         try {
             const db = getDb();
             const rows = db.prepare('SELECT id, name, hp, max_hp FROM characters WHERE world_id = ? AND regeneration > 0 AND hp > 0 AND hp < max_hp')
-                .all(args.id) as Array<{ id: string; name: string; hp: number; max_hp: number }>;
+                .all(worldId) as Array<{ id: string; name: string; hp: number; max_hp: number }>;
             const heal = db.prepare('UPDATE characters SET hp = max_hp, updated_at = ? WHERE id = ?');
             const now = new Date().toISOString();
             for (const r of rows) heal.run(now, r.id);
@@ -370,8 +370,8 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     return {
         ...(regenerated ? { regenerated } : {}),
         success: true,
-        actionType: 'update',
-        worldId: args.id,
+        actionType,
+        worldId,
         environment: updated.environment,
         ...(elapsedHours !== null ? {
             elapsedHours,
@@ -379,7 +379,64 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
                 ? `${elapsedHours}h elapsed since the prior clock — pass THIS number to secret_manage check_conditions {type:'time_passed', hoursPassed:${elapsedHours}}`
                 : `clock moved BACKWARDS ${Math.abs(elapsedHours)}h — rewind or correction; no time_passed check applies`
         } : {}),
-        message: `Updated environment for world ${args.id}${elapsedHours !== null && elapsedHours > 0 ? ` — ${elapsedHours}h elapsed` : ''}${regenerated ? `; regenerated to full: ${regenerated.map(r => r.name).join(', ')}` : ''}`
+        message: `Updated environment for world ${worldId}${elapsedHours !== null && elapsedHours > 0 ? ` — ${elapsedHours}h elapsed` : ''}${regenerated ? `; regenerated to full: ${regenerated.map(r => r.name).join(', ')}` : ''}`
+    };
+}
+
+// Item 14: advance the clock by an amount instead of computing the new day
+// and HH:MM by hand. It writes through the same path as update, then counts
+// what the new clock has reached. Firing stays with the GM: process_scheduled
+// and ledger process_due are explicit verbs (FINDINGS #100).
+const AdvanceSchema = z.preprocess(
+    (v) => (v && typeof v === 'object' && !(v as Record<string, unknown>).worldId && (v as Record<string, unknown>).id
+        ? { ...(v as Record<string, unknown>), worldId: (v as Record<string, unknown>).id }
+        : v),
+    z.object({
+        action: z.literal('advance'),
+        worldId: z.string().describe('World whose clock moves (id accepted as alias)'),
+        id: z.string().optional().describe('Alias of worldId'),
+        minutes: z.number().min(0).optional().describe('Minutes to advance'),
+        hours: z.number().min(0).optional().describe('Hours to advance'),
+        days: z.number().min(0).optional().describe('Days to advance')
+    })
+);
+
+async function handleAdvance(args: z.infer<typeof AdvanceSchema>): Promise<object> {
+    const hours = (args.days ?? 0) * 24 + (args.hours ?? 0) + (args.minutes ?? 0) / 60;
+    if (!(hours > 0)) {
+        return { error: true, actionType: 'advance', message: 'advance needs minutes, hours or days greater than zero. Nothing was written.' };
+    }
+    const db = getDb();
+    const clock = readWorldClock(db, args.worldId);
+    if (!clock) {
+        const exists = db.prepare('SELECT 1 FROM worlds WHERE id = ?').get(args.worldId);
+        return {
+            error: true, actionType: 'advance',
+            message: exists
+                ? `World ${args.worldId} has no clock to advance: set one first with world_manage update {worldId, environment: {day, time: 'HH:MM'}}. Nothing was written.`
+                : `World not found: ${args.worldId}`
+        };
+    }
+    const next = clockAfter(clock.at, hours);
+    const result = writeEnvironment(args.worldId, next, 'advance');
+    if (result.error) return result;
+    const at = clockAt(next)!;
+    // Read-only counts: what process_scheduled and process_due would act on now.
+    let scheduled = 0; let debts = 0;
+    try {
+        scheduled = (db.prepare('SELECT COUNT(*) AS n FROM scheduled_state_changes WHERE fired = 0 AND world_id = ? AND fires_at_day <= ?').get(args.worldId, at) as { n: number }).n;
+    } catch { /* no schedule table yet */ }
+    try {
+        debts = (db.prepare(`SELECT COUNT(*) AS n FROM ledger_debts WHERE world_id = ? AND due_day IS NOT NULL
+                             AND ((status = 'pending' AND due_day <= ?) OR (status = 'due' AND ? > due_day + grace_days))`).get(args.worldId, next.day, next.day) as { n: number }).n;
+    } catch { /* no ledger table yet */ }
+    const label = `Day ${next.day}, ${next.time}`;
+    const due = [scheduled ? `${scheduled} scheduled row(s) due: process_scheduled {worldId}` : '', debts ? `${debts} debt(s) to move: ledger_manage process_due {worldId}` : ''].filter(Boolean);
+    return {
+        ...result,
+        clock: label,
+        dueNow: { scheduled, debts },
+        message: `Clock advanced ${Math.round(hours * 100) / 100}h to ${label}${result.regenerated ? `; regenerated to full: ${(result.regenerated as Array<{ name: string }>).map(r => r.name).join(', ')}` : ''}${due.length ? ` — ${due.join('; ')}` : ''}`
     };
 }
 
@@ -614,6 +671,12 @@ const definitions: Record<WorldManageAction, ActionDefinition> = {
         aliases: ['set', 'modify', 'environment'],
         description: 'Update world environment (time, weather, season) — returns elapsedHours since the prior clock (#88)'
     },
+    advance: {
+        schema: AdvanceSchema,
+        handler: async (args) => handleAdvance(args as z.infer<typeof AdvanceSchema>),
+        aliases: ['pass_time', 'tick'],
+        description: 'Move the world clock forward by minutes, hours or days (midnight rollover handled); same side effects as update, plus dueNow counts'
+    },
     audit: {
         schema: z.preprocess(
             (v) => (v && typeof v === 'object' && !(v as Record<string, unknown>).worldId && (v as Record<string, unknown>).id
@@ -675,13 +738,14 @@ const router = createActionRouter({
 export const WorldManageTool = {
     name: 'world_manage',
     description: `Manage RPG worlds - creation, retrieval, and procedural generation.
-Actions: create, get, list, delete, update (environment), generate (procedural), get_state, snapshot, restore, list_snapshots
+Actions: create, get, list, delete, update (environment), advance (clock), generate (procedural), get_state, snapshot, restore, list_snapshots
 Aliases: new→create, fetch→get, all→list, remove→delete, set→update, gen→generate, state→get_state
 
 🌍 WORLD WORKFLOW:
 1. generate - Create procedural world with terrain/biomes
 2. get_state - Check world status
 3. update - Set time/weather/season
+   advance {worldId, minutes?|hours?|days?} - move the clock forward; returns dueNow {scheduled, debts}
 4. For map operations, use world_map tool instead`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
@@ -697,7 +761,10 @@ Aliases: new→create, fetch→get, all→list, remove→delete, set→update, g
         landRatio: z.number().optional(),
         temperatureOffset: z.number().optional(),
         moistureOffset: z.number().optional(),
-        environment: z.any().optional().describe('Environment properties (for update)')
+        environment: z.any().optional().describe('Environment properties (for update)'),
+        minutes: z.number().optional().describe('advance: minutes to move the clock forward'),
+        hours: z.number().optional().describe('advance: hours to move the clock forward'),
+        days: z.number().optional().describe('advance: days to move the clock forward')
     })
 };
 
@@ -755,6 +822,11 @@ export async function handleWorldManage(args: unknown, _ctx: SessionContext): Pr
                 output = RichFormatter.header('Environment Updated', '🌤️');
                 output += RichFormatter.keyValue({ 'World ID': `\`${parsed.worldId}\``, ...(parsed.elapsedHours !== undefined && parsed.elapsedHours !== null ? { 'Elapsed': `${parsed.elapsedHours}h` } : {}) });
                 if (parsed.elapsedNote) output += RichFormatter.alert(parsed.elapsedNote, 'info');
+                break;
+            case 'advance':
+                output = RichFormatter.header('Clock Advanced', '🕰️');
+                output += RichFormatter.keyValue({ 'World ID': `\`${parsed.worldId}\``, 'Now': parsed.clock, 'Elapsed': `${parsed.elapsedHours}h` });
+                if (parsed.message) output += RichFormatter.alert(parsed.message, 'info');
                 break;
             case 'audit':
                 output = RichFormatter.header('Consistency Audit', '🩺');

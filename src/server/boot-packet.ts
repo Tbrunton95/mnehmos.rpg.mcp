@@ -12,11 +12,14 @@ import { CustomEffectsRepository } from '../storage/repos/custom-effects.repo.js
 import { CharacterRepository } from '../storage/repos/character.repo.js';
 import { loadRule, findPool, conditionsForDisplay } from '../engine/table-rules.js';
 import { recentPrecedents } from './consolidated/precedent-manage.js';
+import { readWorldClock } from '../engine/world-clock.js';
 import type { Character } from '../schema/character.js';
 
 export interface BootPacket {
     worldId: string;
     day: number | null;
+    /** 'HH:MM' when the world keeps a time. */
+    time?: string;
     characters: Array<Record<string, unknown>>;
     clocks: Array<Record<string, unknown>>;
     threads: Array<{ id: string; text: string }>;
@@ -65,11 +68,11 @@ export function buildBootPacket(worldId: string, characterIds?: string[], journa
     const db = getDb();
     const charRepo = new CharacterRepository(db);
 
-    let day: number | null = null;
-    try {
-        const env = JSON.parse(((db.prepare('SELECT environment FROM worlds WHERE id = ?').get(worldId) as { environment?: string } | undefined)?.environment) || '{}');
-        day = typeof env.day === 'number' ? env.day : null;
-    } catch { /* no environment */ }
+    // Item 14: the shared clock reader (legacy currentDay rows included).
+    // Scheduled rows compare against the fractional clock, debts the day.
+    const clock = readWorldClock(db, worldId);
+    const day: number | null = clock?.day ?? null;
+    const at: number | null = clock?.at ?? null;
 
     const ids = characterIds?.length ? characterIds : tryAll(() =>
         (db.prepare("SELECT id FROM characters WHERE world_id = ? AND character_type = 'pc'").all(worldId) as Array<{ id: string }>).map(r => r.id));
@@ -78,10 +81,10 @@ export function buildBootPacket(worldId: string, characterIds?: string[], journa
     const clocks: Array<Record<string, unknown>> = [
         ...tryAll(() => (db.prepare(`SELECT s.fires_at_day AS day, s.note, c.name AS who FROM scheduled_state_changes s JOIN characters c ON c.id = s.character_id
                                      WHERE s.fired = 0 AND c.world_id = ? ORDER BY s.fires_at_day LIMIT 8`).all(worldId) as Array<{ day: number; note: string | null; who: string }>)
-            .map(r => ({ kind: 'scheduled', day: r.day, due: day !== null && r.day <= day, what: `${r.who}: ${r.note ?? '(no note)'}` }))),
+            .map(r => ({ kind: 'scheduled', day: r.day, due: at !== null && r.day <= at, what: `${r.who}: ${r.note ?? '(no note)'}` }))),
         ...tryAll(() => (db.prepare(`SELECT debtor, creditor, amount, currency, due_day, status, consequence FROM ledger_debts
                                      WHERE world_id = ? AND status IN ('pending', 'due', 'lapsed') ORDER BY COALESCE(due_day, 1e9) LIMIT 8`).all(worldId) as Array<Record<string, unknown>>)
-            .map(r => ({ kind: 'debt', day: r.due_day, status: r.status, what: `${r.debtor} owes ${r.creditor} ${r.currency}${r.amount}${r.consequence ? `; if not: ${r.consequence}` : ''}` })))
+            .map(r => ({ kind: 'debt', day: r.due_day, status: r.status, due: day !== null && typeof r.due_day === 'number' && r.due_day <= day, what: `${r.debtor} owes ${r.creditor} ${r.currency}${r.amount}${r.consequence ? `; if not: ${r.consequence}` : ''}` })))
     ];
 
     const threads = tryAll(() => (db.prepare(`SELECT id, content FROM narrative_notes WHERE world_id = ? AND type = 'plot_thread' AND status = 'active'
@@ -99,7 +102,7 @@ export function buildBootPacket(worldId: string, characterIds?: string[], journa
 
     const precedents = recentPrecedents(worldId, 5).map(p => ({ kind: p.kind, statement: p.statement, scope: p.scope }));
 
-    return { worldId, day, characters, clocks, threads, telegraphs, journal, precedents };
+    return { worldId, day, ...(clock?.time ? { time: clock.time } : {}), characters, clocks, threads, telegraphs, journal, precedents };
 }
 
 export function renderBootPacket(p: BootPacket): string {
@@ -119,7 +122,7 @@ export function renderBootPacket(p: BootPacket): string {
         }
     }
     if (p.clocks.length) {
-        out += section(`Clocks${p.day !== null ? ` (day ${p.day})` : ''}`);
+        out += section(`Clocks${p.day !== null ? ` (day ${p.day}${p.time ? `, ${p.time}` : ''})` : ''}`);
         for (const c of p.clocks) out += `• ${c.due || c.status === 'due' || c.status === 'lapsed' ? 'DUE ' : ''}${c.kind === 'debt' ? `[${c.status}] ` : ''}${c.day !== null && c.day !== undefined ? `day ${c.day}: ` : ''}${c.what}\n`;
     }
     if (p.telegraphs.length) {

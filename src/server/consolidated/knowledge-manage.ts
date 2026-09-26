@@ -13,6 +13,7 @@ import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { RichFormatter } from '../utils/formatter.js';
 import { getDb } from '../../storage/index.js';
+import { readWorldClock } from '../../engine/world-clock.js';
 import { SessionContext } from '../types.js';
 import { CustomEffectsRepository } from '../../storage/repos/custom-effects.repo.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
@@ -39,7 +40,7 @@ const KnowledgeInputSchema = z.object({
     how: z.enum(ROADS).optional().describe('learn: witnessed | told | position | deduced | read | rumour'),
     fromId: z.string().optional().describe('learn how=told: who told them (must know it already)'),
     note: z.string().optional().describe('learn: how exactly ("overheard in the Oszaverek quarter")'),
-    day: z.number().optional().describe('learn: in-fiction day'),
+    day: z.number().optional().describe('learn: in-fiction day (default: the world clock)'),
     knowers: z.array(z.object({
         id: z.string(), name: z.string().optional(), how: z.enum(ROADS), fromId: z.string().optional(), note: z.string().optional(), day: z.number().optional()
     })).optional().describe('record: who knows it from the start'),
@@ -97,6 +98,8 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
     const holders = (f: FactRow) => db.prepare('SELECT * FROM knowledge_holders WHERE fact_id = ? ORDER BY created_at').all(f.id) as HolderRow[];
     const holderOf = (f: FactRow, id: string) => db.prepare('SELECT * FROM knowledge_holders WHERE fact_id = ? AND knower_id = ?').get(f.id, id) as HolderRow | undefined;
 
+    // Item 14: an unstamped road takes the world day.
+    const worldDay = readWorldClock(db, input.worldId)?.day;
     const addHolder = (f: FactRow, k: { id: string; name?: string; how: string; fromId?: string; note?: string; day?: number }): string | undefined => {
         if (k.how === 'told') {
             if (!k.fromId) throw new Error(`told needs fromId: who told ${k.name ?? nameOf(k.id)}?`);
@@ -104,7 +107,7 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
         }
         db.prepare(`INSERT INTO knowledge_holders (fact_id, knower_id, knower_name, how, from_id, note, day, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(fact_id, knower_id) DO UPDATE SET how = excluded.how, from_id = excluded.from_id, note = excluded.note, day = excluded.day`)
-            .run(f.id, k.id, k.name ?? null, k.how, k.fromId ?? null, k.note ?? null, k.day ?? null, now);
+            .run(f.id, k.id, k.name ?? null, k.how, k.fromId ?? null, k.note ?? null, k.day ?? worldDay ?? null, now);
         return syncEffect(f, k.id, 'apply');
     };
 

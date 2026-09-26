@@ -13,6 +13,7 @@
  */
 
 import { loadRule, resolveWorldId, findPool, worldLexicon, conditionsForDisplay } from '../../engine/table-rules.js';
+import { readWorldClock, dayClock, SET_CLOCK_HINT } from '../../engine/world-clock.js';
 import { z } from 'zod';
 import { ParticipantExtrasShape, SizeCategorySchema } from '../../schema/token-extras.js';
 import { randomUUID } from 'crypto';
@@ -313,8 +314,8 @@ const ScheduleChangeSchema = z.object({
     // should hand-compute 18/24. firesAtHour rides on firesAtDay; firesInHours
     // is relative to a base the caller names (currentDay [+ currentTime]).
     firesAtHour: z.number().min(0).max(24).optional().describe('Hour of the fires-at day (0–24) — stored as floor(firesAtDay) + hour/24. "Day 48 at 18:00" = firesAtDay:48, firesAtHour:18'),
-    firesInHours: z.number().positive().optional().describe('Relative arming: fires N hours from the base — REQUIRES currentDay (+ optional currentTime). "back in six hours" = firesInHours:6, currentDay:47, currentTime:"14:01"'),
-    currentDay: z.number().optional().describe('Base day for firesInHours (fractional ok)'),
+    firesInHours: z.number().positive().optional().describe('Relative arming: fires N hours from the base — currentDay (+ optional currentTime), or the world clock when omitted. "back in six hours" = firesInHours:6'),
+    currentDay: z.number().optional().describe('Base day for firesInHours (fractional ok). Omit to use the world clock'),
     currentTime: z.string().regex(/^\d{1,2}:\d{2}$/).optional().describe('Base time HH:MM for firesInHours — combined with currentDay into a fractional base'),
     worldId: z.string().optional().describe('FINDINGS #91: scope this row to a world — process_scheduled {worldId} fires ONLY matching rows. Multi-world dbs pass it ALWAYS (KEEPER discipline §13); single-world saves may omit'),
     writes: z.preprocess(mendJsonIfString, z.array(ScheduledWriteOpSchema)).default([]).describe('Ordered ops applied when due. ARRAY param — batch law #16a: direct calls only. May be empty ONLY with event: true'),
@@ -326,7 +327,7 @@ const ScheduleChangeSchema = z.object({
 
 const ProcessScheduledSchema = z.object({
     action: z.literal('process_scheduled'),
-    currentDay: z.number().describe('Current IN-FICTION campaign day — all unfired rows with fires_at_day <= this apply and report'),
+    currentDay: z.number().optional().describe('Current IN-FICTION campaign day — all unfired rows with fires_at_day <= this apply and report. Omit to use the world clock (day and time); the response echoes clockSource'),
     currentTime: z.string().regex(/^\d{1,2}:\d{2}$/).optional().describe('FINDINGS #88: current time HH:MM — combined into a fractional day so hour-clocks fire mid-day (currentDay:47 + "14:01" processes through 47.584)'),
     worldId: z.string().describe("FINDINGS #100: REQUIRED, filtered at the query. An optional filter on a destructive global write is the same bug with better manners — the SALT incident fired 35 cross-campaign events from one call. Unscoped legacy rows are counted and skipped with a warning; claim them via scope_scheduled"),
     characterId: z.string().optional().describe("FINDINGS #100: narrow further to one character's clocks. Honored at the query — before this fix the param was accepted and silently stripped"),
@@ -393,20 +394,18 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
         effects = (db.prepare(`SELECT name FROM custom_effects WHERE target_id = ? AND is_active = 1`).all(args.characterId) as Array<{ name: string }>).map(r => r.name);
     } catch { /* effects line degrades to absent */ }
 
-    // World clock — the #62 honesty rule: day/time render ONLY when exactly
-    // one world row exists; a scratch world never puts a wrong clock on the glass.
-    let day: number | undefined; let time: string | undefined; let weather: string | undefined;
-    try {
-        const count = (db.prepare(`SELECT COUNT(*) AS c FROM worlds`).get() as { c: number }).c;
-        if (count === 1) {
-            const env = JSON.parse(((db.prepare(`SELECT environment FROM worlds`).get() as { environment?: string })?.environment) || '{}');
-            day = env.day; time = env.time; weather = env.weather;
-        }
-    } catch { /* clock degrades to absent */ }
+    // World clock — the #62 honesty rule: day/time render only for the
+    // character's own world (resolveWorldId: its tag, else the only world);
+    // a scratch world never puts a wrong clock on the glass. Weather is
+    // stored as weatherConditions.
+    const worldId = resolveWorldId(db, { characterIds: [args.characterId] });
+    const clock = readWorldClock(db, worldId);
+    const day: number | undefined = clock?.day;
+    const time: string | undefined = clock?.time;
+    const weather: string | undefined = clock?.weather;
 
     // Table rules: a world's status_block rule asks for the tiny block: HP,
     // core pool, location, objective, one or two conditions.
-    const worldId = resolveWorldId(db, { characterIds: [args.characterId] });
     const lex = worldLexicon(db, worldId);
     const tiny = loadRule(db, worldId, 'status_block');
     if (tiny?.spec.compact) {
@@ -1435,15 +1434,6 @@ function applyScheduledOps(
     return { applied, updates };
 }
 
-// FINDINGS #89: fractional days print as a clock — 47.5993 is "Day 47, 14:23",
-// not "Day 47". The banner truncation hid the very hours #88 added.
-function dayClock(d: number): string {
-    const frac = d - Math.floor(d);
-    if (frac < 1 / 1440) return `Day ${Math.floor(d)}`;
-    const mins = Math.round(frac * 1440);
-    return `Day ${Math.floor(d)}, ${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`;
-}
-
 async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>): Promise<object> {
     const { db, characterRepo } = ensureDb();
     ensureScheduleTable(db);
@@ -1467,14 +1457,22 @@ async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>):
     // refuses with the recipe. firesInHours overrides firesAtDay when both
     // are passed (the dummy-day workaround stays legal).
     let firesAt: number;
+    let clockSource: 'param' | 'world' | undefined;
     if (args.firesInHours !== undefined) {
-        if (args.currentDay === undefined) {
-            throw new Error('firesInHours needs a base: pass currentDay (and optionally currentTime "HH:MM"). Nothing was inserted.');
-        }
-        let base = args.currentDay;
-        if (args.currentTime) {
-            const [h, m] = args.currentTime.split(':').map(Number);
-            base = Math.floor(args.currentDay) + (h * 60 + m) / 1440;
+        // Item 14: no base passed means the world clock is the base.
+        let base: number;
+        if (args.currentDay !== undefined) {
+            base = args.currentDay;
+            if (args.currentTime) {
+                const [h, m] = args.currentTime.split(':').map(Number);
+                base = Math.floor(args.currentDay) + (h * 60 + m) / 1440;
+            }
+            clockSource = 'param';
+        } else {
+            const clock = readWorldClock(db, args.worldId ?? resolveWorldId(db, { characterIds: [char.id] }));
+            if (!clock) throw new Error(`firesInHours needs a base: pass currentDay (and optionally currentTime "HH:MM"), ${SET_CLOCK_HINT}. Nothing was inserted.`);
+            base = clock.at;
+            clockSource = 'world';
         }
         firesAt = base + args.firesInHours / 24;
     } else if (args.firesAtDay !== undefined) {
@@ -1524,6 +1522,7 @@ async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>):
         characterName: char.name,
         firesAtDay: firesAt,
         firesAtClock: dayClock(firesAt),
+        ...(clockSource ? { clockSource } : {}),
         ops: args.writes.length,
         note: args.note ?? null,
         recurEveryDays: args.recurEveryDays ?? null,
@@ -1537,11 +1536,24 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
     const { db, characterRepo } = ensureDb();
     ensureScheduleTable(db);
     const now = new Date().toISOString();
+    // Item 14: an explicit currentDay wins; otherwise the world clock gives
+    // both day and time. The world's time is used only with the world's day.
+    let currentDay: number;
+    let currentTime: string | undefined;
+    let clockSource: 'param' | 'world';
+    if (args.currentDay !== undefined) {
+        currentDay = args.currentDay; currentTime = args.currentTime; clockSource = 'param';
+    } else {
+        const clock = readWorldClock(db, args.worldId);
+        if (!clock) throw new Error(`process_scheduled needs currentDay (the in-fiction day), ${SET_CLOCK_HINT}. Nothing fired.`);
+        currentDay = clock.day; currentTime = clock.time; clockSource = 'world';
+    }
+    args = { ...args, currentDay, currentTime };
     // FINDINGS #88: fractionalize the clock — hour-clocks fire mid-day.
-    let effectiveDay = args.currentDay;
-    if (args.currentTime) {
-        const [h, m] = args.currentTime.split(':').map(Number);
-        effectiveDay = Math.floor(args.currentDay) + (h * 60 + m) / 1440;
+    let effectiveDay = currentDay;
+    if (currentTime) {
+        const [h, m] = currentTime.split(':').map(Number);
+        effectiveDay = Math.floor(currentDay) + (h * 60 + m) / 1440;
     }
     const results: Array<Record<string, unknown>> = [];
     // FINDINGS #100: worldId is REQUIRED at the schema and filtered here — an
@@ -1570,7 +1582,7 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
         const chains = wouldFire.filter(w => w.recurEveryDays).length;
         return {
             success: true, actionType: 'process_scheduled', preview: true, writes: 'none',
-            currentDay: args.currentDay, ...(args.currentTime ? { currentTime: args.currentTime, effectiveDay } : {}),
+            currentDay: args.currentDay, clockSource, ...(args.currentTime ? { currentTime: args.currentTime, effectiveDay } : {}),
             worldId: args.worldId, ...(args.characterId ? { characterId: args.characterId } : {}),
             ...(skippedUnscoped > 0 ? { skippedUnscoped } : {}),
             wouldFireCount: wouldFire.length, wouldFire,
@@ -1620,6 +1632,7 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
         success: true,
         actionType: 'process_scheduled',
         currentDay: args.currentDay,
+        clockSource,
         ...(args.currentTime ? { currentTime: args.currentTime, effectiveDay } : {}),
         ...(args.worldId ? { worldId: args.worldId } : {}),
         ...(args.characterId ? { characterId: args.characterId } : {}),
