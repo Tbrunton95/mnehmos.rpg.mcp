@@ -248,6 +248,10 @@ const SetPartSchema = z.object({
     kind: z.enum(PART_KINDS).optional().describe('head | arm | leg | wing | torso | system | other (a crippled leg or wing halves speed)'),
     latchedTo: z.object({ participantId: z.string(), part: z.string().optional() }).optional().describe('latched: who this part holds'),
     holds: z.array(z.string()).optional().describe("Weapons or slots this part wields ('axe', 'mainhand'); attack {weapon} or a profile uses it. Omit to keep"),
+    ac: z.number().int().min(0).optional().describe('AC to hit this part when aimed at (atPart); used when the attack gives no dc. Omit to keep'),
+    hp: z.number().int().min(0).optional().describe('The part\'s own HP: aimed damage lands here instead of the body; 0 breaks it. Omit to keep'),
+    maxHp: z.number().int().min(1).optional().describe('Defaults to hp when first set'),
+    breakAt: z.number().int().min(1).optional().describe("One aimed hit dealing at least this much severs the part (state dead, latches released). Omit to keep"),
     note: z.string().optional(),
     mirrorToCharacter: z.boolean().optional().describe('Also write the part onto the character sheet (a lasting injury)'),
     reason: z.string().optional()
@@ -1132,7 +1136,12 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 state: params.state,
                 latchedTo: params.state === 'latched' ? (params.latchedTo ?? prev?.latchedTo) : undefined,
                 ...(params.note !== undefined ? { note: params.note } : {}),
-                ...(params.holds !== undefined ? { holds: params.holds } : {})
+                ...(params.holds !== undefined ? { holds: params.holds } : {}),
+                ...(params.ac !== undefined ? { ac: params.ac } : {}),
+                ...(params.hp !== undefined ? { hp: params.hp } : {}),
+                ...(params.maxHp !== undefined ? { maxHp: params.maxHp }
+                    : params.hp !== undefined && prev?.maxHp === undefined ? { maxHp: Math.max(1, params.hp) } : {}),
+                ...(params.breakAt !== undefined ? { breakAt: params.breakAt } : {})
             });
             const next = parts.find(x => x.name.toLowerCase() === params.part.toLowerCase())!;
             p.parts = parts;
@@ -1143,7 +1152,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             return { success: true, actionType: 'set_part', encounterId: params.encounterId, participantId: p.id, part: next, previous: prev?.state, mirroredToCharacter: mirrored, message: summary };
         },
         aliases: ['part', 'wound_part', 'cripple'],
-        description: 'Set a named part on a token (intact, crippled, dead, latched, breached); upserts by name'
+        description: 'Set a named part on a token (intact, crippled, dead, latched, breached); upserts by name; ac, hp/maxHp and breakAt armour a part so aimed hits land on it'
     },
     remove_part: {
         schema: RemovePartSchema,
@@ -1434,9 +1443,9 @@ For CORPSES after combat, use corpse_manage tool.`,
         includeParty: z.boolean().optional().describe('Include the active party in the new encounter (create / spawn_quick_enemy)'),
         partyId: z.string().optional().describe('Party to include (defaults to the only active party)'),
         name: z.string().optional().describe('add_participant: ad-hoc participant name; add_condition / remove_condition: condition name'),
-        hp: z.number().optional().describe('Participant HP (add_participant)'),
-        maxHp: z.number().optional().describe('Participant max HP (add_participant)'),
-        ac: z.number().optional().describe('Participant AC (add_participant)'),
+        hp: z.number().optional().describe('Participant HP (add_participant); set_part: the part\'s own HP'),
+        maxHp: z.number().optional().describe('Participant max HP (add_participant); set_part: the part\'s max HP'),
+        ac: z.number().optional().describe('Participant AC (add_participant); set_part: AC to hit the part when aimed at'),
         initiativeBonus: z.number().optional().describe('Initiative bonus (add_participant)'),
         participantId: z.string().optional().describe('remove_participant / adjust_hp: participant/token id'),
         value: z.number().optional().describe('adjust_hp: set HP to exactly this'),
@@ -1473,6 +1482,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         kind: z.enum(PART_KINDS).optional().describe('set_part: head | arm | leg | wing | torso | system | other'),
         latchedTo: z.object({ participantId: z.string(), part: z.string().optional() }).optional().describe('set_part latched: who it holds'),
         holds: z.array(z.string()).optional().describe("set_part: weapons or slots the part wields ('axe', 'mainhand')"),
+        breakAt: z.number().int().optional().describe('set_part: one aimed hit dealing at least this much severs the part'),
         note: z.string().optional().describe('set_part / trigger_readied: note'),
         suppressed: z.boolean().optional().describe('set_unit'),
         inMelee: z.boolean().optional().describe('set_unit'),

@@ -1,4 +1,5 @@
 import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile } from '../../schema/token-extras.js';
+import { findPart as findNamedPart } from './parts.js';
 import { CombatRNG, CheckResult } from './rng.js';
 import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS, conditionAttackModifiers, conditionSpeedFactor } from './conditions.js';
 
@@ -146,6 +147,9 @@ export interface CombatActionResult {
     damageType?: string;     // Findings #40: auditable against resistances
     damageModifier?: 'immune' | 'resistant' | 'vulnerable';  // HIGH-002: set only when one applied
     situational?: string[];  // What changed the roll or the damage (dodge, help, parts, unit cap)
+    // An aimed part with its own hp or breakAt took the hit instead of the
+    // body (damage is then 0): what it took and whether it broke (severed).
+    partHit?: { name: string; damage: number; hpBefore?: number; hpAfter?: number; broken: boolean; state: Part['state'] };
     
     // Heal specifics (if type === 'heal')
     healAmount?: number;
@@ -749,7 +753,11 @@ export class CombatEngine {
             if (goodArm) situational.push(`assumed ${goodArm.name}; name weapon or withPart if the crippled ${crippledArm.name} swings`);
             else { disadvantage = true; situational.push(`${actor.name}'s ${crippledArm.name} crippled (disadvantage; name withPart or unaffectedLimb for the good arm)`); }
         }
-        const aimed = findPart(target, partOpts?.atPart);
+        const aimed = partOpts?.atPart ? findNamedPart(target, partOpts.atPart) : undefined;
+        // A part with its own hp or breakAt is a separate object (a chain, a
+        // shield, a plate): an aimed hit lands on it, not on the body.
+        const armouredPart = aimed && aimed.state !== 'dead' && (aimed.hp !== undefined || aimed.breakAt !== undefined) ? aimed : undefined;
+        let partHit: CombatActionResult['partHit'];
         if (aimed?.state === 'breached') { advantage = true; situational.push(`${target.name}'s ${aimed.name} breached (advantage)`); }
         if (target.parts?.some(pt => pt.state === 'latched' && pt.latchedTo?.participantId === actor.id)) {
             advantage = true;
@@ -822,9 +830,14 @@ export class CombatEngine {
             const modResult = this.calculateDamageWithModifiers(finalBaseDamage, damageType, target);
             damageDealt = modResult.finalDamage;
             damageModifier = modResult.modifier;
+            if (armouredPart) {
+                partHit = this.damagePart(target, armouredPart, damageDealt);
+                situational.push(`${target.name}'s ${armouredPart.name} takes the hit${partHit.broken ? ' and is severed' : ''} (body untouched)`);
+                damageDealt = 0;
+            }
             // A single blow on a unit kills at most one model; cleave on a
             // packed unit, volleys and area attacks flow through models.
-            if (target.unit && !partOpts?.uncapped && target.hp > 0) {
+            else if (target.unit && !partOpts?.uncapped && target.hp > 0) {
                 const models = Math.ceil(target.hp / target.unit.hpPerModel);
                 const currentModelHp = target.hp - (models - 1) * target.unit.hpPerModel;
                 if (damageDealt > currentModelHp) {
@@ -867,7 +880,13 @@ export class CombatEngine {
                 modStr = ' [Vulnerable - Doubled!]';
             }
 
-            breakdown += `\n\n💥 Damage: ${damageDealt}${typeStr}${damageBreakdownStr}${attackRoll.isCrit ? ' (crit)' : ''}${flatDamageBonus ? ` + ${flatDamageLabel ?? 'trait'} ${flatDamageBonus >= 0 ? '+' : ''}${flatDamageBonus}` : ''}${modStr}\n`;
+            const dealtStr = `${typeStr}${damageBreakdownStr}${attackRoll.isCrit ? ' (crit)' : ''}${flatDamageBonus ? ` + ${flatDamageLabel ?? 'trait'} ${flatDamageBonus >= 0 ? '+' : ''}${flatDamageBonus}` : ''}${modStr}`;
+            if (partHit) {
+                const hpStr = partHit.hpBefore !== undefined ? `, ${partHit.hpBefore} → ${partHit.hpAfter} HP` : '';
+                breakdown += `\n\n💥 Part hit: ${partHit.name} takes ${partHit.damage}${dealtStr}${hpStr}${partHit.broken ? ' [SEVERED]' : ''}\n`;
+            } else {
+                breakdown += `\n\n💥 Damage: ${damageDealt}${dealtStr}\n`;
+            }
             breakdown += `   ${target.name}: ${hpBefore} → ${target.hp}/${target.maxHp} HP`;
             if (defeated) {
                 breakdown += ` [DEFEATED]`;
@@ -879,7 +898,9 @@ export class CombatEngine {
         // Build simple message
         let message = '';
         if (attackRoll.isHit) {
-            message = `${attackRoll.isCrit ? 'CRITICAL ' : ''}HIT! ${actor.name} deals ${damageDealt} damage to ${target.name}`;
+            message = partHit
+                ? `${attackRoll.isCrit ? 'CRITICAL ' : ''}HIT! ${actor.name} deals ${partHit.damage} damage to ${target.name}'s ${partHit.name}${partHit.broken ? ' [SEVERED]' : ''}`
+                : `${attackRoll.isCrit ? 'CRITICAL ' : ''}HIT! ${actor.name} deals ${damageDealt} damage to ${target.name}`;
             if (defeated) message += ' [DEFEATED]';
         } else {
             message = `MISS! ${actor.name}'s attack misses ${target.name}`;
@@ -913,8 +934,35 @@ export class CombatEngine {
             defeated,
             message,
             detailedBreakdown: breakdown,
-            ...(situational.length ? { situational } : {})
+            ...(situational.length ? { situational } : {}),
+            ...(partHit ? { partHit } : {})
         };
+    }
+
+    /**
+     * Damage an armoured part: a hit of breakAt or more, or hp run down to 0,
+     * breaks it. A broken part is dead with a 'severed' note, and it lets go:
+     * its own latch and every part latched onto it are released.
+     */
+    private damagePart(owner: CombatParticipant, part: Part, damage: number): NonNullable<CombatActionResult['partHit']> {
+        const hpBefore = part.hp;
+        if (part.hp !== undefined) part.hp = Math.max(0, part.hp - damage);
+        const broken = (part.breakAt !== undefined && damage >= part.breakAt) || (part.hp !== undefined && part.hp <= 0);
+        if (broken) {
+            part.state = 'dead';
+            part.latchedTo = undefined;
+            part.note = part.note ? `${part.note}; severed` : 'severed';
+            const key = part.name.toLowerCase();
+            for (const other of this.state?.participants ?? []) {
+                for (const pt of other.parts ?? []) {
+                    if (pt.latchedTo?.participantId !== owner.id) continue;
+                    if (!pt.latchedTo.part || pt.latchedTo.part.toLowerCase() !== key) continue;
+                    pt.latchedTo = undefined;
+                    if (pt.state === 'latched') pt.state = 'intact';
+                }
+            }
+        }
+        return { name: part.name, damage, ...(hpBefore !== undefined ? { hpBefore, hpAfter: part.hp } : {}), broken, state: part.state };
     }
 
     /**

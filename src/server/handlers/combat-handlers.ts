@@ -18,7 +18,7 @@ import { SessionContext } from '../types.js';
 // CRIT-006: Import spellcasting validation and resolution
 import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
-import { PartSchema, UnitSchema, ParticipantExtrasShape } from '../../schema/token-extras.js';
+import { PartSchema, UnitSchema, ParticipantExtrasShape, type Part } from '../../schema/token-extras.js';
 import { resolveWorldId, bandOrder, loadRule, loadRules, type TableRule } from '../../engine/table-rules.js';
 import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
 import { volleyTier, describeUnit } from '../../engine/combat/units.js';
@@ -251,8 +251,10 @@ function formatCombatStateText(state: CombatState): string {
         output += `${marker} ${icon} ${p.name.padEnd(18)} ${hpBar} ${p.hp}/${p.maxHp} HP  [Init: ${p.initiative}] ID: ${p.id} ${status}\n`;
         if (p.unit) output += `      🪖 ${describeUnit(p)}\n`;
         if (p.attacks?.length) output += `      🗡 attacks: ${p.attacks.map(a => `${a.name} ${a.attackBonus >= 0 ? '+' : ''}${a.attackBonus}`).join(', ')}\n`;
-        const hurt = (p.parts ?? []).filter(pt => pt.state !== 'intact');
-        if (hurt.length) output += `      🦴 ${hurt.map(pt => `${pt.name}: ${pt.state}${pt.latchedTo ? `→${state.participants.find(o => o.id === pt.latchedTo!.participantId)?.name ?? pt.latchedTo.participantId}${pt.latchedTo.part ? ` ${pt.latchedTo.part}` : ''}` : ''}`).join(' · ')}\n`;
+        // Hurt parts, and armoured ones (own ac, hp or breakAt) even when intact.
+        const hurt = (p.parts ?? []).filter(pt => pt.state !== 'intact' || pt.ac !== undefined || pt.hp !== undefined || pt.breakAt !== undefined);
+        const armour = (pt: Part) => `${pt.ac !== undefined ? ` AC ${pt.ac}` : ''}${pt.hp !== undefined ? ` ${pt.hp}/${pt.maxHp ?? pt.hp} HP` : ''}${pt.breakAt !== undefined ? ` breaks at ${pt.breakAt}` : ''}`;
+        if (hurt.length) output += `      🦴 ${hurt.map(pt => `${pt.name}: ${pt.state}${pt.latchedTo ? `→${state.participants.find(o => o.id === pt.latchedTo!.participantId)?.name ?? pt.latchedTo.participantId}${pt.latchedTo.part ? ` ${pt.latchedTo.part}` : ''}` : ''}${armour(pt)}`).join(' · ')}\n`;
         if (p.intent) output += `      ⚑ intent: ${p.intent}\n`;
         if (p.readied) output += `      ⏳ readied: ${p.readied.action} when ${p.readied.trigger}\n`;
     });
@@ -1558,8 +1560,13 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             attackLaneProblems = dres.problems;
         }
 
-        // 2. Target AC (DC)
-        if (!outcome && (dc === undefined || dc === 0)) {
+        // 2. Target AC (DC). Aiming at a part with its own AC (a chain, a
+        // shield) rolls against the part, and body AC bonuses do not apply.
+        const aimedArmour = parsed.atPart && target ? findPart(target, parsed.atPart) : undefined;
+        const partAc = !outcome && (dc === undefined || dc === 0) && aimedArmour?.ac !== undefined ? aimedArmour.ac : undefined;
+        if (partAc !== undefined) {
+            dc = partAc;
+        } else if (!outcome && (dc === undefined || dc === 0)) {
             if (target?.ac !== undefined) {
                 dc = target.ac;
             } else {
@@ -1577,7 +1584,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             }
         }
         const targetMechs = parsed.targetId ? loadAutoMechanics(resolverDb, parsed.targetId) : [];
-        dc = (dc ?? 0) + autoAcBonus(targetMechs, autoApplied);
+        dc = partAc !== undefined ? partAc : (dc ?? 0) + autoAcBonus(targetMechs, autoApplied);
 
         // 3. Damage - auto-calculate from multiple sources
         if (!outcome && (damage === undefined || damage === 0)) {
@@ -1787,7 +1794,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         if (strikeRule && parsed.calledStrike && targetNow) {
             const limb = parsed.calledStrike.toLowerCase();
             const landing = resolveCalledStrike(strikeRule, targetNow, parsed.calledStrike, parsed.atPart);
-            if (result.success && !('problem' in landing)) {
+            if (result.partHit?.broken) {
+                // The aimed part was severed by the hit: nothing left to cripple.
+                resultRec.calledStrike = { rule: strikeRule.name, limb, crippled: false, part: result.partHit.name, severed: true };
+                ruleLines.push(`RULE ${strikeRule.name}: ${targetNow.name}'s ${result.partHit.name} severed`);
+            } else if (result.success && !('problem' in landing)) {
                 // The cripple lands on a named part (the target's own, the one
                 // aimed at, or the limb), which the engine reads for speed and attacks.
                 const part = crippledPart(strikeRule, landing);
@@ -1801,7 +1812,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 ruleLines.push(`RULE ${strikeRule.name}: called strike at the ${limb} missed`);
             }
         }
-        if (actorNow && targetNow) {
+        // A hit on an armoured part never touched the body: no consequence.
+        if (actorNow && targetNow && !result.partHit) {
             for (const peerRule of loadRules(rulesDb, ruleWorld, 'peer_consequence')) {
                 const due = peerConsequence(peerRule, ruleBands, actorNow, targetNow, result);
                 if (!due) continue;
@@ -2531,6 +2543,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             // Table rules: what the engine computed and the GM still names.
             consequenceDue: (r as { consequenceDue?: unknown }).consequenceDue,
             calledStrike: (r as { calledStrike?: unknown }).calledStrike,
+            partHit: r.partHit,
             attackProfile: (r as { attackProfile?: unknown }).attackProfile,
             volley: (r as { volley?: unknown }).volley,
             situational: r.situational,
