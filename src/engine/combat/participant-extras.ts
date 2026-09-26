@@ -13,7 +13,7 @@ export type ExtrasInput = Partial<Pick<CombatParticipant,
     'size' | 'reach' | 'movementSpeed' | 'attackBonus' | 'attackDamage' | 'attackDamageType' |
     'attacksPerAction' | 'attacks' | 'abilities' | 'legendaryActions' | 'legendaryResistances' |
     'legendaryResistancesRemaining' | 'autoLegendaryResistance' | 'hasLairActions' | 'cr' |
-    'band' | 'regeneration' | 'parts' | 'ac'>>;
+    'band' | 'regeneration' | 'parts' | 'ac' | 'species' | 'tags'>>;
 
 /** The character-row fields that default a token (the sheet side of hydrateExtras). */
 export type ExtrasRow = ExtrasInput & { parts?: Part[] };
@@ -22,7 +22,8 @@ const ROW_KEYS = [
     'band', 'regeneration', 'parts', 'ac',
     'size', 'reach', 'movementSpeed', 'attackBonus', 'attackDamage', 'attackDamageType',
     'attacksPerAction', 'attacks', 'abilities', 'legendaryActions', 'legendaryResistances',
-    'legendaryResistancesRemaining', 'autoLegendaryResistance', 'hasLairActions', 'cr'
+    'legendaryResistancesRemaining', 'autoLegendaryResistance', 'hasLairActions', 'cr',
+    'species', 'tags'
 ] as const;
 
 /** The preset side: CreaturePreset names its fields differently. */

@@ -13,6 +13,7 @@ import { listRules, findPool, type RuleSpec, type TableRule } from '../engine/ta
 import { rollTable, type TableRoll, type RollTableEntry } from '../engine/roll-table.js';
 import { loggedRoller, type DiceRoller } from '../math/logged-d20.js';
 import { applyScheduledOps, type ScheduledWriteOp } from '../engine/scheduled-ops.js';
+import { growthFromPools, type GrowthReady } from './growth.js';
 import type { HpMode } from '../engine/forms.js';
 import { CharacterRepository } from '../storage/repos/character.repo.js';
 import { CustomEffectsRepository } from '../storage/repos/custom-effects.repo.js';
@@ -59,6 +60,8 @@ export interface AppliedEntry {
     killed?: true;
     corpseId?: string;
     errors?: string[];
+    /** Growth tracks the writes crossed: offered, never applied. */
+    growthReady?: GrowthReady[];
 }
 
 interface ChainedRoll { table: string; depth: number; rolled: Omit<TableRoll, 'entry' | 'index' | 'rollId' | 'seed'>; entry: TableRoll['entry'] & { index: number }; rollId?: string }
@@ -112,6 +115,10 @@ async function applyEntry(db: Database.Database, worldId: string, characterId: s
                 ...(spec.writes ?? [])
             ];
             const { applied, updates } = applyScheduledOps(char, ops, { defaultSource: source, reason: `${source}: ${entry.text}` });
+            if (updates.resourcePools) {
+                const ready = growthFromPools(db, worldId, char as never, char.resourcePools as never, updates.resourcePools as never);
+                if (ready.length) out.growthReady = ready;
+            }
             if (spec.condition?.pinned && Array.isArray(updates.conditions)) {
                 updates.conditions = (updates.conditions as Array<{ name: string; pinned?: boolean }>).map(c => c.name === spec.condition!.name ? { ...c, pinned: true } : c);
             }
@@ -211,6 +218,7 @@ export async function rollAndApply(db: Database.Database, input: RollAndApplyInp
         ...(poolBonus ? { poolBonus } : {}),
         chained, text, rollId: first.rollId, seed: first.seed,
         ...(applying ? { applied } : {}),
+        ...(applied.some(a => a.growthReady?.length) ? { growthReady: applied.flatMap(a => a.growthReady ?? []) } : {}),
         ...(char && !input.apply ? { preview: true } : {}),
         ...(notes.length ? { note: notes.join('; ') } : {}),
         message: `${rule.name}: ${first.dice}${first.modifier ? ` ${first.modifier >= 0 ? '+' : '-'} ${Math.abs(first.modifier)}` : ''} = ${first.total}${first.clamped ? ' (clamped)' : ''} → ${text}${appliedLine}${char && !input.apply ? ' (preview: nothing applied)' : ''}`

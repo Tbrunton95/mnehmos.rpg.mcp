@@ -35,6 +35,8 @@ import {
 } from '../../schema/party.js';
 import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
 import { handleKill } from './character-manage.js';
+import { creditGrowth } from '../growth.js';
+import { resolveWorldId } from '../../engine/table-rules.js';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { RichFormatter } from '../utils/formatter.js';
 
@@ -560,6 +562,19 @@ async function handleAfterBattle(args: z.infer<typeof AfterBattleSchema>): Promi
         partyRepo.updateMember(party.id, m.characterId, { loyalty: to });
         loyalty.push({ characterId: m.characterId, from: loyaltyOf(m), to, ...(to === 0 ? { wavering: true } : {}) });
     }
+    // Growth tracks: a victory feeds each surviving member's growth pool.
+    // Recruits joining now were not in the fight.
+    const growth: Array<Record<string, unknown>> = [];
+    if (args.victory) {
+        const db = getDb();
+        for (const m of partyRepo.findMembersByParty(party.id)) {
+            if (dead.has(m.characterId)) continue;
+            try {
+                const credit = creditGrowth(db, resolveWorldId(db, { characterIds: [m.characterId] }), m.characterId, 'victory');
+                if (credit) growth.push({ characterId: m.characterId, name: charRepo.findById(m.characterId)?.name ?? m.characterId, ...credit });
+            } catch { /* no rules table: no growth */ }
+        }
+    }
     const recruited: Array<Record<string, unknown>> = [];
     const now = new Date().toISOString();
     for (const r of args.recruits ?? []) {
@@ -578,7 +593,8 @@ async function handleAfterBattle(args: z.infer<typeof AfterBattleSchema>): Promi
     return {
         success: true, actionType: 'after_battle', partyId: party.id, victory: args.victory,
         losses, killed, loyalty, recruited,
-        message: `${party.name} after ${args.victory ? 'victory' : 'defeat'}: ${killed.length} dead${killed.length ? ` (${killed.map(k => String(k.name)).join(', ')})` : ''}, ${losses.reduce((s, l) => s + Number(l.models), 0)} models lost; survivors loyalty ${step > 0 ? '+1' : '-1'}${recruited.length ? `; ${recruited.length} recruited` : ''}${loyalty.some(l => l.wavering) ? '; some are wavering (loyalty 0)' : ''}.`
+        ...(growth.length ? { growth } : {}),
+        message: `${party.name} after ${args.victory ? 'victory' : 'defeat'}: ${killed.length} dead${killed.length ? ` (${killed.map(k => String(k.name)).join(', ')})` : ''}, ${losses.reduce((s, l) => s + Number(l.models), 0)} models lost; survivors loyalty ${step > 0 ? '+1' : '-1'}${recruited.length ? `; ${recruited.length} recruited` : ''}${loyalty.some(l => l.wavering) ? '; some are wavering (loyalty 0)' : ''}${growth.length ? `; growth: ${growth.map(g => `${String(g.name)} ${String(g.from)} → ${String(g.to)}${g.growthReady ? ` (ready for ${String((g.growthReady as { form: string }).form)})` : ''}`).join(', ')}` : ''}.`
     };
 }
 

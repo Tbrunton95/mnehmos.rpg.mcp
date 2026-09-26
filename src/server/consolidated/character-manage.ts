@@ -44,6 +44,7 @@ import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
 import { SceneRepository } from '../../storage/repos/scene.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { RichFormatter } from '../utils/formatter.js';
+import { growthReadyFor } from '../growth.js';
 import {
     CharacterOptionCategory,
     findOpen5eBackground,
@@ -1587,12 +1588,28 @@ async function handleOffer(args: z.infer<typeof OfferSchema>): Promise<object> {
         value,
         consumed,
         favour,
+        ...(favour.growthReady ? { growthReady: favour.growthReady } : {}),
         ...(answer ? { answer } : {}),
         message: `${char.name} offers ${what} to ${String(favour.pool ?? member)} (+${value}). ${String(favour.message ?? '')}${answer ? ` Answer: ${String(answer.message ?? answer.text ?? '')}` : ''}`
     };
 }
 
 export async function handleAdjustPool(args: z.input<typeof AdjustPoolSchema>): Promise<object> {
+    const res = await adjustPoolCore(args) as Record<string, unknown>;
+    // Growth tracks: a pool that crossed a step offers the form; never applied.
+    if (res.success && typeof res.before === 'number' && typeof res.current === 'number' && typeof res.pool === 'string') {
+        const { db, characterRepo } = ensureDb();
+        const char = characterRepo.findById(String(res.characterId));
+        if (char) {
+            const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] });
+            const ready = growthReadyFor(db, worldId, char as never, res.pool, res.before, res.current);
+            if (ready) return { ...res, growthReady: ready, message: `${String(res.message)} · GROWTH READY: ${ready.form} (${ready.call})` };
+        }
+    }
+    return res;
+}
+
+async function adjustPoolCore(args: z.input<typeof AdjustPoolSchema>): Promise<object> {
     const { characterRepo } = ensureDb();
     const char = characterRepo.findById(args.characterId);
     if (!char) throw new Error(`Character ${args.characterId} not found`);

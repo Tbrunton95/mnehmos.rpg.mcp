@@ -19,7 +19,22 @@ import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { checkConcentration, breakConcentration } from '../../engine/magic/concentration.js';
 import type { Character } from '../../schema/character.js';
-import { breakTestDue, type BreakTest } from '../../engine/combat/units.js';
+import { breakTestDue, moraleModifiers, type BreakTest } from '../../engine/combat/units.js';
+import { nearbyAllies, type SpeciesOf } from '../../engine/combat/nearby.js';
+
+/** A token's species from its character sheet's race, for tokens that carry none. */
+export function sheetSpecies(db: Database.Database): SpeciesOf {
+    const repo = new CharacterRepository(db);
+    const cache = new Map<string, string | undefined>();
+    return (p) => {
+        if (!cache.has(p.id)) {
+            let race: string | undefined;
+            try { race = repo.findById(p.id)?.race ?? undefined; } catch { race = undefined; }
+            cache.set(p.id, race);
+        }
+        return cache.get(p.id);
+    };
+}
 
 type SpellSpec = RuleSpec<'spell'>;
 type CastingRollSpec = NonNullable<SpellSpec['castingRoll']>;
@@ -140,6 +155,7 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
     }
 
     const charRepo = new CharacterRepository(db);
+    const speciesOf = sheetSpecies(db);
     let char: Character | null = null;
     try { char = charRepo.findById(actorId); } catch { /* token-only caster */ }
 
@@ -198,8 +214,20 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
         char = charRepo.findById(char.id);
     }
 
+    // ── Waaagh! energy: allies around the caster add to the casting roll ──
+    let nearbyBonus: { count: number; bonus: number; per: number; max?: number; range: number; overload: boolean } | undefined;
+    const extra: Array<{ label: string; value: number }> = [];
+    const near = spec.castingRoll?.bonusFromNearby;
+    if (near) {
+        const { count } = nearbyAllies(state.participants, actor, { range: near.range, match: near.match }, speciesOf);
+        let bonus = Math.floor(count / near.per);
+        if (near.max !== undefined) bonus = Math.min(bonus, near.max);
+        nearbyBonus = { count, bonus, per: near.per, ...(near.max !== undefined ? { max: near.max } : {}), range: near.range, overload: near.overloadAt !== undefined && bonus >= near.overloadAt };
+        if (bonus) extra.push({ label: `nearby ${count}`, value: bonus });
+    }
+
     // ── Casting roll ──
-    const casting = spec.castingRoll ? computeCastingTotal(engine, spec.castingRoll, actor, char, reason) : undefined;
+    const casting = spec.castingRoll ? computeCastingTotal(engine, spec.castingRoll, actor, char, reason, extra) : undefined;
     const success = casting ? casting.total >= spec.castingRoll!.target : true;
     const double = casting ? isDouble(casting.rolls) : false;
     const fumble = casting ? isFumble(casting.rolls) : false;
@@ -250,7 +278,7 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
                     out.damage = dmg;
                     out.damageModifier = typed.modifier;
                     if (after?.unit) {
-                        const due = breakTestDue(after, out.hpBefore);
+                        const due = breakTestDue(after, out.hpBefore, { moraleBonus: moraleModifiers(after, engine.getState()?.participants ?? [], speciesOf) });
                         if (due) breakTests.push(due);
                     }
                     if (dmg > 0) {
@@ -311,9 +339,11 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
     // ── Miscast ──
     let miscast: Record<string, unknown> | undefined;
     if (casting && spec.miscast) {
-        const on = spec.miscast.on;
-        const trigger = on === 'double' ? double : on === 'fumble' ? fumble : !success;
-        if (trigger) {
+        const rule = spec.miscast.on;
+        const ruled = rule === 'double' ? double : rule === 'fumble' ? fumble : !success;
+        // An overload (nearby bonus at overloadAt) rolls the table too, once.
+        const on = ruled ? rule : nearbyBonus?.overload ? 'overload' : undefined;
+        if (on) {
             const hpBefore = char?.hp;
             const { rollAndApply } = await import('../roll-table-apply.js');
             const r = await rollAndApply(db, {
@@ -321,6 +351,16 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
                 roller: engineRoller(engine, { forId: actorId })
             });
             miscast = { on, table: spec.miscast.table, ...r };
+            // A condition the table puts on the caster's sheet reaches the token too.
+            const tok = engine.getState()?.participants.find(p => p.id === actorId);
+            for (const a of (Array.isArray(r.applied) ? r.applied : []) as Array<{ condition?: string }>) {
+                if (!a.condition || !tok) continue;
+                const norm = normalizeCondition({ name: a.condition, sourceId: actorId, source: spec.miscast.table } as never, actorId);
+                if (norm) {
+                    const { id: _drop, ...rest } = norm;
+                    engine.applyCondition(actorId, rest);
+                }
+            }
             // A table write to the caster's HP reaches the token too.
             const fresh = char ? charRepo.findById(char.id) : null;
             if (fresh && hpBefore !== undefined && fresh.hp !== hpBefore) {
@@ -337,12 +377,14 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
     if (costLines.length) output += `💠 Cost: ${costLines.join(', ')}\n`;
     if (casting) {
         output += `🎲 Casting: ${casting.parts.join(' ')} = ${casting.total} vs ${spec.castingRoll!.target} [${success ? 'CAST' : 'FAILED'}]${double ? ' (double)' : ''}${fumble ? ' (fumble)' : ''}\n`;
+        if (nearbyBonus) output += `📣 ${nearbyBonus.count} allies within ${nearbyBonus.range} ft: +${nearbyBonus.bonus}${nearbyBonus.max !== undefined ? ` (max ${nearbyBonus.max})` : ''}${nearbyBonus.overload ? ' — OVERLOAD' : ''}\n`;
     }
     if (unbind) output += `🚫 ${unbind.name} tries to unbind: ${unbind.dice} (${unbind.rolls.join('+')}) = ${unbind.total} vs ${casting!.total} [${unbind.unbound ? 'UNBOUND' : 'FAILS'}]\n`;
     for (const e of effects) if (e.line) output += `${e.line}\n`;
     for (const due of breakTests) output += `▌ ${due.line}\n`;
     if (notes.length) output += `(${notes.join('; ')})\n`;
     if (miscast) output += `\n⚠️ MISCAST (${String(miscast.on)}): ${String(miscast.message ?? miscast.text ?? '')}\n`;
+    else if (nearbyBonus?.overload && !spec.miscast) notes.push('overload, but the spell has no miscast table');
     const totalDamage = effects.reduce((a, e) => a + (e.damage ?? 0), 0);
     const totalHealing = effects.reduce((a, e) => a + (e.healing ?? 0), 0);
     output += `\n[WORLD SPELL: ${name}, ${lands ? 'CAST' : unbind?.unbound ? 'UNBOUND' : 'FAILED'}, DMG: ${totalDamage}, HEAL: ${totalHealing}]`;
@@ -364,6 +406,7 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
         worldSpell: {
             name, rule: rule.name,
             ...(casting ? { casting: { ...casting, target: spec.castingRoll!.target, success, double, fumble } } : {}),
+            ...(nearbyBonus ? { nearbyBonus } : {}),
             costs: costLines,
             ...(unbind ? { unbind } : {}),
             effects: effects.map(({ line: _l, ...e }) => e),

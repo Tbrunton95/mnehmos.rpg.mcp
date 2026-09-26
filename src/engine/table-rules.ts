@@ -9,7 +9,7 @@
  */
 import type Database from 'better-sqlite3';
 import { z } from 'zod';
-import { PartSchema, UnitSchema, ParticipantExtrasShape, type AttackProfile, type Part } from '../schema/token-extras.js';
+import { PartSchema, UnitSchema, ParticipantExtrasShape, nearbyMatchSchema, type AttackProfile, type Part } from '../schema/token-extras.js';
 import { expandCreatureTemplate, type CreaturePreset } from '../data/creature-presets.js';
 import { UNPRINTABLE_POOLS } from '../render/pda.js';
 import { scheduledWriteOpSchema } from './scheduled-ops.js';
@@ -220,7 +220,19 @@ export const RuleSpecSchemas = {
             /** The caster's ability modifier adds to the roll. */
             ability: abilityShort().optional(),
             /** The total the casting roll must reach. */
-            target: z.number().int()
+            target: z.number().int(),
+            /**
+             * Waaagh! energy: +1 per `per` allies within range feet that
+             * match (units count their live models), capped at max. At
+             * overloadAt or more the spell's miscast table rolls too.
+             */
+            bonusFromNearby: z.object({
+                range: z.number().min(0),
+                per: z.number().int().min(1).default(1),
+                max: z.number().int().min(0).optional(),
+                match: nearbyMatchSchema().default({}),
+                overloadAt: z.number().int().min(1).optional()
+            }).passthrough().optional()
         }).passthrough().optional(),
         contestedBy: z.literal('unbind').optional(),
         /** Signed pool moves on the caster, paid whether or not the cast succeeds. */
@@ -283,6 +295,24 @@ export const RuleSpecSchemas = {
         tools: z.array(z.string()).default([]),
         /** Starting gold when the create call names none. */
         gold: z.number().min(0).optional()
+    }).passthrough(),
+    /**
+     * A growth track: kills and victories feed a pool; crossing a step
+     * offers that step's form (growthReady) and never applies it.
+     */
+    growth_track: z.object({
+        pool: z.string().min(1),
+        steps: z.array(z.object({
+            at: z.number(),
+            form: z.string().min(1),
+            note: z.string().optional()
+        }).passthrough()).min(1),
+        /** Added to the killer's pool for each kill in combat. */
+        perKill: z.number().optional(),
+        /** Added per band step the victim stands at or above the killer (same band: once). */
+        perBandAbove: z.number().optional(),
+        /** Added to each surviving member by party_manage after_battle {victory: true}. */
+        perVictory: z.number().optional()
     }).passthrough()
 } as const;
 
@@ -316,7 +346,7 @@ function refineRollTable(
  * listing them as enforced. Some kinds here arrive in later releases.
  */
 export const DATA_KINDS: ReadonlySet<string> = new Set([
-    'creature', 'roll_table', 'pool_family', 'spell', 'skill', 'species', 'char_class', 'background'
+    'creature', 'roll_table', 'pool_family', 'spell', 'skill', 'species', 'char_class', 'background', 'growth_track'
 ]);
 
 export type RuleKind = keyof typeof RuleSpecSchemas;
@@ -620,7 +650,9 @@ export function creatureToParticipant(spec: CreatureSpec, opts: { id: string; na
         regeneration: spec.regeneration,
         band: spec.band,
         parts,
-        unit: spec.unit ? copy(spec.unit) : undefined
+        unit: spec.unit ? copy(spec.unit) : undefined,
+        species: spec.species,
+        tags: spec.tags ? [...spec.tags] : undefined
     };
     for (const [k, v] of Object.entries(optional)) if (v !== undefined) out[k] = v;
     return out;

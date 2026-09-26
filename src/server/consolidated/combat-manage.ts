@@ -5,10 +5,12 @@
  * advance_turn, roll_death_save, execute_lair_action
  */
 
-import { PartSchema, UnitSchema, ReadiedSchema, ReadiedAttackSchema, PART_STATES, PART_KINDS, ParticipantExtrasShape, SizeCategorySchema } from '../../schema/token-extras.js';
+import { PartSchema, UnitSchema, ReadiedSchema, ReadiedAttackSchema, PART_STATES, PART_KINDS, ParticipantExtrasShape, SizeCategorySchema, nearbyMatchSchema, mobRuleSchema, type Buff } from '../../schema/token-extras.js';
 import { hydrateExtras, type ExtrasRow } from '../../engine/combat/participant-extras.js';
 import { upsertPart } from '../../engine/combat/parts.js';
-import { volleyTier, describeUnit, breakTestDue } from '../../engine/combat/units.js';
+import { volleyTier, describeUnit, breakTestDue, moraleModifiers } from '../../engine/combat/units.js';
+import { sheetSpecies } from '../handlers/world-spell.js';
+import { nearbyAllies } from '../../engine/combat/nearby.js';
 import type { CombatParticipant } from '../../engine/combat/engine.js';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
@@ -52,7 +54,7 @@ import { freshSeed } from '../../math/seed.js';
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_intent', 'trigger_readied', 'legendary_action', 'legendary_resistance', 'use_ability', 'budget', 'get_history', 'list'] as const;
+const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_intent', 'trigger_readied', 'legendary_action', 'legendary_resistance', 'use_ability', 'battle_cry', 'budget', 'get_history', 'list'] as const;
 type CombatManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -199,6 +201,26 @@ const UseAbilitySchema = z.object({
     reason: z.string().optional()
 });
 
+/** A dice notation ('1d4', '2d6+1') or a plain number for a buff's damage bonus. */
+const BUFF_DICE = /^\s*\d*d\d+(\s*[+-]\s*\d+)?\s*$/i;
+
+const BattleCrySchema = z.object({
+    action: z.literal('battle_cry'),
+    encounterId: z.string(),
+    participantId: z.string().describe('Who calls it'),
+    name: z.string().min(1).default('Waaagh!').describe("The buff's name (default 'Waaagh!')"),
+    range: z.number().min(0).default(60).describe('Feet from the caller, edge to edge (default 60)'),
+    match: nearbyMatchSchema().optional().describe('Which allies hear it: {band?, species?, tag?, nameIncludes?}; the caller always does'),
+    rounds: z.number().int().min(1).default(1).describe("Rounds it lasts: it ends at the start of the caller's turn after that many (default 1: until the caller's next turn)"),
+    attackAdvantage: z.boolean().optional().describe('Attacks roll with advantage'),
+    damageBonus: z.union([z.number().int(), z.string().regex(BUFF_DICE, "dice like '1d4' or '2d6+1'")]).optional().describe("Added to damage on a hit: a number or dice ('1d4')"),
+    speedBonus: z.number().int().optional().describe('Feet added to speed'),
+    moraleBonus: z.number().int().optional().describe("Added to a unit's morale on a break test"),
+    ability: z.string().optional().describe("An ability on the caller's token it spends ('Waaagh!'): must be ready; a recharge ability rolls to come back at the start of its turn"),
+    actionCost: z.enum(['action', 'bonus', 'none']).default('none').describe("What it costs the caller's turn (default none)"),
+    reason: z.string().optional()
+});
+
 const BudgetSchema = z.object({
     action: z.literal('budget'),
     encounterId: z.string().optional().describe("Rate a live encounter: its hostile tokens' cr, its allies' sheet levels"),
@@ -316,6 +338,7 @@ const SetUnitSchema = z.object({
     routed: z.boolean().optional().describe('Routed after a failed break test: no volleys, no further break tests. false rallies it'),
     morale: z.number().int().optional().describe('The morale shown on BREAK TEST DUE'),
     breakAt: z.number().gt(0).lt(1).optional().describe('Fraction of models whose crossing owes a break test (default 0.5)'),
+    mobRule: mobRuleSchema().nullable().optional().describe('{per, maxBonus?, attackBonusPer?, nearby?: {range, match}}: morale and to-hit grow with live models; null clears'),
     reason: z.string().optional()
 });
 
@@ -1136,7 +1159,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             p.hp = after;
 
             // Item 12: a unit carried through its breakAt owes a break test.
-            const breakTest = p.unit ? breakTestDue(p, before) : null;
+            const breakTest = p.unit ? breakTestDue(p, before, { moraleBonus: moraleModifiers(p, state.participants, sheetSpecies(getDb())) }) : null;
             saveEncounterState(new EncounterRepository(getDb()), params.encounterId, state);
             getDomainServices().combatActionLog.log({
                 encounterId: params.encounterId,
@@ -1314,13 +1337,15 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             for (const k of ['suppressed', 'inMelee', 'brokenFormation', 'packed', 'routed', 'morale', 'breakAt'] as const) {
                 if (params[k] !== undefined) (p.unit as Record<string, unknown>)[k] = params[k];
             }
+            if (params.mobRule === null) delete (p.unit as Record<string, unknown>).mobRule;
+            else if (params.mobRule !== undefined) p.unit.mobRule = params.mobRule;
             new EncounterRepository(getDb()).saveState(params.encounterId, state);
             const tier = volleyTier(p);
             logConditionChange(params.encounterId, state, 'set_unit', p.id, `${p.name}: ${describeUnit(p)}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
             return { success: true, actionType: 'set_unit', encounterId: params.encounterId, participantId: p.id, unit: p.unit, volley: tier, message: `${p.name}: ${describeUnit(p)}` };
         },
         aliases: ['unit', 'suppress', 'formation'],
-        description: 'Set a unit token\'s suppressed / inMelee / brokenFormation / packed flags, and routed / morale / breakAt for break tests; reports the volley tier'
+        description: 'Set a unit token\'s suppressed / inMelee / brokenFormation / packed flags, routed / morale / breakAt for break tests, and mobRule; reports the volley tier'
     },
     set_intent: {
         schema: SetIntentSchema,
@@ -1495,6 +1520,69 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         },
         aliases: ['ability', 'breath_weapon', 'recharge_ability'],
         description: "Use a limited ability (a breath weapon): spends the action, marks a recharge ability spent, and resolves damage and a save per target on the fight's dice"
+    },
+    battle_cry: {
+        schema: BattleCrySchema,
+        handler: async (params: z.infer<typeof BattleCrySchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'battle_cry', message: `${message} Nothing was written.`, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB).`);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter.`);
+            if (params.attackAdvantage !== true && !params.damageBonus && !params.speedBonus && !params.moraleBonus) {
+                return refuse('A battle cry needs something in it: attackAdvantage, damageBonus, speedBonus or moraleBonus.');
+            }
+            if (!engine.canTakeActions(p.id)) return refuse(`${p.name} is down or incapacitated and cannot call ${params.name}.`);
+            let ability: NonNullable<typeof p.abilities>[number] | undefined;
+            if (params.ability) {
+                ability = (p.abilities ?? []).find(a => a.name.toLowerCase() === params.ability!.trim().toLowerCase());
+                if (!ability) {
+                    const known = (p.abilities ?? []).map(a => a.name);
+                    return refuse(`${p.name} has no ability '${params.ability}'${known.length ? `; it has ${known.join(', ')}` : ''}.`);
+                }
+                if (ability.ready === false) return refuse(`${p.name}'s ${ability.name} is spent and not recharged (recharge ${ability.recharge ?? '?'}+ on a d6 at the start of its turn).`);
+            }
+            if (params.actionCost !== 'none') {
+                const economy = engine.validateActionEconomy(p.id, params.actionCost);
+                if (!economy.valid) return refuse(`${p.name}: ${economy.error ?? `${params.actionCost} unavailable`}.`);
+            }
+
+            const buff: Buff = {
+                name: params.name, source: p.name, sourceId: p.id,
+                untilRound: state.round + params.rounds - 1,
+                ...(params.attackAdvantage ? { attackAdvantage: true } : {}),
+                ...(params.damageBonus !== undefined ? { damageBonus: params.damageBonus } : {}),
+                ...(params.speedBonus ? { speedBonus: params.speedBonus } : {}),
+                ...(params.moraleBonus ? { moraleBonus: params.moraleBonus } : {})
+            };
+            const heard = nearbyAllies(state.participants, p, { range: params.range, match: params.match }, sheetSpecies(getDb())).participants;
+            const recipients = [p, ...heard];
+            for (const r of recipients) {
+                // The same cry again replaces the old one; it never stacks.
+                const had = r.buffs?.find(b => b.name.toLowerCase() === buff.name.toLowerCase());
+                r.buffs = [...(r.buffs ?? []).filter(b => b !== had), { ...buff }];
+                // Speed on the caller's own turn reaches the movement it has left.
+                if (r.id === p.id && buff.speedBonus && r.movementRemaining !== undefined) {
+                    r.movementRemaining += buff.speedBonus - (had?.speedBonus ?? 0);
+                }
+            }
+            if (params.actionCost !== 'none') engine.commitAction(p.id, params.actionCost);
+            if (ability?.recharge) ability.ready = false;
+            saveEncounterState(new EncounterRepository(getDb()), params.encounterId, state);
+            const effects = [buff.attackAdvantage && 'advantage on attacks', buff.damageBonus !== undefined && `+${buff.damageBonus} damage on a hit`, buff.speedBonus && `+${buff.speedBonus} ft speed`, buff.moraleBonus && `+${buff.moraleBonus} morale`].filter(Boolean).join(', ');
+            const summary = `${p.name} calls ${buff.name}: ${recipients.map(r => r.name).join(', ')} (${effects}) until the start of ${p.name}'s turn in round ${buff.untilRound + 1}${params.reason ? ` — ${params.reason}` : ''}`;
+            logConditionChange(params.encounterId, state, 'battle_cry', p.id, summary, params.reason);
+            return {
+                success: true, actionType: 'battle_cry', encounterId: params.encounterId, participantId: p.id,
+                buff, recipients: recipients.map(r => ({ id: r.id, name: r.name })),
+                ...(ability ? { ability: { name: ability.name, ready: ability.ready !== false } } : {}),
+                message: `📣 ${summary}${ability?.recharge ? `\n${ability.name} is spent; it recharges on a d6 of ${ability.recharge}+ at the start of ${p.name}'s turn.` : ''}`
+            };
+        },
+        aliases: ['waaagh', 'warcry', 'war_cry', 'rally_cry'],
+        description: "A battle cry (the Waaagh!): buffs the caller and every matching ally in range (advantage, damage, speed, morale) until the start of the caller's next turn; can spend a recharging ability"
     },
     budget: {
         schema: BudgetSchema,
@@ -1726,6 +1814,7 @@ Aliases: start/begin→create, state/status→get, finish/stop→end, restore/re
    legendary_action {participantId, cost?, description} - a non-attack legendary action off its turn (attacks: combat_action attack with legendaryCost)
    legendary_resistance {participantId, reason} - turn a failed save into a success
    use_ability {participantId, ability, targetIds?, damage?: number | dice, damageType?, savingThrow?: {ability, dc}} - a limited ability (breath weapon): spends the action, marks a recharge ability spent (it rolls a d6 at the start of its turn), saves per target
+   battle_cry {participantId, name?: 'Waaagh!', range?: 60, match?: {species?, band?, tag?, nameIncludes?}, rounds?: 1, attackAdvantage?, damageBonus?: number | dice, speedBonus?, moraleBonus?, ability?, actionCost?} - buffs the caller and matching allies in range until the start of the caller's next turn
    budget {partyLevels | partyId, creatures: [{creature | cr | xp, count?}] | encounterId} - read-only 5e XP budget: TRIVIAL/EASY/MEDIUM/HARD/DEADLY
 6. end - Finish combat
 
@@ -1737,7 +1826,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
         encounterId: z.string().optional().describe('Encounter ID (required for most actions)'),
         seed: z.string().optional().describe('Seed for new encounter (create only)'),
-        participants: z.array(z.any()).optional().describe("Array of participants (create only). Shape per entry: { id: <character UUID — always the UUID>, name, hp, maxHp, initiativeBonus?: number (default 0, #103), ac?: number (falls back to attacker-side derivation), isEnemy?: boolean, position?: {x,y}, plus optional statline: size, reach, movementSpeed, attackBonus, attackDamage, attackDamageType, attacksPerAction, attacks [{name, attackBonus, damage, damageType?, part?, reachFt?, default?}], abilities [{name, recharge?}], legendaryActions, legendaryResistances, legendaryResistancesRemaining, autoLegendaryResistance, hasLairActions, cr, band, regeneration, parts, unit, intent }"),
+        participants: z.array(z.any()).optional().describe("Array of participants (create only). Shape per entry: { id: <character UUID — always the UUID>, name, hp, maxHp, initiativeBonus?: number (default 0, #103), ac?: number (falls back to attacker-side derivation), isEnemy?: boolean, position?: {x,y}, plus optional statline: size, reach, movementSpeed, attackBonus, attackDamage, attackDamageType, attacksPerAction, attacks [{name, attackBonus, damage, damageType?, part?, reachFt?, default?}], abilities [{name, recharge?}], legendaryActions, legendaryResistances, legendaryResistancesRemaining, autoLegendaryResistance, hasLairActions, cr, band, regeneration, parts, unit, intent, species, tags }"),
         terrain: z.any().optional().describe('Terrain configuration (create only)'),
         characterId: z.string().optional().describe('Character ID (death_save, add_participant)'),
         // FINDINGS #34 mirror block — add_participant + includeParty params
@@ -1809,7 +1898,18 @@ For CORPSES after combat, use corpse_manage tool.`,
         actionDescription: z.string().optional().describe('Lair action description'),
         targetIds: z.array(z.string()).optional().describe('lair_action / use_ability: target IDs'),
         damage: z.union([z.number(), z.string()]).optional().describe("lair_action / use_ability: damage, a number or dice ('8d6') rolled once for every target"),
-        ability: z.string().optional().describe("use_ability: the ability's name on the token ('Fire Breath')"),
+        ability: z.string().optional().describe("use_ability: the ability's name on the token ('Fire Breath'); battle_cry: an ability it spends ('Waaagh!')"),
+        range: z.number().optional().describe('battle_cry: feet from the caller (default 60)'),
+        match: nearbyMatchSchema().optional().describe('battle_cry: which allies hear it {band?, species?, tag?, nameIncludes?}'),
+        rounds: z.number().int().optional().describe("battle_cry: rounds it lasts (default 1: until the caller's next turn)"),
+        attackAdvantage: z.boolean().optional().describe('battle_cry: attacks roll with advantage'),
+        damageBonus: z.union([z.number(), z.string()]).optional().describe("battle_cry: added to damage on a hit, a number or dice ('1d4')"),
+        speedBonus: z.number().optional().describe('battle_cry: feet added to speed'),
+        moraleBonus: z.number().optional().describe("battle_cry: added to a unit's morale on a break test"),
+        actionCost: z.enum(['action', 'bonus', 'none']).optional().describe("battle_cry: what it costs the caller's turn (default none)"),
+        mobRule: mobRuleSchema().nullable().optional().describe('set_unit: {per, maxBonus?, attackBonusPer?, nearby?: {range, match}}; null clears'),
+        species: z.string().optional().describe("add_participant: species ('Orruk') that nearby counts and battle cries match"),
+        tags: z.array(z.string()).optional().describe('add_participant: free tags nearby matches read'),
         partyLevels: z.array(z.number()).optional().describe('budget: character levels, one per member'),
         creatures: z.array(z.any()).optional().describe('budget: monsters to rate [{creature | cr | xp, count?}]'),
         damageType: z.string().optional().describe('Damage type'),

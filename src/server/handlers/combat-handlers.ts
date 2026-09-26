@@ -21,9 +21,10 @@ import { resolveSpell } from '../../engine/magic/spell-resolver.js';
 import { PartSchema, UnitSchema, ParticipantExtrasShape, type Part, type ReadiedAttack } from '../../schema/token-extras.js';
 import { worldProgression } from '../../engine/progression.js';
 import { resolveWorldId, bandOrder, loadRule, loadRules, castingClassFor, findWorldRule, type TableRule } from '../../engine/table-rules.js';
-import { castWorldSpell } from './world-spell.js';
+import { castWorldSpell, sheetSpecies } from './world-spell.js';
+import { creditGrowth } from '../growth.js';
 import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
-import { volleyTier, describeUnit, breakTestDue, type BreakTest } from '../../engine/combat/units.js';
+import { volleyTier, describeUnit, breakTestDue, moraleModifiers, type BreakTest } from '../../engine/combat/units.js';
 import { upsertPart, findPart, resolveAttackSource } from '../../engine/combat/parts.js';
 import { compareBands } from '../../engine/table-rules.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
@@ -245,6 +246,8 @@ function buildStateJson(state: CombatState, encounterId: string, sessionId?: str
             ...(p.band ? { band: p.band } : {}),
             ...(p.regeneration ? { regeneration: p.regeneration } : {}),
             ...(p.cr !== undefined ? { cr: p.cr } : {}),
+            ...(p.species ? { species: p.species } : {}),
+            ...(p.buffs?.length ? { buffs: p.buffs } : {}),
             ...(p.parts?.length ? { parts: p.parts } : {}),
             ...(p.unit ? { unit: { ...p.unit, ...unitView(p) } } : {}),
             ...(p.intent ? { intent: p.intent } : {}),
@@ -1998,11 +2001,23 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             resultRec.targetUnit = { models: t?.models, maxModels: t?.maxModels, volley: t?.dice ?? null };
             ruleLines.push(`UNIT ${targetNow.name}: ${describeUnit(targetNow)}`);
             // Item 12: a unit carried through its breakAt owes a break test.
-            const due = result.target ? breakTestDue(targetNow, result.target.hpBefore) : null;
+            const due = result.target ? breakTestDue(targetNow, result.target.hpBefore, { moraleBonus: moraleModifiers(targetNow, afterState?.participants ?? [], sheetSpecies(getDb())) }) : null;
             if (due) {
                 resultRec.breakTests = [due];
                 ruleLines.push(due.line);
             }
+        }
+
+        // Growth tracks: a kill feeds the killer's growth pool (more for a
+        // victim of its band or above). The next form is offered, never taken.
+        if (result.target && result.target.hpBefore > 0 && targetNow && targetNow.hp <= 0 && actorNow) {
+            try {
+                const credit = creditGrowth(rulesDb, ruleWorld, parsed.actorId, 'kill', { victim: targetNow.name, victimBand: targetNow.band, attackerBand: actorNow.band });
+                if (credit) {
+                    resultRec.growth = credit;
+                    ruleLines.push(`GROWTH ${credit.track}: ${credit.pool} ${credit.from} → ${credit.to} (${credit.reason})${credit.growthReady ? `; ready for ${credit.growthReady.form}: ${credit.growthReady.call}` : ''}`);
+                }
+            } catch { /* no character row or rules table: no credit */ }
         }
 
         // Commit Action Economy: legendary actions, the reaction, or one
@@ -2533,7 +2548,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 const hpAfter = updatedTarget?.hp ?? 0;
                 const defeated = hpAfter <= 0;
                 if (updatedTarget?.unit) {
-                    const due = breakTestDue(updatedTarget, hpBefore);
+                    const due = breakTestDue(updatedTarget, hpBefore, { moraleBonus: moraleModifiers(updatedTarget, freshState?.participants ?? [], sheetSpecies(getDb())) });
                     if (due) breakTests.push(due);
                 }
 
@@ -2854,6 +2869,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             conditionsApplied: (r as { conditionsApplied?: unknown }).conditionsApplied,
             worldSpell: (r as { worldSpell?: unknown }).worldSpell,
             breakTests: (r as { breakTests?: unknown }).breakTests,
+            growth: (r as { growth?: unknown }).growth,
             // Item 11: reactions a move set off, each at the step it happened.
             opportunityAttacks: (r as { opportunityAttacks?: unknown }).opportunityAttacks,
             opportunityAttacksAvailable: (r as { opportunityAttacksAvailable?: unknown }).opportunityAttacksAvailable,

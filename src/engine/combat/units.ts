@@ -5,6 +5,7 @@
  * broken formation each drop it one more step.
  */
 import type { CombatParticipant } from './engine.js';
+import { nearbyAllies, type SpeciesOf } from './nearby.js';
 
 export const DEFAULT_TIERS = [
     { minFraction: 0.75, dice: '4d6' },
@@ -110,4 +111,35 @@ export function breakTestDue(
         setUnit,
         line: `BREAK TEST DUE: ${p.name} fell to ${modelsAfter}/${u.models} models (break at ${Math.round(breakAt * 100)}%): ${moraleText}. Roll it; on a failure ${setUnit}`
     };
+}
+
+/**
+ * The morale terms a unit brings to its break test: mob rule (+1 per `per`
+ * live models, plus allied units nearby when set, capped at maxBonus) and
+ * each battle-cry buff's moraleBonus. Pass them to breakTestDue.
+ */
+export function moraleModifiers(
+    p: CombatParticipant,
+    participants: CombatParticipant[] = [],
+    speciesOf?: SpeciesOf
+): MoraleModifier[] {
+    const out: MoraleModifier[] = [];
+    const mob = p.unit?.mobRule;
+    if (p.unit && mob) {
+        let models = liveModels(p);
+        if (mob.nearby) models += nearbyAllies(participants, p, { range: mob.nearby.range, match: mob.nearby.match, unitsOnly: true }, speciesOf).count;
+        let bonus = Math.floor(models / mob.per);
+        if (mob.maxBonus !== undefined) bonus = Math.min(bonus, mob.maxBonus);
+        if (bonus) out.push({ label: `mob rule (${models} models)`, value: bonus });
+    }
+    for (const b of p.buffs ?? []) if (b.moraleBonus) out.push({ label: b.name, value: b.moraleBonus });
+    return out;
+}
+
+/** Mob rule to hit: +1 per attackBonusPer live models, or 0. */
+export function mobAttackBonus(p: Pick<CombatParticipant, 'hp' | 'unit'>): { bonus: number; models: number } {
+    const per = p.unit?.mobRule?.attackBonusPer;
+    if (!p.unit || !per) return { bonus: 0, models: 0 };
+    const models = liveModels(p);
+    return { bonus: Math.floor(models / per), models };
 }
