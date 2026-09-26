@@ -41,7 +41,34 @@ export const ExitSchema = z.object({
         .describe('Type of terrain affecting travel speed and difficulty'),
     difficulty: z.number().int().min(5).max(30).optional()
         .describe('DC for Navigation or Survival checks if terrain is challenging'),
+    // Item 6: what the exit IS in the fiction (door, ladder, hatch, gate…),
+    // kept apart from type, which is only whether it can be passed.
+    kind: z.string().optional()
+        .describe('Free-text exit kind: door, passage, ladder, hatch, gate…'),
+    gateId: z.string().optional()
+        .describe('The gate this exit belongs to (spatial_manage gate_create)'),
 });
+
+/**
+ * Exits as spatial_manage link wrote them before item 6 carried a free-text
+ * type ('passage', 'door') the enum rejects, so the room never read. Read
+ * them as OPEN (LOCKED / HIDDEN when the text says so) with the text in kind.
+ */
+export function normalizeLegacyExit(raw: unknown): unknown {
+    if (!raw || typeof raw !== 'object') return raw;
+    const e = raw as Record<string, unknown>;
+    if (e.type === 'OPEN' || e.type === 'LOCKED' || e.type === 'HIDDEN') return e;
+    const text = typeof e.type === 'string' ? e.type : undefined;
+    return { ...e, type: exitTypeFor(text), ...(e.kind === undefined && text ? { kind: text } : {}) };
+}
+
+/** The exit enum a free-text exit kind implies: 'locked door' is LOCKED, 'secret passage' HIDDEN, anything else OPEN. */
+export function exitTypeFor(kind: string | undefined): 'OPEN' | 'LOCKED' | 'HIDDEN' {
+    const k = (kind ?? '').toLowerCase();
+    if (/\blocked\b/.test(k)) return 'LOCKED';
+    if (/\b(hidden|secret)\b/.test(k)) return 'HIDDEN';
+    return 'OPEN';
+}
 
 export type Exit = z.infer<typeof ExitSchema>;
 

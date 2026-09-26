@@ -9,9 +9,57 @@
  */
 import type Database from 'better-sqlite3';
 import { z } from 'zod';
-import { PartSchema, UnitSchema, ParticipantExtrasShape, type AttackProfile, type Part } from '../schema/token-extras.js';
+import { PartSchema, UnitSchema, ParticipantExtrasShape, nearbyMatchSchema, type AttackProfile, type Part } from '../schema/token-extras.js';
 import { expandCreatureTemplate, type CreaturePreset } from '../data/creature-presets.js';
 import { UNPRINTABLE_POOLS } from '../render/pda.js';
+import { scheduledWriteOpSchema } from './scheduled-ops.js';
+import { hpModeSchema } from './forms.js';
+import { EffectCategorySchema, EffectMechanicSchema } from '../schema/improvisation.js';
+
+/**
+ * What a roll_table entry does to the character it is rolled for, in this
+ * order: gift (an effect), condition and writes, form, then terminal death.
+ */
+const TableEntryApplySchema = z.object({
+    gift: z.object({
+        name: z.string().min(1),
+        description: z.string().optional(),
+        category: EffectCategorySchema.default('boon'),
+        powerLevel: z.number().int().min(1).max(5).default(1),
+        mechanics: z.array(EffectMechanicSchema).default([])
+    }).optional(),
+    condition: z.object({
+        name: z.string().min(1),
+        duration: z.number().int().optional(),
+        source: z.string().optional(),
+        pinned: z.boolean().optional()
+    }).optional(),
+    writes: z.array(scheduledWriteOpSchema()).optional(),
+    /** 'kill': the character dies (character_manage kill); the chain stops. */
+    terminal: z.literal('kill').optional(),
+    /** With terminal kill: leave a corpse (default false). */
+    corpse: z.boolean().optional(),
+    /** A creature rule or preset the character takes the form of; 'base' puts a form down. */
+    form: z.string().optional(),
+    hpMode: hpModeSchema().optional()
+}).passthrough();
+
+const SHORT_ABILITY_KEYS = ['str', 'dex', 'con', 'int', 'wis', 'cha'] as const;
+export type ShortAbility = typeof SHORT_ABILITY_KEYS[number];
+const LONG_TO_SHORT: Record<string, ShortAbility> = { strength: 'str', dexterity: 'dex', constitution: 'con', intelligence: 'int', wisdom: 'wis', charisma: 'cha' };
+const toShortAbility = (v: unknown) => {
+    if (typeof v !== 'string') return v;
+    const k = v.trim().toLowerCase();
+    return LONG_TO_SHORT[k] ?? k;
+};
+/** An ability named long or short, any case ('Strength', 'STR'), stored short. */
+const abilityShort = () => z.preprocess(toShortAbility, z.enum(SHORT_ABILITY_KEYS));
+const abilityBonusesSchema = () => z.preprocess(
+    (v) => v && typeof v === 'object' && !Array.isArray(v)
+        ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, n]) => [toShortAbility(k) as string, n]))
+        : v,
+    z.object({ str: z.number().int(), dex: z.number().int(), con: z.number().int(), int: z.number().int(), wis: z.number().int(), cha: z.number().int() }).partial().strict()
+);
 
 export const DEFAULT_BAND_ORDER = ['Mortal', 'Elite Mortal', 'Astartes', 'Astartes Elite', 'Monster/Lord', 'Primarch-class'];
 
@@ -45,7 +93,14 @@ export const RuleSpecSchemas = {
         catastrophicEffect: z.string().default('catastrophic')
     }).passthrough(),
     progression: z.object({
-        mode: z.enum(['milestone', 'xp']).default('milestone')
+        /** milestone: levels on the GM's call; xp: XP offers them; none: the world has no levelling. */
+        mode: z.enum(['milestone', 'xp', 'none']).default('milestone'),
+        /** Highest level a character may hold (default 20); null means no cap. */
+        maxLevel: z.number().int().min(1).nullable().optional(),
+        /** XP to reach each level from 1 ([0, 300, 900, ...]); the last step repeats past the end. */
+        xpThresholds: z.array(z.number().int().min(0)).min(2).optional(),
+        /** Proficiency bonus by level from 1; the last value holds past the end. */
+        profBonus: z.array(z.number().int()).min(1).optional()
     }).passthrough(),
     status_block: z.object({
         compact: z.boolean().default(true),
@@ -112,8 +167,187 @@ export const RuleSpecSchemas = {
         unit: UnitSchema.optional(),
         xpValue: z.number().min(0).optional(),
         traits: z.array(z.string()).default([])
+    }).passthrough(),
+    /**
+     * A random table (the Eye of the Gods, a miscast table, omens, weather).
+     * Entries are all weighted (cumulative ranges from 1) or all ranged
+     * (min..max on the die). table_rules roll rolls it; data, never enforced.
+     */
+    roll_table: z.object({
+        /** Default: 1d<total weight>, or 1d<highest max>. */
+        dice: z.string().optional(),
+        /** A character pool whose current value, ÷ poolDivisor (floored), adds to the roll. */
+        modifierPool: z.string().optional(),
+        poolDivisor: z.number().gt(0).default(1),
+        entries: z.array(z.object({
+            min: z.number().int().optional(),
+            max: z.number().int().optional(),
+            weight: z.number().int().positive().optional(),
+            text: z.string().min(1),
+            /** Another roll_table rule rolled after this entry. */
+            chain: z.string().optional(),
+            /** What the entry does to the character it is rolled for. */
+            apply: TableEntryApplySchema.optional()
+        }).passthrough()).min(1)
+    }).passthrough().superRefine(refineRollTable),
+    /**
+     * A family of rival pools (the gods' favour). adjust_pool {family} moves
+     * a member; a gain makes each jealous rival lose round(gain × fraction).
+     * floor (may be negative) and max clamp the family's pools.
+     */
+    pool_family: z.object({
+        pools: z.array(z.string().min(1)).min(1),
+        max: z.number().optional(),
+        floor: z.number().optional(),
+        /** jealousy[gainer][rival] = fraction of the gain the rival loses. */
+        jealousy: z.record(z.string(), z.record(z.string(), z.number().min(0))).default({}),
+        /** What an offering is worth: an item name, 'kill', or a deed. */
+        offering_values: z.record(z.string(), z.number()).default({})
+    }).passthrough(),
+    /**
+     * A world spell (item 9): cast_spell of this name rolls a casting roll
+     * (default 2d6) against a target instead of spending a slot. cost moves
+     * the caster's pools (signed; a spend it cannot pay is refused), effects
+     * land on the targets (or the caster), a contested spell can be unbound
+     * (combat_action unbinderId), and a miscast table rolls on a double, a
+     * failure or a fumble (every die a 1).
+     */
+    spell: z.object({
+        displayName: z.string().optional(),
+        castingRoll: z.object({
+            dice: z.string().min(1).default('2d6'),
+            modifier: z.number().int().default(0),
+            /** The caster's ability modifier adds to the roll. */
+            ability: abilityShort().optional(),
+            /** The total the casting roll must reach. */
+            target: z.number().int(),
+            /**
+             * Waaagh! energy: +1 per `per` allies within range feet that
+             * match (units count their live models), capped at max. At
+             * overloadAt or more the spell's miscast table rolls too.
+             */
+            bonusFromNearby: z.object({
+                range: z.number().min(0),
+                per: z.number().int().min(1).default(1),
+                max: z.number().int().min(0).optional(),
+                match: nearbyMatchSchema().default({}),
+                overloadAt: z.number().int().min(1).optional()
+            }).passthrough().optional()
+        }).passthrough().optional(),
+        contestedBy: z.literal('unbind').optional(),
+        /** Signed pool moves on the caster, paid whether or not the cast succeeds. */
+        cost: z.array(z.object({ pool: z.string().min(1), delta: z.number() }).passthrough()).default([]),
+        /** Feet, edge to edge; checked when both tokens are placed. */
+        range: z.number().min(0).optional(),
+        castingTime: z.enum(['action', 'bonus', 'reaction']).optional(),
+        effects: z.array(z.object({
+            type: z.enum(['damage', 'healing', 'condition', 'pool']),
+            dice: z.string().optional(),
+            damageType: z.string().optional(),
+            condition: z.string().optional(),
+            /** Rounds (condition). */
+            duration: z.number().int().min(1).optional(),
+            /** dc omitted = the casting total. */
+            save: z.object({ ability: abilityShort(), dc: z.number().int().optional() }).passthrough().optional(),
+            saveEffect: z.enum(['half', 'none']).default('none'),
+            pool: z.string().optional(),
+            delta: z.number().optional(),
+            target: z.enum(['target', 'caster']).default('target')
+        }).passthrough().superRefine((e, ctx) => {
+            if ((e.type === 'damage' || e.type === 'healing') && !e.dice) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['dice'], message: `a ${e.type} effect needs dice` });
+            if (e.type === 'condition' && !e.condition) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['condition'], message: 'a condition effect needs condition' });
+            if (e.type === 'pool' && (!e.pool || e.delta === undefined)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['pool'], message: 'a pool effect needs pool and delta' });
+        })).default([]),
+        miscast: z.object({ on: z.enum(['double', 'fail', 'fumble']), table: z.string().min(1) }).passthrough().optional(),
+        /** false: only a caster whose knownSpells lists it can cast it. */
+        known: z.boolean().default(true)
+    }).passthrough(),
+    /** A world skill: the ability it rolls with. Skill checks and stunts read it. */
+    skill: z.object({
+        ability: abilityShort(),
+        description: z.string().optional()
+    }).passthrough(),
+    /** A world species (character_manage create race:). Beats an SRD species of the same name. */
+    species: z.object({
+        size: ParticipantExtrasShape.size,
+        speed: z.number().int().min(0).optional(),
+        abilityBonuses: abilityBonusesSchema().optional(),
+        languages: z.array(z.string()).default([]),
+        traits: z.array(z.string()).default([]),
+        /** Extra max HP per level (like the Dwarven Toughness mechanic). */
+        hpPerLevel: z.number().int().optional()
+    }).passthrough(),
+    /** A world class (character_manage create class:). Beats an SRD class of the same name. */
+    char_class: z.object({
+        hitDie: z.number().int().min(1).default(8),
+        saves: z.array(abilityShort()).default([]),
+        /** Skill proficiencies the class grants at create. */
+        skills: z.array(z.string()).default([]),
+        armor: z.array(z.string()).optional(),
+        weapons: z.array(z.string()).optional(),
+        /** Casts SRD spells with the slots, ability and spell list of an SRD caster class. */
+        casting: z.object({ as: z.string().min(1) }).passthrough().optional()
+    }).passthrough(),
+    /** A world background (character_manage create background:). Beats an SRD background of the same name. */
+    background: z.object({
+        skills: z.array(z.string()).default([]),
+        languages: z.array(z.string()).default([]),
+        tools: z.array(z.string()).default([]),
+        /** Starting gold when the create call names none. */
+        gold: z.number().min(0).optional()
+    }).passthrough(),
+    /**
+     * A growth track: kills and victories feed a pool; crossing a step
+     * offers that step's form (growthReady) and never applies it.
+     */
+    growth_track: z.object({
+        pool: z.string().min(1),
+        steps: z.array(z.object({
+            at: z.number(),
+            form: z.string().min(1),
+            note: z.string().optional()
+        }).passthrough()).min(1),
+        /** Added to the killer's pool for each kill in combat. */
+        perKill: z.number().optional(),
+        /** Added per band step the victim stands at or above the killer (same band: once). */
+        perBandAbove: z.number().optional(),
+        /** Added to each surviving member by party_manage after_battle {victory: true}. */
+        perVictory: z.number().optional()
     }).passthrough()
 } as const;
+
+function refineRollTable(
+    spec: { entries: Array<{ min?: number; max?: number; weight?: number }> },
+    ctx: z.RefinementCtx
+): void {
+    const ranged = spec.entries.filter(e => e.min !== undefined);
+    if (ranged.length && ranged.length !== spec.entries.length) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries'], message: 'entries are all weighted (weight) or all ranged (min/max); do not mix them' });
+        return;
+    }
+    spec.entries.forEach((e, i) => {
+        if (e.min === undefined && e.max !== undefined) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', i, 'min'], message: 'max needs min' });
+        if (e.min !== undefined && e.weight !== undefined) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', i], message: 'an entry takes weight or min/max, not both' });
+        if (e.min !== undefined && e.max !== undefined && e.max < e.min) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', i, 'max'], message: 'max is below min' });
+    });
+    if (ranged.length) {
+        const spans = ranged.map((e, i) => ({ i, lo: e.min!, hi: e.max ?? e.min! })).sort((a, b) => a.lo - b.lo);
+        for (let k = 1; k < spans.length; k++) {
+            if (spans[k].lo <= spans[k - 1].hi) {
+                ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['entries', spans[k].i], message: `ranges overlap (${spans[k - 1].lo}-${spans[k - 1].hi} and ${spans[k].lo}-${spans[k].hi})` });
+            }
+        }
+    }
+}
+
+/**
+ * Kinds that are the world's data (a bestiary, tables, spells, character
+ * options), not rules the engine enforces: boot counts them instead of
+ * listing them as enforced. Some kinds here arrive in later releases.
+ */
+export const DATA_KINDS: ReadonlySet<string> = new Set([
+    'creature', 'roll_table', 'pool_family', 'spell', 'skill', 'species', 'char_class', 'background', 'growth_track'
+]);
 
 export type RuleKind = keyof typeof RuleSpecSchemas;
 export const RULE_KINDS = Object.keys(RuleSpecSchemas) as RuleKind[];
@@ -176,6 +410,37 @@ export function loadRules<K extends RuleKind>(db: Database.Database, worldId: st
 export function loadRule<K extends RuleKind>(db: Database.Database, worldId: string | null | undefined, kind: K, name?: string): TableRule<K> | undefined {
     const rules = loadRules(db, worldId, kind);
     return name ? rules.find(r => r.name.toLowerCase() === name.toLowerCase()) : rules[0];
+}
+
+/** Case, space, underscore and hyphen blind: 'Waaagh Lore' = 'waaagh_lore'. */
+function nameKey(s: string): string { return s.toLowerCase().replace(/[\s_-]+/g, ''); }
+
+/** A world's enabled rule of a kind by name, matched blind to case, spaces and underscores. */
+export function findWorldRule<K extends RuleKind>(db: Database.Database, worldId: string | null | undefined, kind: K, name: string | null | undefined): TableRule<K> | undefined {
+    if (!worldId || !name) return undefined;
+    const key = nameKey(name);
+    return loadRules(db, worldId, kind).find(r => nameKey(r.name) === key);
+}
+
+/** The ability a world skill rolls with, or undefined when the world defines no such skill. */
+export function worldSkillAbility(db: Database.Database, worldId: string | null | undefined, skill: string | null | undefined): ShortAbility | undefined {
+    return findWorldRule(db, worldId, 'skill', skill)?.spec.ability;
+}
+
+/** A world class's casting ({as: SRD caster class}), or undefined. */
+export function worldClassCasting(db: Database.Database, worldId: string | null | undefined, className: string | null | undefined): { as: string } | undefined {
+    const casting = findWorldRule(db, worldId, 'char_class', className)?.spec.casting;
+    return casting ? { as: casting.as } : undefined;
+}
+
+/**
+ * The class a character casts SRD spells as: its world class's casting.as,
+ * else its own class. Slot tables, the casting ability and spell lists read
+ * this name; the sheet keeps its own class.
+ */
+export function castingClassFor(db: Database.Database, character: { id: string; characterClass?: string | null }): string | undefined {
+    const worldId = resolveWorldId(db, { characterIds: [character.id] });
+    return worldClassCasting(db, worldId, character.characterClass)?.as ?? character.characterClass ?? undefined;
 }
 
 /**
@@ -272,6 +537,22 @@ export function conditionsForDisplay<C extends { pinned?: boolean }>(conditions:
 /** The world's band order, or the Day 366 default when no band rule exists. */
 export function bandOrder(db: Database.Database, worldId: string | null | undefined): string[] {
     return loadRule(db, worldId, 'band')?.spec.order ?? DEFAULT_BAND_ORDER;
+}
+
+/**
+ * The band order that ranks these bands. A world can hold several band
+ * rules (day-366's 'bands' beside orruk-waaagh's 'orruk-bands'); the first
+ * by name may know neither band. Reads the first enabled band rule whose
+ * order contains every band given, else falls back to bandOrder.
+ */
+export function bandOrderFor(db: Database.Database, worldId: string | null | undefined, bands: Array<string | null | undefined>): string[] {
+    const want = bands.filter((b): b is string => !!b && !!b.trim()).map(b => b.trim().toLowerCase());
+    if (want.length) {
+        const holds = (order: string[]) => want.every(w => order.some(o => o.toLowerCase() === w));
+        const hit = loadRules(db, worldId, 'band').find(r => holds(r.spec.order));
+        if (hit) return hit.spec.order;
+    }
+    return bandOrder(db, worldId);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -385,7 +666,9 @@ export function creatureToParticipant(spec: CreatureSpec, opts: { id: string; na
         regeneration: spec.regeneration,
         band: spec.band,
         parts,
-        unit: spec.unit ? copy(spec.unit) : undefined
+        unit: spec.unit ? copy(spec.unit) : undefined,
+        species: spec.species,
+        tags: spec.tags ? [...spec.tags] : undefined
     };
     for (const [k, v] of Object.entries(optional)) if (v !== undefined) out[k] = v;
     return out;

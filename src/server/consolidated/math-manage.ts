@@ -3,6 +3,7 @@
  * Replaces 5 separate tools: dice_roll, probability_calculate, algebra_solve, algebra_simplify, physics_projectile
  */
 
+import { matchUniqueLabel } from '../../utils/match-label.js';
 import { z } from 'zod';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { SessionContext } from '../types.js';
@@ -16,6 +17,8 @@ import { PhysicsEngine } from '../../math/physics.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { loadAutoMechanics, autoSkillBonus, autoSaveBonus, autoAdvantage, applyDeclaredEffects } from '../../engine/effects-resolver.js';
 import { parseAbility } from '../../engine/combat/conditions.js';
+import { resolveWorldId, worldSkillAbility } from '../../engine/table-rules.js';
+import { worldProgression } from '../../engine/progression.js';
 import * as pda from '../../render/pda.js';
 import { ExportEngine } from '../../math/export.js';
 import { CalculationRepository, StoredCalculation } from '../../storage/repos/calculation.repo.js';
@@ -134,7 +137,6 @@ const OpposedSchema = z.object({
 // concentration saves roll and log the same way.
 
 function abilityMod(score: number): number { return Math.floor((score - 10) / 2); }
-function profBonus(level: number): number { return Math.floor((level - 1) / 4) + 2; }
 
 async function handleCharacterRoll(
     kind: 'skill' | 'ability' | 'save',
@@ -151,6 +153,10 @@ async function handleCharacterRoll(
     // SQL from here down.
     const charId = char.id;
     args = { ...args, characterId: charId };
+    // Item 10: the proficiency curve is the world's (table_rules progression).
+    const worldId = resolveWorldId(db, { characterIds: [charId] });
+    const progression = worldProgression(db, worldId);
+    const profBonus = (level: number) => progression.profBonus(level);
 
     const stats = char.stats as Record<string, number>;
     // FINDINGS #104: membership tests below were CASE-SENSITIVE while sheets
@@ -174,7 +180,8 @@ async function handleCharacterRoll(
 
     if (kind === 'skill') {
         const skill = (args.skill || '').toLowerCase().replace(/ /g, '_');
-        const ability = args.ability || SKILL_ABILITY[skill] || 'wis';
+        // Item 8: a world skill (table_rules skill) names its own ability.
+        const ability = args.ability || worldSkillAbility(db, worldId, args.skill) || SKILL_ABILITY[skill] || 'wis';
         const mod = abilityMod(stats[ability] ?? 10);
         // #67-E: stealth/perception COLUMNS are authoritative when present.
         // The eavesdrop listener layer already rolls these columns (Findings
@@ -302,15 +309,16 @@ async function handleCharacterRoll(
         const resolveSource = (text: string, which: string): string | undefined => {
             const t = text.trim().toLowerCase();
             if (!t) { resolverProblems.push(`${which} source "" is empty — nothing granted`); return undefined; }
-            // One hit per distinct name: a condition and the feature made from it count once.
-            const hits = new Map<string, string>();
-            for (const c of conds) {
-                if (c.name.toLowerCase().includes(t) || (c.source ?? '').toLowerCase().includes(t)) hits.set(shortName(c.name).toLowerCase(), shortName(c.name));
-            }
-            for (const n of effectNames) if (n.toLowerCase().includes(t)) hits.set(n.toLowerCase(), n);
-            if (hits.size === 1) return [...hits.values()][0];
-            resolverProblems.push(hits.size
-                ? `${which} source "${text}" matches ${hits.size} conditions or effects [${[...hits.values()].join(' | ')}] — use more of the text; nothing granted`
+            // One hit per distinct name: a condition and the feature made from it
+            // count once. Exact beats prefix beats substring (matchUniqueLabel).
+            const candidates = [
+                ...conds.map(c => ({ label: shortName(c.name), texts: [shortName(c.name), c.name, c.source ?? ''], value: shortName(c.name) })),
+                ...effectNames.map(n => ({ label: n, texts: [n], value: n }))
+            ];
+            const m = matchUniqueLabel(candidates, t);
+            if ('match' in m) return m.match;
+            resolverProblems.push('ambiguous' in m
+                ? `${which} source "${text}" matches ${m.ambiguous.length} conditions or effects by ${m.tier} [${m.ambiguous.join(' | ')}] — use more of the text; nothing granted`
                 : `${which} source "${text}" matches nothing in ${char.name}'s conditions or active effects — nothing granted`);
             return undefined;
         };

@@ -3,6 +3,7 @@ import type Database from 'better-sqlite3';
 import { freshSeed } from './seed.js';
 import { recordRolls, type RollLogEntry } from '../storage/roll-log.js';
 import { currentOperation } from '../server/operation-guard.js';
+import { parseDiceTerms } from '../engine/combat/rng.js';
 
 /**
  * Seeded d20 for rolls made outside an encounter's stream (math_manage
@@ -57,4 +58,70 @@ export function loggedDice(
         dice: rolls.map(value => ({ sides, value })), result: total, replay: seed
     }, tool);
     return { rolls, total, seed, rollId };
+}
+
+/**
+ * Any dice notation ('2d6+1', '1d100', '1d4-1d4+10'), seeded and logged. The
+ * seed is kept so roll_log can replay it; pass one only to replay exactly.
+ * rolls are the dice in order, negative for a subtracted term.
+ */
+export function loggedRoll(
+    db: Database.Database,
+    tag: { purpose: string; forId?: string; targetId?: string },
+    notation: string,
+    opts: { seed?: string; tool?: string } = {}
+): { total: number; rolls: number[]; seed: string; rollId?: string } {
+    const terms = parseDiceTerms(notation);
+    const seed = opts.seed ?? freshSeed(tag.purpose.replace(/\s+/g, '-'));
+    const rng = seedrandom(seed);
+    const rolls: number[] = [];
+    const dice: Array<{ sides: number; value: number }> = [];
+    let total = 0;
+    for (const t of terms) {
+        if (t.kind === 'dice') {
+            for (let i = 0; i < t.count; i++) {
+                const v = Math.floor(rng() * t.sides) + 1;
+                dice.push({ sides: t.sides, value: v });
+                rolls.push(t.sign * v);
+                total += t.sign * v;
+            }
+        } else total += t.sign * t.value;
+    }
+    const rollId = logRoll(db, {
+        purpose: tag.purpose, forId: tag.forId, targetId: tag.targetId, expression: notation.replace(/\s+/g, ''),
+        dice, result: total, replay: seed
+    }, opts.tool);
+    return { total, rolls, seed, rollId };
+}
+
+/**
+ * The one dice shape tables, miscasts and offerings take: roll a notation
+ * under a purpose tag. loggedRoller rolls outside an encounter;
+ * engineRoller rolls on an encounter's own seeded stream.
+ */
+export type DiceRoller = (notation: string, tag: string) => { total: number; rolls: number[]; rollId?: string; seed?: string };
+
+/**
+ * A DiceRoller on loggedRoll. With a seed, the roller's n-th roll uses
+ * `${seed}` (n = 0) then `${seed}:${n}`, so a whole sequence (a table and
+ * its chains) replays from one seed.
+ */
+export function loggedRoller(db: Database.Database, opts: { forId?: string; targetId?: string; tool?: string; seed?: string } = {}): DiceRoller {
+    let n = 0;
+    return (notation, tag) => {
+        const seed = opts.seed === undefined ? undefined : n === 0 ? opts.seed : `${opts.seed}:${n}`;
+        n++;
+        return loggedRoll(db, { purpose: tag, forId: opts.forId, targetId: opts.targetId }, notation, { seed, tool: opts.tool });
+    };
+}
+
+/** A DiceRoller on an encounter's stream (CombatEngine.rollDice), tagged for roll_log. */
+export function engineRoller(
+    engine: { rollDice(notation: string, tag: { purpose: string; forId?: string; targetId?: string }): { total: number; rolls: number[] } },
+    opts: { forId?: string; targetId?: string } = {}
+): DiceRoller {
+    return (notation, tag) => {
+        const r = engine.rollDice(notation, { purpose: tag, ...(opts.forId ? { forId: opts.forId } : {}), ...(opts.targetId ? { targetId: opts.targetId } : {}) });
+        return { total: r.total, rolls: r.rolls };
+    };
 }

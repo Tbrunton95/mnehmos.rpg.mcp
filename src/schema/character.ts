@@ -117,6 +117,12 @@ export const CharacterSchema = z.object({
     abilities: z.array(AbilitySchema).optional(),
     cr: z.number().min(0).optional(),
     autoLegendaryResistance: z.boolean().optional(),
+    /** The form a character has taken (character_manage set_form): its name and the sheet's own values to go back to. */
+    form: z.object({
+        name: z.string(),
+        since: z.string().optional(),
+        base: z.record(z.string(), z.unknown())
+    }).optional(),
 
     // Spellcasting fields (CRIT-002/006)
     // Flexible character class - allows any string (standard D&D classes or custom like "Chronomancer")

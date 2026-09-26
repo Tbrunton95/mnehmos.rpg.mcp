@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { RoomNode, RoomNodeSchema, Exit, NodeNetwork, NodeNetworkSchema } from '../../schema/spatial.js';
+import { RoomNode, RoomNodeSchema, Exit, NodeNetwork, NodeNetworkSchema, normalizeLegacyExit } from '../../schema/spatial.js';
 
 export class SpatialRepository {
     constructor(private db: Database.Database) { }
@@ -297,7 +297,7 @@ export class SpatialRepository {
             baseDescription: row.base_description,
             biomeContext: row.biome_context,
             atmospherics: JSON.parse(row.atmospherics),
-            exits: JSON.parse(row.exits),
+            exits: (JSON.parse(row.exits) as unknown[]).map(normalizeLegacyExit),
             entityIds: JSON.parse(row.entity_ids),
             createdAt: row.created_at,
             updatedAt: row.updated_at,

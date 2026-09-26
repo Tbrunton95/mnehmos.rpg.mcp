@@ -4,6 +4,17 @@ import { CharacterRepository } from '../../src/storage/repos/character.repo.js';
 import { handleExecuteCombatAction, handleCreateEncounter, handleGetEncounterState, clearCombatState } from '../../src/server/handlers/combat-handlers.js';
 import { closeDb, getDb } from '../../src/storage/index.js';
 import { CombatEngine } from '../../src/engine/combat/engine.js';
+import { parseDiceTerms } from '../../src/engine/combat/rng.js';
+
+function maxDice(notation: string) {
+    const rolls: number[] = []; let modifier = 0;
+    for (const t of parseDiceTerms(notation)) {
+        if (t.kind === 'dice') for (let i = 0; i < t.count; i++) rolls.push(t.sign * t.sides);
+        else modifier += t.sign * t.value;
+    }
+    const diceTotal = rolls.reduce((a, b) => a + b, 0);
+    return { notation, rolls, diceTotal, modifier, total: diceTotal + modifier };
+}
 import { getInitialSpellSlots, getMaxSpellLevel } from '../../src/engine/magic/spell-validator.js';
 import { resolveSpell } from '../../src/engine/magic/spell-resolver.js';
 import { getSpell } from '../../src/engine/magic/spell-database.js';
@@ -76,7 +87,8 @@ describe('cast_spell damage modifiers', () => {
         }, ctx as any);
         const encounterId = created.content[0].text.match(/Encounter ID: (encounter-[^\n]+)/)![1];
         // 8d6 all sixes = 48 fire; every d20 = 20, so the save passes: 24.
-        vi.spyOn(Math, 'random').mockReturnValue(0.99);
+        // Spell damage rolls on the encounter's dice: every die at its maximum.
+        vi.spyOn(CombatEngine.prototype, 'rollDice').mockImplementation((n: string) => maxDice(n));
         // The save rolls on the encounter's seeded stream now.
         vi.spyOn(CombatEngine.prototype, 'rollD20').mockReturnValue(20);
         await handleExecuteCombatAction({ encounterId, action: 'cast_spell', actorId: wizardId, spellName: 'Fireball', targetId: 'dummy' }, ctx as any);

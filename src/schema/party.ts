@@ -44,6 +44,11 @@ export const PartyMemberSchema = z.object({
     sharePercentage: z.number().int().min(0).max(100).default(100),
     joinedAt: z.string().datetime(),
     notes: z.string().optional(),
+    // Item 7: the warband. Unset loyalty reads 5.
+    loyalty: z.number().int().min(0).max(10).nullable().optional(),
+    wage: z.number().min(0).nullable().optional(),
+    payMode: z.enum(['wage', 'share', 'none']).nullable().optional(),
+    unitModels: z.number().int().min(0).nullable().optional(),
 });
 
 export type PartyMember = z.infer<typeof PartyMemberSchema>;

@@ -24,6 +24,7 @@ import {
 } from '../../schema/improvisation.js';
 import { loadAutoMechanics, autoSkillBonus, applyDeclaredEffects } from '../../engine/effects-resolver.js';
 import { freshSeed } from '../../math/seed.js';
+import { resolveWorldId, worldSkillAbility } from '../../engine/table-rules.js';
 import { getOrLoadEngine, syncParticipantHpFromDb } from '../handlers/combat-handlers.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 
@@ -37,12 +38,18 @@ const ACTIONS = [
 ] as const;
 type ImprovisationAction = typeof ACTIONS[number];
 
-const SkillEnum = z.enum([
-    'acrobatics', 'animal_handling', 'arcana', 'athletics', 'deception',
-    'history', 'insight', 'intimidation', 'investigation', 'medicine',
-    'nature', 'perception', 'performance', 'persuasion', 'religion',
-    'sleight_of_hand', 'stealth', 'survival'
-]);
+// Item 8: any skill name. An SRD skill maps to its ability; a world skill
+// (table_rules skill) names its own; anything else needs `ability`.
+const skillField = () => z.string().trim().min(1);
+const LONG_ABILITY: Record<string, string> = { str: 'strength', dex: 'dexterity', con: 'constitution', int: 'intelligence', wis: 'wisdom', cha: 'charisma' };
+const stuntAbilityField = () => z.preprocess(
+    (v) => {
+        if (typeof v !== 'string') return v;
+        const k = v.trim().toLowerCase();
+        return LONG_ABILITY[k] ?? k;
+    },
+    z.enum(['strength', 'dexterity', 'constitution', 'intelligence', 'wisdom', 'charisma'])
+);
 
 const DamageTypeEnum = z.enum([
     'bludgeoning', 'piercing', 'slashing', 'fire', 'cold', 'lightning',
@@ -137,8 +144,7 @@ function rollD20(advantage?: boolean, disadvantage?: boolean, rng?: seedrandom.P
     return { roll: roll1, rolls: [roll1] };
 }
 
-function getSkillModifier(stats: Record<string, number>, skill: SkillName): number {
-    const ability = SKILL_TO_ABILITY[skill];
+function getSkillModifier(stats: Record<string, number>, ability: string): number {
     const abilityScore = stats[ability.substring(0, 3)] ?? stats[ability] ?? 10;
     return Math.floor((abilityScore - 10) / 2);
 }
@@ -160,7 +166,8 @@ const StuntSchema = z.object({
     targetTypes: z.array(z.enum(['character', 'npc'])).optional(),
     narrativeIntent: defaultText('Improvised action')
         .describe('What the character is attempting; defaults to a generic improvised action'),
-    skill: SkillEnum,
+    skill: skillField(),
+    ability: stuntAbilityField().optional().describe('Item 8: the ability the stunt rolls with; needed for a skill that is neither SRD nor a world skill'),
     dc: z.number().int().min(5).max(35),
     advantage: z.boolean().optional(),
     disadvantage: z.boolean().optional(),
@@ -387,6 +394,15 @@ function normalizeMechanics<T extends { type: string }>(mechanics: T[] | undefin
 
 async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionContext): Promise<object> {
     const { db, charRepo } = ensureDb();
+    // Item 8: which ability the skill rolls with, before any die is rolled.
+    const srdSkill = args.skill.toLowerCase().replace(/[\s-]+/g, '_') as SkillName;
+    const worldAbility = worldSkillAbility(db, resolveWorldId(db, { encounterId: args.encounterId, characterIds: [args.actorId] }), args.skill);
+    const stuntAbility = args.ability
+        ?? (worldAbility ? LONG_ABILITY[worldAbility] : undefined)
+        ?? (Object.hasOwn(SKILL_TO_ABILITY, srdSkill) ? SKILL_TO_ABILITY[srdSkill] : undefined);
+    if (!stuntAbility) {
+        throw new Error(`Skill '${args.skill}' is not an SRD skill or a skill this world defines (table_rules skill): pass ability (str, dex, con, int, wis or cha) for it. Nothing was rolled.`);
+    }
     const seed = freshSeed(`stunt-${args.encounterId || 'free'}-${args.actorId}`);
     const rng = seedrandom(seed);
 
@@ -417,7 +433,7 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
         const actor = charRepo.findById(args.actorId);
         if (actor?.stats) {
             actorName = actor.name;
-            const abilityPart = getSkillModifier(actor.stats as Record<string, number>, args.skill);
+            const abilityPart = getSkillModifier(actor.stats as Record<string, number>, stuntAbility);
             const skillKey = (args.skill || '').toLowerCase().replace(/ /g, '_');
             // #67-E: stealth/perception columns are authoritative on stunts too —
             // same displacement rule as roll_skill_check; one number per character.
@@ -1179,7 +1195,8 @@ ARCANE SYNTHESIS:
         targetIds: z.array(z.string()).optional(),
         targetTypes: z.array(z.enum(['character', 'npc'])).optional(),
         narrativeIntent: z.string().optional(),
-        skill: z.string().optional(),
+        skill: z.string().optional().describe('Stunt: any skill. SRD skills and world skills (table_rules skill) know their ability; others need ability'),
+        ability: z.string().optional().describe('Stunt: the ability to roll with (str/dex/con/int/wis/cha, long or short)'),
         dc: z.number().optional(),
         xpAward: z.number().optional().describe('XP credited to the actor (stunt)'),
         advantage: z.boolean().optional(),

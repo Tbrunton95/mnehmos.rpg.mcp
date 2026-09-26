@@ -8,6 +8,7 @@ import { randomUUID } from 'crypto';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { CorpseRepository } from '../../storage/repos/corpse.repo.js';
 import { getDb } from '../../storage/index.js';
+import { logRoll } from '../../math/logged-d20.js';
 import { characterLexicon } from '../../engine/table-rules.js';
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
@@ -113,7 +114,8 @@ const GenerateLootSchema = z.object({
     action: z.literal('generate_loot'),
     corpseId: z.string().describe('Corpse to generate loot for'),
     creatureType: z.string().describe('Creature type for loot table'),
-    cr: z.number().optional().describe('Challenge rating for loot scaling')
+    cr: z.number().optional().describe('Challenge rating for loot scaling'),
+    seed: z.string().optional().describe('Replay exact loot dice (echoed in the result). Leave out for a fresh roll')
 });
 
 const AdvanceDecaySchema = z.object({
@@ -386,7 +388,14 @@ const definitions: Record<CorpseAction, ActionDefinition> = {
         schema: GenerateLootSchema,
         handler: async (params: z.infer<typeof GenerateLootSchema>) => {
             const repo = getRepo();
-            const result = repo.generateLoot(params.corpseId, params.creatureType, params.cr);
+            const result = repo.generateLoot(params.corpseId, params.creatureType, params.cr, { seed: params.seed });
+            // Seeded in the repository, logged here: the seed replays the loot.
+            const rollId = result.draws.length ? logRoll(getDb(), {
+                purpose: `loot ${params.creatureType}`, forId: params.corpseId,
+                expression: result.draws.map(d => `d${d.sides}`).join(','),
+                dice: result.draws.map(d => ({ sides: d.sides, value: d.value })),
+                result: result.currency.gold, replay: result.seed
+            }, 'corpse_manage') : undefined;
             return {
                 success: true,
                 corpseId: params.corpseId,
@@ -396,10 +405,12 @@ const definitions: Record<CorpseAction, ActionDefinition> = {
                     items: result.itemsAdded,
                     currency: result.currency,
                     harvestable: result.harvestable
-                }
+                },
+                seed: result.seed,
+                ...(rollId ? { rollId } : {})
             };
         },
-        aliases: ['gen_loot', 'roll_loot']
+        aliases: ['gen_loot', 'roll_loot', 'loot_table_roll']
     },
 
     advance_decay: {
@@ -562,7 +573,7 @@ export const CorpseManageTool = {
 
 📋 LOOT TABLES:
 - loot_table_create: Define drop tables for creature types
-- loot_table_roll: Generate random loot from table
+- generate_loot {corpseId, creatureType, cr?, seed?} (alias loot_table_roll, roll_loot): roll a corpse's loot from its table on seeded, logged dice
 
 ⏰ DECAY SYSTEM:
 - advance_decay: Progress corpse decay state
@@ -579,6 +590,7 @@ Aliases: spawn→create, take→loot, skin→harvest`,
         characterType: z.enum(['pc', 'npc', 'enemy', 'neutral']).optional(),
         creatureType: z.string().optional().describe('Creature type'),
         cr: z.number().optional().describe('Challenge rating'),
+        seed: z.string().optional().describe('generate_loot: replay exact loot dice'),
         worldId: z.string().optional(),
         regionId: z.string().optional(),
         encounterId: z.string().optional(),

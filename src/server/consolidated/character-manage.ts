@@ -12,8 +12,13 @@
  * - level_up -> action: 'level_up'
  */
 
-import { loadRule, resolveWorldId, findPool, worldLexicon, conditionsForDisplay, shownCounters } from '../../engine/table-rules.js';
+import { loadRule, loadRules, findWorldRule, castingClassFor, resolveWorldId, findPool, worldLexicon, conditionsForDisplay, shownCounters, resolveCreature, creatureToParticipant } from '../../engine/table-rules.js';
+import { worldProgression, levelCapProblem } from '../../engine/progression.js';
+import { FORM_KEYS, sheetFromCreature, snapshotBase, nextHp, hpModeSchema, type HpMode } from '../../engine/forms.js';
+import { pushSheetToLiveTokens } from '../handlers/combat-handlers.js';
 import { readWorldClock, dayClock, SET_CLOCK_HINT } from '../../engine/world-clock.js';
+import { scheduledWriteOpSchema, applyScheduledOps, type ScheduledWriteOp } from '../../engine/scheduled-ops.js';
+import { applyFamilyDelta, familyMember, type FamilyMove } from '../../engine/pool-family.js';
 import { z } from 'zod';
 import { ParticipantExtrasShape, SizeCategorySchema } from '../../schema/token-extras.js';
 import { randomUUID } from 'crypto';
@@ -32,11 +37,14 @@ import {
 import { resolveInstance, mintInstance } from './inventory-manage.js';
 import { provisionStartingEquipment } from '../../services/starting-equipment.service.js';
 import { CLASS_DATA, getSpellSlots, isSpellcaster } from '../../data/class-starting-data.js';
+import { restoreAllSpellSlots } from '../../engine/magic/spell-validator.js';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { CorpseRepository } from '../../storage/repos/corpse.repo.js';
+import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
 import { SceneRepository } from '../../storage/repos/scene.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { RichFormatter } from '../utils/formatter.js';
+import { growthReadyFor } from '../growth.js';
 import {
     CharacterOptionCategory,
     findOpen5eBackground,
@@ -50,16 +58,10 @@ import {
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'update', 'list', 'delete', 'kill', 'add_xp', 'adjust_pool', 'get_progression', 'level_up', 'schedule_change', 'process_scheduled', 'list_scheduled', 'cancel_scheduled', 'scope_scheduled', 'scope_characters', 'get_status_block', 'options'] as const;
+const ACTIONS = ['create', 'get', 'update', 'list', 'delete', 'kill', 'add_xp', 'adjust_pool', 'get_progression', 'level_up', 'schedule_change', 'process_scheduled', 'list_scheduled', 'cancel_scheduled', 'scope_scheduled', 'scope_characters', 'get_status_block', 'options', 'set_form', 'offer'] as const;
 type CharacterAction = typeof ACTIONS[number];
 
 const CharacterTypeSchema = z.enum(['pc', 'npc', 'enemy', 'neutral']);
-
-const XP_TABLE: Record<number, number> = {
-    1: 0, 2: 300, 3: 900, 4: 2700, 5: 6500, 6: 14000, 7: 23000, 8: 34000,
-    9: 48000, 10: 64000, 11: 85000, 12: 100000, 13: 120000, 14: 140000,
-    15: 165000, 16: 195000, 17: 225000, 18: 265000, 19: 305000, 20: 355000
-};
 
 const CLASS_SAVE_KEYS: Record<string, z.infer<typeof SaveProficiencySchema>> = {
     strength: 'str',
@@ -142,8 +144,8 @@ const CreateSchema = z.object({
     hp: z.number().int().min(1).optional(),
     maxHp: z.number().int().min(1).optional(),
     ac: z.number().int().min(0).optional(),
-    level: z.number().int().min(1).max(20).optional().default(1)
-        .describe('Starting character level, from 1 through 20; determines class progression, features, and spell slots'),
+    level: z.number().int().min(1).optional().default(1)
+        .describe("Starting character level, 1 to the world's max (20 unless a table_rules progression rule sets maxLevel); determines class progression, features, and spell slots"),
     characterType: CharacterTypeSchema.optional().default('pc'),
     factionId: z.string().optional(),
     behavior: z.string().optional(),
@@ -205,8 +207,8 @@ const UpdateSchema = z.object({
     hp: z.number().int().min(0).optional(),
     maxHp: z.number().int().min(1).optional(),
     ac: z.number().int().min(0).optional(),
-    level: z.number().int().min(1).max(20).optional()
-        .describe('Character level, from 1 through 20'),
+    level: z.number().int().min(1).optional()
+        .describe("Character level, 1 to the world's max (20 unless a table_rules progression rule sets maxLevel)"),
     xp: z.number().int().min(0).optional().describe('Findings #43: absolute XP set — the surgical correction verb the double-fire revert lacked. Audited like every xp write'),
     characterType: CharacterTypeSchema.optional(),
     stats: StatsSchema.partial().optional(),
@@ -269,7 +271,9 @@ const AdjustPoolSchema = z.object({
     label: z.string().optional().describe("Display name for the counter (\"An'ggrath's calls\"); shown at boot and on the status block"),
     note: z.string().optional().describe('What the counter is, or to whom it is owed'),
     show: z.boolean().optional().describe('true: list it in the boot digest and the status block; false hides it again'),
-    linkItem: z.string().optional().describe("Item template or instance id the character owns (a token, a charm). The pool is authoritative: the item's charges mirror it on every write, and inventory_manage adjust_charges on it is refused")
+    linkItem: z.string().optional().describe("Item template or instance id the character owns (a token, a charm). The pool is authoritative: the item's charges mirror it on every write, and inventory_manage adjust_charges on it is refused"),
+    family: z.string().optional().describe("A pool_family rule (the gods' favour): the pool moves inside its family, so a gain makes jealous rivals lose and the family's floor/max clamp. Delta only; returns rivals[]"),
+    worldId: z.string().optional().describe("family: the world whose pool_family rule to read (default: the character's)")
 });
 
 const ListSchema = z.object({
@@ -297,15 +301,7 @@ const DeleteSchema = z.object({
 // write_audit through characterRepo.update — the audit outranks memory (#51).
 const mendJsonIfString = (v: unknown) => { if (typeof v === 'string') { try { return JSON.parse(v); } catch { return v; } } return v; };
 
-const ScheduledWriteOpSchema = z.object({
-    op: z.enum(['adjust_pool', 'adjust_hp', 'adjust_max_hp', 'add_condition', 'remove_condition']),
-    pool: z.string().optional().describe('Pool name (adjust_pool)'),
-    delta: z.number().optional().describe('Delta (adjust_pool / adjust_hp / adjust_max_hp)'),
-    max: z.number().optional().describe('Pool max update (adjust_pool)'),
-    name: z.string().optional().describe('Condition name (add_condition / remove_condition)'),
-    duration: z.number().optional().describe('Condition duration (add_condition)'),
-    source: z.string().optional().describe('Condition source (add_condition; default "mend clock")')
-});
+const ScheduledWriteOpSchema = scheduledWriteOpSchema();
 
 const ScheduleChangeSchema = z.object({
     action: z.literal('schedule_change'),
@@ -545,15 +541,16 @@ const AddXpSchema = z.object({
 
 const GetProgressionSchema = z.object({
     action: z.literal('get_progression'),
-    level: z.number().int().min(1).max(20).optional().describe('Level to check progression for (table lookup mode)'),
-    characterId: z.string().optional().describe('Findings #35: character mode — reads the row and reports current XP vs thresholds')
+    level: z.number().int().min(1).optional().describe('Level to check progression for (table lookup mode)'),
+    characterId: z.string().optional().describe('Findings #35: character mode — reads the row and reports current XP vs thresholds'),
+    worldId: z.string().optional().describe("Item 10: table mode reads this world's progression rule (default: the SRD table)")
 });
 
 const LevelUpSchema = z.object({
     action: z.literal('level_up'),
     characterId: z.string().describe('Character ID'),
     hpIncrease: z.number().int().min(0).optional(),
-    targetLevel: z.number().int().min(2).max(20).optional()
+    targetLevel: z.number().int().min(2).optional()
 });
 
 const OptionCategorySchema = z.enum(['all', 'classes', 'species', 'backgrounds', 'skills', 'languages', 'alignments']);
@@ -561,7 +558,8 @@ const OptionCategorySchema = z.enum(['all', 'classes', 'species', 'backgrounds',
 const OptionsSchema = z.object({
     action: z.literal('options'),
     category: OptionCategorySchema.optional().default('all'),
-    query: z.string().optional().describe('Optional case-insensitive name filter')
+    query: z.string().optional().describe('Optional case-insensitive name filter'),
+    worldId: z.string().optional().describe("Item 8: also list the world's own classes, species, backgrounds and skills (table_rules char_class, species, background, skill)")
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -632,21 +630,29 @@ function initialHitPoints(hitDie: number, constitutionModifier: number, level: n
 }
 
 function levelUpHitPointRule(character: {
+    id?: string;
     characterClass?: string | null;
     race?: string | null;
     stats: { con: number };
 }, levelsGained: number) {
     const className = character.characterClass || 'Adventurer';
-    const classSource = findOpen5eClass(className);
-    const classData = CLASS_DATA[className.trim().toLowerCase().replace(/^srd[-_:]/, '')];
-    const hitDie = classSource?.hitDie
+    // Item 8: a world class's hit die and a world species' HP per level first.
+    const db = getDb();
+    const worldId = character.id ? resolveWorldId(db, { characterIds: [character.id] }) : null;
+    const worldClass = findWorldRule(db, worldId, 'char_class', className)?.spec;
+    const worldSpecies = findWorldRule(db, worldId, 'species', character.race)?.spec;
+    const classSource = worldClass ? undefined : findOpen5eClass(className);
+    const classData = worldClass ? undefined : CLASS_DATA[className.trim().toLowerCase().replace(/^srd[-_:]/, '')];
+    const hitDie = worldClass?.hitDie ?? classSource?.hitDie
         ?? Number.parseInt(classData?.hitDice.replace('d', '') ?? '8', 10);
     const constitutionModifier = Math.floor((character.stats.con - 10) / 2);
     const hitDieIncrease = Math.max(1, Math.floor(hitDie / 2) + 1 + constitutionModifier);
-    const speciesSource = character.race ? findOpen5eSpecies(character.race) : undefined;
-    const speciesMaxHpPerLevel = speciesSource?.mechanics
-        .filter((mechanic) => mechanic.type === 'max_hp_per_level')
-        .reduce((total, mechanic) => total + mechanic.value, 0) ?? 0;
+    const speciesSource = character.race && !worldSpecies ? findOpen5eSpecies(character.race) : undefined;
+    const speciesMaxHpPerLevel = worldSpecies
+        ? worldSpecies.hpPerLevel ?? 0
+        : speciesSource?.mechanics
+            .filter((mechanic) => mechanic.type === 'max_hp_per_level')
+            .reduce((total, mechanic) => total + mechanic.value, 0) ?? 0;
     const hpPerLevel = hitDieIncrease + speciesMaxHpPerLevel;
 
     return {
@@ -676,34 +682,56 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         throw new Error('RENAMED (#95): perceptionBonus/stealthBonus are now perceptionOverride/stealthOverride — they OVERRIDE the composed WIS/DEX+proficiency column, they do not add to it. Re-issue with the new name. Nothing was written.');
     }
     const now = new Date().toISOString();
-    const classSource = findOpen5eClass(args.class || 'Adventurer');
-    const speciesSource = findOpen5eSpecies(args.race || 'Human');
-    const backgroundSource = args.background ? findOpen5eBackground(args.background) : undefined;
-    const className = classSource?.name ?? args.class ?? 'Adventurer';
-    const raceName = speciesSource?.name ?? args.race ?? 'Human';
-    const backgroundName = backgroundSource?.name ?? args.background;
-    const classData = CLASS_DATA[className.trim().toLowerCase().replace(/^srd[-_:]/, '')];
+    // Item 8: the world's own class, species and background come first
+    // (table_rules char_class / species / background); the SRD catalog is
+    // the fallback for names the world does not define.
+    const worldId = args.worldId;
+    // Item 10: the level cap is the world's progression rule (default 20).
+    const capProblem = levelCapProblem(worldProgression(db, worldId), args.level ?? 1);
+    if (capProblem) throw new Error(capProblem);
+    const worldClassRule = findWorldRule(db, worldId, 'char_class', args.class || 'Adventurer');
+    const worldClass = worldClassRule?.spec;
+    const worldSpeciesRule = findWorldRule(db, worldId, 'species', args.race || 'Human');
+    const worldSpecies = worldSpeciesRule?.spec;
+    const worldBackgroundRule = args.background ? findWorldRule(db, worldId, 'background', args.background) : undefined;
+    const worldBackground = worldBackgroundRule?.spec;
+    const classSource = worldClass ? undefined : findOpen5eClass(args.class || 'Adventurer');
+    const speciesSource = worldSpecies ? undefined : findOpen5eSpecies(args.race || 'Human');
+    const backgroundSource = worldBackground || !args.background ? undefined : findOpen5eBackground(args.background);
+    const className = worldClassRule?.name ?? classSource?.name ?? args.class ?? 'Adventurer';
+    const raceName = worldSpeciesRule?.name ?? speciesSource?.name ?? args.race ?? 'Human';
+    const backgroundName = worldBackgroundRule?.name ?? backgroundSource?.name ?? args.background;
+    const classData = worldClass ? undefined : CLASS_DATA[className.trim().toLowerCase().replace(/^srd[-_:]/, '')];
     const legacyClassSaves = classData?.savingThrows
         .map((ability) => CLASS_SAVE_KEYS[ability])
         .filter((ability): ability is z.infer<typeof SaveProficiencySchema> => Boolean(ability)) ?? [];
-    const classSaveProficiencies = classSource?.savingThrows ?? legacyClassSaves;
-    const backgroundSkills = validSkillProficiencies(backgroundSource?.skillProficiencies);
+    const classSaveProficiencies = worldClass?.saves ?? classSource?.savingThrows ?? legacyClassSaves;
+    // World skills are free strings: the SRD enum filter is for SRD backgrounds only.
+    const backgroundSkills = worldBackground ? worldBackground.skills : validSkillProficiencies(backgroundSource?.skillProficiencies);
 
     const stats = { ...(args.stats ?? { str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 10 }) };
-    const speciesAbilityBonusesApplied = Boolean(args.applySpeciesAbilityBonuses && speciesSource);
+    const worldSpeciesBonuses = (worldSpecies?.abilityBonuses ?? {}) as Partial<Record<keyof typeof stats, number>>;
+    const speciesAbilityBonusesApplied = Boolean(args.applySpeciesAbilityBonuses && (speciesSource || Object.keys(worldSpeciesBonuses).length));
     if (speciesAbilityBonusesApplied && speciesSource) {
         for (const ability of Object.keys(speciesSource.abilityBonuses) as Array<keyof typeof stats>) {
             stats[ability] += speciesSource.abilityBonuses[ability];
+        }
+    } else if (speciesAbilityBonusesApplied) {
+        for (const [ability, bonus] of Object.entries(worldSpeciesBonuses) as Array<[keyof typeof stats, number]>) {
+            stats[ability] += bonus;
         }
     }
 
     // Source-backed classes own hit-die HP. Custom classes retain the d8 fallback.
     const conModifier = Math.floor((stats.con - 10) / 2);
-    const hitDie = classSource?.hitDie ?? Number.parseInt(classData?.hitDice.replace('d', '') ?? '8', 10);
+    const hitDie = worldClass?.hitDie ?? classSource?.hitDie ?? Number.parseInt(classData?.hitDice.replace('d', '') ?? '8', 10);
     const level = args.level ?? 1;
-    const speciesMaxHpBonus = speciesSource?.mechanics
-        .filter((mechanic) => mechanic.type === 'max_hp_per_level')
-        .reduce((total, mechanic) => total + mechanic.value * level, 0) ?? 0;
+    const speciesMaxHpBonus = worldSpecies
+        ? (worldSpecies.hpPerLevel ?? 0) * level
+        : speciesSource?.mechanics
+            .filter((mechanic) => mechanic.type === 'max_hp_per_level')
+            .reduce((total, mechanic) => total + mechanic.value * level, 0) ?? 0;
+    const startingGold = args.startingGold ?? worldBackground?.gold;
     const baseHp = initialHitPoints(hitDie, conModifier, level);
     const derivedMaxHp = baseHp + speciesMaxHpBonus;
     const hp = args.hp ?? derivedMaxHp;
@@ -749,13 +777,13 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         preparedSpells: args.preparedSpells?.length
             ? [...args.preparedSpells]
             : [...(args.knownSpells || [])],
-        skillProficiencies: uniqueStrings(backgroundSkills, args.skillProficiencies),
+        skillProficiencies: uniqueStrings(worldClass?.skills, backgroundSkills, args.skillProficiencies),
         saveProficiencies: args.saveProficiencies ?? classSaveProficiencies,
         expertise: args.expertise || [],
-        armorProficiencies: args.armorProficiencies ?? classSource?.armorProficiencies ?? classData?.armorProficiencies ?? [],
-        weaponProficiencies: args.weaponProficiencies ?? classSource?.weaponProficiencies ?? classData?.weaponProficiencies ?? [],
-        toolProficiencies: uniqueStrings(backgroundSource?.toolProficiencies, args.toolProficiencies),
-        languages: uniqueStrings(speciesSource?.languages, backgroundSource?.fixedLanguages, args.languages),
+        armorProficiencies: args.armorProficiencies ?? worldClass?.armor ?? classSource?.armorProficiencies ?? classData?.armorProficiencies ?? [],
+        weaponProficiencies: args.weaponProficiencies ?? worldClass?.weapons ?? classSource?.weaponProficiencies ?? classData?.weaponProficiencies ?? [],
+        toolProficiencies: uniqueStrings(worldBackground?.tools ?? backgroundSource?.toolProficiencies, args.toolProficiencies),
+        languages: uniqueStrings(worldSpecies?.languages ?? speciesSource?.languages, worldBackground?.languages ?? backgroundSource?.fixedLanguages, args.languages),
         resistances: args.resistances || [],
         vulnerabilities: args.vulnerabilities || [],
         immunities: args.immunities || [],
@@ -765,6 +793,7 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         regeneration: args.regeneration,
         // Combat profile and legendary counters (tokens hydrate from these)
         ...Object.fromEntries(COMBAT_PROFILE_FIELDS.filter(k => args[k] !== undefined).map(k => [k, args[k]])),
+        ...(args.size === undefined && worldSpecies?.size ? { size: worldSpecies.size } : {}),
         // FINDINGS #93: resourcePools was accepted by BOTH schemas and never
         // read by the payload — the #33/#59/#90 anatomy on the worst possible
         // verb: a create whose banner said it worked. Honored now.
@@ -803,7 +832,7 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
             {
                 customEquipment: args.customEquipment,
                 customSpells: args.knownSpells?.length ? args.knownSpells : undefined,
-                startingGold: args.startingGold ?? (backgroundSource
+                startingGold: startingGold ?? (backgroundSource
                     ? backgroundSource.startingCurrencyCopper / 100
                     : undefined),
                 additionalEquipmentSourceKeys: backgroundSource?.startingItemSourceKeys
@@ -831,7 +860,7 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
             spellSlots: character.spellSlots,
             pactMagicSlots: character.pactMagicSlots
         } as any);
-    } else if (args.startingGold !== undefined) {
+    } else if (startingGold !== undefined) {
         // Findings #40: startingGold rode the provisioning path and was
         // discarded with the kit when provisionEquipment was false. The #38
         // fix then failed SILENTLY — it wrote to a phantom 'inventories'
@@ -841,11 +870,21 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         // and the catch now REPORTS instead of swallowing.
         try {
             db.prepare('UPDATE characters SET currency = ? WHERE id = ?')
-                .run(JSON.stringify({ gold: args.startingGold, silver: 0, copper: 0 }), characterId);
+                .run(JSON.stringify({ gold: startingGold, silver: 0, copper: 0 }), characterId);
         } catch (goldErr) {
             (character as unknown as Record<string, unknown>)._startingGoldError =
                 `startingGold write failed: ${(goldErr as Error).message}`;
         }
+    }
+
+    // Item 8: a world class that casts as an SRD caster takes that caster's
+    // slots (or pact slots) for its level; the sheet keeps its own class.
+    if (worldClass?.casting) {
+        const asCaster = restoreAllSpellSlots({ ...(character as any), characterClass: worldClass.casting.as, level });
+        const slotUpdate: Record<string, unknown> = {};
+        if (asCaster.pactMagicSlots) slotUpdate.pactMagicSlots = character.pactMagicSlots = asCaster.pactMagicSlots;
+        else if (asCaster.spellSlots) slotUpdate.spellSlots = character.spellSlots = asCaster.spellSlots;
+        if (Object.keys(slotUpdate).length) characterRepo.update(characterId, slotUpdate as any);
     }
 
     const provenance = getOpen5eCatalogProvenance();
@@ -855,7 +894,14 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         _rules: {
             rulesVersion: provenance.rulesVersion,
             sourcePackHash: provenance.packHash,
-            class: classSource ? {
+            class: worldClass ? {
+                world: true,
+                name: className,
+                hitDie,
+                saves: worldClass.saves,
+                skills: worldClass.skills,
+                ...(worldClass.casting ? { casting: { as: worldClass.casting.as } } : {})
+            } : classSource ? {
                 sourceKey: classSource.sourceKey,
                 contentKey: classSource.contentKey,
                 hitDie: classSource.hitDie,
@@ -874,6 +920,16 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
                 deferredMechanics: deferredSpeciesMechanics,
                 unsupportedFeatureNames: unsupportedSpeciesFeatures,
                 maxHpBonus: speciesMaxHpBonus
+            } : worldSpecies ? {
+                world: true,
+                name: raceName,
+                size: worldSpecies.size,
+                speed: worldSpecies.speed,
+                traits: worldSpecies.traits,
+                abilityBonuses: worldSpecies.abilityBonuses ?? {},
+                abilityBonusesApplied: speciesAbilityBonusesApplied,
+                languages: worldSpecies.languages,
+                maxHpBonus: speciesMaxHpBonus
             } : { custom: true, name: raceName },
             background: backgroundSource ? {
                 sourceKey: backgroundSource.sourceKey,
@@ -889,6 +945,13 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
                     ...(backgroundSource.languageChoiceCount > 0 ? ['language_choice'] : []),
                     ...(backgroundSource.toolChoice ? ['tool_choice'] : [])
                 ]
+            } : worldBackground ? {
+                world: true,
+                name: backgroundName,
+                skills: worldBackground.skills,
+                languages: worldBackground.languages,
+                tools: worldBackground.tools,
+                gold: worldBackground.gold
             } : backgroundName ? { custom: true, name: backgroundName } : null
         }
     };
@@ -995,6 +1058,12 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
         throw new Error(`GUARD REFUSAL: character ${args.characterId} is "${character.name}", not "${args.expectName}" — NOTHING was written.`);
     }
     args = { ...args, characterId: character.id };
+    // Item 10: the level cap is the world's progression rule (default 20).
+    if (args.level !== undefined) {
+        const db = getDb();
+        const capProblem = levelCapProblem(worldProgression(db, args.worldId ?? resolveWorldId(db, { characterIds: [character.id] })), args.level);
+        if (capProblem) throw new Error(capProblem);
+    }
 
     validateWizardPreparedSpells(
         args.class ?? character.characterClass,
@@ -1278,7 +1347,7 @@ const KillSchema = z.object({
     currency: z.record(z.number()).optional().describe('Currency on the corpse (e.g. {gold: 150})')
 });
 
-async function handleKill(args: z.infer<typeof KillSchema>): Promise<object> {
+export async function handleKill(args: z.input<typeof KillSchema>): Promise<object> {
     const { db, characterRepo } = ensureDb();
     const char = characterRepo.findById(args.characterId);
     if (!char) return { error: true, message: `Character ${args.characterId} not found`, writes: 'none' };
@@ -1336,7 +1405,211 @@ async function handleKill(args: z.infer<typeof KillSchema>): Promise<object> {
     };
 }
 
-async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise<object> {
+// Item 2: FORMS — any creature rule or preset is a shape a character takes.
+const SetFormSchema = z.object({
+    action: z.literal('set_form'),
+    characterId: z.string(),
+    form: z.string().min(1).describe("A creature rule of the character's world or a built-in preset ('Daemon Prince', 'goblin'); 'base' puts the form down"),
+    hpMode: hpModeSchema().optional().describe('keep_fraction (default): keep the share of HP left; full: heal to the new maximum; keep: keep the number, capped'),
+    worldId: z.string().optional().describe("World whose creature rules to read (default: the character's)")
+});
+
+const LONG_ABILITY = { str: 'strength', dex: 'dexterity', con: 'constitution', int: 'intelligence', wis: 'wisdom', cha: 'charisma' } as const;
+/** Token keys a form sets that a sheet does not carry: removed when the form is put down. */
+const FORM_ONLY_TOKEN_KEYS = ['movementSpeed', 'attackBonus', 'attackDamage', 'attackDamageType', 'unit'];
+
+/**
+ * Take a form or put it down. The form replaces the sheet fields it names
+ * (stats merge over the base); the base snapshot is taken once, so a
+ * form-to-form swap still reverts to the character's own sheet.
+ */
+export function setForm(args: { characterId: string; form: string; hpMode?: HpMode; worldId?: string }): Record<string, unknown> {
+    const { db, characterRepo } = ensureDb();
+    const char = characterRepo.findById(args.characterId) as (Record<string, unknown> & { id: string; name: string; hp: number; maxHp: number; stats: Record<string, number>; form?: { name: string; since?: string; base: Record<string, unknown> } }) | null;
+    if (!char) return { error: true, actionType: 'set_form', message: `Character ${args.characterId} not found`, writes: 'none' };
+    const updates: Record<string, unknown> = {};
+    let tokenFields: Record<string, unknown>;
+    let formName: string;
+    let source: string | undefined;
+
+    if (args.form.trim().toLowerCase() === 'base') {
+        if (!char.form) return { error: true, actionType: 'set_form', message: `${char.name} is in no form; nothing to put down.`, writes: 'none' };
+        const base = char.form.base;
+        for (const k of FORM_KEYS) updates[k] = base[k] === null || base[k] === undefined ? undefined : base[k];
+        const newMax = (base.maxHp as number | null) ?? char.maxHp;
+        updates.maxHp = newMax;
+        updates.hp = nextHp(args.hpMode, char.hp, char.maxHp, newMax);
+        updates.form = undefined;
+        formName = 'base';
+        const stats = (updates.stats ?? char.stats) as Record<string, number>;
+        tokenFields = {
+            ...Object.fromEntries(FORM_ONLY_TOKEN_KEYS.map(k => [k, undefined])),
+            ...Object.fromEntries(FORM_KEYS.filter(k => k !== 'stats').map(k => [k, updates[k]])),
+            abilityScores: Object.fromEntries(Object.entries(LONG_ABILITY).map(([s, l]) => [l, stats[s] ?? 10]))
+        };
+    } else {
+        const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] });
+        const creature = resolveCreature(db, worldId, args.form);
+        if (!creature) return { error: true, actionType: 'set_form', message: `No creature '${args.form}' in this world's bestiary or the presets. Nothing was written.`, writes: 'none' };
+        const base = char.form?.base ?? snapshotBase(char);
+        const shape = sheetFromCreature(creature.spec);
+        for (const k of FORM_KEYS) updates[k] = shape[k] !== undefined ? shape[k] : (base[k] === null ? undefined : base[k]);
+        updates.stats = { ...((base.stats as Record<string, number> | null) ?? char.stats), ...((shape.stats as Record<string, number> | undefined) ?? {}) };
+        updates.hp = nextHp(args.hpMode, char.hp, char.maxHp, updates.maxHp as number);
+        updates.form = { name: creature.name, since: new Date().toISOString(), base };
+        formName = creature.name;
+        source = creature.source;
+        const { id: _i, name: _n, position: _p, conditions: _c, initiative: _in, isEnemy: _e, ...fromCreature } = creatureToParticipant(creature.spec, { id: char.id, name: char.name });
+        const stats = updates.stats as Record<string, number>;
+        tokenFields = {
+            ...Object.fromEntries(FORM_KEYS.filter(k => k !== 'stats').map(k => [k, updates[k]])),
+            ...fromCreature,
+            hp: updates.hp, maxHp: updates.maxHp,
+            abilityScores: Object.fromEntries(Object.entries(LONG_ABILITY).map(([s, l]) => [l, stats[s] ?? 10]))
+        };
+    }
+
+    characterRepo.update(char.id, updates as Partial<import('../../schema/character.js').Character>);
+    const liveTokens = pushSheetToLiveTokens(char.id, tokenFields);
+    return {
+        success: true,
+        actionType: 'set_form',
+        characterId: char.id,
+        characterName: char.name,
+        form: formName,
+        ...(source ? { source } : {}),
+        ...(char.form && formName !== 'base' ? { previousForm: char.form.name } : {}),
+        hpBefore: char.hp,
+        hp: updates.hp,
+        maxHp: updates.maxHp,
+        ac: updates.ac,
+        hpMode: args.hpMode ?? 'keep_fraction',
+        liveTokens,
+        message: formName === 'base'
+            ? `${char.name} returns to their own shape: HP ${char.hp}/${char.maxHp} -> ${updates.hp}/${updates.maxHp}.`
+            : `${char.name} takes the form of ${formName}: HP ${char.hp}/${char.maxHp} -> ${updates.hp}/${updates.maxHp}, AC ${updates.ac}.${liveTokens.length ? ` ${liveTokens.length} live token(s) updated.` : ''}`
+    };
+}
+
+// Item 5: OFFERINGS — an item, a kill or a deed given to one pool of a family.
+const OFFERING_KINDS = ['item', 'kill', 'deed'] as const;
+/** A fresh enum each call, so no outer schema holds one zod instance twice. */
+function offeringSchema() { return z.enum(OFFERING_KINDS); }
+
+const OfferSchema = z.object({
+    action: z.literal('offer'),
+    characterId: z.string().describe('Who makes the offering'),
+    family: z.string().describe('The pool_family rule (the gods)'),
+    pool: z.string().describe('The family pool the offering goes to (the god)'),
+    offering: offeringSchema().describe('item (itemId, quantity), kill (victimId) or deed (deed)'),
+    itemId: z.string().optional().describe('offering item: the item template id (or its name) in the character\'s inventory'),
+    quantity: z.number().int().min(1).optional().describe('offering item: how many (default 1); the value is per item'),
+    victimId: z.string().optional().describe('offering kill: the character killed as the offering'),
+    deed: z.string().optional().describe('offering deed: what was done in the god\'s name'),
+    value: z.number().optional().describe("Favour gained; default the family's offering_values for the item name, 'kill' or the deed (any case)"),
+    answerTable: z.string().optional().describe("A roll_table rolled as the god's answer, the favour pool as its modifier"),
+    apply: z.boolean().optional().describe('answerTable: apply the answer (default true); false previews'),
+    seed: z.string().optional().describe('answerTable: replay exact dice'),
+    worldId: z.string().optional().describe("World whose rules to read (default: the character's)")
+});
+
+async function handleOffer(args: z.infer<typeof OfferSchema>): Promise<object> {
+    const { db, characterRepo } = ensureDb();
+    const refuse = (message: string) => ({ error: true, actionType: 'offer', message: `${message} Nothing was written.`, writes: 'none' });
+    const char = characterRepo.findById(args.characterId);
+    if (!char) return refuse(`Character ${args.characterId} not found.`);
+    const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] });
+    const rule = loadRule(db, worldId, 'pool_family', args.family);
+    if (!rule) return refuse(`No pool_family '${args.family}' in this world.`);
+    const member = familyMember(rule.spec, args.pool);
+    if (!member) return refuse(`'${args.pool}' is not in family '${rule.name}' (${rule.spec.pools.join(', ')}).`);
+    if (args.answerTable && !loadRule(db, worldId, 'roll_table', args.answerTable)) return refuse(`No roll_table '${args.answerTable}' in this world.`);
+    const priceOf = (key: string): number | undefined => {
+        const k = Object.keys(rule.spec.offering_values).find(x => x.toLowerCase() === key.toLowerCase());
+        return k === undefined ? undefined : rule.spec.offering_values[k];
+    };
+
+    let value: number | undefined;
+    let what: string;
+    let consume: () => Promise<Record<string, unknown> | { error: true; message: string }>;
+    if (args.offering === 'item') {
+        if (!args.itemId) return refuse('offering item needs itemId.');
+        const quantity = args.quantity ?? 1;
+        const owned = db.prepare('SELECT ii.item_id AS id, ii.quantity AS quantity, i.name AS name FROM inventory_items ii JOIN items i ON i.id = ii.item_id WHERE ii.character_id = ?').all(char.id) as Array<{ id: string; quantity: number; name: string }>;
+        const item = owned.find(o => o.id === args.itemId) ?? owned.find(o => o.name.toLowerCase() === args.itemId!.toLowerCase());
+        if (!item) return refuse(`${char.name} does not carry '${args.itemId}'.`);
+        if (item.quantity < quantity) return refuse(`${char.name} carries ${item.quantity} ${item.name}, not ${quantity}.`);
+        const each = args.value ?? priceOf(item.name);
+        value = each === undefined ? undefined : args.value !== undefined ? args.value : each * quantity;
+        what = `${quantity} × ${item.name}`;
+        consume = async () => {
+            if (!new InventoryRepository(db).removeItem(char.id, item.id, quantity)) return { error: true as const, message: `could not remove ${what}` };
+            return { item: item.name, itemId: item.id, quantity };
+        };
+    } else if (args.offering === 'kill') {
+        if (!args.victimId) return refuse('offering kill needs victimId.');
+        const victim = characterRepo.findById(args.victimId);
+        if (!victim) return refuse(`Victim ${args.victimId} not found.`);
+        value = args.value ?? priceOf('kill');
+        what = `the death of ${victim.name}`;
+        consume = async () => {
+            const k = await handleKill({ action: 'kill', characterId: victim.id, cause: `offered to ${member}`, worldId: worldId ?? undefined }) as { success?: boolean; corpseId?: string; message?: string };
+            if (!k.success) return { error: true as const, message: String(k.message) };
+            return { victim: victim.name, victimId: victim.id, ...(k.corpseId ? { corpseId: k.corpseId } : {}) };
+        };
+    } else {
+        if (!args.deed) return refuse('offering deed needs deed.');
+        value = args.value ?? priceOf(args.deed);
+        what = args.deed;
+        consume = async () => ({ deed: args.deed });
+    }
+    if (value === undefined) return refuse(`No value for ${args.offering === 'kill' ? "'kill'" : `'${args.offering === 'item' ? what.replace(/^\d+ × /, '') : what}'`} in ${rule.name}'s offering_values; pass value.`);
+
+    const consumed = await consume();
+    if ('error' in consumed) return refuse(`The offering failed: ${consumed.message}.`);
+    const favour = await handleAdjustPool({ action: 'adjust_pool', characterId: char.id, pool: member, delta: value, family: rule.name, worldId: worldId ?? undefined, reason: `offering: ${what}` }) as Record<string, unknown>;
+
+    let answer: Record<string, unknown> | undefined;
+    if (args.answerTable) {
+        const { rollAndApply } = await import('../roll-table-apply.js');
+        answer = await rollAndApply(db, {
+            worldId: worldId!, name: args.answerTable, characterId: char.id,
+            modifierPool: String(favour.pool ?? member), apply: args.apply ?? true, seed: args.seed, tool: 'character_manage'
+        });
+    }
+    return {
+        success: true,
+        actionType: 'offer',
+        characterId: char.id,
+        characterName: char.name,
+        offering: args.offering,
+        to: favour.pool ?? member,
+        family: rule.name,
+        value,
+        consumed,
+        favour,
+        ...(favour.growthReady ? { growthReady: favour.growthReady } : {}),
+        ...(answer ? { answer } : {}),
+        message: `${char.name} offers ${what} to ${String(favour.pool ?? member)} (+${value}). ${String(favour.message ?? '')}${answer ? ` Answer: ${String(answer.message ?? answer.text ?? '')}` : ''}`
+    };
+}
+
+export async function handleAdjustPool(args: z.input<typeof AdjustPoolSchema>): Promise<object> {
+    const res = await adjustPoolCore(args) as Record<string, unknown>;
+    // Growth tracks: a pool that crossed a step offers the form; never applied.
+    if (res.success && typeof res.before === 'number' && typeof res.current === 'number' && typeof res.pool === 'string') {
+        const { db, characterRepo } = ensureDb();
+        const char = characterRepo.findById(String(res.characterId));
+        if (char) {
+            const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] });
+            const ready = growthReadyFor(db, worldId, char as never, res.pool, res.before, res.current);
+            if (ready) return { ...res, growthReady: ready, message: `${String(res.message)} · GROWTH READY: ${ready.form} (${ready.call})` };
+        }
+    }
+    return res;
+}
+
+async function adjustPoolCore(args: z.input<typeof AdjustPoolSchema>): Promise<object> {
     const { characterRepo } = ensureDb();
     const char = characterRepo.findById(args.characterId);
     if (!char) throw new Error(`Character ${args.characterId} not found`);
@@ -1345,6 +1618,22 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
     args = { ...args, characterId: char.id };
 
     const pools: Record<string, ResourcePool> = { ...((char as { resourcePools?: Record<string, ResourcePool> }).resourcePools || {}) };
+
+    // Item 3: favour families. Checked before removePool and linkItem, so a
+    // refused family move writes nothing (adjustFamilyPool links the item).
+    // The pool moves inside its family: the family's
+    // floor and max clamp, and a gain makes each jealous rival lose.
+    if (args.family) {
+        const { db } = ensureDb();
+        if (args.value !== undefined) return { error: true, actionType: 'adjust_pool', message: 'family moves take delta, not value: a set has no gain to be jealous of.', writes: 'none' };
+        if (args.removePool) return { error: true, actionType: 'adjust_pool', message: 'removePool does not take family.', writes: 'none' };
+        const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] });
+        const rule = loadRule(db, worldId, 'pool_family', args.family);
+        if (!rule) return { error: true, actionType: 'adjust_pool', message: `No pool_family '${args.family}' in ${worldId ? `world ${worldId}` : 'this world'}. Nothing was written.`, writes: 'none' };
+        const member = familyMember(rule.spec, args.pool);
+        if (!member) return { error: true, actionType: 'adjust_pool', message: `'${args.pool}' is not in family '${rule.name}' (${rule.spec.pools.join(', ')}). Nothing was written.`, writes: 'none' };
+        return adjustFamilyPool(char, pools, { name: rule.name, spec: rule.spec }, member, args);
+    }
 
     // FINDINGS #34 T2.6: pool deletion — a traded rifle's condition pool
     // should not haunt its old owner at zero forever.
@@ -1369,6 +1658,7 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
         const inst = (resolved.instance ?? mintInstance(db, char.id, resolved.templateId)) as { id: string; charges?: number | null; charges_max?: number | null };
         linked = { instanceId: inst.id, charges: typeof inst.charges === 'number' ? inst.charges : null, chargesMax: typeof inst.charges_max === 'number' ? inst.charges_max : null };
     }
+
     const fresh = !(args.pool in pools);
     const existing: ResourcePool = pools[args.pool] || { current: fresh && linked?.charges != null ? linked.charges : 0, max: args.max ?? linked?.chargesMax ?? 100 };
     const max = args.max ?? existing.max;
@@ -1379,7 +1669,7 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
     }
     const current = args.value !== undefined
         ? Math.min(max, Math.max(0, args.value))
-        : Math.min(max, Math.max(0, before + args.delta));
+        : Math.min(max, Math.max(0, before + (args.delta ?? 0)));
     pools[args.pool] = {
         ...existing, current, max,
         ...(args.label !== undefined ? { label: args.label } : {}),
@@ -1422,6 +1712,63 @@ async function handleAdjustPool(args: z.infer<typeof AdjustPoolSchema>): Promise
         ...(p.show !== undefined ? { show: p.show } : {}),
         ...(item ? { item } : {}),
         message: `${args.pool}: ${before} -> ${current} (of ${max})${args.value !== undefined ? ' [set]' : ''}${args.witnesses?.length ? ` — witnessed by ${args.witnesses.length}` : ''}${item ? ` · ${item.name} charges ${item.charges}/${item.max}` : ''}`
+    };
+}
+
+/** adjust_pool {family}: the family move, then label/note/show/link on the named pool. */
+function adjustFamilyPool(
+    char: { id: string; name: string },
+    pools: Record<string, ResourcePool>,
+    family: { name: string; spec: import('../../engine/pool-family.js').PoolFamilySpec },
+    member: string,
+    args: z.input<typeof AdjustPoolSchema>
+): object {
+    const { db, characterRepo } = ensureDb();
+    const withMax = { ...pools };
+    const own = findPool(withMax, member);
+    if (own && args.max !== undefined) withMax[own.key] = { ...own.pool, max: args.max };
+    const delta = args.delta ?? 0;
+    const { pools: moved, moves } = applyFamilyDelta(withMax as Record<string, ResourcePool & { [k: string]: unknown }>, family, member, delta, args.reason ?? `family ${family.name}`, { witnesses: args.witnesses });
+    const main = moves[0];
+    let linkedId: string | undefined;
+    if (args.linkItem) {
+        const resolved = resolveInstance(db, char.id, args.linkItem);
+        if ('error' in resolved) return { error: true, actionType: 'adjust_pool', message: `linkItem: ${resolved.error}. Nothing was written.`, writes: 'none' };
+        linkedId = (resolved.instance ?? mintInstance(db, char.id, resolved.templateId) as { id: string }).id;
+    }
+    const p = moved[main.pool] = {
+        ...moved[main.pool],
+        ...(args.label !== undefined ? { label: args.label } : {}),
+        ...(args.note !== undefined ? { note: args.note } : {}),
+        ...(args.show !== undefined ? { show: args.show } : {}),
+        ...(linkedId ? { itemInstanceId: linkedId } : {})
+    } as ResourcePool;
+    characterRepo.update(char.id, { resourcePools: moved } as Partial<import('../../schema/character.js').Character>);
+    const touched = Object.fromEntries(moves.map(m => [m.pool, moved[m.pool] as ResourcePool]));
+    const items = mirrorLinkedCharges(char.id, touched);
+    const item = items.find(i => i.pool === main.pool);
+    const rivals: FamilyMove[] = moves.slice(1).map(({ rival: _r, ...m }) => m);
+    return {
+        success: true,
+        actionType: 'adjust_pool',
+        characterId: char.id,
+        characterName: char.name,
+        pool: main.pool,
+        family: family.name,
+        before: main.from,
+        mode: 'delta',
+        delta,
+        current: main.to,
+        max: p.max,
+        clamped: main.from + delta !== main.to,
+        rivals,
+        ...(args.witnesses?.length ? { witnesses: args.witnesses } : {}),
+        ...(args.reason ? { reason: args.reason } : {}),
+        ...(p.label ? { label: p.label } : {}),
+        ...(p.note ? { note: p.note } : {}),
+        ...(p.show !== undefined ? { show: p.show } : {}),
+        ...(item ? { item } : {}),
+        message: `${main.pool}: ${main.from} -> ${main.to} (of ${p.max})${rivals.length ? ` · jealous: ${rivals.map(r => `${r.pool} ${r.from} -> ${r.to}`).join(', ')}` : ''}${item ? ` · ${item.name} charges ${item.charges}/${item.max}` : ''}`
     };
 }
 
@@ -1478,76 +1825,10 @@ function ensureScheduleTable(db: ReturnType<typeof getDb>): void {
     try { db.exec('ALTER TABLE scheduled_state_changes ADD COLUMN world_id TEXT'); } catch { /* column exists */ }
 }
 
-type ScheduledWriteOp = z.infer<typeof ScheduledWriteOpSchema>;
 type ScheduleRow = { id: number; character_id: string; fires_at_day: number; writes: string; note: string | null; fired: number; fired_at: string | null; created_at: string; recur_every_days: number | null; is_event?: number | null; world_id?: string | null };
 
-// FINDINGS #73: op application EXTRACTED — one arithmetic shared by
-// process_scheduled and schedule_change fireNow, so a named one-off lands in
-// the same ledger with the same math as the recurring clocks. Kroshka's
-// exertion adds stop being scattered manual pokes.
-function applyScheduledOps(
-    char: { hp: number; maxHp: number },
-    ops: ScheduledWriteOp[]
-): { applied: string[]; updates: Record<string, unknown> } {
-    const applied: string[] = [];
-    const pools = { ...((char as { resourcePools?: Record<string, { current: number; max: number; lastRefilledAt?: string }> }).resourcePools || {}) };
-    let conditions = [...(((char as { conditions?: Array<{ name: string; duration?: number; source?: string }> }).conditions) || [])];
-    let hp = char.hp, maxHp = char.maxHp;
-    let poolsTouched = false, condsTouched = false, hpTouched = false, maxHpTouched = false;
-    for (const op of ops) {
-        switch (op.op) {
-            case 'adjust_pool': {
-                if (!op.pool) { applied.push('⚠ adjust_pool op missing pool name — skipped'); break; }
-                const existing = pools[op.pool] || { current: 0, max: op.max ?? 100 };
-                const pmax = op.max ?? existing.max;
-                const before = existing.current;
-                const current = Math.min(pmax, Math.max(0, before + (op.delta ?? 0)));
-                pools[op.pool] = { ...existing, current, max: pmax };
-                poolsTouched = true;
-                applied.push(`${op.pool}: ${before} → ${current} (of ${pmax})`);
-                break;
-            }
-            case 'adjust_hp': {
-                const before = hp;
-                hp = Math.min(maxHp, Math.max(0, hp + (op.delta ?? 0)));
-                if (hp !== before) hpTouched = true;
-                applied.push(`hp: ${before} → ${hp}`);
-                break;
-            }
-            case 'adjust_max_hp': {
-                const beforeM = maxHp;
-                maxHp = Math.max(1, maxHp + (op.delta ?? 0));
-                if (hp > maxHp) { hp = maxHp; hpTouched = true; }
-                if (maxHp !== beforeM) maxHpTouched = true;
-                applied.push(`maxHp: ${beforeM} → ${maxHp}`);
-                break;
-            }
-            case 'add_condition': {
-                if (!op.name) { applied.push('⚠ add_condition op missing name — skipped'); break; }
-                if (conditions.some(c => c.name === op.name)) { applied.push(`condition "${op.name}" already present — skipped`); break; }
-                conditions.push({ name: op.name, ...(op.duration !== undefined ? { duration: op.duration } : {}), source: op.source ?? 'mend clock' });
-                condsTouched = true;
-                applied.push(`+condition ${op.name}`);
-                break;
-            }
-            case 'remove_condition': {
-                if (!op.name) { applied.push('⚠ remove_condition op missing name — skipped'); break; }
-                const beforeLen = conditions.length;
-                conditions = conditions.filter(c => c.name !== op.name);
-                if (conditions.length !== beforeLen) { condsTouched = true; applied.push(`−condition ${op.name}`); }
-                else applied.push(`condition "${op.name}" not present — skipped`);
-                break;
-            }
-        }
-    }
-    if (ops.length === 0) applied.push('⚠ writes JSON empty or malformed — nothing applied');
-    const updates: Record<string, unknown> = {};
-    if (poolsTouched) updates.resourcePools = pools;
-    if (condsTouched) updates.conditions = conditions;
-    if (hpTouched) updates.hp = hp;
-    if (maxHpTouched) updates.maxHp = maxHp;
-    return { applied, updates };
-}
+// FINDINGS #73: op application lives in engine/scheduled-ops.ts, shared by
+// process_scheduled, schedule_change fireNow, table entries and offerings.
 
 async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>): Promise<object> {
     const { db, characterRepo } = ensureDb();
@@ -1796,10 +2077,10 @@ async function handleCancelScheduled(args: z.infer<typeof CancelScheduledSchema>
     return { success: true, actionType: 'cancel_scheduled', scheduleId: args.scheduleId, note: row.note, firesAtDay: row.fires_at_day, message: `Cancelled scheduled change ${args.scheduleId}${row.note ? ` (${row.note})` : ''} — was due Day ${row.fires_at_day}` };
 }
 
-/** The character's world uses milestone progression (table_rules progression). */
-function isMilestone(characterId: string): boolean {
+/** The character's world's progression (table_rules progression; default the SRD). */
+function progressionFor(characterId: string) {
     const db = getDb();
-    return loadRule(db, resolveWorldId(db, { characterIds: [characterId] }), 'progression')?.spec.mode === 'milestone';
+    return worldProgression(db, resolveWorldId(db, { characterIds: [characterId] }));
 }
 
 async function handleAddXp(args: z.infer<typeof AddXpSchema>): Promise<object> {
@@ -1813,10 +2094,13 @@ async function handleAddXp(args: z.infer<typeof AddXpSchema>): Promise<object> {
     const currentXp = char.xp ?? 0;
     const newXp = Math.max(0, currentXp + args.amount);   // Findings #43: corrections floor at 0
     const currentLevel = char.level;
-    const nextLevelXp = XP_TABLE[currentLevel + 1];
-    // Table rules: milestone progression never offers a level-up for XP.
-    const milestone = isMilestone(char.id);
-    const canLevelUp = !milestone && nextLevelXp !== undefined && newXp >= nextLevelXp;
+    // Table rules: milestone and none never offer a level-up for XP; the
+    // thresholds and cap are the world's (item 10).
+    const prog = progressionFor(char.id);
+    const atCap = prog.maxLevel !== null && currentLevel >= prog.maxLevel;
+    const nextLevelXp = atCap ? undefined : prog.xpFor(currentLevel + 1);
+    const milestone = prog.mode === 'milestone';
+    const canLevelUp = prog.mode === 'xp' && nextLevelXp !== undefined && newXp >= nextLevelXp;
 
     characterRepo.update(char.id, { xp: newXp });
 
@@ -1827,11 +2111,11 @@ async function handleAddXp(args: z.infer<typeof AddXpSchema>): Promise<object> {
         newXp,
         level: currentLevel,
         canLevelUp,
-        ...(milestone ? { progression: 'milestone' } : {}),
+        ...(prog.mode !== 'xp' ? { progression: prog.mode } : {}),
         nextLevelXp: nextLevelXp || null,
         message: canLevelUp
             ? `Added ${args.amount} XP. Total: ${newXp}. LEVEL UP AVAILABLE for Level ${currentLevel + 1}!`
-            : `Added ${args.amount} XP. Total: ${newXp}.${milestone ? ' Milestone progression: levels come on the GM\'s call, not from XP.' : ''}`
+            : `Added ${args.amount} XP. Total: ${newXp}.${milestone ? ' Milestone progression: levels come on the GM\'s call, not from XP.' : prog.mode === 'none' ? ' This world has no levelling (progression none).' : ''}`
     };
 }
 
@@ -1844,7 +2128,8 @@ async function handleGetProgression(args: z.infer<typeof GetProgressionSchema>):
         if (!char) throw new Error(`Character ${args.characterId} not found`);
         const lvl = (char as { level: number }).level;
         const xp = (char as { xp?: number }).xp ?? 0;
-        const nextXp = lvl >= 20 ? null : XP_TABLE[lvl + 1];
+        const prog = progressionFor(char.id);
+        const nextXp = prog.maxLevel !== null && lvl >= prog.maxLevel ? null : prog.xpFor(lvl + 1);
         return {
             characterId: args.characterId,
             name: char.name,
@@ -1852,25 +2137,26 @@ async function handleGetProgression(args: z.infer<typeof GetProgressionSchema>):
             xp,
             xpForNextLevel: nextXp,
             xpToNext: nextXp === null ? null : Math.max(0, nextXp - xp),
-            readyToLevel: !isMilestone(char.id) && nextXp !== null && xp >= nextXp,
-            ...(isMilestone(char.id) ? { progression: 'milestone' } : {})
+            readyToLevel: prog.mode === 'xp' && nextXp !== null && xp >= nextXp,
+            ...(prog.mode !== 'xp' ? { progression: prog.mode } : {})
         };
     }
     if (args.level === undefined) {
         throw new Error('Pass characterId (character mode) or level (table mode)');
     }
     const level = args.level;
+    const prog = worldProgression(getDb(), args.worldId);
 
-    if (level >= 20) {
+    if (prog.maxLevel !== null && level >= prog.maxLevel) {
         return {
-            level: 20,
+            level: prog.maxLevel,
             maxLevel: true,
-            xpForCurrentLevel: XP_TABLE[20]
+            xpForCurrentLevel: prog.xpFor(prog.maxLevel)
         };
     }
 
-    const currentXpBase = XP_TABLE[level];
-    const nextLevelXp = XP_TABLE[level + 1];
+    const currentXpBase = prog.xpFor(level);
+    const nextLevelXp = prog.xpFor(level + 1);
 
     return {
         level,
@@ -1894,9 +2180,17 @@ async function handleLevelUp(args: z.infer<typeof LevelUpSchema>): Promise<objec
     if (targetLevel <= currentLevel) {
         throw new Error(`Target level ${targetLevel} must be greater than current level ${currentLevel}`);
     }
+    // Item 10: the level cap is the world's progression rule (default 20).
+    const capProblem = levelCapProblem(progressionFor(char.id), targetLevel);
+    if (capProblem) throw new Error(capProblem);
 
     const levelsGained = targetLevel - currentLevel;
-    const hpRule = levelUpHitPointRule(char, levelsGained);
+    // Item 2: in a form, the level grows the character's own sheet (the base
+    // snapshot), read on its own CON; the worn statblock keeps its HP, and
+    // set_form 'base' brings the gain back.
+    const form = (char as { form?: { name: string; since?: string; base: Record<string, unknown> } }).form;
+    const baseStats = form && form.base.stats && typeof form.base.stats === 'object' ? form.base.stats as typeof char.stats : char.stats;
+    const hpRule = levelUpHitPointRule({ ...char, stats: baseStats }, levelsGained);
     // Omitted HP uses the engine's deterministic average progression. Treat an
     // explicit zero the same way: zero is not a legal ordinary D&D level-up
     // increment, and silently persisting it was the defect this action exposed.
@@ -1906,16 +2200,29 @@ async function handleLevelUp(args: z.infer<typeof LevelUpSchema>): Promise<objec
     const hpProvenance = args.hpIncrease && args.hpIncrease > 0
         ? { mode: 'explicit' as const, levelsGained, hpIncrease }
         : hpRule;
-    const updates: Record<string, unknown> = {
-        level: targetLevel,
-        maxHp: (char.maxHp || 0) + hpIncrease,
-        hp: (char.hp || 0) + hpIncrease,
-    };
+    const updates: Record<string, unknown> = form
+        ? {
+            level: targetLevel,
+            form: {
+                ...form,
+                base: {
+                    ...form.base,
+                    maxHp: (Number(form.base.maxHp) || 0) + hpIncrease,
+                    hp: (Number(form.base.hp ?? form.base.maxHp) || 0) + hpIncrease
+                }
+            }
+        }
+        : {
+            level: targetLevel,
+            maxHp: (char.maxHp || 0) + hpIncrease,
+            hp: (char.hp || 0) + hpIncrease,
+        };
 
     // Recompute spell slots for the new level. Without this, level_up would
     // not grant the new caster slots a player earned with the level. Mirrors
     // the create-time path through convertSpellSlotsToObject.
-    const className = char.characterClass;
+    // Item 8: a world class with casting.as levels on that caster's table.
+    const className = char.characterClass ? castingClassFor(getDb(), char) : undefined;
     if (className && isSpellcaster(className)) {
         const slots = getSpellSlots(className, targetLevel);
         const next = convertSpellSlotsToObject(slots);
@@ -1931,8 +2238,9 @@ async function handleLevelUp(args: z.infer<typeof LevelUpSchema>): Promise<objec
         newLevel: targetLevel,
         hpIncrease,
         hpProvenance,
-        newMaxHp: updates.maxHp ?? char.maxHp,
+        newMaxHp: form ? (updates.form as { base: { maxHp: number } }).base.maxHp : updates.maxHp ?? char.maxHp,
         spellSlots: updates.spellSlots,
+        ...(form ? { form: form.name, formNote: `In the form of ${form.name}: the HP gain goes to ${char.name}'s own sheet (restored by set_form 'base'); the form keeps ${char.hp}/${char.maxHp}` } : {}),
         message: `Leveled up to ${targetLevel}!`
     };
 }
@@ -1946,8 +2254,19 @@ async function handleOptions(args: z.infer<typeof OptionsSchema>): Promise<objec
         hitDie: (d as { hitDie?: number }).hitDie,
         spellcaster: isSpellcaster(key)
     }));
+    // Item 8: the world's own entries, listed beside the SRD catalog.
+    let world: Record<string, unknown> | undefined;
+    if (args.worldId) {
+        const db = getDb();
+        const q = args.query?.toLowerCase();
+        const list = (kind: 'char_class' | 'species' | 'background' | 'skill') => loadRules(db, args.worldId, kind)
+            .filter(r => !q || r.name.toLowerCase().includes(q))
+            .map(r => ({ name: r.name, ...(r.spec as Record<string, unknown>) }));
+        world = { worldId: args.worldId, classes: list('char_class'), species: list('species'), backgrounds: list('background'), skills: list('skill') };
+    }
     return {
         ...catalog,
+        ...(world ? { world } : {}),
         provisioningClasses,
         provisioningRule: "Kit key goes in class:, never background:. Provisioning fires ONLY for characterType 'pc' or omitted (PC-gate). Companions: create with class set + characterType OMITTED, then update characterType."
     };
@@ -2135,6 +2454,18 @@ const definitions: Record<CharacterAction, ActionDefinition> = {
         aliases: ['levelup', 'advance'],
         description: 'Level up a character'
     },
+    set_form: {
+        schema: SetFormSchema,
+        handler: async (args: z.infer<typeof SetFormSchema>) => setForm(args),
+        aliases: ['form', 'transform', 'shapechange'],
+        description: "Take a creature's form (a world creature rule or preset) or put it down with form: 'base'. The sheet keeps its own values to go back to; live tokens follow"
+    },
+    offer: {
+        schema: OfferSchema,
+        handler: handleOffer,
+        aliases: ['offering', 'sacrifice', 'tithe'],
+        description: "Offer an item, a kill or a deed to one pool of a pool_family: the offering is consumed, favour moves through the family (rivals grow jealous), and answerTable rolls the god's answer with the favour as its modifier"
+    },
     options: {
         schema: OptionsSchema,
         handler: handleOptions,
@@ -2190,7 +2521,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         createCorpse: z.boolean().optional().describe('kill: false = death without a body (default true)'),
         encounterId: z.string().optional().describe('kill: encounter the corpse lands in'),
         position: z.object({ x: z.number(), y: z.number() }).optional().describe('kill: corpse position'),
-        worldId: z.string().optional().describe('kill: world for the corpse row'),
+        worldId: z.string().optional().describe("kill: world for the corpse row; create: the world whose classes, species and backgrounds to read first; options: also list the world's own entries; get_progression table mode: the world's progression rule"),
         currency: z.record(z.number()).optional().describe('kill: currency on the corpse (e.g. {gold: 150})'),
         // Create fields
         name: z.string().optional(),
@@ -2203,7 +2534,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         hp: z.number().int().optional(),
         maxHp: z.number().int().optional(),
         ac: z.number().int().optional(),
-        level: z.number().int().min(1).max(20).optional().describe('Character level from 1 through 20'),
+        level: z.number().int().min(1).optional().describe("Character level, 1 to the world's max (20 unless a table_rules progression rule sets maxLevel; null = no cap)"),
         xp: z.number().optional().describe('Absolute XP set (update) — Findings #43'),
         characterType: CharacterTypeSchema.optional(),
         factionId: z.string().optional(),
@@ -2237,6 +2568,17 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         label: z.string().optional().describe('adjust_pool (mirror): display name for the counter'),
         show: z.boolean().optional().describe('adjust_pool (mirror): list the counter at boot and on the status block'),
         linkItem: z.string().optional().describe('adjust_pool (mirror): item template or instance id whose charges mirror the pool'),
+        offering: offeringSchema().optional().describe('offer: item | kill | deed'),
+        itemId: z.string().optional().describe('offer item: item template id (or name) in the inventory'),
+        quantity: z.number().int().optional().describe('offer item: how many (default 1)'),
+        victimId: z.string().optional().describe('offer kill: the character killed as the offering'),
+        deed: z.string().optional().describe('offer deed: what was done'),
+        answerTable: z.string().optional().describe("offer: roll_table rolled as the god's answer"),
+        apply: z.boolean().optional().describe('offer: apply the answer (default true); false previews'),
+        seed: z.string().optional().describe('offer: replay the answer dice'),
+        form: z.string().optional().describe("set_form: a creature rule or preset to take the shape of; 'base' puts the form down"),
+        hpMode: hpModeSchema().optional().describe('set_form: keep_fraction (default) | full | keep'),
+        family: z.string().optional().describe("adjust_pool: a pool_family rule — the pool moves inside its family (jealous rivals lose on a gain); returns rivals[]"),
         firesAtHour: z.number().optional().describe('schedule_change: hour of the fires-at day (0–24)'),
         firesInHours: z.number().optional().describe('schedule_change: fires N hours from currentDay(+currentTime)'),
         limit: z.number().int().optional().describe('list #93: cap returned rows'),
@@ -2351,6 +2693,16 @@ export async function handleCharacterManage(args: unknown, _ctx: SessionContext)
                 output += RichFormatter.section('Provisioning Classes');
                 output += RichFormatter.list(data.provisioningClasses.map((c: { class: string; hitDie?: number; spellcaster?: boolean }) => `${c.class} (d${c.hitDie ?? '?'}${c.spellcaster ? ', caster' : ''})`));
                 output += RichFormatter.alert(String(data.provisioningRule), 'info');
+            }
+            if (data.world) {
+                const names = (xs: Array<{ name: string }>) => xs.map(x => x.name).join(', ') || 'none';
+                output += RichFormatter.section('World Options');
+                output += RichFormatter.list([
+                    `Classes: ${names(data.world.classes)}`,
+                    `Species: ${names(data.world.species)}`,
+                    `Backgrounds: ${names(data.world.backgrounds)}`,
+                    `Skills: ${names(data.world.skills)}`
+                ]);
             }
         } else if (action === 'create' || action === 'new' || action === 'add' || action === 'spawn') {
             output = RichFormatter.header(`Character Created: ${data.name}`, '👤');

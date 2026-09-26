@@ -12,6 +12,7 @@ import { getDb } from '../../storage/index.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { getCombatManager } from '../state/combat-manager.js';
 import { restoreAllSpellSlots, restorePactSlots, getSpellcastingConfig } from '../../engine/magic/spell-validator.js';
+import { castingClassFor, findWorldRule, resolveWorldId } from '../../engine/table-rules.js';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { findOpen5eClass } from '../../content/open5e-catalog.js';
 import { CLASS_DATA } from '../../data/class-starting-data.js';
@@ -47,8 +48,14 @@ function rollDie(sides: number): number {
 }
 
 // The same lookup character creation uses; custom classes fall back to d8.
-function getHitDieSize(characterClass: string | undefined): number {
+function getHitDieSize(characterClass: string | undefined, characterId?: string): number {
     const className = characterClass || 'Adventurer';
+    // Item 8: a world class (table_rules char_class) names its own hit die.
+    if (characterId) {
+        const db = getDb();
+        const world = findWorldRule(db, resolveWorldId(db, { characterIds: [characterId] }), 'char_class', className);
+        if (world) return world.spec.hitDie;
+    }
     const classData = CLASS_DATA[className.trim().toLowerCase().replace(/^srd[-_:]/, '')];
     return findOpen5eClass(className)?.hitDie
         ?? Number.parseInt(classData?.hitDice.replace('d', '') ?? '8', 10);
@@ -108,15 +115,15 @@ async function handleLongRest(args: z.infer<typeof LongRestSchema>, ctx?: Sessio
     const hitDiceRegained = Math.min(dice.max - dice.current, Math.max(1, Math.floor(dice.max / 2)));
     const pools: Pools = { ...((character.resourcePools ?? {}) as Pools), hit_dice: { current: dice.current + hitDiceRegained, max: dice.max } };
 
-    // Restore spell slots on long rest
-    const charClass = character.characterClass || 'fighter';
+    // Restore spell slots on long rest (item 8: a world class's casting.as table)
+    const charClass = castingClassFor(getDb(), character) || 'fighter';
     const spellConfig = getSpellcastingConfig(charClass);
 
     let spellSlotsRestored: { type: string; slotsRestored?: number; slotLevel?: number; level1?: number; level2?: number; level3?: number; level4?: number; level5?: number } | undefined = undefined;
     let updatedChar = { ...character, hp: newHp, resourcePools: pools };
 
     if (spellConfig.canCast && character.level >= spellConfig.startLevel) {
-        const restoredChar = restoreAllSpellSlots(character);
+        const restoredChar = restoreAllSpellSlots({ ...character, characterClass: charClass });
 
         if (spellConfig.pactMagic) {
             spellSlotsRestored = {
@@ -173,7 +180,7 @@ async function handleShortRest(args: z.infer<typeof ShortRestSchema>, ctx?: Sess
 
     const dice = hitDicePool(character as { level: number; resourcePools?: Pools });
     const hitDiceToSpend = Math.min(args.hitDiceToSpend ?? 1, dice.current);
-    const hitDieSize = getHitDieSize(character.characterClass);
+    const hitDieSize = getHitDieSize(character.characterClass, character.id);
     const conModifier = getAbilityModifier(character.stats.con);
 
     // Roll hit dice for healing
@@ -189,8 +196,8 @@ async function handleShortRest(args: z.infer<typeof ShortRestSchema>, ctx?: Sess
     const actualHealing = Math.min(totalHealing, character.maxHp - character.hp);
     const newHp = character.hp + actualHealing;
 
-    // Restore warlock pact slots on short rest
-    const charClass = character.characterClass || 'fighter';
+    // Restore warlock pact slots on short rest (item 8: casting.as)
+    const charClass = castingClassFor(getDb(), character) || 'fighter';
     const spellConfig = getSpellcastingConfig(charClass);
 
     let pactSlotsRestored: { slotsRestored: number; slotLevel: number } | undefined = undefined;
@@ -199,7 +206,7 @@ async function handleShortRest(args: z.infer<typeof ShortRestSchema>, ctx?: Sess
     let updatedChar: Record<string, unknown> = { hp: newHp, resourcePools: pools };
 
     if (spellConfig.pactMagic && spellConfig.canCast && character.level >= spellConfig.startLevel) {
-        const restoredChar = restorePactSlots(character);
+        const restoredChar = restorePactSlots({ ...character, characterClass: charClass });
         pactSlotsRestored = {
             slotsRestored: restoredChar.pactMagicSlots?.max || 0,
             slotLevel: restoredChar.pactMagicSlots?.slotLevel || 0

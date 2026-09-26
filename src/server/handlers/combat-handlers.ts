@@ -4,7 +4,7 @@ import * as pda from '../../render/pda.js';
 import { randomUUID } from 'crypto';
 import { freshSeed } from '../../math/seed.js';
 import { CombatEngine, CombatParticipant, CombatState, CombatActionResult } from '../../engine/combat/engine.js';
-import { normalizeConditions } from '../../engine/combat/conditions.js';
+import { normalizeConditions, normalizeCondition } from '../../engine/combat/conditions.js';
 import { ConditionInputSchema, footprintCells } from '../../schema/encounter.js';
 import { SpatialEngine } from '../../engine/spatial/engine.js';
 
@@ -19,9 +19,12 @@ import { SessionContext } from '../types.js';
 import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
 import { PartSchema, UnitSchema, ParticipantExtrasShape, type Part, type ReadiedAttack } from '../../schema/token-extras.js';
-import { resolveWorldId, bandOrder, loadRule, loadRules, type TableRule } from '../../engine/table-rules.js';
+import { worldProgression } from '../../engine/progression.js';
+import { resolveWorldId, bandOrderFor, loadRule, loadRules, castingClassFor, findWorldRule, type TableRule } from '../../engine/table-rules.js';
+import { castWorldSpell, sheetSpecies } from './world-spell.js';
+import { creditGrowth } from '../growth.js';
 import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
-import { volleyTier, describeUnit } from '../../engine/combat/units.js';
+import { volleyTier, describeUnit, breakTestDue, moraleModifiers, type BreakTest } from '../../engine/combat/units.js';
 import { upsertPart, findPart, resolveAttackSource } from '../../engine/combat/parts.js';
 import { compareBands } from '../../engine/table-rules.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
@@ -136,6 +139,43 @@ export function mirrorConditionToRow(characterId: string, op: 'add' | 'remove', 
 }
 
 /**
+ * Item 2: a sheet change that reshapes a creature (a form taken or put down)
+ * reaches its tokens in every active encounter: the stored rows and any
+ * engine held in memory. A field given as undefined is removed from the
+ * token. Returns the encounter ids patched.
+ */
+export function pushSheetToLiveTokens(characterId: string, tokenFields: Record<string, unknown>): string[] {
+    const patch = (tok: Record<string, unknown>) => {
+        for (const [k, v] of Object.entries(tokenFields)) {
+            if (v === undefined) delete tok[k];
+            else tok[k] = JSON.parse(JSON.stringify(v));
+        }
+    };
+    const patched = new Set<string>();
+    const db = getDb();
+    try {
+        const rows = db.prepare("SELECT id, tokens FROM encounters WHERE status = 'active' AND tokens LIKE ?").all(`%"${characterId}"%`) as Array<{ id: string; tokens: string }>;
+        const upd = db.prepare('UPDATE encounters SET tokens = ?, updated_at = ? WHERE id = ?');
+        for (const r of rows) {
+            const tokens = JSON.parse(r.tokens) as Array<Record<string, unknown>>;
+            const tok = tokens.find(t => t.id === characterId);
+            if (!tok) continue;
+            patch(tok);
+            upd.run(JSON.stringify(tokens), new Date().toISOString(), r.id);
+            patched.add(r.id);
+        }
+    } catch { /* no encounters table */ }
+    const manager = getCombatManager();
+    for (const key of manager.list()) {
+        const tok = manager.get(key)?.getState()?.participants.find(p => p.id === characterId) as unknown as Record<string, unknown> | undefined;
+        if (!tok) continue;
+        patch(tok);
+        patched.add(key.slice(key.indexOf(':') + 1));
+    }
+    return [...patched];
+}
+
+/**
  * The encounter's live engine: from process memory, or rehydrated from the
  * database (after a restart or eviction) and registered. null when the
  * encounter exists in neither.
@@ -206,6 +246,8 @@ function buildStateJson(state: CombatState, encounterId: string, sessionId?: str
             ...(p.band ? { band: p.band } : {}),
             ...(p.regeneration ? { regeneration: p.regeneration } : {}),
             ...(p.cr !== undefined ? { cr: p.cr } : {}),
+            ...(p.species ? { species: p.species } : {}),
+            ...(p.buffs?.length ? { buffs: p.buffs } : {}),
             ...(p.parts?.length ? { parts: p.parts } : {}),
             ...(p.unit ? { unit: { ...p.unit, ...unitView(p) } } : {}),
             ...(p.intent ? { intent: p.intent } : {}),
@@ -888,7 +930,9 @@ Examples:
             spellName: z.string().optional()
                 .describe('CRIT-006: Name of the spell to cast (must exist in spell database)'),
             slotLevel: z.number().int().min(1).max(9).optional()
-                .describe('CRIT-006: Spell slot level to use (for upcasting)')
+                .describe('CRIT-006: Spell slot level to use (for upcasting)'),
+            unbinderId: z.string().optional()
+                .describe("Item 9: a participant who tries to unbind a world spell (table_rules spell with contestedBy: 'unbind'): rolls the casting dice, a higher total stops it")
         })
     },
     ADVANCE_TURN: {
@@ -1528,7 +1572,25 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         return 'action';
     };
 
-    if (parsed.action === 'attack') {
+    // Item 9: a world's own spell of this name casts on its rule, not the SRD.
+    let worldSpell: { rule: TableRule<'spell'>; worldId: string } | undefined;
+    if (parsed.action === 'cast_spell' && parsed.spellName) {
+        const worldId = resolveWorldId(getDb(), { encounterId: parsed.encounterId, characterIds: [parsed.actorId] });
+        const rule = findWorldRule(getDb(), worldId, 'spell', parsed.spellName);
+        if (rule && worldId) worldSpell = { rule, worldId };
+    }
+
+    if (worldSpell) {
+        const targetIds = parsed.targetIds?.length
+            ? parsed.targetIds
+            : parsed.targetId ? parsed.targetId.split(',').map(t => t.trim()).filter(Boolean) : [];
+        const cast = await castWorldSpell({
+            engine, db: getDb(), rule: worldSpell.rule, worldId: worldSpell.worldId,
+            actorId: parsed.actorId, targetIds, unbinderId: parsed.unbinderId, damage: parsed.damage
+        });
+        output = cast.output;
+        result = cast.result;
+    } else if (parsed.action === 'attack') {
         // Validation & Auto-Calculation
         let attackBonus = parsed.attackBonus;
         let dc = parsed.dc;
@@ -1749,7 +1811,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // checked before the roll so a refused strike spends nothing.
         const rulesDb = getDb();
         const ruleWorld = resolveWorldId(rulesDb, { encounterId: parsed.encounterId, characterIds: [parsed.actorId, parsed.targetId ?? ''] });
-        const ruleBands = bandOrder(rulesDb, ruleWorld);
+        // The band ladder that holds both bands (a world may import several).
+        const ruleBands = bandOrderFor(rulesDb, ruleWorld, [actor?.band, target?.band]);
         let strikeRule: TableRule<'called_strike'> | undefined;
         let preparedRule: TableRule<'prepared_asset'> | undefined;
         if (parsed.calledStrike && target?.unit) throw new Error(`Called strikes are against a single opponent; ${target.name} is a unit`);
@@ -1938,6 +2001,24 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             const t = volleyTier(targetNow);
             resultRec.targetUnit = { models: t?.models, maxModels: t?.maxModels, volley: t?.dice ?? null };
             ruleLines.push(`UNIT ${targetNow.name}: ${describeUnit(targetNow)}`);
+            // Item 12: a unit carried through its breakAt owes a break test.
+            const due = result.target ? breakTestDue(targetNow, result.target.hpBefore, { moraleBonus: moraleModifiers(targetNow, afterState?.participants ?? [], sheetSpecies(getDb())) }) : null;
+            if (due) {
+                resultRec.breakTests = [due];
+                ruleLines.push(due.line);
+            }
+        }
+
+        // Growth tracks: a kill feeds the killer's growth pool (more for a
+        // victim of its band or above). The next form is offered, never taken.
+        if (result.target && result.target.hpBefore > 0 && targetNow && targetNow.hp <= 0 && actorNow) {
+            try {
+                const credit = creditGrowth(rulesDb, ruleWorld, parsed.actorId, 'kill', { victim: targetNow.name, victimBand: targetNow.band, attackerBand: actorNow.band });
+                if (credit) {
+                    resultRec.growth = credit;
+                    ruleLines.push(`GROWTH ${credit.track}: ${credit.pool} ${credit.from} → ${credit.to} (${credit.reason})${credit.growthReady ? `; ready for ${credit.growthReady.form}: ${credit.growthReady.call}` : ''}`);
+                }
+            } catch { /* no character row or rules table: no credit */ }
         }
 
         // Commit Action Economy: legendary actions, the reaction, or one
@@ -2273,6 +2354,14 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             throw new Error(`Character ${parsed.actorId} not found in database. Spellcasting requires a character record with class and spell slots.`);
         }
 
+        // Item 8: a world class with casting.as casts SRD spells as that
+        // caster (slots, ability, spell list); the sheet keeps its own class.
+        const ownClass = casterChar.characterClass;
+        const castingAs = castingClassFor(db, casterChar);
+        if (castingAs && castingAs !== ownClass) casterChar = { ...casterChar, characterClass: castingAs };
+        // Item 10: spell DC and attack read the caster's world proficiency curve.
+        const casterProfBonus = worldProgression(db, resolveWorldId(db, { characterIds: [casterChar.id] })).profBonus(casterChar.level);
+
         // Get target (needed for validation of range)
         // Re-use logic: defined outside or define here once?
         // Note: variable 'target' is defined later in the file.
@@ -2335,9 +2424,32 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             }
         }
 
-        // Resolve spell effects (damage calculation)
+        // Resolve spell effects (damage calculation) on the encounter's seeded,
+        // logged dice. Each target rolls its own save below, so the resolver
+        // rolls none (perTargetSaves) and leaves debuff conditions to us.
+        const attackTargetId = validationTarget?.id ?? parsed.targetIds?.[0];
+        let spellAttackSituational: string[] = [];
         const resolution = resolveSpell(spell, casterChar, effectiveSlotLevel, {
-            targetAC
+            targetAC,
+            perTargetSaves: true,
+            advantage: parsed.advantage,
+            disadvantage: parsed.disadvantage,
+            casterId: parsed.actorId,
+            targetId: attackTargetId,
+            profBonus: casterProfBonus,
+            dice: {
+                d20: (_tag, advantage, disadvantage) => {
+                    if (!attackTargetId || !currentState.participants.some(p => p.id === attackTargetId)) {
+                        const rolls = [engine.rollD20({ purpose: 'spell attack', forId: parsed.actorId })];
+                        if (!!advantage !== !!disadvantage) rolls.push(engine.rollD20({ purpose: 'spell attack', forId: parsed.actorId }));
+                        return { natural: advantage && !disadvantage ? Math.max(...rolls) : disadvantage && !advantage ? Math.min(...rolls) : rolls[0], rolls };
+                    }
+                    const r = engine.rollSpellAttackD20(parsed.actorId, attackTargetId, { ranged: parsed.ranged, advantage, disadvantage });
+                    spellAttackSituational = r.situational;
+                    return r;
+                },
+                roll: (notation, tag) => engine.rollDice(notation, { purpose: tag, forId: parsed.actorId, ...(attackTargetId ? { targetId: attackTargetId } : {}) })
+            }
         });
 
         // Collect all targets (support both single targetId and multiple targetIds for AoE)
@@ -2375,13 +2487,16 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         const saveType = damageEffect?.saveType;
         const saveEffect = damageEffect?.saveEffect;
         const requiresSave = saveType && saveType !== 'none';
-        const spellSaveDC = casterChar.spellSaveDC || calculateSpellSaveDC(casterChar);
+        const spellSaveDC = casterChar.spellSaveDC || calculateSpellSaveDC(casterChar, casterProfBonus);
         // Each target rolls its own save below, so a save spell starts from the
         // full roll. resolution.damage already carries the resolver's single
         // unmodified save; using it would halve (or zero) the damage twice.
         const baseDamage = requiresSave
             ? (resolution.damageRolled ?? resolution.damage ?? 0)
             : (resolution.damage ?? 0);
+
+        // Item 12: units the spell carried through their breakAt.
+        const breakTests: BreakTest[] = [];
 
         // Apply damage/healing to ALL targets
         if (baseDamage > 0 && allTargetIds.length > 0) {
@@ -2433,6 +2548,10 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 const updatedTarget = freshState?.participants.find(p => p.id === tid);
                 const hpAfter = updatedTarget?.hp ?? 0;
                 const defeated = hpAfter <= 0;
+                if (updatedTarget?.unit) {
+                    const due = breakTestDue(updatedTarget, hpBefore, { moraleBonus: moraleModifiers(updatedTarget, freshState?.participants ?? [], sheetSpecies(getDb())) });
+                    if (due) breakTests.push(due);
+                }
 
                 // Sync HP to character database after spell damage
                 if (damageDealt > 0 && updatedTarget) {
@@ -2481,6 +2600,37 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             }
         }
 
+        // Debuff spells: each target rolls its own save (when the spell has
+        // one) on the encounter's dice; a failure, or no save, applies the
+        // spell's conditions to the token.
+        const conditionsApplied: Array<{ id: string; name: string; condition: string; save?: ParticipantSaveResult }> = [];
+        const conditionLines: string[] = [];
+        for (const effect of spell.effects.filter(e => e.type === 'debuff' && e.conditions?.length)) {
+            const hasSave = !!effect.saveType && effect.saveType !== 'none';
+            for (const tid of allTargetIds) {
+                const tp = engine.getState()?.participants.find(p => p.id === tid);
+                if (!tp) continue;
+                let save: ParticipantSaveResult | undefined;
+                if (hasSave) {
+                    save = rollParticipantSave(engine, getDb(), tp, effect.saveType!, spellSaveDC, {
+                        purpose: `${toLongAbility(effect.saveType!) ?? effect.saveType} save vs ${spell.name}`
+                    });
+                    const line = `🎲 ${tp.name} ${save.ability.toUpperCase()} save: d20(${save.rolls.join(',')}) ${save.modifier >= 0 ? '+' : '-'} ${Math.abs(save.modifier)} = ${save.total} vs DC ${spellSaveDC} [${save.saved ? 'PASS' : 'FAIL'}]`;
+                    conditionLines.push(line);
+                    if (save.legendaryResisted) conditionLines.push(`⭐ Legendary resistance spent: the failed save becomes a success`);
+                    if (save.saved) continue;
+                }
+                for (const name of effect.conditions!) {
+                    const norm = normalizeCondition({ name, sourceId: parsed.actorId, ...(hasSave ? { saveDC: spellSaveDC, saveAbility: effect.saveType } : {}) } as never, tid);
+                    if (!norm) continue;
+                    const { id: _drop, ...rest } = norm;
+                    const applied = engine.applyCondition(tid, rest);
+                    conditionsApplied.push({ id: tid, name: tp.name, condition: applied.type, ...(save ? { save } : {}) });
+                    conditionLines.push(`🔗 ${tp.name} is ${applied.type} (${spell.name})`);
+                }
+            }
+        }
+
         // Handle healing (single target only for now)
         let primaryTarget = currentState.participants.find(p => p.id === parsed.targetId);
         const targetHpBefore = primaryTarget?.hp || 0;
@@ -2493,7 +2643,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // Consume spell slot (if not cantrip)
         if (effectiveSlotLevel > 0) {
             const updatedChar = consumeSpellSlot(casterChar, effectiveSlotLevel);
-            charRepo.update(casterChar.id, updatedChar);
+            charRepo.update(casterChar.id, { ...updatedChar, characterClass: ownClass });
         }
 
         // Handle concentration
@@ -2581,6 +2731,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         const reportedDamage = damageResults.length > 0
             ? damageResults.reduce((sum, dr) => sum + (dr.damageDealt ?? 0), 0)
             : (requiresSave ? baseDamage : (resolution.damage || 0));
+        if (spellAttackSituational.length) output += `\n(${spellAttackSituational.join('; ')})\n`;
+        if (conditionLines.length) output += `\n${conditionLines.join('\n')}\n`;
+        for (const due of breakTests) output += `\n▌ ${due.line}\n`;
         output += `\n[SPELL: ${spell.name}, SLOT: ${effectiveSlotLevel > 0 ? effectiveSlotLevel : 'cantrip'}, DMG: ${reportedDamage}, HEAL: ${resolution.healing || 0}]`;
 
         // Commit Action Economy
@@ -2609,6 +2762,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // Per-target saves ride the action JSON so the client sees each die and modifier.
         const saves = damageResults.filter(dr => dr.save).map(dr => ({ id: dr.id, name: dr.name, ...dr.save! }));
         if (saves.length) (result as { saves?: unknown }).saves = saves;
+        if (conditionsApplied.length) (result as { conditionsApplied?: unknown }).conditionsApplied = conditionsApplied;
+        if (breakTests.length) (result as { breakTests?: unknown }).breakTests = breakTests;
+        if (spellAttackSituational.length) result.situational = spellAttackSituational;
     } else {
         throw new Error(`Unknown action: ${parsed.action}`);
     }
@@ -2711,6 +2867,10 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             legendary: (r as { legendary?: unknown }).legendary,
             reaction: (r as { reaction?: unknown }).reaction,
             saves: (r as { saves?: unknown }).saves,
+            conditionsApplied: (r as { conditionsApplied?: unknown }).conditionsApplied,
+            worldSpell: (r as { worldSpell?: unknown }).worldSpell,
+            breakTests: (r as { breakTests?: unknown }).breakTests,
+            growth: (r as { growth?: unknown }).growth,
             // Item 11: reactions a move set off, each at the step it happened.
             opportunityAttacks: (r as { opportunityAttacks?: unknown }).opportunityAttacks,
             opportunityAttacksAvailable: (r as { opportunityAttacksAvailable?: unknown }).opportunityAttacksAvailable,

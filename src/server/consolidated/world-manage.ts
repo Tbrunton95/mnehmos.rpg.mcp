@@ -17,7 +17,7 @@ import { getWorldManager } from '../state/world-manager.js';
 import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
 import { persistGeneratedWorldEntities } from '../../services/generated-world-persistence.service.js';
-import { readWorldClock, clockAt, clockAfter } from '../../engine/world-clock.js';
+import { readWorldClock, clockAt, clockAfter, dayClock, clockWarning, recordsAfterClock } from '../../engine/world-clock.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -72,6 +72,7 @@ const UpdateSchema = z.preprocess(
         action: z.literal('update'),
         id: z.string().describe('World ID (worldId accepted as alias)'),
         worldId: z.string().optional().describe('Alias of id — pass either'),
+        correction: z.boolean().optional().describe('Item 15: the clock was WRONG, not time passing — skips regeneration and the elapsed/time_passed note; returns correction {from, to, deltaHours}'),
         environment: WorldEnvironmentSchema.partial().describe(
             'Canonical environment properties to update: day, time, date, timeOfDay, season, moonPhase, weatherConditions, temperature, lighting'
         )
@@ -326,14 +327,18 @@ async function handleDelete(args: z.infer<typeof DeleteSchema>): Promise<object>
 }
 
 async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object> {
-    return writeEnvironment(args.id, args.environment, 'update');
+    return writeEnvironment(args.id, args.environment, 'update', { correction: args.correction === true });
 }
+
+// Item 15: a plain update that jumps this far (or goes backwards) is more
+// often a fix than a journey; the result says how to mark it as one.
+const LARGE_JUMP_HOURS = 72;
 
 /**
  * The one write path for the world clock: update and advance both land here,
  * so elapsedHours, regeneration and the time_passed note never diverge.
  */
-function writeEnvironment(worldId: string, patch: Partial<z.infer<typeof WorldEnvironmentSchema>>, actionType: 'update' | 'advance'): Record<string, unknown> {
+function writeEnvironment(worldId: string, patch: Partial<z.infer<typeof WorldEnvironmentSchema>>, actionType: 'update' | 'advance', opts: { correction?: boolean } = {}): Record<string, unknown> {
     const worldRepo = getWorldRepo();
     // FINDINGS #88: elapsedHours — the world clock and the emission timer must
     // never disagree. The PRIOR clock is read before the write; the delta is
@@ -349,7 +354,28 @@ function writeEnvironment(worldId: string, patch: Partial<z.infer<typeof WorldEn
 
     // Read the merged clock so a time-only update still yields elapsed hours.
     const newClock = clockAt(updated.environment as { day?: number; time?: string });
-    const elapsedHours = priorClock !== null && newClock !== null ? Math.round((newClock - priorClock) * 24 * 100) / 100 : null;
+    const deltaHours = priorClock !== null && newClock !== null ? Math.round((newClock - priorClock) * 24 * 100) / 100 : null;
+
+    // Item 15: a correction moves the clock without time passing — no
+    // regeneration, no elapsed hours to feed time_passed, just what moved.
+    if (opts.correction) {
+        const db = getDb();
+        const warning = clockWarning(db, worldId);
+        return {
+            success: true,
+            actionType,
+            worldId,
+            environment: updated.environment,
+            correction: {
+                from: priorClock !== null ? dayClock(priorClock) : null,
+                to: newClock !== null ? dayClock(newClock) : null,
+                deltaHours
+            },
+            ...(warning ? { clockWarning: warning } : {}),
+            message: `Clock corrected for world ${worldId}${newClock !== null ? ` to ${dayClock(newClock)}` : ''} — no time passed: no regeneration, no time_passed check`
+        };
+    }
+    const elapsedHours = deltaHours;
 
     // Table rules: regeneration runs out of combat too. A minute is ten
     // rounds, so any advance of a minute or more restores regenerating
@@ -379,6 +405,9 @@ function writeEnvironment(worldId: string, patch: Partial<z.infer<typeof WorldEn
                 ? `${elapsedHours}h elapsed since the prior clock — pass THIS number to secret_manage check_conditions {type:'time_passed', hoursPassed:${elapsedHours}}`
                 : `clock moved BACKWARDS ${Math.abs(elapsedHours)}h — rewind or correction; no time_passed check applies`
         } : {}),
+        ...(actionType === 'update' && elapsedHours !== null && (elapsedHours >= LARGE_JUMP_HOURS || elapsedHours < 0) ? {
+            hint: `The clock moved ${elapsedHours}h. If this fixes a wrong clock rather than passing time, re-send with correction: true — it skips regeneration and the time_passed note.`
+        } : {}),
         message: `Updated environment for world ${worldId}${elapsedHours !== null && elapsedHours > 0 ? ` — ${elapsedHours}h elapsed` : ''}${regenerated ? `; regenerated to full: ${regenerated.map(r => r.name).join(', ')}` : ''}`
     };
 }
@@ -406,6 +435,16 @@ async function handleAdvance(args: z.infer<typeof AdvanceSchema>): Promise<objec
     if (!(hours > 0)) {
         return { error: true, actionType: 'advance', message: 'advance needs minutes, hours or days greater than zero. Nothing was written.' };
     }
+    return advanceWorldClock(args.worldId, hours);
+}
+
+/**
+ * Move a world's clock forward by `hours` through the one write path
+ * (regeneration, elapsed note) and count what came due. world_manage advance
+ * and spatial_manage traverse {advanceClock} both call it.
+ */
+export function advanceWorldClock(worldId: string, hours: number): Record<string, unknown> {
+    const args = { worldId };
     const db = getDb();
     const clock = readWorldClock(db, args.worldId);
     if (!clock) {
@@ -430,12 +469,19 @@ async function handleAdvance(args: z.infer<typeof AdvanceSchema>): Promise<objec
         debts = (db.prepare(`SELECT COUNT(*) AS n FROM ledger_debts WHERE world_id = ? AND due_day IS NOT NULL
                              AND ((status = 'pending' AND due_day <= ?) OR (status = 'due' AND ? > due_day + grace_days))`).get(args.worldId, next.day, next.day) as { n: number }).n;
     } catch { /* no ledger table yet */ }
+    // Item 4: congregations with a whole week to process. Reported only when
+    // there are some, so worlds without cults see the same dueNow as before.
+    let congregations = 0;
+    try {
+        congregations = (db.prepare(`SELECT COUNT(*) AS n FROM congregations WHERE world_id = ? AND status = 'active'
+                                     AND last_processed_day IS NOT NULL AND ? - last_processed_day >= 7`).get(args.worldId, at) as { n: number }).n;
+    } catch { /* no congregations table yet */ }
     const label = `Day ${next.day}, ${next.time}`;
-    const due = [scheduled ? `${scheduled} scheduled row(s) due: process_scheduled {worldId}` : '', debts ? `${debts} debt(s) to move: ledger_manage process_due {worldId}` : ''].filter(Boolean);
+    const due = [scheduled ? `${scheduled} scheduled row(s) due: process_scheduled {worldId}` : '', debts ? `${debts} debt(s) to move: ledger_manage process_due {worldId}` : '', congregations ? `${congregations} congregation(s) with a week to process: congregation_manage process_weekly {worldId}` : ''].filter(Boolean);
     return {
         ...result,
         clock: label,
-        dueNow: { scheduled, debts },
+        dueNow: { scheduled, debts, ...(congregations > 0 ? { congregations } : {}) },
         message: `Clock advanced ${Math.round(hours * 100) / 100}h to ${label}${result.regenerated ? `; regenerated to full: ${(result.regenerated as Array<{ name: string }>).map(r => r.name).join(', ')}` : ''}${due.length ? ` — ${due.join('; ')}` : ''}`
     };
 }
@@ -515,6 +561,11 @@ async function handleAudit(args: { worldId?: string }): Promise<object> {
         // FINDINGS #105: scoped lane live once encounters carry world_id.
         () => db.prepare(`SELECT id, round, updated_at AS updatedAt FROM encounters WHERE world_id = ? AND status = 'active'`).all(W),
         () => db.prepare(`SELECT id, round, updated_at AS updatedAt FROM encounters WHERE status = 'active'`).all());
+    // Items 14/15: records stamped later than the clock — a clock that went
+    // backwards. Advisory: the rows are right, the clock may not be.
+    runW('records dated after the world clock (advisory)',
+        () => recordsAfterClock(db, W!),
+        () => (db.prepare('SELECT id FROM worlds').all() as Array<{ id: string }>).flatMap(w => recordsAfterClock(db, w.id).map(r => ({ worldId: w.id, ...r }))));
     runW('party position vs member seats',
         () => auditPartySeats(db, W),
         () => auditPartySeats(db, undefined));
@@ -744,8 +795,8 @@ Aliases: new→create, fetch→get, all→list, remove→delete, set→update, g
 🌍 WORLD WORKFLOW:
 1. generate - Create procedural world with terrain/biomes
 2. get_state - Check world status
-3. update - Set time/weather/season
-   advance {worldId, minutes?|hours?|days?} - move the clock forward; returns dueNow {scheduled, debts}
+3. update - Set time/weather/season; correction:true when fixing a wrong clock (no regeneration, no time_passed)
+   advance {worldId, minutes?|hours?|days?} - move the clock forward; returns dueNow {scheduled, debts, congregations?}
 4. For map operations, use world_map tool instead`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
@@ -762,6 +813,7 @@ Aliases: new→create, fetch→get, all→list, remove→delete, set→update, g
         temperatureOffset: z.number().optional(),
         moistureOffset: z.number().optional(),
         environment: z.any().optional().describe('Environment properties (for update)'),
+        correction: z.boolean().optional().describe('update: the clock was wrong, not time passing — no regeneration, no elapsed note; returns correction {from, to, deltaHours}'),
         minutes: z.number().optional().describe('advance: minutes to move the clock forward'),
         hours: z.number().optional().describe('advance: hours to move the clock forward'),
         days: z.number().optional().describe('advance: days to move the clock forward')
@@ -821,7 +873,10 @@ export async function handleWorldManage(args: unknown, _ctx: SessionContext): Pr
             case 'update':
                 output = RichFormatter.header('Environment Updated', '🌤️');
                 output += RichFormatter.keyValue({ 'World ID': `\`${parsed.worldId}\``, ...(parsed.elapsedHours !== undefined && parsed.elapsedHours !== null ? { 'Elapsed': `${parsed.elapsedHours}h` } : {}) });
+                if (parsed.correction) output += RichFormatter.alert(`Correction: ${parsed.correction.from ?? '?'} → ${parsed.correction.to ?? '?'} (${parsed.correction.deltaHours ?? '?'}h) — no time passed`, 'info');
                 if (parsed.elapsedNote) output += RichFormatter.alert(parsed.elapsedNote, 'info');
+                if (parsed.hint) output += RichFormatter.alert(parsed.hint, 'warning');
+                if (parsed.clockWarning) output += RichFormatter.alert(parsed.clockWarning, 'warning');
                 break;
             case 'advance':
                 output = RichFormatter.header('Clock Advanced', '🕰️');

@@ -45,12 +45,18 @@ describe('character_manage consolidated tool', () => {
             expect(CharacterManageTool.description).toContain('level_up');
         });
 
-        it('documents class-aware spell choices and exposes the D&D level range', () => {
+        it('documents class-aware spell choices and exposes the D&D level range', async () => {
             expect(CharacterManageTool.description).toContain('knownSpells');
             expect(CharacterManageTool.description).toContain('preparedSpells');
             expect(CharacterManageTool.description).toContain('daily preparation is not used');
             expect(CharacterManageTool.inputSchema.parse({ action: 'create', name: 'Level Seven', level: 7 }).level).toBe(7);
-            expect(() => CharacterManageTool.inputSchema.parse({ action: 'create', name: 'Too Powerful', level: 21 })).toThrow();
+            // Item 10: the cap is the world's progression rule, checked by the
+            // handler (default 20; table_rules progression maxLevel null lifts it).
+            const tooPowerful = CharacterManageTool.inputSchema.parse({ action: 'create', name: 'Too Powerful', level: 21 });
+            expect(tooPowerful.level).toBe(21);
+            const refused = await handleCharacterManage(tooPowerful, ctx);
+            expect(refused.content[0].text).toMatch(/max level 20/);
+            expect(characterRepo.findAll()).toHaveLength(0);
         });
 
         it('exposes cantripsKnown through the MCP registration schema', () => {

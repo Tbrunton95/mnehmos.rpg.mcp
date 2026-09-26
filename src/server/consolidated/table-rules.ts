@@ -12,12 +12,13 @@ import { RichFormatter } from '../utils/formatter.js';
 import { getDb } from '../../storage/index.js';
 import { SessionContext } from '../types.js';
 import { RULE_KINDS, RuleKind, parseRuleSpec, listRules, TableRule, findPool } from '../../engine/table-rules.js';
+import { rollAndApply } from '../roll-table-apply.js';
 import { RULE_PRESETS } from '../../data/table-rules/day-366.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import type { CombatParticipant } from '../../engine/combat/engine.js';
 
-const ACTIONS = ['define', 'get', 'list', 'enable', 'disable', 'delete', 'import'] as const;
+const ACTIONS = ['define', 'get', 'list', 'enable', 'disable', 'delete', 'import', 'roll'] as const;
 
 const RuleEntrySchema = z.object({
     kind: z.string(),
@@ -38,6 +39,11 @@ const TableRulesInputSchema = z.object({
     fromToken: z.object({ encounterId: z.string(), participantId: z.string() }).optional()
         .describe('define kind creature: capture the statline of a live combat token; spec is merged on top'),
     fromCharacterId: z.string().optional().describe('define kind creature: capture the statline of a character sheet; spec is merged on top'),
+    characterId: z.string().optional().describe('roll: who the roll is for (logged; their modifierPool feeds the modifier)'),
+    modifier: z.number().int().optional().describe('roll: added to the dice before the entry is read (clamped to the table)'),
+    modifierPool: z.string().optional().describe("roll: the character's pool whose current ÷ poolDivisor adds to the roll (default: the table's modifierPool)"),
+    apply: z.boolean().optional().describe('roll: apply the entry to characterId (default true when characterId is given; false previews)'),
+    seed: z.string().optional().describe('roll: replay exact dice. Leave out for a fresh roll'),
     sessionId: z.string().optional()
 });
 
@@ -180,6 +186,15 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
             db.prepare('DELETE FROM table_rules WHERE id = ?').run(rule.id);
             return { success: true, actionType: 'delete', name: rule.name, message: `'${rule.name}' deleted` };
         }
+        case 'roll': case 'roll_table': {
+            if (!input.name) return { error: true, message: 'roll needs name (a roll_table rule)' };
+            // Item 1: with a character the entry applies itself unless apply: false previews it.
+            return rollAndApply(db, {
+                worldId: input.worldId, name: input.name, characterId: input.characterId,
+                modifier: input.modifier, modifierPool: input.modifierPool,
+                apply: input.apply ?? !!input.characterId, seed: input.seed, tool: 'table_rules'
+            });
+        }
         case 'import': {
             let entries = input.rules;
             if (!entries && input.preset) {
@@ -235,13 +250,21 @@ Kinds:
 - peer_consequence {thresholdFraction, onCrit, options, direction}: a hit on a peer (same band or higher) that crits or deals ≥ the fraction of max HP flags CONSEQUENCE DUE; direction 'both' flags a higher band's hits on a lower one too. A hit that kills, or a hit on a unit, never flags; the GM names it and applies it with combat_manage set_part.
 - called_strike {requirePeer, limbs}: combat_action attack calledStrike: 'leg'|'arm' or any named part of the target ('jaw', 'collar chain') cripples it on a hit (no roll penalty, no threshold). A named part keeps its kind and reads limbs[name] ?? limbs[kind] ?? limbs.other.
 - prepared_asset {catastrophicMargin, missOptions, hitEffect, catastrophicEffect}: combat_action attack preparedAsset: <rule name> reports the tier (miss / hit / catastrophic); the GM names the effect.
-- progression {mode: 'milestone'}: add_xp stops offering level-ups.
+- progression {mode: 'milestone' | 'xp' | 'none', maxLevel?, xpThresholds?, profBonus?}: milestone and none stop add_xp offering level-ups. maxLevel caps create, update and level_up (default 20; null = no cap). xpThresholds lists XP for levels 1, 2, ... (the last step repeats); profBonus lists the proficiency bonus by level (the last value holds) for skills, saves and spell DC/attack. Without a rule: XP, level 20, the SRD table.
 - status_block {compact, maxConditions, corePool}: tiny status blocks; corePool names the one resource pool shown (any case).
 - lexicon {currency, badge, questFailLine}: the world's words for fixed labels (currency on the gold field, the status block's header badge, the quest-failed line). Without one a world reads RU, ПДА and "The Zone doesn't wait."
 - principle {text}: reference text shown at session boot, never enforced.
-- creature {hp, ac, displayName?, maxHp?, stats?, initiativeBonus?, attackBonus/attackDamage or attacks[], attacksPerAction?, abilities?, size?, movementSpeed?, cr?, band?, regeneration?, parts?, unit?, resistances?, traits?, legendary counts, hasLairActions?}: the world's bestiary. Spawn with combat_manage spawn_quick_enemy {creature, worldId} or add_participant {creature, count}; a world entry beats a built-in preset of the same name. define can capture one: fromToken {encounterId, participantId} or fromCharacterId, with spec merged on top. Boot counts these as the bestiary; they are never enforced.
+- creature {hp, ac, displayName?, maxHp?, stats?, initiativeBonus?, attackBonus/attackDamage or attacks[], attacksPerAction?, abilities?, size?, movementSpeed?, cr?, band?, species?, tags?, regeneration?, parts?, unit?, resistances?, traits?, legendary counts, hasLairActions?}: the world's bestiary. Spawn with combat_manage spawn_quick_enemy {creature, worldId} or add_participant {creature, count}; a world entry beats a built-in preset of the same name. define can capture one: fromToken {encounterId, participantId} or fromCharacterId, with spec merged on top. Boot counts these as the bestiary; they are never enforced.
+- roll_table {entries: [{weight | min/max, text, chain?, apply?}], dice?, modifierPool?, poolDivisor}: a random table (omens, miscasts, the Eye of the Gods). Weights read as cumulative ranges from 1; the default die is 1d<total weight> or 1d<highest max>. An entry's apply {gift?: {name, description?, category?, powerLevel?, mechanics?}, condition?: {name, duration?, source?, pinned?}, writes?: [ops as schedule_change], form?: '<creature>' | 'base', hpMode?, terminal?: 'kill', corpse?} acts on the character rolled for, in that order (gift, condition and writes, form, death). Data, never enforced.
+- pool_family {pools, max?, floor?, jealousy: {gainer: {rival: fraction}}, offering_values}: rival pools (the gods' favour). character_manage adjust_pool {family} moves a member; a gain makes jealous rivals lose round(gain × fraction). Data, never enforced.
+- skill {ability, description?}: a world skill. roll_skill_check and improvisation stunt read its ability (a stunt on any other non-SRD skill takes ability).
+- species {size?, speed?, abilityBonuses?, languages, traits, hpPerLevel?}, char_class {hitDie (8), saves, skills, armor?, weapons?, casting?: {as: '<SRD caster class>'}}, background {skills, languages, tools, gold?}: the world's character options. character_manage create reads the world's entry first and the SRD second; options {worldId} lists them. A class with casting.as casts SRD spells with that caster's slots and ability. Data, never enforced.
+- spell {castingRoll?: {dice ('2d6'), modifier, ability?, target}, cost: [{pool, delta}], effects: [{type damage|healing|condition|pool, dice?, damageType?, condition?, duration?, save?: {ability, dc?}, saveEffect half|none, pool?, delta?, target target|caster}], contestedBy?: 'unbind', miscast?: {on double|fail|fumble, table}, range?, castingTime?, known (true), displayName?}: a world spell. combat_action cast_spell of its name rolls the casting roll on the encounter's dice (a save's dc defaults to the casting total), pays the costs (a spend the caster cannot pay is refused; paid on a failure too), lets unbinderId contest it (higher total wins), and rolls the miscast table on a double, a failure or a fumble. No slots. known: false needs the caster's knownSpells.
+  castingRoll.bonusFromNearby {range, per (1), max?, match: {species?, band?, tag?, nameIncludes?}, overloadAt?}: +1 per per allies of the caster within range feet that match (units count live models), capped at max; at overloadAt or more the miscast table rolls too (on: 'overload').
+- growth_track {pool, steps: [{at, form, note?}], perKill?, perBandAbove?, perVictory?}: a kill in combat adds perKill (+ perBandAbove per band step the victim is at or above the killer) to the killer's pool, party_manage after_battle {victory: true} adds perVictory to each survivor with the pool. Crossing a step (by kills, adjust_pool, offer or table writes) returns growthReady {form, call}: the character_manage set_form call to make. It is never applied by itself. Data, never enforced.
+roll {worldId, name, characterId?, modifier?, modifierPool?, apply?, seed?}: rolls a roll_table on seeded, logged dice. The modifier (plus the character's modifierPool ÷ poolDivisor) shifts the total, clamped to the table; an entry's chain rolls the next table (5 deep). With characterId, each entry's apply acts on the character (apply: false previews and writes nothing); a death stops the chain. Returns rolled, entry, chained, text, rollId and applied[].
 A name is unique per world across kinds: define refuses to change an existing rule's kind.
-import {worldId, preset: 'day-366'} loads the Day 366 table rules. worldId REQUIRED on every call.`,
+import {worldId, preset: 'day-366' | 'orruk-waaagh'} loads a bundled rule set: the Day 366 table rules, or the Orruk Waaagh! (Gorkamorka favour, teef, Orruk and Grot, Brute / Ardboy / Wurrgog Prophet / Weirdnob Shaman, Ardboy-to-Great Warboss forms, the Getting Bigga track, the Waaagh! Overload table and three spells). worldId REQUIRED on every call.`,
     inputSchema: TableRulesInputSchema,
     // Every action shares the one input schema; the switch dispatcher validates per action.
     actionSchemas: Object.fromEntries(ACTIONS.map(a => [a, { schema: TableRulesInputSchema, aliases: [] as string[] }]))

@@ -4,6 +4,7 @@ import { CharacterRepository } from '../../../src/storage/repos/character.repo.j
 import { ItemRepository } from '../../../src/storage/repos/item.repo.js';
 import { InventoryRepository } from '../../../src/storage/repos/inventory.repo.js';
 import { randomUUID } from 'crypto';
+import { queryRolls } from '../../../src/storage/roll-log.js';
 
 describe('scroll_manage consolidated tool', () => {
     let characterId: string;
@@ -213,6 +214,15 @@ describe('scroll_manage consolidated tool', () => {
             expect(parsed.roll).toBeDefined();
             expect(parsed.total).toBeDefined();
             expect(parsed.dc).toBe(13); // 10 + spell level 3
+        });
+
+        it('the Arcana d20 is seeded and logged', async () => {
+            const result = await handleScrollManage({ action: 'identify', characterId, scrollItemId: scrollId, useIdentifySpell: false }, ctx);
+            const parsed = JSON.parse(result.content[0].text);
+            const row = queryRolls(db, { forId: characterId }).find((r: any) => String(r.purpose).startsWith('arcana check')) as any;
+            expect(row).toBeDefined();
+            expect(row.dice[0].value).toBe(parsed.roll);
+            expect(row.replay).toBeTruthy();
         });
 
         it('should accept alias "id"', async () => {

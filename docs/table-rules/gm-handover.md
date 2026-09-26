@@ -72,6 +72,22 @@ When several steps must land together, send them as one `batch_manage execute_se
 | A head, limb or plate changes state | `combat_manage set_part {part, state}` |
 | A monster's full statline | `combat_manage create` / `add_participant` with `size`, `reach`, `attacksPerAction`, `attacks`, `abilities`, `legendaryActions`, `legendaryResistances`, `hasLairActions`, `cr` |
 | Save a monster to the world's bestiary | `table_rules define {worldId, kind: 'creature', name, spec}` (or `fromToken {encounterId, participantId}` / `fromCharacterId`) |
+| Roll a house table (omens, the Eye of the Gods) | `table_rules roll {worldId, name, characterId?, modifier?}` on a `roll_table` rule; the entry's `chain` rolls the next table |
+| Move a god's favour (jealousy applies) | `character_manage adjust_pool {characterId, pool, delta, family, reason}` on a `pool_family` rule; returns `rivals[]` |
+| Transform a character (daemonhood, spawndom) | `character_manage set_form {characterId, form, hpMode?}`; `form: 'base'` reverts |
+| Roll the Eye of the Gods and apply it | `table_rules roll {worldId, name, characterId}` on entries with `apply` (gift, condition, writes, form, terminal kill); `apply: false` previews |
+| Make an offering to a god | `character_manage offer {characterId, family, pool, offering: item \| kill \| deed, itemId?, quantity?, victimId?, deed?, value?, answerTable?}` |
+| Found or run a cult | `congregation_manage create {worldId, name, god, founderId, size, zeal?, family?}`; `tend`, `strike {losses?, zealDelta?}`, `purge`; `process_weekly {worldId}` when advance shows `dueNow.congregations` |
+| Realmgate, toll bridge, portcullis | `spatial_manage gate_create {name, fromRoomId, toRoomId, direction, travelHours?, toll?: {gold}, holder?}`; `traverse {gateId, characterId, advanceClock?}`; `set_gate {gateId, status: open \| closed, holder?}`; `gate_list {worldId?, roomId?}` |
+| A Waaagh! (battle cry) | `combat_manage battle_cry {participantId, ability?: 'Waaagh!', match?: {species: 'Orruk'}, range?: 60, rounds?: 1, attackAdvantage?, damageBonus?, speedBonus?, moraleBonus?, actionCost?}`; lasts until the start of the caller's next turn. actionCost none (default) is free and may be called out of turn; action or bonus only on the caller's turn |
+| A mob that grows braver with numbers | `combat_manage set_unit {participantId, mobRule: {per, maxBonus?, attackBonusPer?, nearby?: {range, match}}}` |
+| An Orruk gets bigga | kills and after_battle victories feed the growth pool; when a reply shows `growthReady`, offer its `call` (`character_manage set_form`) to the player |
+| Run a warband | `party_manage muster {partyId}`; `pay {partyId, payerId?, amount?}`; `after_battle {partyId, victory, casualties?: [{characterId, models?, dead?}], recruits?}`; members take `loyalty`, `wage`, `payMode`, `unitModels` |
+| A world's own class, species, background, skill | `table_rules define {kind: char_class \| species \| background \| skill, name, spec}`; `character_manage create` reads them first; `options {worldId}`; `casting: {as: 'wizard'}` casts SRD spells as a wizard |
+| Levels past 20, a custom XP table or curve | `table_rules define {kind: progression, spec: {maxLevel: null \| N, xpThresholds?, profBonus?, mode?}}` |
+| A world's own spell (warp, winds of magic) | `table_rules define {kind: spell, spec: {castingRoll: {target}, cost?, effects, miscast?: {on, table}, contestedBy?: 'unbind'}}`; `combat_action cast_spell {spellName, targetId, unbinderId?}` |
+| A unit breaks and runs | watch for BREAK TEST DUE; `combat_manage set_unit {participantId, routed: true}` on a failed test (`morale`, `breakAt` set there too; `routed: false` rallies) |
+| Loot a body | `corpse_manage generate_loot {corpseId, creatureType}` (logged; `seed` replays) |
 | Spawn from the bestiary | `combat_manage spawn_quick_enemy {creature, count, worldId}` or `add_participant {encounterId, creature, count}` |
 | A recurring monster's statline, once | `character_manage update {characterId, ...}` with the same fields; tokens joined by id start with it |
 | Multiattack | `attacksPerAction: N` on the statline, then one `combat_action attack` per swing (`attack 1/2`, `2/2`) |
@@ -83,7 +99,8 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Opportunity attack or readied swing | NPC opportunity attacks roll on the move; a PC's comes back in `opportunityAttacksAvailable` with the call to make (`reaction: true` on the attack) |
 | Ready an attack that fires itself | `combat_action ready {readiedAction, trigger, on: 'enters_reach' \| 'leaves_reach', watch, attack: {using?}}`; free-text readied actions fire with `combat_manage trigger_readied {participantId, targetId?}` (spends the reaction, rolls a stored attack) |
 | Grab, pin, throw or finish unarmed | `combat_action grapple {encounterId, actorId, targetId, move}` (one attack; band and size disadvantage are automatic); `control: true` pins; `move: 'execute'` finishes a pinned lower-band foe; `move: 'break'` escapes the holder named in targetId |
-| A saving throw, with advantage from a condition or feature | `math_manage roll_saving_throw {characterId, ability, dc, advantageSources: ['VAUREK']}` (logged as `wis save (adv: VAUREK)`) |
+| A saving throw, with advantage from a condition or feature | `math_manage roll_saving_throw {characterId, ability, dc, advantageSources: ['VAUREK']}` (logged as `wis save (adv: VAUREK)`); an exact name beats a longer one, then a prefix, then any part |
+| Cast a spell | `combat_action cast_spell {actorId, spellName, targetId \| targetIds}`: attack, damage and saves on the fight's logged dice; debuff conditions land on a failed save (`conditionsApplied`) |
 | A boss burns legendary resistance on failed saves by itself | add `autoLegendaryResistance: true` to its statline; without it, a failed save reports how many are left |
 | Squad fires / is suppressed | `combat_action volley`; `combat_manage set_unit` |
 | Cut through a packed lower-band squad | add `cleave: true` |
@@ -102,5 +119,6 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Souls owed to a god | `ledger_manage create {worldId, debtor, creditor, amount, currency: 'souls', dueDay, consequence}` |
 | Time passes | `world_manage advance {worldId, hours}` (or `minutes`, `days`); set the clock once with `world_manage update {worldId, environment: {day, time}}` |
 | Clocks and debts the clock reached | `character_manage process_scheduled {worldId}`, `ledger_manage process_due {worldId}` (no day needed) |
+| The clock is wrong (not time passing) | `world_manage update {worldId, correction: true, environment: {day, time}}`; boot's CLOCK warning and `world_manage audit {worldId}` name records dated after the clock |
 | Did a timed-out call apply? | `session_manage op_status {forOpId}` |
 | Check a past roll | `session_manage rolls {forId \| encounterId \| forOpId}` |

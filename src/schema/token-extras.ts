@@ -62,6 +62,36 @@ export const AbilitySchema = z.object({
 export type Ability = z.infer<typeof AbilitySchema>;
 
 /**
+ * Who counts as 'nearby' for a Waaagh! (a spell's nearby bonus, a battle
+ * cry, mob rule): every key given must match. species reads the token's
+ * species, else the character sheet's race; tag reads the token's tags.
+ * A factory, so each schema that embeds it gets its own instance.
+ */
+export const nearbyMatchSchema = () => z.object({
+    band: z.string().optional().describe('Same band (any case)'),
+    species: z.string().optional().describe("Token species or the sheet's race (any case): 'Orruk'"),
+    tag: z.string().optional().describe("One of the token's tags (any case)"),
+    nameIncludes: z.string().optional().describe('Part of the name (any case)')
+});
+export type NearbyMatch = z.infer<ReturnType<typeof nearbyMatchSchema>>;
+
+/**
+ * A battle-cry buff on a token (combat_manage battle_cry). It lasts until
+ * the start of its source's turn after untilRound.
+ */
+export const BuffSchema = z.object({
+    name: z.string().min(1),
+    source: z.string().describe('Who called it (name)'),
+    sourceId: z.string().optional().describe('Who called it (participant id); the buff expires at the start of their turn after untilRound'),
+    untilRound: z.number().int(),
+    attackAdvantage: z.boolean().optional(),
+    damageBonus: z.union([z.number(), z.string()]).optional().describe("Added to damage on a hit: a number or dice ('1d4'), rolled on the encounter's dice"),
+    speedBonus: z.number().optional().describe('Feet added to speed'),
+    moraleBonus: z.number().optional().describe('Added to morale on a break test')
+});
+export type Buff = z.infer<typeof BuffSchema>;
+
+/**
  * Participant extras shared by combat_manage create, add_participant and the
  * internal create_encounter schema. A plain shape so each schema can spread
  * it; outer mirrors list the same keys flat (arrays of objects as z.any).
@@ -81,12 +111,29 @@ export const ParticipantExtrasShape = {
     legendaryResistancesRemaining: z.number().int().min(0).optional().describe('Legendary resistances left (defaults to the full count)'),
     autoLegendaryResistance: z.boolean().optional().describe('Spend a legendary resistance on a failed save automatically'),
     hasLairActions: z.boolean().optional().describe('Adds a LAIR slot at initiative 20 to the turn order'),
-    cr: z.number().min(0).optional().describe('Challenge rating')
+    cr: z.number().min(0).optional().describe('Challenge rating'),
+    species: z.string().optional().describe("Species ('Orruk'): nearby counts and battle cries match it"),
+    tags: z.array(z.string()).optional().describe("Free tags ('mob', 'ladz') that nearby matches read")
 };
 
 export const UnitTierSchema = z.object({
     minFraction: z.number().min(0).max(1).describe('Fraction of models still standing for this tier'),
     dice: z.string().min(1).describe("Volley damage at this tier ('4d6')")
+});
+
+/**
+ * Mob rule: +1 morale on a break test per `per` live models (plus the
+ * models of allied units nearby, when set), capped at maxBonus; +1 to hit
+ * per attackBonusPer live models.
+ */
+export const mobRuleSchema = () => z.object({
+    per: z.number().int().min(1).describe('Live models per +1 morale'),
+    maxBonus: z.number().int().min(0).optional().describe('Cap on the morale bonus'),
+    attackBonusPer: z.number().int().min(1).optional().describe('Live models per +1 to hit'),
+    nearby: z.object({
+        range: z.number().min(0).describe('Feet, edge to edge'),
+        match: nearbyMatchSchema().default({})
+    }).optional().describe("Allied units in range add their live models to the morale count")
 });
 
 export const UnitSchema = z.object({
@@ -97,7 +144,11 @@ export const UnitSchema = z.object({
     tiers: z.array(UnitTierSchema).min(1).optional().describe('Highest first. Default 4d6 ≥75%, 3d6 ≥50%, 2d6 ≥25%, 1d6 below'),
     suppressed: z.boolean().optional(),
     inMelee: z.boolean().optional(),
-    brokenFormation: z.boolean().optional()
+    brokenFormation: z.boolean().optional(),
+    morale: z.number().int().optional().describe("The unit's morale, shown on a BREAK TEST DUE line (the GM rolls the test)"),
+    breakAt: z.number().gt(0).lt(1).optional().describe('Fraction of models: dropping through it owes a break test (default 0.5)'),
+    routed: z.boolean().optional().describe('Routed: cannot volley and owes no more break tests (set_unit)'),
+    mobRule: mobRuleSchema().optional().describe('Mob rule: morale (and to-hit) grow with the models standing')
 });
 export type Unit = z.infer<typeof UnitSchema>;
 

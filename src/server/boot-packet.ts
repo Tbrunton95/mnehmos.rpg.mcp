@@ -13,7 +13,7 @@ import { CharacterRepository } from '../storage/repos/character.repo.js';
 import { loadRule, findPool, conditionsForDisplay, shownCounters } from '../engine/table-rules.js';
 import { recentPrecedents } from './consolidated/precedent-manage.js';
 import { NOTE_SOFT_CAP, splitSections } from './consolidated/narrative-manage.js';
-import { readWorldClock } from '../engine/world-clock.js';
+import { readWorldClock, clockWarning } from '../engine/world-clock.js';
 import type { Character } from '../schema/character.js';
 
 export interface BootPacket {
@@ -28,6 +28,8 @@ export interface BootPacket {
     telegraphs: Array<{ encounterId: string; name: string; intent?: string; readied?: string }>;
     journal: Array<{ type: string; text: string; at: string }>;
     precedents: Array<{ kind: string; statement: string; scope: string | null }>;
+    /** Items 14/15: records dated after the world clock (advisory), absent when none. */
+    clockWarning?: string;
 }
 
 const clip = (s: string, n: number) => s.length > n ? `${s.slice(0, n)}…` : s;
@@ -125,12 +127,16 @@ export function buildBootPacket(worldId: string, characterIds?: string[], journa
 
     const precedents = recentPrecedents(worldId, 5).map(p => ({ kind: p.kind, statement: p.statement, scope: p.scope }));
 
-    return { worldId, day, ...(clock?.time ? { time: clock.time } : {}), characters, clocks, threads, telegraphs, journal, precedents };
+    let warning: string | undefined;
+    try { warning = clockWarning(db, worldId); } catch { warning = undefined; }
+
+    return { worldId, day, ...(clock?.time ? { time: clock.time } : {}), ...(warning ? { clockWarning: warning } : {}), characters, clocks, threads, telegraphs, journal, precedents };
 }
 
 export function renderBootPacket(p: BootPacket): string {
     let out = '';
     const section = (title: string) => `\n## ${title}\n`;
+    if (p.clockWarning) out += `\n⚠ CLOCK: ${p.clockWarning}\n`;
     if (p.characters.length) {
         out += section('Characters');
         for (const c of p.characters) {

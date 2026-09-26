@@ -19,8 +19,15 @@ import {
     handleListRooms,
     handleCreateNodeNetwork,
     handleGetNodeNetwork,
-    handleListNodeNetworks
+    handleListNodeNetworks,
+    seatCharacterInRoom
 } from '../handlers/spatial-handlers.js';
+import { randomUUID } from 'crypto';
+import { exitTypeFor } from '../../schema/spatial.js';
+import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
+import { CharacterRepository } from '../../storage/repos/character.repo.js';
+import { readWorldClock, SET_CLOCK_HINT } from '../../engine/world-clock.js';
+import { advanceWorldClock } from './world-manage.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -38,7 +45,11 @@ const ACTIONS = [
     'list',
     'network_create',
     'network_get',
-    'network_list'
+    'network_list',
+    'gate_create',
+    'gate_list',
+    'set_gate',
+    'traverse'
 ] as const;
 type SpatialAction = typeof ACTIONS[number];
 
@@ -481,25 +492,196 @@ async function handleLink(args: z.infer<typeof LinkSchema>): Promise<object> {
     const rooms = [args.fromRoomId, args.toRoomId].map(id => db.prepare('SELECT id, name, exits FROM room_nodes WHERE id = ?').get(id) as { id: string; name: string; exits: string } | undefined);
     if (!rooms[0]) return { error: true, message: `from-room ${args.fromRoomId} not found — nothing linked` };
     if (!rooms[1]) return { error: true, message: `to-room ${args.toRoomId} not found — nothing linked` };
-    const writeExit = (room: { id: string; exits: string }, direction: string, targetNodeId: string) => {
-        let exits: Array<{ direction: string; targetNodeId: string; type: string }> = [];
-        try { exits = JSON.parse(room.exits || '[]'); } catch { exits = []; }
-        const replaced = exits.some(e => e.direction === direction);
-        exits = exits.filter(e => e.direction !== direction);
-        exits.push({ direction, targetNodeId, type: args.exitType });
-        db.prepare('UPDATE room_nodes SET exits = ? WHERE id = ?').run(JSON.stringify(exits), room.id);
-        return replaced;
-    };
-    const r1 = writeExit(rooms[0]!, args.direction, args.toRoomId);
+    // Item 6: type is the exit enum the room reader parses (OPEN, LOCKED,
+    // HIDDEN); the free text goes in kind. Writing 'passage' as the type
+    // made every linked room throw on read.
+    const exit = { type: exitTypeFor(args.exitType), kind: args.exitType };
+    const r1 = writeExit(db, rooms[0]!.id, args.direction, args.toRoomId, exit);
     let r2 = false;
-    if (args.bidirectional) r2 = writeExit(rooms[1]!, OPPOSITES[args.direction], args.fromRoomId);
+    if (args.bidirectional) r2 = writeExit(db, rooms[1]!.id, OPPOSITES[args.direction], args.fromRoomId, exit);
     return {
         success: true,
         actionType: 'link',
         from: { roomId: rooms[0]!.id, name: rooms[0]!.name, direction: args.direction, replacedExisting: r1 },
         ...(args.bidirectional ? { to: { roomId: rooms[1]!.id, name: rooms[1]!.name, direction: OPPOSITES[args.direction], replacedExisting: r2 } } : { oneWay: true }),
         exitType: args.exitType,
+        exitEnum: exit.type,
         message: `${rooms[0]!.name} ─${args.direction}→ ${rooms[1]!.name}${args.bidirectional ? ` (and back, ${OPPOSITES[args.direction]})` : ' (ONE WAY)'}`
+    };
+}
+
+/** Write (or replace) the exit in one direction of a room; true when one was replaced. */
+function writeExit(db: ReturnType<typeof getDb>, roomId: string, direction: string, targetNodeId: string, extra: Record<string, unknown>): boolean {
+    const row = db.prepare('SELECT exits FROM room_nodes WHERE id = ?').get(roomId) as { exits?: string } | undefined;
+    let exits: Array<Record<string, unknown>> = [];
+    try { exits = JSON.parse(row?.exits || '[]'); } catch { exits = []; }
+    const replaced = exits.some(e => e.direction === direction);
+    exits = exits.filter(e => e.direction !== direction);
+    exits.push({ direction, targetNodeId, ...extra });
+    db.prepare('UPDATE room_nodes SET exits = ? WHERE id = ?').run(JSON.stringify(exits), roomId);
+    return replaced;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Item 6: GATES — realmgates, toll bridges, portcullises. A gate joins two
+// rooms (often in different networks) with a travel time, a toll in gold, a
+// holder (who keeps it; informational) and a status (open | closed). Its
+// exits carry kind 'gate' and its id; a closed gate's exits are LOCKED.
+// traverse moves a character through it, pays the toll and, with
+// advanceClock, moves the world clock by the travel time.
+// ═══════════════════════════════════════════════════════════════════════════
+const tollSchema = () => z.object({
+    gold: z.number().min(0).optional(),
+    silver: z.number().min(0).optional(),
+    copper: z.number().min(0).optional()
+}).describe('Toll each traveller pays from their own purse: {gold?, silver?, copper?}');
+const gateStatusSchema = () => z.enum(['open', 'closed']);
+type Toll = { gold?: number; silver?: number; copper?: number };
+
+function gdb() {
+    const db = getDb();
+    db.exec(`CREATE TABLE IF NOT EXISTS gates (
+        id TEXT PRIMARY KEY, world_id TEXT, name TEXT NOT NULL,
+        from_room_id TEXT NOT NULL, to_room_id TEXT NOT NULL, direction TEXT NOT NULL,
+        travel_hours REAL NOT NULL DEFAULT 0, toll TEXT, holder TEXT,
+        status TEXT NOT NULL DEFAULT 'open', bidirectional INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL)`);
+    return db;
+}
+type GateRow = { id: string; world_id: string | null; name: string; from_room_id: string; to_room_id: string; direction: string; travel_hours: number; toll: string | null; holder: string | null; status: string; bidirectional: number };
+const parseToll = (t: string | null): Toll | null => { try { const v = t ? JSON.parse(t) : null; return v && Object.values(v).some(n => Number(n) > 0) ? v : null; } catch { return null; } };
+const tollText = (t: Toll | null) => t ? [t.gold ? `${t.gold} gold` : '', t.silver ? `${t.silver} silver` : '', t.copper ? `${t.copper} copper` : ''].filter(Boolean).join(', ') : 'none';
+const gateView = (g: GateRow) => ({
+    gateId: g.id, worldId: g.world_id, name: g.name, fromRoomId: g.from_room_id, toRoomId: g.to_room_id,
+    direction: g.direction, travelHours: g.travel_hours, toll: parseToll(g.toll), holder: g.holder,
+    status: g.status, bidirectional: !!g.bidirectional
+});
+const findGate = (db: ReturnType<typeof getDb>, id?: string) => id ? ((db.prepare('SELECT * FROM gates WHERE id = ?').get(id) as GateRow | undefined) ?? null) : null;
+function writeGateExits(db: ReturnType<typeof getDb>, g: GateRow): void {
+    const extra = { type: g.status === 'closed' ? 'LOCKED' : 'OPEN', kind: 'gate', gateId: g.id, description: `${g.name} (gate)` };
+    writeExit(db, g.from_room_id, g.direction, g.to_room_id, extra);
+    if (g.bidirectional) writeExit(db, g.to_room_id, OPPOSITES[g.direction], g.from_room_id, extra);
+}
+
+const GateCreateSchema = z.object({
+    action: z.literal('gate_create'),
+    worldId: z.string().optional().describe("World the gate belongs to (default: the from-room's network world); traverse advanceClock moves this world's clock"),
+    name: z.string().min(1).describe('Gate name'),
+    fromRoomId: z.string().describe('Room on the near side'),
+    toRoomId: z.string().describe('Room on the far side (any network)'),
+    direction: DirectionEnum.describe('Direction FROM from-room through the gate'),
+    travelHours: z.number().min(0).optional().describe('In-fiction hours the crossing takes (default 0)'),
+    toll: tollSchema().optional(),
+    holder: z.string().optional().describe('Who holds the gate (informational)'),
+    status: gateStatusSchema().optional().describe('open (default) | closed'),
+    bidirectional: z.boolean().optional().default(true).describe('Travel both ways (default true)')
+});
+const GateListSchema = z.object({
+    action: z.literal('gate_list'),
+    worldId: z.string().optional().describe('Filter: gates of this world'),
+    roomId: z.string().optional().describe('Filter: gates with an end in this room')
+});
+const SetGateSchema = z.object({
+    action: z.literal('set_gate'),
+    gateId: z.string().describe('Gate id'),
+    status: gateStatusSchema().optional().describe('open | closed (its exits follow: OPEN | LOCKED)'),
+    holder: z.string().optional().describe('Who holds it now'),
+    toll: tollSchema().optional(),
+    travelHours: z.number().min(0).optional(),
+    name: z.string().optional()
+});
+const TraverseSchema = z.object({
+    action: z.literal('traverse'),
+    gateId: z.string().describe('Gate to pass through'),
+    characterId: z.string().describe('Traveller; must be seated at one end (the far end only when bidirectional)'),
+    advanceClock: z.boolean().optional().describe("true: move the gate's world clock forward by its travelHours (world_manage advance; dueNow returned)")
+});
+
+async function handleGateCreate(args: z.infer<typeof GateCreateSchema>): Promise<object> {
+    const db = gdb();
+    const rooms = [args.fromRoomId, args.toRoomId].map(id => db.prepare('SELECT id, name, network_id FROM room_nodes WHERE id = ?').get(id) as { id: string; name: string; network_id: string | null } | undefined);
+    if (!rooms[0]) return { error: true, message: `from-room ${args.fromRoomId} not found. Nothing was written.` };
+    if (!rooms[1]) return { error: true, message: `to-room ${args.toRoomId} not found. Nothing was written.` };
+    const worldId = args.worldId ?? (rooms[0].network_id
+        ? (db.prepare('SELECT world_id FROM node_networks WHERE id = ?').get(rooms[0].network_id) as { world_id?: string } | undefined)?.world_id ?? null
+        : null);
+    const id = `gate-${randomUUID().slice(0, 8)}`;
+    db.prepare(`INSERT INTO gates (id, world_id, name, from_room_id, to_room_id, direction, travel_hours, toll, holder, status, bidirectional, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(id, worldId, args.name, args.fromRoomId, args.toRoomId, args.direction, args.travelHours ?? 0, args.toll ? JSON.stringify(args.toll) : null, args.holder ?? null, args.status ?? 'open', args.bidirectional ? 1 : 0, new Date().toISOString());
+    const g = findGate(db, id)!;
+    writeGateExits(db, g);
+    return {
+        success: true, actionType: 'gate_create', gateId: id, gate: gateView(g),
+        message: `${args.name}: ${rooms[0].name} ─${args.direction}→ ${rooms[1].name}${args.bidirectional ? ' (both ways)' : ' (ONE WAY)'}, ${g.travel_hours}h, toll ${tollText(parseToll(g.toll))}${g.holder ? `, held by ${g.holder}` : ''} — ${g.status}`
+    };
+}
+
+async function handleGateList(args: z.infer<typeof GateListSchema>): Promise<object> {
+    const db = gdb();
+    const where: string[] = []; const params: unknown[] = [];
+    if (args.worldId) { where.push('world_id = ?'); params.push(args.worldId); }
+    if (args.roomId) { where.push('(from_room_id = ? OR to_room_id = ?)'); params.push(args.roomId, args.roomId); }
+    const rows = db.prepare(`SELECT * FROM gates${where.length ? ` WHERE ${where.join(' AND ')}` : ''} ORDER BY created_at`).all(...params) as GateRow[];
+    return { success: true, actionType: 'gate_list', count: rows.length, gates: rows.map(gateView), message: `${rows.length} gate(s)` };
+}
+
+async function handleSetGate(args: z.infer<typeof SetGateSchema>): Promise<object> {
+    const db = gdb();
+    const g = findGate(db, args.gateId);
+    if (!g) return { error: true, message: `No gate ${args.gateId}. Nothing was written.` };
+    db.prepare('UPDATE gates SET status = ?, holder = ?, toll = ?, travel_hours = ?, name = ? WHERE id = ?')
+        .run(args.status ?? g.status, args.holder ?? g.holder, args.toll ? JSON.stringify(args.toll) : g.toll, args.travelHours ?? g.travel_hours, args.name ?? g.name, g.id);
+    const after = findGate(db, g.id)!;
+    writeGateExits(db, after);
+    return { success: true, actionType: 'set_gate', gateId: g.id, gate: gateView(after), message: `${after.name}: ${after.status}${after.holder ? `, held by ${after.holder}` : ''}, toll ${tollText(parseToll(after.toll))}` };
+}
+
+async function handleTraverse(args: z.infer<typeof TraverseSchema>): Promise<object> {
+    const db = gdb();
+    const g = findGate(db, args.gateId);
+    if (!g) return { error: true, message: `No gate ${args.gateId}. Nothing was written.` };
+    if (g.status !== 'open') return { error: true, message: `${g.name} is closed${g.holder ? ` (held by ${g.holder})` : ''}: set_gate {status: 'open'} first. Nothing was written.` };
+    const character = new CharacterRepository(db).findById(args.characterId);
+    if (!character) return { error: true, message: `Character ${args.characterId} not found. Nothing was written.` };
+    const at = (character as unknown as { currentRoomId?: string }).currentRoomId;
+    let toRoomId: string;
+    if (at === g.from_room_id) toRoomId = g.to_room_id;
+    else if (at === g.to_room_id) {
+        if (!g.bidirectional) return { error: true, message: `${g.name} is one way (from ${g.from_room_id}); ${character.name} is on the far side. Nothing was written.` };
+        toRoomId = g.from_room_id;
+    } else return { error: true, message: `${character.name} is not at ${g.name} (seated in ${at ?? 'no room'}; its ends are ${g.from_room_id} and ${g.to_room_id}). Move there first. Nothing was written.` };
+    if (!db.prepare('SELECT 1 FROM room_nodes WHERE id = ?').get(toRoomId)) return { error: true, message: `${g.name} leads to room ${toRoomId}, which no longer exists. Nothing was written.` };
+    if (args.advanceClock && g.travel_hours > 0) {
+        if (!g.world_id) return { error: true, message: `${g.name} has no world, so advanceClock has no clock to move. Nothing was written.` };
+        if (!readWorldClock(db, g.world_id)) return { error: true, message: `World ${g.world_id} has no clock for advanceClock: ${SET_CLOCK_HINT}. Nothing was written.` };
+    }
+    const toll = parseToll(g.toll);
+    const inv = new InventoryRepository(db);
+    if (toll && !inv.hasCurrency(character.id, toll)) {
+        const purse = inv.getCurrency(character.id);
+        return { error: true, message: `${character.name} cannot pay the toll of ${tollText(toll)} (purse: ${purse.gold} gold, ${purse.silver} silver, ${purse.copper} copper). Nothing was written.` };
+    }
+    const names = db.prepare('SELECT id, name FROM room_nodes WHERE id IN (?, ?)').all(at, toRoomId) as Array<{ id: string; name: string }>;
+    const nameOf = (id: string) => names.find(n => n.id === id)?.name ?? id;
+    const move = db.transaction(() => {
+        // Seat first: the seat writes the whole sheet it read, purse included,
+        // so the toll comes off after it.
+        seatCharacterInRoom(character, toRoomId);
+        if (toll && !inv.removeCurrency(character.id, toll)) throw new Error('toll could not be taken');
+    });
+    move();
+    let clock: Record<string, unknown> | undefined;
+    if (args.advanceClock && g.travel_hours > 0 && g.world_id) {
+        const r = advanceWorldClock(g.world_id, g.travel_hours);
+        clock = { clock: r.clock, elapsedHours: r.elapsedHours, dueNow: r.dueNow, ...(r.regenerated ? { regenerated: r.regenerated } : {}), ...(r.error ? { error: r.error, message: r.message } : {}) };
+    }
+    return {
+        success: true, actionType: 'traverse', gateId: g.id, gateName: g.name, characterId: character.id, characterName: character.name,
+        from: { roomId: at, name: nameOf(at!) }, to: { roomId: toRoomId, name: nameOf(toRoomId) },
+        travelHours: g.travel_hours, ...(toll ? { tollPaid: toll } : {}), ...(g.holder ? { holder: g.holder } : {}),
+        ...(clock ? { clock } : {}),
+        message: `${character.name} passes ${g.name}: ${nameOf(at!)} → ${nameOf(toRoomId)}${toll ? `, paying ${tollText(toll)}` : ''}${g.travel_hours ? ` (${g.travel_hours}h${clock ? `; clock now ${String(clock.clock)}` : ' — the clock was not moved; pass advanceClock: true'})` : ''}`
     };
 }
 
@@ -579,6 +761,30 @@ const definitions: Record<SpatialAction, ActionDefinition> = {
         handler: handleNetworkList,
         aliases: ['networks'],
         description: 'List node networks, optionally filtered by world'
+    },
+    gate_create: {
+        schema: GateCreateSchema,
+        handler: handleGateCreate,
+        aliases: ['create_gate', 'realmgate', 'add_gate'],
+        description: 'Item 6: a gate between two rooms (any networks): {name, fromRoomId, toRoomId, direction, travelHours?, toll?: {gold}, holder?, status?, bidirectional?, worldId?}. Writes exits of kind gate on both sides'
+    },
+    gate_list: {
+        schema: GateListSchema,
+        handler: handleGateList,
+        aliases: ['gates', 'list_gates'],
+        description: 'List gates, by worldId and/or roomId'
+    },
+    set_gate: {
+        schema: SetGateSchema,
+        handler: handleSetGate,
+        aliases: ['update_gate', 'open_gate', 'close_gate'],
+        description: 'Change a gate: status open|closed (exits follow), holder, toll, travelHours, name'
+    },
+    traverse: {
+        schema: TraverseSchema,
+        handler: handleTraverse,
+        aliases: ['pass_gate', 'cross', 'use_gate'],
+        description: 'Pass a character through an open gate: pays the toll from their purse (refused if short), moves them to the other end, and with advanceClock moves the world clock by travelHours'
     }
 };
 
@@ -595,7 +801,7 @@ const router = createActionRouter({
 export const SpatialManageTool = {
     name: 'spatial_manage',
     description: `Manage spatial graph - rooms, exits, and character locations.
-Actions: look, generate, update, get_exits, move, list, network_create, network_get, network_list
+Actions: look, generate, update, get_exits, link, move, unseat, delete_room, list, network_create, network_get, network_list, gate_create, gate_list, set_gate, traverse
 Aliases: observe→look, create→generate, edit→update, exits→get_exits, enter→move, rooms→list, networks→network_list
 
 🏠 SPATIAL WORKFLOW:
@@ -606,6 +812,8 @@ Aliases: observe→look, create→generate, edit→update, exits→get_exits, en
 5. get_exits - Get all exits from a room
 6. move - Move character to a room
 7. list / network_list - List rooms or networks
+8. link - Join two rooms with an exit (exitType door/ladder/hatch is the exit's kind; 'locked …' / 'hidden …' lock or hide it)
+9. gate_create / gate_list / set_gate / traverse - Gates between rooms of any networks: travel hours, a toll in gold, a holder, open or closed; traverse {gateId, characterId, advanceClock?} pays and crosses
 
 Environmental effects: DARKNESS, FOG, ANTIMAGIC, SILENCE, BRIGHT, MAGICAL
 Biomes: forest, mountain, urban, dungeon, coastal, cavern, divine, arcane`,
@@ -636,7 +844,14 @@ Biomes: forest, mountain, urban, dungeon, coastal, cavern, divine, arcane`,
         centerY: z.number().optional().describe('Network center Y'),
         boundingBox: BoundingBoxSchema.optional().describe('Network bounding box'),
         localX: z.number().optional().describe('Room local X within network'),
-        localY: z.number().optional().describe('Room local Y within network')
+        localY: z.number().optional().describe('Room local Y within network'),
+        // Item 6 (mirror law): gate params
+        gateId: z.string().optional().describe('set_gate / traverse: gate id'),
+        travelHours: z.number().min(0).optional().describe('gate_create / set_gate: in-fiction hours the crossing takes'),
+        toll: tollSchema().optional(),
+        holder: z.string().optional().describe('gate_create / set_gate: who holds the gate (informational)'),
+        status: gateStatusSchema().optional().describe('gate_create / set_gate: open | closed'),
+        advanceClock: z.boolean().optional().describe("traverse: move the gate's world clock by its travelHours")
     })
 };
 

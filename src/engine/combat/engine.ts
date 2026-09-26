@@ -1,9 +1,10 @@
-import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile } from '../../schema/token-extras.js';
+import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile, Buff } from '../../schema/token-extras.js';
 import { findPart as findNamedPart, matchProfile } from './parts.js';
 import { CombatRNG, CheckResult } from './rng.js';
 import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS, conditionAttackModifiers, conditionSpeedFactor } from './conditions.js';
 
 import { SizeCategory, GridBounds, edgeDistanceSquares, effectiveReachFt } from '../../schema/encounter.js';
+import { mobAttackBonus } from './units.js';
 
 /**
  * Character interface for combat participants
@@ -96,6 +97,9 @@ export interface CombatParticipant {
     autoLegendaryResistance?: boolean; // Spend a legendary resistance on a failed save automatically
     cr?: number;                     // Challenge rating
     lairUsedRound?: number;          // Round the lair action was last used (lair owner only)
+    species?: string;                // 'Orruk': nearby counts and battle cries match it
+    tags?: string[];                 // Free tags nearby matches read
+    buffs?: Buff[];                  // Battle-cry buffs (combat_manage battle_cry)
 }
 
 /**
@@ -281,7 +285,9 @@ export class CombatEngine {
         this.state.turnOrder = newTurnOrder;
         if (newIndex >= 0) this.state.currentTurnIndex = newIndex;
 
-        return this.state;
+        // Callers persist this state directly: it carries the RNG position
+        // after the initiative rolls (getState refreshes it).
+        return this.getState()!;
     }
 
     startEncounter(participants: CombatParticipant[]): CombatState {
@@ -355,7 +361,9 @@ export class CombatEngine {
             state: this.state
         });
 
-        return this.state;
+        // Callers persist this state directly: it carries the RNG position
+        // after the initiative rolls (getState refreshes it).
+        return this.getState()!;
     }
 
     /**
@@ -437,6 +445,39 @@ export class CombatEngine {
     /** Roll any dice ('2d6') on the encounter's stream, tagged for roll_log. */
     rollDice(notation: string, tag: import('./rng.js').RollTag): import('./rng.js').DamageResult {
         return this.tagged(tag, () => this.rng.rollDamageDetailed(notation));
+    }
+
+    /**
+     * A spell attack d20 on the encounter's stream, with the same Dodge, Help
+     * (spent) and standard-condition modifiers a weapon attack reads. Within
+     * 5 ft comes from the grid when both tokens are placed, else it is
+     * assumed unless the attack is ranged. Logged as 'spell attack'.
+     */
+    rollSpellAttackD20(actorId: string, targetId: string, opts: { ranged?: boolean; advantage?: boolean; disadvantage?: boolean } = {}): {
+        natural: number; rolls: number[]; advantage: boolean; disadvantage: boolean; situational: string[]; autoCrit?: string
+    } {
+        if (!this.state) throw new Error('No active combat');
+        const actor = this.state.participants.find(p => p.id === actorId);
+        const target = this.state.participants.find(p => p.id === targetId);
+        if (!actor) throw new Error(`Actor ${actorId} not found`);
+        if (!target) throw new Error(`Target ${targetId} not found`);
+        let advantage = !!opts.advantage;
+        let disadvantage = !!opts.disadvantage;
+        const situational: string[] = [];
+        if (target.isDodging) { disadvantage = true; situational.push(`${target.name} is dodging (disadvantage)`); }
+        if (actor.helpedBy) {
+            advantage = true;
+            const helper = this.state.participants.find(p => p.id === actor.helpedBy);
+            situational.push(`helped by ${helper?.name ?? actor.helpedBy} (advantage)`);
+            actor.helpedBy = undefined;
+        }
+        const within5ft = opts.ranged ? false
+            : (actor.position && target.position ? edgeDistanceSquares(actor, target) <= 1 : true);
+        const mods = conditionAttackModifiers(actor, target, { within5ft, participants: this.state.participants });
+        if (mods.adv.length) { advantage = true; situational.push(...mods.adv); }
+        if (mods.dis.length) { disadvantage = true; situational.push(...mods.dis); }
+        const r = this.tagged({ purpose: 'spell attack', forId: actorId, targetId }, () => this.rng.rollAttackD20(0, 0, advantage, disadvantage));
+        return { natural: r.roll, rolls: r.allRolls, advantage, disadvantage, situational, ...(mods.autoCrit ? { autoCrit: mods.autoCrit } : {}) };
     }
 
     /** Roll under a tag so the audit log says who the dice were for and why. */
@@ -789,6 +830,18 @@ export class CombatEngine {
             situational.push(`${target.name} is latched onto ${actor.name} (advantage)`);
         }
 
+        // Battle-cry buffs (combat_manage battle_cry): advantage while they last.
+        const buffs = actor.buffs ?? [];
+        for (const b of buffs) {
+            if (b.attackAdvantage) { advantage = true; situational.push(`${b.name} (advantage)`); }
+        }
+        // Mob rule: a unit hits harder to miss the more models it has standing.
+        const mob = mobAttackBonus(actor);
+        if (mob.bonus) {
+            attackBonus += mob.bonus;
+            situational.push(`mob rule +${mob.bonus} to hit (${mob.models} models)`);
+        }
+
         // Conditions can carry mechanics in metadata (a called strike's
         // crippled arm). The GM passes unaffectedLimb for the good arm.
         const hampering = actor.conditions.filter(c => c.metadata?.attackDisadvantage);
@@ -846,10 +899,25 @@ export class CombatEngine {
         const capturedDamageRolls = rolled.rolls;
         damageBreakdownStr = rolled.breakdown;
 
+        // Battle-cry damage: a flat bonus or dice on the encounter's stream,
+        // added on a hit (never doubled by a crit). A GM-posted result lands
+        // exactly as posted, so it takes none.
+        let buffDamage = 0;
+        if (attackRoll.isHit && !resolved) {
+            for (const b of buffs) {
+                if (b.damageBonus === undefined || b.damageBonus === 0) continue;
+                const extra = typeof b.damageBonus === 'number'
+                    ? b.damageBonus
+                    : this.tagged({ purpose: `${b.name} damage`, forId: actorId, targetId }, () => this.rng.roll(String(b.damageBonus)));
+                buffDamage += extra;
+                situational.push(`${b.name} +${extra} damage${typeof b.damageBonus === 'string' ? ` (${b.damageBonus})` : ''}`);
+            }
+        }
+
         if (attackRoll.isHit) {
             // FINDINGS #70: the damage lane lands here — outside the crit
             // doubling, inside the resistance math.
-            const finalBaseDamage = baseDamageVal + (flatDamageBonus ?? 0);
+            const finalBaseDamage = baseDamageVal + (flatDamageBonus ?? 0) + buffDamage;
             
             // HIGH-002: Apply resistance/vulnerability/immunity
             const modResult = this.calculateDamageWithModifiers(finalBaseDamage, damageType, target);
@@ -1330,13 +1398,38 @@ export class CombatEngine {
     }
 
     /**
+     * Battle-cry buffs end at the start of their source's turn once the round
+     * is past untilRound. A buff whose source is gone or down ends at the
+     * start of its bearer's own turn instead, so it never outlives the fight.
+     */
+    private expireBuffs(participant: CombatParticipant): void {
+        if (!this.state) return;
+        const round = this.state.round;
+        const faded = new Map<string, string[]>();
+        for (const p of this.state.participants) {
+            if (!p.buffs?.length) continue;
+            const keep = p.buffs.filter(b => {
+                if (round <= b.untilRound) return true;
+                const source = b.sourceId ? this.state!.participants.find(o => o.id === b.sourceId) : undefined;
+                const orphan = !source || source.hp <= 0;
+                const ends = b.sourceId === participant.id || (orphan && p.id === participant.id);
+                if (ends) faded.set(b.name, [...(faded.get(b.name) ?? []), p.name]);
+                return !ends;
+            });
+            p.buffs = keep.length ? keep : undefined;
+        }
+        for (const [name, who] of faded) this.turnStartNotes.push(`${name} fades from ${who.join(', ')}`);
+    }
+
+    /**
      * Base speed after conditions whose metadata carries a speedFactor (a
      * crippled leg halves it) and the standard conditions' own speed.
      */
     effectiveSpeed(participant: CombatParticipant): number {
         // Held by another creature's latched part: it cannot move away.
         if (this.state?.participants.some(o => o.parts?.some(pt => pt.state === 'latched' && pt.latchedTo?.participantId === participant.id))) return 0;
-        const base = participant.movementSpeed ?? 30;
+        // Battle-cry speed adds to the base, before any halving.
+        const base = (participant.movementSpeed ?? 30) + (participant.buffs ?? []).reduce((n, b) => n + (b.speedBonus ?? 0), 0);
         let factor = participant.conditions.reduce((f, c) => {
             const sf = c.metadata?.speedFactor;
             return typeof sf === 'number' ? f * sf : f;
@@ -1415,6 +1508,9 @@ export class CombatEngine {
      * Process start-of-turn condition effects
      */
     private processStartOfTurnConditions(participant: CombatParticipant): void {
+        // Battle cries end first, so this turn's speed no longer carries them.
+        this.expireBuffs(participant);
+
         // HIGH-003: Reset reaction at start of turn
         this.resetTurnResources(participant);
 
