@@ -20,9 +20,9 @@ import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../..
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
 import { PartSchema, UnitSchema, ParticipantExtrasShape } from '../../schema/token-extras.js';
 import { resolveWorldId, bandOrder, loadRule, loadRules, type TableRule } from '../../engine/table-rules.js';
-import { peerConsequence, calledStrikeProblem, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
+import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
 import { volleyTier, describeUnit } from '../../engine/combat/units.js';
-import { upsertPart } from '../../engine/combat/parts.js';
+import { upsertPart, findPart, resolveAttackSource } from '../../engine/combat/parts.js';
 import { compareBands } from '../../engine/table-rules.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
@@ -197,6 +197,7 @@ function buildStateJson(state: CombatState, encounterId: string, sessionId?: str
             ac: p.ac,
             attackDamage: p.attackDamage,
             attackBonus: p.attackBonus,
+            ...(p.attacks?.length ? { attacks: p.attacks } : {}),
             // Table state the GM reads each round
             ...(p.band ? { band: p.band } : {}),
             ...(p.parts?.length ? { parts: p.parts } : {}),
@@ -249,6 +250,7 @@ function formatCombatStateText(state: CombatState): string {
         // Include ID for LLM targeting
         output += `${marker} ${icon} ${p.name.padEnd(18)} ${hpBar} ${p.hp}/${p.maxHp} HP  [Init: ${p.initiative}] ID: ${p.id} ${status}\n`;
         if (p.unit) output += `      🪖 ${describeUnit(p)}\n`;
+        if (p.attacks?.length) output += `      🗡 attacks: ${p.attacks.map(a => `${a.name} ${a.attackBonus >= 0 ? '+' : ''}${a.attackBonus}`).join(', ')}\n`;
         const hurt = (p.parts ?? []).filter(pt => pt.state !== 'intact');
         if (hurt.length) output += `      🦴 ${hurt.map(pt => `${pt.name}: ${pt.state}${pt.latchedTo ? `→${state.participants.find(o => o.id === pt.latchedTo!.participantId)?.name ?? pt.latchedTo.participantId}${pt.latchedTo.part ? ` ${pt.latchedTo.part}` : ''}` : ''}`).join(' · ')}\n`;
         if (p.intent) output += `      ⚑ intent: ${p.intent}\n`;
@@ -783,10 +785,13 @@ Examples:
             outcome: z.enum(['hit', 'crit', 'miss']).optional().describe('A result the GM resolved at the table. The engine rolls no d20 (no nat 1/20 override) and applies damage exactly as posted: a number is never doubled; a dice string with crit doubles its dice only. Resistances, HP write-through and concentration still apply. hit/crit need damage.'),
             advantage: z.boolean().optional().describe('Roll 2d20 keep highest (Findings #31/#32)'),
             disadvantage: z.boolean().optional().describe('Roll 2d20 keep lowest'),
-            calledStrike: z.string().optional().describe("Table rules (called_strike): 'leg' or 'arm'. No roll penalty; a hit cripples that limb. Needs a target of your band or greater"),
+            calledStrike: z.string().optional().describe("Table rules (called_strike): 'leg', 'arm' or any named part of the target ('jaw', 'collar chain'). No roll penalty; a hit cripples that part (it keeps its kind). Needs a target of your band or greater"),
             preparedAsset: z.string().optional().describe('Table rules (prepared_asset): the rule name; reports miss / hit / catastrophic tier and the effect the GM names'),
             unaffectedLimb: z.boolean().optional().describe('The attacker uses a limb its crippling condition does not touch (skips that disadvantage)'),
             withPart: z.string().optional().describe("The attacker's named part used ('middle head'): crippled = disadvantage; dead or latched = refused"),
+            using: z.string().optional().describe("Named attack profile on the token or sheet ('grown blade'; unique prefix ok): fills attackBonus, damage, damageType and the part when omitted"),
+            weapon: z.string().optional().describe('Alias of using; also finds the part whose holds names this weapon'),
+            hand: z.enum(['mainhand', 'offhand']).optional().describe('Which hand swings: finds the part whose holds names the slot'),
             atPart: z.string().optional().describe('The target part aimed at: breached = advantage; a called strike cripples this part'),
             ranged: z.boolean().optional().describe('A ranged attack (not within 5 ft): a prone target is disadvantage and paralysed/unconscious no auto-crit. Unset = from token positions, else melee'),
             ignoreConditions: z.boolean().optional().describe('Skip the automatic advantage/disadvantage/auto-crit from standard conditions (raw roll)'),
@@ -1447,10 +1452,47 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         let attackBonus = parsed.attackBonus;
         let dc = parsed.dc;
         let damage: number | string | undefined = parsed.damage;
+        let damageType = parsed.damageType;
+        let ranged = parsed.ranged;
+        const outcome = parsed.outcome;
+
+        const currentState = engine.getState();
+        const actor = currentState?.participants.find(p => p.id === parsed.actorId);
+        const target = currentState?.participants.find(p => p.id === parsed.targetId);
+
+        // Named attack profiles (token, else sheet) and the part that swings.
+        // using/weapon picks a profile, which fills whatever the call omits;
+        // with nothing named and no bonus, the default (or sole) profile
+        // stands in for the STR/DEX guess below.
+        const profiles = actor?.attacks?.length ? actor.attacks : (new CharacterRepository(getDb()).findById(parsed.actorId)?.attacks ?? []);
+        const named = parsed.using ?? parsed.weapon;
+        const sourceOpts = { using: parsed.using, weapon: parsed.weapon, withPart: parsed.withPart, hand: parsed.hand };
+        let source = actor ? resolveAttackSource({ parts: actor.parts, attacks: profiles }, sourceOpts) : { notes: [] as string[] };
+        let defaulted = false;
+        if (actor && !source.profile && !named && parsed.attackBonus === undefined && !outcome) {
+            const fallback = profiles.find(a => a.default) ?? (profiles.length === 1 ? profiles[0] : undefined);
+            if (fallback) {
+                source = resolveAttackSource({ parts: actor.parts, attacks: profiles }, { ...sourceOpts, using: fallback.name });
+                defaulted = true;
+            }
+        }
+        const profile = source.profile;
+        if (profile) {
+            attackBonus ??= profile.attackBonus;
+            damage ??= profile.damage;
+            damageType ??= profile.damageType;
+            ranged ??= profile.ranged;
+        }
+        // The part the engine checks: a real withPart wins; a withPart that
+        // named a profile gives way to the profile's part; an unknown one is
+        // passed on so the engine refuses it, listing parts and profiles.
+        const withPartIsPart = !!(parsed.withPart && actor && findPart(actor, parsed.withPart));
+        const withPartWasProfile = !!(parsed.withPart && !withPartIsPart && !named && !defaulted && profile);
+        const withPart = parsed.withPart && !withPartIsPart && !withPartWasProfile ? parsed.withPart : source.part?.name;
+
         // A GM-resolved attack (outcome) skips every auto-fill below: no d20 is
         // rolled, so attack bonus and AC are unused, and the posted damage is
         // the total (0 means 0; no trait damage lane is added on top).
-        const outcome = parsed.outcome;
         if (outcome && outcome !== 'miss' && damage === undefined) {
             throw new Error(`outcome '${outcome}' needs the damage you rolled (a number, or dice to roll)`);
         }
@@ -1459,10 +1501,6 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             dc = dc ?? 0;
             damage = damage ?? 0;
         }
-
-        const currentState = engine.getState();
-        const actor = currentState?.participants.find(p => p.id === parsed.actorId);
-        const target = currentState?.participants.find(p => p.id === parsed.targetId);
 
         // 1. Attack Bonus - auto-calculate from multiple sources
         if (attackBonus === undefined) {
@@ -1617,7 +1655,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             strikeRule = loadRule(rulesDb, ruleWorld, 'called_strike');
             if (!strikeRule) throw new Error(`calledStrike needs an enabled called_strike rule in this encounter's world${ruleWorld ? '' : ' (the encounter has no world: create it with worldId)'}`);
             if (actor && target) {
-                const problem = calledStrikeProblem(strikeRule, ruleBands, actor, target, parsed.calledStrike.toLowerCase());
+                const problem = calledStrikeProblem(strikeRule, ruleBands, actor, target, parsed.calledStrike, parsed.atPart);
                 if (problem) throw new Error(problem);
             }
         }
@@ -1640,14 +1678,14 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             attackBonus!,
             dc!,
             damage!,
-            parsed.damageType,  // HIGH-002: Pass damage type for resistance calculation
+            damageType,  // HIGH-002: Pass damage type for resistance calculation
             parsed.advantage,
             parsed.disadvantage,
             damageLaneBonus || undefined,  // FINDINGS #70: resolver damage lane
             damageLaneLabel,
             outcome,
             parsed.unaffectedLimb,
-            { withPart: parsed.withPart, atPart: parsed.atPart, uncapped: !!(parsed.cleave || parsed.volley), ranged: parsed.ranged, ignoreConditions: parsed.ignoreConditions }
+            { withPart, atPart: parsed.atPart, uncapped: !!(parsed.cleave || parsed.volley), ranged, ignoreConditions: parsed.ignoreConditions }
         );
 
         // Sync HP to character database after attack
@@ -1748,10 +1786,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         const targetNow = afterState?.participants.find(p => p.id === parsed.targetId);
         if (strikeRule && parsed.calledStrike && targetNow) {
             const limb = parsed.calledStrike.toLowerCase();
-            if (result.success) {
-                // The cripple lands on a named part (the one aimed at, or the
-                // limb), which the engine reads for speed and attacks.
-                const part = crippledPart(strikeRule, limb, parsed.atPart);
+            const landing = resolveCalledStrike(strikeRule, targetNow, parsed.calledStrike, parsed.atPart);
+            if (result.success && !('problem' in landing)) {
+                // The cripple lands on a named part (the target's own, the one
+                // aimed at, or the limb), which the engine reads for speed and attacks.
+                const part = crippledPart(strikeRule, landing);
                 // Merged, not replaced: a latch, holds or ac on that part survive.
                 targetNow.parts = upsertPart(targetNow.parts ?? [], part);
                 if (charRepoFor(targetNow.id)) new CharacterRepository(getDb()).update(targetNow.id, { parts: targetNow.parts } as never);
@@ -1778,7 +1817,12 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             ruleLines.push(`RULE ${prepared.rule}: ${prepared.tier.toUpperCase()}${prepared.margin !== undefined ? ` (margin ${prepared.margin >= 0 ? '+' : ''}${prepared.margin})` : ''}, ${prepared.note}`);
         }
 
+        for (const note of source.notes) ruleLines.push(`⚖️ ${note}`);
         for (const note of (result.situational ?? []).slice().reverse()) ruleLines.unshift(`⚖️ ${note}`);
+        if (profile) {
+            resultRec.attackProfile = { name: profile.name, attackBonus: profile.attackBonus, damage: profile.damage, ...(profile.damageType ? { damageType: profile.damageType } : {}), ...(source.part ? { part: source.part.name } : {}), ...(defaulted ? { default: true } : {}) };
+            ruleLines.unshift(`🗡 using ${profile.name} (${profile.attackBonus >= 0 ? '+' : ''}${profile.attackBonus}, ${profile.damage}${profile.damageType ? ` ${profile.damageType}` : ''})${source.part ? ` with ${source.part.name}` : ''}${defaulted ? ' [default profile]' : ''}`);
+        }
         if (parsed.volley) {
             resultRec.volley = parsed.volley;
             ruleLines.unshift(`VOLLEY ${parsed.volley.dice} (${parsed.volley.reason})`);
@@ -2487,6 +2531,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             // Table rules: what the engine computed and the GM still names.
             consequenceDue: (r as { consequenceDue?: unknown }).consequenceDue,
             calledStrike: (r as { calledStrike?: unknown }).calledStrike,
+            attackProfile: (r as { attackProfile?: unknown }).attackProfile,
             volley: (r as { volley?: unknown }).volley,
             situational: r.situational,
             targetUnit: (r as { targetUnit?: unknown }).targetUnit,

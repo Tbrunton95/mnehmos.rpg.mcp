@@ -45,7 +45,8 @@ export const DAY_366_PRESET: RulePresetEntry[] = [
             requirePeer: true,
             limbs: {
                 leg: { speed: 0.5, notes: ['no brace', 'footing/Athletics at disadvantage'] },
-                arm: { attackDisadvantage: true, notes: ["that arm's attacks at disadvantage"] }
+                arm: { attackDisadvantage: true, notes: ["that arm's attacks at disadvantage"] },
+                other: { notes: ['that part fails; GM names it'] }
             }
         }
     },

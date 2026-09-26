@@ -247,6 +247,7 @@ const SetPartSchema = z.object({
     state: z.enum(PART_STATES).describe('intact | crippled | dead | latched | breached'),
     kind: z.enum(PART_KINDS).optional().describe('head | arm | leg | wing | torso | system | other (a crippled leg or wing halves speed)'),
     latchedTo: z.object({ participantId: z.string(), part: z.string().optional() }).optional().describe('latched: who this part holds'),
+    holds: z.array(z.string()).optional().describe("Weapons or slots this part wields ('axe', 'mainhand'); attack {weapon} or a profile uses it. Omit to keep"),
     note: z.string().optional(),
     mirrorToCharacter: z.boolean().optional().describe('Also write the part onto the character sheet (a lasting injury)'),
     reason: z.string().optional()
@@ -1130,7 +1131,8 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 kind: params.kind ?? prev?.kind ?? 'other',
                 state: params.state,
                 latchedTo: params.state === 'latched' ? (params.latchedTo ?? prev?.latchedTo) : undefined,
-                ...(params.note !== undefined ? { note: params.note } : {})
+                ...(params.note !== undefined ? { note: params.note } : {}),
+                ...(params.holds !== undefined ? { holds: params.holds } : {})
             });
             const next = parts.find(x => x.name.toLowerCase() === params.part.toLowerCase())!;
             p.parts = parts;
@@ -1470,6 +1472,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         state: z.enum(PART_STATES).optional().describe('set_part: intact | crippled | dead | latched | breached'),
         kind: z.enum(PART_KINDS).optional().describe('set_part: head | arm | leg | wing | torso | system | other'),
         latchedTo: z.object({ participantId: z.string(), part: z.string().optional() }).optional().describe('set_part latched: who it holds'),
+        holds: z.array(z.string()).optional().describe("set_part: weapons or slots the part wields ('axe', 'mainhand')"),
         note: z.string().optional().describe('set_part / trigger_readied: note'),
         suppressed: z.boolean().optional().describe('set_unit'),
         inMelee: z.boolean().optional().describe('set_unit'),

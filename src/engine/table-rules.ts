@@ -31,7 +31,8 @@ export const RuleSpecSchemas = {
             notes: z.array(z.string()).default([])
         })).default({
             leg: { speed: 0.5, notes: ['no brace', 'footing/Athletics at disadvantage'] },
-            arm: { attackDisadvantage: true, notes: ["that arm's attacks at disadvantage"] }
+            arm: { attackDisadvantage: true, notes: ["that arm's attacks at disadvantage"] },
+            other: { notes: ['that part fails; GM names it'] }
         })
     }).passthrough(),
     prepared_asset: z.object({

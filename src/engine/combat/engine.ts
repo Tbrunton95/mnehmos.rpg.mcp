@@ -717,7 +717,10 @@ export class CombatEngine {
         const findPart = (who: CombatParticipant, name?: string) => name ? who.parts?.find(pt => pt.name.toLowerCase() === partName(name)) : undefined;
         const usedPart = findPart(actor, partOpts?.withPart);
         if (partOpts?.withPart) {
-            if (!usedPart) throw new Error(`${actor.name} has no part '${partOpts.withPart}' (parts: ${actor.parts?.map(pt => pt.name).join(', ') || 'none'})`);
+            if (!usedPart) {
+                const named = actor.attacks?.length ? `; named attacks: ${actor.attacks.map(a => a.name).join(', ')} (pass using)` : '';
+                throw new Error(`${actor.name} has no part '${partOpts.withPart}' (parts: ${actor.parts?.map(pt => pt.name).join(', ') || 'none'})${named}`);
+            }
             if (usedPart.state === 'dead') throw new Error(`${actor.name}'s ${usedPart.name} is dead and cannot attack`);
             if (usedPart.state === 'latched') throw new Error(`${actor.name}'s ${usedPart.name} is latched and cannot attack while it holds`);
         }
@@ -738,9 +741,14 @@ export class CombatEngine {
         // is hit with advantage.
         if (usedPart?.state === 'crippled') { disadvantage = true; situational.push(`${actor.name}'s ${usedPart.name} crippled (disadvantage)`); }
         // Measure of a Body: a crippled arm's attacks are at disadvantage. With
-        // no part named, assume the crippled arm unless the GM says otherwise.
+        // no part resolved (no withPart, weapon or profile part), assume the
+        // crippled arm only when no intact arm could be swinging instead.
         const crippledArm = actor.parts?.find(pt => pt.state === 'crippled' && pt.kind === 'arm');
-        if (!partOpts?.withPart && crippledArm && !unaffectedLimb) { disadvantage = true; situational.push(`${actor.name}'s ${crippledArm.name} crippled (disadvantage; name withPart or unaffectedLimb for the good arm)`); }
+        if (!usedPart && crippledArm && !unaffectedLimb) {
+            const goodArm = actor.parts?.find(pt => pt.kind === 'arm' && pt.state === 'intact');
+            if (goodArm) situational.push(`assumed ${goodArm.name}; name weapon or withPart if the crippled ${crippledArm.name} swings`);
+            else { disadvantage = true; situational.push(`${actor.name}'s ${crippledArm.name} crippled (disadvantage; name withPart or unaffectedLimb for the good arm)`); }
+        }
         const aimed = findPart(target, partOpts?.atPart);
         if (aimed?.state === 'breached') { advantage = true; situational.push(`${target.name}'s ${aimed.name} breached (advantage)`); }
         if (target.parts?.some(pt => pt.state === 'latched' && pt.latchedTo?.participantId === actor.id)) {

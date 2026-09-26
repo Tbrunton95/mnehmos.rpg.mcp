@@ -64,7 +64,9 @@ When several steps must land together, send them as one `batch_manage execute_se
 | --- | --- |
 | Session start | `session_manage boot {worldId}` |
 | The table rolled dice | `combat_action attack {..., outcome, damage}` |
-| Strike at a joint of a peer | add `calledStrike: 'leg' \| 'arm'` and `atPart` |
+| Strike at a joint of a peer | add `calledStrike: 'leg' \| 'arm' \| '<any part it has>'` and `atPart` |
+| Swing a named attack | add `using: 'grown blade'` (or `weapon`); it fills bonus, damage, type and the part that swings |
+| Say what a part wields | `combat_manage set_part {part, state, holds: ['whip']}` |
 | Prepared weapon fires on its trigger | add `preparedAsset: 'prepared-anti-armour'` |
 | A head, limb or plate changes state | `combat_manage set_part {part, state}` |
 | A monster's full statline | `combat_manage create` / `add_participant` with `size`, `reach`, `attacksPerAction`, `attacks`, `abilities`, `legendaryActions`, `legendaryResistances`, `hasLairActions`, `cr` |
