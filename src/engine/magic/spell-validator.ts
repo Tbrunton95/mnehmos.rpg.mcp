@@ -148,10 +148,12 @@ export function getSpellcastingAbility(characterClass: string | undefined | null
 /**
  * Get max spell level a character can cast based on class and level
  */
-export function getMaxSpellLevel(characterClass: CharacterClass, level: number): number {
+export function getMaxSpellLevel(characterClass: CharacterClass, rawLevel: number): number {
     const config = lookupSpellConfig(characterClass);
     if (!config || !config.canCast) return 0;
-    if (level < config.startLevel) return 0;
+    if (rawLevel < config.startLevel) return 0;
+    // Item 10: the slot tables stop at 20; a higher level casts as a 20th.
+    const level = Math.min(rawLevel, 20);
 
     if (config.pactMagic) {
         // Warlock uses pact magic
@@ -182,8 +184,10 @@ export function getMaxSpellLevel(characterClass: CharacterClass, level: number):
 /**
  * Get initial spell slots for a character based on class and level
  */
-export function getInitialSpellSlots(characterClass: CharacterClass, level: number): SpellSlots {
+export function getInitialSpellSlots(characterClass: CharacterClass, rawLevel: number): SpellSlots {
     const config = lookupSpellConfig(characterClass);
+    // Item 10: the slot tables stop at 20; a higher level holds a 20th's slots.
+    const level = Math.min(rawLevel, 20);
     const empty: SpellSlots = {
         level1: { current: 0, max: 0 },
         level2: { current: 0, max: 0 },
@@ -227,11 +231,12 @@ export function getInitialSpellSlots(characterClass: CharacterClass, level: numb
  * Calculate spell save DC for a character
  * DC = 8 + proficiency bonus + spellcasting ability modifier
  */
-export function calculateSpellSaveDC(character: Character): number {
+export function calculateSpellSaveDC(character: Character, profBonusOverride?: number): number {
     const config = lookupSpellConfig(character.characterClass);
     if (!config || !config.canCast) return 0;
 
-    const profBonus = Math.floor((character.level - 1) / 4) + 2;
+    // Item 10: a world's proficiency curve, when the caller passes it.
+    const profBonus = profBonusOverride ?? Math.floor((character.level - 1) / 4) + 2;
     const abilityMod = getAbilityModifier(character, config.ability);
 
     return 8 + profBonus + abilityMod;
@@ -241,11 +246,12 @@ export function calculateSpellSaveDC(character: Character): number {
  * Calculate spell attack bonus for a character
  * Attack = proficiency bonus + spellcasting ability modifier
  */
-export function calculateSpellAttackBonus(character: Character): number {
+export function calculateSpellAttackBonus(character: Character, profBonusOverride?: number): number {
     const config = lookupSpellConfig(character.characterClass);
     if (!config || !config.canCast) return 0;
 
-    const profBonus = Math.floor((character.level - 1) / 4) + 2;
+    // Item 10: a world's proficiency curve, when the caller passes it.
+    const profBonus = profBonusOverride ?? Math.floor((character.level - 1) / 4) + 2;
     const abilityMod = getAbilityModifier(character, config.ability);
 
     return profBonus + abilityMod;
@@ -708,7 +714,7 @@ export function restoreAllSpellSlots(character: Character): Character {
 
     if (config.pactMagic) {
         // Warlock pact magic
-        const warlockSlots = WARLOCK_SLOTS[character.level];
+        const warlockSlots = WARLOCK_SLOTS[Math.min(character.level, 20)];
         return {
             ...character,
             pactMagicSlots: {
@@ -739,7 +745,7 @@ export function restorePactSlots(character: Character): Character {
         return character; // Not a warlock or unknown class
     }
 
-    const warlockSlots = WARLOCK_SLOTS[character.level];
+    const warlockSlots = WARLOCK_SLOTS[Math.min(character.level, 20)];
     return {
         ...character,
         pactMagicSlots: {

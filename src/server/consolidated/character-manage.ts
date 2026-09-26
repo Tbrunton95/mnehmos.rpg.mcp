@@ -13,6 +13,7 @@
  */
 
 import { loadRule, loadRules, findWorldRule, castingClassFor, resolveWorldId, findPool, worldLexicon, conditionsForDisplay, shownCounters, resolveCreature, creatureToParticipant } from '../../engine/table-rules.js';
+import { worldProgression, levelCapProblem } from '../../engine/progression.js';
 import { FORM_KEYS, sheetFromCreature, snapshotBase, nextHp, hpModeSchema, type HpMode } from '../../engine/forms.js';
 import { pushSheetToLiveTokens } from '../handlers/combat-handlers.js';
 import { readWorldClock, dayClock, SET_CLOCK_HINT } from '../../engine/world-clock.js';
@@ -60,12 +61,6 @@ const ACTIONS = ['create', 'get', 'update', 'list', 'delete', 'kill', 'add_xp', 
 type CharacterAction = typeof ACTIONS[number];
 
 const CharacterTypeSchema = z.enum(['pc', 'npc', 'enemy', 'neutral']);
-
-const XP_TABLE: Record<number, number> = {
-    1: 0, 2: 300, 3: 900, 4: 2700, 5: 6500, 6: 14000, 7: 23000, 8: 34000,
-    9: 48000, 10: 64000, 11: 85000, 12: 100000, 13: 120000, 14: 140000,
-    15: 165000, 16: 195000, 17: 225000, 18: 265000, 19: 305000, 20: 355000
-};
 
 const CLASS_SAVE_KEYS: Record<string, z.infer<typeof SaveProficiencySchema>> = {
     strength: 'str',
@@ -148,8 +143,8 @@ const CreateSchema = z.object({
     hp: z.number().int().min(1).optional(),
     maxHp: z.number().int().min(1).optional(),
     ac: z.number().int().min(0).optional(),
-    level: z.number().int().min(1).max(20).optional().default(1)
-        .describe('Starting character level, from 1 through 20; determines class progression, features, and spell slots'),
+    level: z.number().int().min(1).optional().default(1)
+        .describe("Starting character level, 1 to the world's max (20 unless a table_rules progression rule sets maxLevel); determines class progression, features, and spell slots"),
     characterType: CharacterTypeSchema.optional().default('pc'),
     factionId: z.string().optional(),
     behavior: z.string().optional(),
@@ -211,8 +206,8 @@ const UpdateSchema = z.object({
     hp: z.number().int().min(0).optional(),
     maxHp: z.number().int().min(1).optional(),
     ac: z.number().int().min(0).optional(),
-    level: z.number().int().min(1).max(20).optional()
-        .describe('Character level, from 1 through 20'),
+    level: z.number().int().min(1).optional()
+        .describe("Character level, 1 to the world's max (20 unless a table_rules progression rule sets maxLevel)"),
     xp: z.number().int().min(0).optional().describe('Findings #43: absolute XP set — the surgical correction verb the double-fire revert lacked. Audited like every xp write'),
     characterType: CharacterTypeSchema.optional(),
     stats: StatsSchema.partial().optional(),
@@ -545,15 +540,16 @@ const AddXpSchema = z.object({
 
 const GetProgressionSchema = z.object({
     action: z.literal('get_progression'),
-    level: z.number().int().min(1).max(20).optional().describe('Level to check progression for (table lookup mode)'),
-    characterId: z.string().optional().describe('Findings #35: character mode — reads the row and reports current XP vs thresholds')
+    level: z.number().int().min(1).optional().describe('Level to check progression for (table lookup mode)'),
+    characterId: z.string().optional().describe('Findings #35: character mode — reads the row and reports current XP vs thresholds'),
+    worldId: z.string().optional().describe("Item 10: table mode reads this world's progression rule (default: the SRD table)")
 });
 
 const LevelUpSchema = z.object({
     action: z.literal('level_up'),
     characterId: z.string().describe('Character ID'),
     hpIncrease: z.number().int().min(0).optional(),
-    targetLevel: z.number().int().min(2).max(20).optional()
+    targetLevel: z.number().int().min(2).optional()
 });
 
 const OptionCategorySchema = z.enum(['all', 'classes', 'species', 'backgrounds', 'skills', 'languages', 'alignments']);
@@ -689,6 +685,9 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
     // (table_rules char_class / species / background); the SRD catalog is
     // the fallback for names the world does not define.
     const worldId = args.worldId;
+    // Item 10: the level cap is the world's progression rule (default 20).
+    const capProblem = levelCapProblem(worldProgression(db, worldId), args.level ?? 1);
+    if (capProblem) throw new Error(capProblem);
     const worldClassRule = findWorldRule(db, worldId, 'char_class', args.class || 'Adventurer');
     const worldClass = worldClassRule?.spec;
     const worldSpeciesRule = findWorldRule(db, worldId, 'species', args.race || 'Human');
@@ -1058,6 +1057,12 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
         throw new Error(`GUARD REFUSAL: character ${args.characterId} is "${character.name}", not "${args.expectName}" — NOTHING was written.`);
     }
     args = { ...args, characterId: character.id };
+    // Item 10: the level cap is the world's progression rule (default 20).
+    if (args.level !== undefined) {
+        const db = getDb();
+        const capProblem = levelCapProblem(worldProgression(db, args.worldId ?? resolveWorldId(db, { characterIds: [character.id] })), args.level);
+        if (capProblem) throw new Error(capProblem);
+    }
 
     validateWizardPreparedSpells(
         args.class ?? character.characterClass,
@@ -2052,10 +2057,10 @@ async function handleCancelScheduled(args: z.infer<typeof CancelScheduledSchema>
     return { success: true, actionType: 'cancel_scheduled', scheduleId: args.scheduleId, note: row.note, firesAtDay: row.fires_at_day, message: `Cancelled scheduled change ${args.scheduleId}${row.note ? ` (${row.note})` : ''} — was due Day ${row.fires_at_day}` };
 }
 
-/** The character's world uses milestone progression (table_rules progression). */
-function isMilestone(characterId: string): boolean {
+/** The character's world's progression (table_rules progression; default the SRD). */
+function progressionFor(characterId: string) {
     const db = getDb();
-    return loadRule(db, resolveWorldId(db, { characterIds: [characterId] }), 'progression')?.spec.mode === 'milestone';
+    return worldProgression(db, resolveWorldId(db, { characterIds: [characterId] }));
 }
 
 async function handleAddXp(args: z.infer<typeof AddXpSchema>): Promise<object> {
@@ -2069,10 +2074,13 @@ async function handleAddXp(args: z.infer<typeof AddXpSchema>): Promise<object> {
     const currentXp = char.xp ?? 0;
     const newXp = Math.max(0, currentXp + args.amount);   // Findings #43: corrections floor at 0
     const currentLevel = char.level;
-    const nextLevelXp = XP_TABLE[currentLevel + 1];
-    // Table rules: milestone progression never offers a level-up for XP.
-    const milestone = isMilestone(char.id);
-    const canLevelUp = !milestone && nextLevelXp !== undefined && newXp >= nextLevelXp;
+    // Table rules: milestone and none never offer a level-up for XP; the
+    // thresholds and cap are the world's (item 10).
+    const prog = progressionFor(char.id);
+    const atCap = prog.maxLevel !== null && currentLevel >= prog.maxLevel;
+    const nextLevelXp = atCap ? undefined : prog.xpFor(currentLevel + 1);
+    const milestone = prog.mode === 'milestone';
+    const canLevelUp = prog.mode === 'xp' && nextLevelXp !== undefined && newXp >= nextLevelXp;
 
     characterRepo.update(char.id, { xp: newXp });
 
@@ -2083,11 +2091,11 @@ async function handleAddXp(args: z.infer<typeof AddXpSchema>): Promise<object> {
         newXp,
         level: currentLevel,
         canLevelUp,
-        ...(milestone ? { progression: 'milestone' } : {}),
+        ...(prog.mode !== 'xp' ? { progression: prog.mode } : {}),
         nextLevelXp: nextLevelXp || null,
         message: canLevelUp
             ? `Added ${args.amount} XP. Total: ${newXp}. LEVEL UP AVAILABLE for Level ${currentLevel + 1}!`
-            : `Added ${args.amount} XP. Total: ${newXp}.${milestone ? ' Milestone progression: levels come on the GM\'s call, not from XP.' : ''}`
+            : `Added ${args.amount} XP. Total: ${newXp}.${milestone ? ' Milestone progression: levels come on the GM\'s call, not from XP.' : prog.mode === 'none' ? ' This world has no levelling (progression none).' : ''}`
     };
 }
 
@@ -2100,7 +2108,8 @@ async function handleGetProgression(args: z.infer<typeof GetProgressionSchema>):
         if (!char) throw new Error(`Character ${args.characterId} not found`);
         const lvl = (char as { level: number }).level;
         const xp = (char as { xp?: number }).xp ?? 0;
-        const nextXp = lvl >= 20 ? null : XP_TABLE[lvl + 1];
+        const prog = progressionFor(char.id);
+        const nextXp = prog.maxLevel !== null && lvl >= prog.maxLevel ? null : prog.xpFor(lvl + 1);
         return {
             characterId: args.characterId,
             name: char.name,
@@ -2108,25 +2117,26 @@ async function handleGetProgression(args: z.infer<typeof GetProgressionSchema>):
             xp,
             xpForNextLevel: nextXp,
             xpToNext: nextXp === null ? null : Math.max(0, nextXp - xp),
-            readyToLevel: !isMilestone(char.id) && nextXp !== null && xp >= nextXp,
-            ...(isMilestone(char.id) ? { progression: 'milestone' } : {})
+            readyToLevel: prog.mode === 'xp' && nextXp !== null && xp >= nextXp,
+            ...(prog.mode !== 'xp' ? { progression: prog.mode } : {})
         };
     }
     if (args.level === undefined) {
         throw new Error('Pass characterId (character mode) or level (table mode)');
     }
     const level = args.level;
+    const prog = worldProgression(getDb(), args.worldId);
 
-    if (level >= 20) {
+    if (prog.maxLevel !== null && level >= prog.maxLevel) {
         return {
-            level: 20,
+            level: prog.maxLevel,
             maxLevel: true,
-            xpForCurrentLevel: XP_TABLE[20]
+            xpForCurrentLevel: prog.xpFor(prog.maxLevel)
         };
     }
 
-    const currentXpBase = XP_TABLE[level];
-    const nextLevelXp = XP_TABLE[level + 1];
+    const currentXpBase = prog.xpFor(level);
+    const nextLevelXp = prog.xpFor(level + 1);
 
     return {
         level,
@@ -2150,6 +2160,9 @@ async function handleLevelUp(args: z.infer<typeof LevelUpSchema>): Promise<objec
     if (targetLevel <= currentLevel) {
         throw new Error(`Target level ${targetLevel} must be greater than current level ${currentLevel}`);
     }
+    // Item 10: the level cap is the world's progression rule (default 20).
+    const capProblem = levelCapProblem(progressionFor(char.id), targetLevel);
+    if (capProblem) throw new Error(capProblem);
 
     const levelsGained = targetLevel - currentLevel;
     const hpRule = levelUpHitPointRule(char, levelsGained);
@@ -2470,7 +2483,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         createCorpse: z.boolean().optional().describe('kill: false = death without a body (default true)'),
         encounterId: z.string().optional().describe('kill: encounter the corpse lands in'),
         position: z.object({ x: z.number(), y: z.number() }).optional().describe('kill: corpse position'),
-        worldId: z.string().optional().describe("kill: world for the corpse row; create: the world whose classes, species and backgrounds to read first; options: also list the world's own entries"),
+        worldId: z.string().optional().describe("kill: world for the corpse row; create: the world whose classes, species and backgrounds to read first; options: also list the world's own entries; get_progression table mode: the world's progression rule"),
         currency: z.record(z.number()).optional().describe('kill: currency on the corpse (e.g. {gold: 150})'),
         // Create fields
         name: z.string().optional(),
@@ -2483,7 +2496,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         hp: z.number().int().optional(),
         maxHp: z.number().int().optional(),
         ac: z.number().int().optional(),
-        level: z.number().int().min(1).max(20).optional().describe('Character level from 1 through 20'),
+        level: z.number().int().min(1).optional().describe("Character level, 1 to the world's max (20 unless a table_rules progression rule sets maxLevel; null = no cap)"),
         xp: z.number().optional().describe('Absolute XP set (update) — Findings #43'),
         characterType: CharacterTypeSchema.optional(),
         factionId: z.string().optional(),

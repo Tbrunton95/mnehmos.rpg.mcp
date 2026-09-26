@@ -93,7 +93,14 @@ export const RuleSpecSchemas = {
         catastrophicEffect: z.string().default('catastrophic')
     }).passthrough(),
     progression: z.object({
-        mode: z.enum(['milestone', 'xp']).default('milestone')
+        /** milestone: levels on the GM's call; xp: XP offers them; none: the world has no levelling. */
+        mode: z.enum(['milestone', 'xp', 'none']).default('milestone'),
+        /** Highest level a character may hold (default 20); null means no cap. */
+        maxLevel: z.number().int().min(1).nullable().optional(),
+        /** XP to reach each level from 1 ([0, 300, 900, ...]); the last step repeats past the end. */
+        xpThresholds: z.array(z.number().int().min(0)).min(2).optional(),
+        /** Proficiency bonus by level from 1; the last value holds past the end. */
+        profBonus: z.array(z.number().int()).min(1).optional()
     }).passthrough(),
     status_block: z.object({
         compact: z.boolean().default(true),

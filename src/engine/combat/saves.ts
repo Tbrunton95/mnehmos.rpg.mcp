@@ -14,6 +14,8 @@ import type Database from 'better-sqlite3';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import type { CombatEngine, CombatParticipant } from './engine.js';
 import { exhaustionLevel } from './conditions.js';
+import { resolveWorldId } from '../table-rules.js';
+import { worldProgression } from '../progression.js';
 
 export type AbilityLong = 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
 export type AbilityShort = 'str' | 'dex' | 'con' | 'int' | 'wis' | 'cha';
@@ -43,6 +45,8 @@ export interface SaveSource {
     saveProficiencies?: string[];
     level?: number;
     cr?: number;
+    /** Item 10: the proficiency bonus from the world's curve, when the source has a sheet. */
+    profBonus?: number;
 }
 
 export interface SaveModifier {
@@ -61,7 +65,7 @@ export function saveModifier(src: SaveSource, ability: string): SaveModifier {
     const proficient = (src.saveProficiencies ?? []).some(s => toLongAbility(s) === long);
     let prof = 0;
     if (proficient) {
-        prof = proficiencyByLevel(src.level ?? (src.cr !== undefined ? Math.max(1, src.cr) : 1));
+        prof = src.profBonus ?? proficiencyByLevel(src.level ?? (src.cr !== undefined ? Math.max(1, src.cr) : 1));
         parts.push(`save proficiency +${prof}`);
     }
     return { mod, prof, total: mod + prof, parts };
@@ -95,7 +99,8 @@ export function saveSourceFor(db: Database.Database | undefined, p: CombatPartic
             return {
                 stats: row.stats as Record<string, number>,
                 saveProficiencies: (row as { saveProficiencies?: string[] }).saveProficiencies?.length ? (row as { saveProficiencies?: string[] }).saveProficiencies : tokenProfs,
-                level: row.level
+                level: row.level,
+                profBonus: worldProgression(db, resolveWorldId(db, { characterIds: [row.id] })).profBonus(row.level)
             };
         }
     }

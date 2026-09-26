@@ -250,7 +250,7 @@ Kinds:
 - peer_consequence {thresholdFraction, onCrit, options, direction}: a hit on a peer (same band or higher) that crits or deals ≥ the fraction of max HP flags CONSEQUENCE DUE; direction 'both' flags a higher band's hits on a lower one too. A hit that kills, or a hit on a unit, never flags; the GM names it and applies it with combat_manage set_part.
 - called_strike {requirePeer, limbs}: combat_action attack calledStrike: 'leg'|'arm' or any named part of the target ('jaw', 'collar chain') cripples it on a hit (no roll penalty, no threshold). A named part keeps its kind and reads limbs[name] ?? limbs[kind] ?? limbs.other.
 - prepared_asset {catastrophicMargin, missOptions, hitEffect, catastrophicEffect}: combat_action attack preparedAsset: <rule name> reports the tier (miss / hit / catastrophic); the GM names the effect.
-- progression {mode: 'milestone'}: add_xp stops offering level-ups.
+- progression {mode: 'milestone' | 'xp' | 'none', maxLevel?, xpThresholds?, profBonus?}: milestone and none stop add_xp offering level-ups. maxLevel caps create, update and level_up (default 20; null = no cap). xpThresholds lists XP for levels 1, 2, ... (the last step repeats); profBonus lists the proficiency bonus by level (the last value holds) for skills, saves and spell DC/attack. Without a rule: XP, level 20, the SRD table.
 - status_block {compact, maxConditions, corePool}: tiny status blocks; corePool names the one resource pool shown (any case).
 - lexicon {currency, badge, questFailLine}: the world's words for fixed labels (currency on the gold field, the status block's header badge, the quest-failed line). Without one a world reads RU, ПДА and "The Zone doesn't wait."
 - principle {text}: reference text shown at session boot, never enforced.

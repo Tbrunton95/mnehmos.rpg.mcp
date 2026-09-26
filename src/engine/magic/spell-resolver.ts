@@ -91,6 +91,8 @@ export interface SpellResolutionOptions {
     disadvantage?: boolean;
     casterId?: string;
     targetId?: string;
+    /** Item 10: the caster's proficiency bonus from its world's curve. */
+    profBonus?: number;
 }
 
 export interface SpellResolutionResult {
@@ -136,8 +138,8 @@ export function resolveSpell(
     };
 
     // Get caster's spell save DC and attack bonus (a set attack bonus of 0 stands)
-    const spellSaveDC = caster.spellSaveDC || calculateSpellSaveDC(caster);
-    const spellAttackBonus = caster.spellAttackBonus ?? calculateSpellAttackBonus(caster);
+    const spellSaveDC = caster.spellSaveDC || calculateSpellSaveDC(caster, options.profBonus);
+    const spellAttackBonus = caster.spellAttackBonus ?? calculateSpellAttackBonus(caster, options.profBonus);
     const dice = options.dice;
     const roll = (notation: string, tag: string): { total: number; rolls: number[] } => {
         if (!dice) return rollDice(notation);

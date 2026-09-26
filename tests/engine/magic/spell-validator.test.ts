@@ -17,7 +17,9 @@ import {
     getMaxSpellLevel,
     getInitialSpellSlots,
     hasSpellSlotAvailable,
-    consumeSpellSlot
+    consumeSpellSlot,
+    restoreAllSpellSlots,
+    restorePactSlots
 } from '../../../src/engine/magic/spell-validator.js';
 import type { Character } from '../../../src/schema/character.js';
 import { FIXED_TIMESTAMP } from '../../fixtures.js';
@@ -130,5 +132,19 @@ describe('spell-validator case-insensitive class lookup', () => {
             expect(result.available).toBe(false);
             expect(result.reason).toContain('Unknown');
         });
+    });
+});
+
+describe('spell-validator above level 20 (item 10)', () => {
+    it('a level 25 caster casts and holds slots as a level 20 caster', () => {
+        expect(getMaxSpellLevel('wizard' as any, 25)).toBe(9);
+        expect(getInitialSpellSlots('wizard' as any, 25)).toEqual(getInitialSpellSlots('wizard' as any, 20));
+        expect(getInitialSpellSlots('wizard' as any, 25).level9.max).toBe(1);
+        expect(getMaxSpellLevel('paladin' as any, 25)).toBe(getMaxSpellLevel('paladin' as any, 20));
+        expect(getInitialSpellSlots('paladin' as any, 30)).toEqual(getInitialSpellSlots('paladin' as any, 20));
+        expect(getMaxSpellLevel('warlock' as any, 25)).toBe(5);
+        const warlock = { characterClass: 'warlock', level: 25 } as any;
+        expect(restoreAllSpellSlots(warlock).pactMagicSlots).toEqual({ current: 4, max: 4, slotLevel: 5 });
+        expect(restorePactSlots(warlock).pactMagicSlots).toEqual({ current: 4, max: 4, slotLevel: 5 });
     });
 });

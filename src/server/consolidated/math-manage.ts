@@ -18,6 +18,7 @@ import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { loadAutoMechanics, autoSkillBonus, autoSaveBonus, autoAdvantage, applyDeclaredEffects } from '../../engine/effects-resolver.js';
 import { parseAbility } from '../../engine/combat/conditions.js';
 import { resolveWorldId, worldSkillAbility } from '../../engine/table-rules.js';
+import { worldProgression } from '../../engine/progression.js';
 import * as pda from '../../render/pda.js';
 import { ExportEngine } from '../../math/export.js';
 import { CalculationRepository, StoredCalculation } from '../../storage/repos/calculation.repo.js';
@@ -136,7 +137,6 @@ const OpposedSchema = z.object({
 // concentration saves roll and log the same way.
 
 function abilityMod(score: number): number { return Math.floor((score - 10) / 2); }
-function profBonus(level: number): number { return Math.floor((level - 1) / 4) + 2; }
 
 async function handleCharacterRoll(
     kind: 'skill' | 'ability' | 'save',
@@ -153,6 +153,10 @@ async function handleCharacterRoll(
     // SQL from here down.
     const charId = char.id;
     args = { ...args, characterId: charId };
+    // Item 10: the proficiency curve is the world's (table_rules progression).
+    const worldId = resolveWorldId(db, { characterIds: [charId] });
+    const progression = worldProgression(db, worldId);
+    const profBonus = (level: number) => progression.profBonus(level);
 
     const stats = char.stats as Record<string, number>;
     // FINDINGS #104: membership tests below were CASE-SENSITIVE while sheets
@@ -177,7 +181,7 @@ async function handleCharacterRoll(
     if (kind === 'skill') {
         const skill = (args.skill || '').toLowerCase().replace(/ /g, '_');
         // Item 8: a world skill (table_rules skill) names its own ability.
-        const ability = args.ability || worldSkillAbility(db, resolveWorldId(db, { characterIds: [charId] }), args.skill) || SKILL_ABILITY[skill] || 'wis';
+        const ability = args.ability || worldSkillAbility(db, worldId, args.skill) || SKILL_ABILITY[skill] || 'wis';
         const mod = abilityMod(stats[ability] ?? 10);
         // #67-E: stealth/perception COLUMNS are authoritative when present.
         // The eavesdrop listener layer already rolls these columns (Findings

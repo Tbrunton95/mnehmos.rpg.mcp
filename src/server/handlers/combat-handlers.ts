@@ -19,6 +19,7 @@ import { SessionContext } from '../types.js';
 import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
 import { PartSchema, UnitSchema, ParticipantExtrasShape, type Part, type ReadiedAttack } from '../../schema/token-extras.js';
+import { worldProgression } from '../../engine/progression.js';
 import { resolveWorldId, bandOrder, loadRule, loadRules, castingClassFor, type TableRule } from '../../engine/table-rules.js';
 import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
 import { volleyTier, describeUnit } from '../../engine/combat/units.js';
@@ -2315,6 +2316,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         const ownClass = casterChar.characterClass;
         const castingAs = castingClassFor(db, casterChar);
         if (castingAs && castingAs !== ownClass) casterChar = { ...casterChar, characterClass: castingAs };
+        // Item 10: spell DC and attack read the caster's world proficiency curve.
+        const casterProfBonus = worldProgression(db, resolveWorldId(db, { characterIds: [casterChar.id] })).profBonus(casterChar.level);
 
         // Get target (needed for validation of range)
         // Re-use logic: defined outside or define here once?
@@ -2390,6 +2393,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             disadvantage: parsed.disadvantage,
             casterId: parsed.actorId,
             targetId: attackTargetId,
+            profBonus: casterProfBonus,
             dice: {
                 d20: (_tag, advantage, disadvantage) => {
                     if (!attackTargetId || !currentState.participants.some(p => p.id === attackTargetId)) {
@@ -2440,7 +2444,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         const saveType = damageEffect?.saveType;
         const saveEffect = damageEffect?.saveEffect;
         const requiresSave = saveType && saveType !== 'none';
-        const spellSaveDC = casterChar.spellSaveDC || calculateSpellSaveDC(casterChar);
+        const spellSaveDC = casterChar.spellSaveDC || calculateSpellSaveDC(casterChar, casterProfBonus);
         // Each target rolls its own save below, so a save spell starts from the
         // full roll. resolution.damage already carries the resolver's single
         // unmodified save; using it would halve (or zero) the damage twice.
