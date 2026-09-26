@@ -406,6 +406,16 @@ async function handleAdvance(args: z.infer<typeof AdvanceSchema>): Promise<objec
     if (!(hours > 0)) {
         return { error: true, actionType: 'advance', message: 'advance needs minutes, hours or days greater than zero. Nothing was written.' };
     }
+    return advanceWorldClock(args.worldId, hours);
+}
+
+/**
+ * Move a world's clock forward by `hours` through the one write path
+ * (regeneration, elapsed note) and count what came due. world_manage advance
+ * and spatial_manage traverse {advanceClock} both call it.
+ */
+export function advanceWorldClock(worldId: string, hours: number): Record<string, unknown> {
+    const args = { worldId };
     const db = getDb();
     const clock = readWorldClock(db, args.worldId);
     if (!clock) {

@@ -78,6 +78,7 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Roll the Eye of the Gods and apply it | `table_rules roll {worldId, name, characterId}` on entries with `apply` (gift, condition, writes, form, terminal kill); `apply: false` previews |
 | Make an offering to a god | `character_manage offer {characterId, family, pool, offering: item \| kill \| deed, itemId?, quantity?, victimId?, deed?, value?, answerTable?}` |
 | Found or run a cult | `congregation_manage create {worldId, name, god, founderId, size, zeal?, family?}`; `tend`, `strike {losses?, zealDelta?}`, `purge`; `process_weekly {worldId}` when advance shows `dueNow.congregations` |
+| Realmgate, toll bridge, portcullis | `spatial_manage gate_create {name, fromRoomId, toRoomId, direction, travelHours?, toll?: {gold}, holder?}`; `traverse {gateId, characterId, advanceClock?}`; `set_gate {gateId, status: open \| closed, holder?}`; `gate_list {worldId?, roomId?}` |
 | Loot a body | `corpse_manage generate_loot {corpseId, creatureType}` (logged; `seed` replays) |
 | Spawn from the bestiary | `combat_manage spawn_quick_enemy {creature, count, worldId}` or `add_participant {encounterId, creature, count}` |
 | A recurring monster's statline, once | `character_manage update {characterId, ...}` with the same fields; tokens joined by id start with it |

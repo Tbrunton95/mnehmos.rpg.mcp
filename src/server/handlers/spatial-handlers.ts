@@ -455,8 +455,10 @@ export async function handleLookAtSurroundings(
     direction: e.direction,
     type: e.type,
     description:
-      e.description || `A ${e.type.toLowerCase()} passage leads ${e.direction}`,
+      e.description || (e.kind ? `A ${e.kind} leads ${e.direction}` : `A ${e.type.toLowerCase()} passage leads ${e.direction}`),
     targetNodeId: e.targetNodeId,
+    ...(e.kind ? { kind: e.kind } : {}),
+    ...(e.gateId ? { gateId: e.gateId } : {}),
     travelTime: e.travelTime,
     terrain: e.terrain,
     difficulty: e.difficulty,
@@ -652,6 +654,8 @@ export async function handleGetRoomExits(args: unknown, _ctx: SessionContext) {
               travelTime: e.travelTime,
               terrain: e.terrain,
               difficulty: e.difficulty,
+              kind: e.kind,
+              gateId: e.gateId,
             })),
           },
           null,
@@ -660,6 +664,39 @@ export async function handleGetRoomExits(args: unknown, _ctx: SessionContext) {
       },
     ],
   };
+}
+
+/**
+ * Seat a character in a room: out of the old room's entity list, onto the
+ * sheet's currentRoomId, into the new room's list, and one more visit.
+ * move and gate traverse both land here, so the two sides never disagree.
+ */
+export function seatCharacterInRoom(character: { id: string }, toRoomId: string): { oldRoomId?: string } {
+  const spatialRepo = getSpatialRepo();
+  const characterRepo = getCharacterRepo();
+  const oldRoomId = (character as unknown as { currentRoomId?: string }).currentRoomId;
+  // Remove character from old room if present
+  if (oldRoomId) {
+    try {
+      spatialRepo.removeEntityFromRoom(oldRoomId, character.id);
+    } catch (e) {
+      // Old room may not exist anymore, that's okay
+    }
+  }
+
+  // Update character's current room (using unknown to bypass TypeScript checks for current_room_id)
+  const updatedChar = {
+    ...(character as any),
+    currentRoomId: toRoomId,
+  };
+  characterRepo.update(character.id, updatedChar as any);
+
+  // Add character to new room
+  spatialRepo.addEntityToRoom(toRoomId, character.id);
+
+  // Increment visit count
+  spatialRepo.incrementVisitCount(toRoomId);
+  return { oldRoomId };
 }
 
 export async function handleMoveCharacterToRoom(
@@ -745,27 +782,7 @@ export async function handleMoveCharacterToRoom(
     };
   }
 
-  // Remove character from old room if present
-  if (oldRoomId) {
-    try {
-      spatialRepo.removeEntityFromRoom(oldRoomId, parsed.characterId);
-    } catch (e) {
-      // Old room may not exist anymore, that's okay
-    }
-  }
-
-  // Update character's current room (using unknown to bypass TypeScript checks for current_room_id)
-  const updatedChar = {
-    ...(character as any),
-    currentRoomId: destinationRoomId,
-  };
-  characterRepo.update(parsed.characterId, updatedChar as any);
-
-  // Add character to new room
-  spatialRepo.addEntityToRoom(destinationRoomId!, parsed.characterId);
-
-  // Increment visit count
-  spatialRepo.incrementVisitCount(destinationRoomId!);
+  seatCharacterInRoom(character, destinationRoomId!);
 
   const roomCoordinateUpdates: Partial<RoomNode> = {};
   if (parsed.networkId !== undefined) roomCoordinateUpdates.networkId = parsed.networkId;
