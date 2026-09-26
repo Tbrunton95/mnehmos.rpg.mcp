@@ -38,6 +38,7 @@ import { provisionStartingEquipment } from '../../services/starting-equipment.se
 import { CLASS_DATA, getSpellSlots, isSpellcaster } from '../../data/class-starting-data.js';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { CorpseRepository } from '../../storage/repos/corpse.repo.js';
+import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
 import { SceneRepository } from '../../storage/repos/scene.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { RichFormatter } from '../utils/formatter.js';
@@ -54,7 +55,7 @@ import {
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'update', 'list', 'delete', 'kill', 'add_xp', 'adjust_pool', 'get_progression', 'level_up', 'schedule_change', 'process_scheduled', 'list_scheduled', 'cancel_scheduled', 'scope_scheduled', 'scope_characters', 'get_status_block', 'options', 'set_form'] as const;
+const ACTIONS = ['create', 'get', 'update', 'list', 'delete', 'kill', 'add_xp', 'adjust_pool', 'get_progression', 'level_up', 'schedule_change', 'process_scheduled', 'list_scheduled', 'cancel_scheduled', 'scope_scheduled', 'scope_characters', 'get_status_block', 'options', 'set_form', 'offer'] as const;
 type CharacterAction = typeof ACTIONS[number];
 
 const CharacterTypeSchema = z.enum(['pc', 'npc', 'enemy', 'neutral']);
@@ -1420,6 +1421,108 @@ export function setForm(args: { characterId: string; form: string; hpMode?: HpMo
     };
 }
 
+// Item 5: OFFERINGS — an item, a kill or a deed given to one pool of a family.
+const OFFERING_KINDS = ['item', 'kill', 'deed'] as const;
+/** A fresh enum each call, so no outer schema holds one zod instance twice. */
+function offeringSchema() { return z.enum(OFFERING_KINDS); }
+
+const OfferSchema = z.object({
+    action: z.literal('offer'),
+    characterId: z.string().describe('Who makes the offering'),
+    family: z.string().describe('The pool_family rule (the gods)'),
+    pool: z.string().describe('The family pool the offering goes to (the god)'),
+    offering: offeringSchema().describe('item (itemId, quantity), kill (victimId) or deed (deed)'),
+    itemId: z.string().optional().describe('offering item: the item template id (or its name) in the character\'s inventory'),
+    quantity: z.number().int().min(1).optional().describe('offering item: how many (default 1); the value is per item'),
+    victimId: z.string().optional().describe('offering kill: the character killed as the offering'),
+    deed: z.string().optional().describe('offering deed: what was done in the god\'s name'),
+    value: z.number().optional().describe("Favour gained; default the family's offering_values for the item name, 'kill' or the deed (any case)"),
+    answerTable: z.string().optional().describe("A roll_table rolled as the god's answer, the favour pool as its modifier"),
+    apply: z.boolean().optional().describe('answerTable: apply the answer (default true); false previews'),
+    seed: z.string().optional().describe('answerTable: replay exact dice'),
+    worldId: z.string().optional().describe("World whose rules to read (default: the character's)")
+});
+
+async function handleOffer(args: z.infer<typeof OfferSchema>): Promise<object> {
+    const { db, characterRepo } = ensureDb();
+    const refuse = (message: string) => ({ error: true, actionType: 'offer', message: `${message} Nothing was written.`, writes: 'none' });
+    const char = characterRepo.findById(args.characterId);
+    if (!char) return refuse(`Character ${args.characterId} not found.`);
+    const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] });
+    const rule = loadRule(db, worldId, 'pool_family', args.family);
+    if (!rule) return refuse(`No pool_family '${args.family}' in this world.`);
+    const member = familyMember(rule.spec, args.pool);
+    if (!member) return refuse(`'${args.pool}' is not in family '${rule.name}' (${rule.spec.pools.join(', ')}).`);
+    if (args.answerTable && !loadRule(db, worldId, 'roll_table', args.answerTable)) return refuse(`No roll_table '${args.answerTable}' in this world.`);
+    const priceOf = (key: string): number | undefined => {
+        const k = Object.keys(rule.spec.offering_values).find(x => x.toLowerCase() === key.toLowerCase());
+        return k === undefined ? undefined : rule.spec.offering_values[k];
+    };
+
+    let value: number | undefined;
+    let what: string;
+    let consume: () => Promise<Record<string, unknown> | { error: true; message: string }>;
+    if (args.offering === 'item') {
+        if (!args.itemId) return refuse('offering item needs itemId.');
+        const quantity = args.quantity ?? 1;
+        const owned = db.prepare('SELECT ii.item_id AS id, ii.quantity AS quantity, i.name AS name FROM inventory_items ii JOIN items i ON i.id = ii.item_id WHERE ii.character_id = ?').all(char.id) as Array<{ id: string; quantity: number; name: string }>;
+        const item = owned.find(o => o.id === args.itemId) ?? owned.find(o => o.name.toLowerCase() === args.itemId!.toLowerCase());
+        if (!item) return refuse(`${char.name} does not carry '${args.itemId}'.`);
+        if (item.quantity < quantity) return refuse(`${char.name} carries ${item.quantity} ${item.name}, not ${quantity}.`);
+        const each = args.value ?? priceOf(item.name);
+        value = each === undefined ? undefined : args.value !== undefined ? args.value : each * quantity;
+        what = `${quantity} × ${item.name}`;
+        consume = async () => {
+            if (!new InventoryRepository(db).removeItem(char.id, item.id, quantity)) return { error: true as const, message: `could not remove ${what}` };
+            return { item: item.name, itemId: item.id, quantity };
+        };
+    } else if (args.offering === 'kill') {
+        if (!args.victimId) return refuse('offering kill needs victimId.');
+        const victim = characterRepo.findById(args.victimId);
+        if (!victim) return refuse(`Victim ${args.victimId} not found.`);
+        value = args.value ?? priceOf('kill');
+        what = `the death of ${victim.name}`;
+        consume = async () => {
+            const k = await handleKill({ action: 'kill', characterId: victim.id, cause: `offered to ${member}`, worldId: worldId ?? undefined }) as { success?: boolean; corpseId?: string; message?: string };
+            if (!k.success) return { error: true as const, message: String(k.message) };
+            return { victim: victim.name, victimId: victim.id, ...(k.corpseId ? { corpseId: k.corpseId } : {}) };
+        };
+    } else {
+        if (!args.deed) return refuse('offering deed needs deed.');
+        value = args.value ?? priceOf(args.deed);
+        what = args.deed;
+        consume = async () => ({ deed: args.deed });
+    }
+    if (value === undefined) return refuse(`No value for ${args.offering === 'kill' ? "'kill'" : `'${args.offering === 'item' ? what.replace(/^\d+ × /, '') : what}'`} in ${rule.name}'s offering_values; pass value.`);
+
+    const consumed = await consume();
+    if ('error' in consumed) return refuse(`The offering failed: ${consumed.message}.`);
+    const favour = await handleAdjustPool({ action: 'adjust_pool', characterId: char.id, pool: member, delta: value, family: rule.name, worldId: worldId ?? undefined, reason: `offering: ${what}` }) as Record<string, unknown>;
+
+    let answer: Record<string, unknown> | undefined;
+    if (args.answerTable) {
+        const { rollAndApply } = await import('../roll-table-apply.js');
+        answer = await rollAndApply(db, {
+            worldId: worldId!, name: args.answerTable, characterId: char.id,
+            modifierPool: String(favour.pool ?? member), apply: args.apply ?? true, seed: args.seed, tool: 'character_manage'
+        });
+    }
+    return {
+        success: true,
+        actionType: 'offer',
+        characterId: char.id,
+        characterName: char.name,
+        offering: args.offering,
+        to: favour.pool ?? member,
+        family: rule.name,
+        value,
+        consumed,
+        favour,
+        ...(answer ? { answer } : {}),
+        message: `${char.name} offers ${what} to ${String(favour.pool ?? member)} (+${value}). ${String(favour.message ?? '')}${answer ? ` Answer: ${String(answer.message ?? answer.text ?? '')}` : ''}`
+    };
+}
+
 export async function handleAdjustPool(args: z.input<typeof AdjustPoolSchema>): Promise<object> {
     const { characterRepo } = ensureDb();
     const char = characterRepo.findById(args.characterId);
@@ -2230,6 +2333,12 @@ const definitions: Record<CharacterAction, ActionDefinition> = {
         aliases: ['form', 'transform', 'shapechange'],
         description: "Take a creature's form (a world creature rule or preset) or put it down with form: 'base'. The sheet keeps its own values to go back to; live tokens follow"
     },
+    offer: {
+        schema: OfferSchema,
+        handler: handleOffer,
+        aliases: ['offering', 'sacrifice', 'tithe'],
+        description: "Offer an item, a kill or a deed to one pool of a pool_family: the offering is consumed, favour moves through the family (rivals grow jealous), and answerTable rolls the god's answer with the favour as its modifier"
+    },
     options: {
         schema: OptionsSchema,
         handler: handleOptions,
@@ -2332,6 +2441,14 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         label: z.string().optional().describe('adjust_pool (mirror): display name for the counter'),
         show: z.boolean().optional().describe('adjust_pool (mirror): list the counter at boot and on the status block'),
         linkItem: z.string().optional().describe('adjust_pool (mirror): item template or instance id whose charges mirror the pool'),
+        offering: offeringSchema().optional().describe('offer: item | kill | deed'),
+        itemId: z.string().optional().describe('offer item: item template id (or name) in the inventory'),
+        quantity: z.number().int().optional().describe('offer item: how many (default 1)'),
+        victimId: z.string().optional().describe('offer kill: the character killed as the offering'),
+        deed: z.string().optional().describe('offer deed: what was done'),
+        answerTable: z.string().optional().describe("offer: roll_table rolled as the god's answer"),
+        apply: z.boolean().optional().describe('offer: apply the answer (default true); false previews'),
+        seed: z.string().optional().describe('offer: replay the answer dice'),
         form: z.string().optional().describe("set_form: a creature rule or preset to take the shape of; 'base' puts the form down"),
         hpMode: hpModeSchema().optional().describe('set_form: keep_fraction (default) | full | keep'),
         family: z.string().optional().describe("adjust_pool: a pool_family rule — the pool moves inside its family (jealous rivals lose on a gain); returns rivals[]"),
