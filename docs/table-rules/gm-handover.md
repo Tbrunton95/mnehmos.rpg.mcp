@@ -74,6 +74,7 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Save a monster to the world's bestiary | `table_rules define {worldId, kind: 'creature', name, spec}` (or `fromToken {encounterId, participantId}` / `fromCharacterId`) |
 | Roll a house table (omens, the Eye of the Gods) | `table_rules roll {worldId, name, characterId?, modifier?}` on a `roll_table` rule; the entry's `chain` rolls the next table |
 | Move a god's favour (jealousy applies) | `character_manage adjust_pool {characterId, pool, delta, family, reason}` on a `pool_family` rule; returns `rivals[]` |
+| Transform a character (daemonhood, spawndom) | `character_manage set_form {characterId, form, hpMode?}`; `form: 'base'` reverts |
 | Loot a body | `corpse_manage generate_loot {corpseId, creatureType}` (logged; `seed` replays) |
 | Spawn from the bestiary | `combat_manage spawn_quick_enemy {creature, count, worldId}` or `add_participant {encounterId, creature, count}` |
 | A recurring monster's statline, once | `character_manage update {characterId, ...}` with the same fields; tokens joined by id start with it |

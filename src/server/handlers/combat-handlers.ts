@@ -136,6 +136,43 @@ export function mirrorConditionToRow(characterId: string, op: 'add' | 'remove', 
 }
 
 /**
+ * Item 2: a sheet change that reshapes a creature (a form taken or put down)
+ * reaches its tokens in every active encounter: the stored rows and any
+ * engine held in memory. A field given as undefined is removed from the
+ * token. Returns the encounter ids patched.
+ */
+export function pushSheetToLiveTokens(characterId: string, tokenFields: Record<string, unknown>): string[] {
+    const patch = (tok: Record<string, unknown>) => {
+        for (const [k, v] of Object.entries(tokenFields)) {
+            if (v === undefined) delete tok[k];
+            else tok[k] = JSON.parse(JSON.stringify(v));
+        }
+    };
+    const patched = new Set<string>();
+    const db = getDb();
+    try {
+        const rows = db.prepare("SELECT id, tokens FROM encounters WHERE status = 'active' AND tokens LIKE ?").all(`%"${characterId}"%`) as Array<{ id: string; tokens: string }>;
+        const upd = db.prepare('UPDATE encounters SET tokens = ?, updated_at = ? WHERE id = ?');
+        for (const r of rows) {
+            const tokens = JSON.parse(r.tokens) as Array<Record<string, unknown>>;
+            const tok = tokens.find(t => t.id === characterId);
+            if (!tok) continue;
+            patch(tok);
+            upd.run(JSON.stringify(tokens), new Date().toISOString(), r.id);
+            patched.add(r.id);
+        }
+    } catch { /* no encounters table */ }
+    const manager = getCombatManager();
+    for (const key of manager.list()) {
+        const tok = manager.get(key)?.getState()?.participants.find(p => p.id === characterId) as unknown as Record<string, unknown> | undefined;
+        if (!tok) continue;
+        patch(tok);
+        patched.add(key.slice(key.indexOf(':') + 1));
+    }
+    return [...patched];
+}
+
+/**
  * The encounter's live engine: from process memory, or rehydrated from the
  * database (after a restart or eviction) and registered. null when the
  * encounter exists in neither.

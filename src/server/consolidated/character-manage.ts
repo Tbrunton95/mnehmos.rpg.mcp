@@ -12,7 +12,9 @@
  * - level_up -> action: 'level_up'
  */
 
-import { loadRule, resolveWorldId, findPool, worldLexicon, conditionsForDisplay, shownCounters } from '../../engine/table-rules.js';
+import { loadRule, resolveWorldId, findPool, worldLexicon, conditionsForDisplay, shownCounters, resolveCreature, creatureToParticipant } from '../../engine/table-rules.js';
+import { FORM_KEYS, sheetFromCreature, snapshotBase, nextHp, hpModeSchema, type HpMode } from '../../engine/forms.js';
+import { pushSheetToLiveTokens } from '../handlers/combat-handlers.js';
 import { readWorldClock, dayClock, SET_CLOCK_HINT } from '../../engine/world-clock.js';
 import { scheduledWriteOpSchema, applyScheduledOps, type ScheduledWriteOp } from '../../engine/scheduled-ops.js';
 import { applyFamilyDelta, familyMember, type FamilyMove } from '../../engine/pool-family.js';
@@ -52,7 +54,7 @@ import {
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'update', 'list', 'delete', 'kill', 'add_xp', 'adjust_pool', 'get_progression', 'level_up', 'schedule_change', 'process_scheduled', 'list_scheduled', 'cancel_scheduled', 'scope_scheduled', 'scope_characters', 'get_status_block', 'options'] as const;
+const ACTIONS = ['create', 'get', 'update', 'list', 'delete', 'kill', 'add_xp', 'adjust_pool', 'get_progression', 'level_up', 'schedule_change', 'process_scheduled', 'list_scheduled', 'cancel_scheduled', 'scope_scheduled', 'scope_characters', 'get_status_block', 'options', 'set_form'] as const;
 type CharacterAction = typeof ACTIONS[number];
 
 const CharacterTypeSchema = z.enum(['pc', 'npc', 'enemy', 'neutral']);
@@ -1332,6 +1334,92 @@ export async function handleKill(args: z.input<typeof KillSchema>): Promise<obje
     };
 }
 
+// Item 2: FORMS — any creature rule or preset is a shape a character takes.
+const SetFormSchema = z.object({
+    action: z.literal('set_form'),
+    characterId: z.string(),
+    form: z.string().min(1).describe("A creature rule of the character's world or a built-in preset ('Daemon Prince', 'goblin'); 'base' puts the form down"),
+    hpMode: hpModeSchema().optional().describe('keep_fraction (default): keep the share of HP left; full: heal to the new maximum; keep: keep the number, capped'),
+    worldId: z.string().optional().describe("World whose creature rules to read (default: the character's)")
+});
+
+const LONG_ABILITY = { str: 'strength', dex: 'dexterity', con: 'constitution', int: 'intelligence', wis: 'wisdom', cha: 'charisma' } as const;
+/** Token keys a form sets that a sheet does not carry: removed when the form is put down. */
+const FORM_ONLY_TOKEN_KEYS = ['movementSpeed', 'attackBonus', 'attackDamage', 'attackDamageType', 'unit'];
+
+/**
+ * Take a form or put it down. The form replaces the sheet fields it names
+ * (stats merge over the base); the base snapshot is taken once, so a
+ * form-to-form swap still reverts to the character's own sheet.
+ */
+export function setForm(args: { characterId: string; form: string; hpMode?: HpMode; worldId?: string }): Record<string, unknown> {
+    const { db, characterRepo } = ensureDb();
+    const char = characterRepo.findById(args.characterId) as (Record<string, unknown> & { id: string; name: string; hp: number; maxHp: number; stats: Record<string, number>; form?: { name: string; since?: string; base: Record<string, unknown> } }) | null;
+    if (!char) return { error: true, actionType: 'set_form', message: `Character ${args.characterId} not found`, writes: 'none' };
+    const updates: Record<string, unknown> = {};
+    let tokenFields: Record<string, unknown>;
+    let formName: string;
+    let source: string | undefined;
+
+    if (args.form.trim().toLowerCase() === 'base') {
+        if (!char.form) return { error: true, actionType: 'set_form', message: `${char.name} is in no form; nothing to put down.`, writes: 'none' };
+        const base = char.form.base;
+        for (const k of FORM_KEYS) updates[k] = base[k] === null || base[k] === undefined ? undefined : base[k];
+        const newMax = (base.maxHp as number | null) ?? char.maxHp;
+        updates.maxHp = newMax;
+        updates.hp = nextHp(args.hpMode, char.hp, char.maxHp, newMax);
+        updates.form = undefined;
+        formName = 'base';
+        const stats = (updates.stats ?? char.stats) as Record<string, number>;
+        tokenFields = {
+            ...Object.fromEntries(FORM_ONLY_TOKEN_KEYS.map(k => [k, undefined])),
+            ...Object.fromEntries(FORM_KEYS.filter(k => k !== 'stats').map(k => [k, updates[k]])),
+            abilityScores: Object.fromEntries(Object.entries(LONG_ABILITY).map(([s, l]) => [l, stats[s] ?? 10]))
+        };
+    } else {
+        const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] });
+        const creature = resolveCreature(db, worldId, args.form);
+        if (!creature) return { error: true, actionType: 'set_form', message: `No creature '${args.form}' in this world's bestiary or the presets. Nothing was written.`, writes: 'none' };
+        const base = char.form?.base ?? snapshotBase(char);
+        const shape = sheetFromCreature(creature.spec);
+        for (const k of FORM_KEYS) updates[k] = shape[k] !== undefined ? shape[k] : (base[k] === null ? undefined : base[k]);
+        updates.stats = { ...((base.stats as Record<string, number> | null) ?? char.stats), ...((shape.stats as Record<string, number> | undefined) ?? {}) };
+        updates.hp = nextHp(args.hpMode, char.hp, char.maxHp, updates.maxHp as number);
+        updates.form = { name: creature.name, since: new Date().toISOString(), base };
+        formName = creature.name;
+        source = creature.source;
+        const { id: _i, name: _n, position: _p, conditions: _c, initiative: _in, isEnemy: _e, ...fromCreature } = creatureToParticipant(creature.spec, { id: char.id, name: char.name });
+        const stats = updates.stats as Record<string, number>;
+        tokenFields = {
+            ...Object.fromEntries(FORM_KEYS.filter(k => k !== 'stats').map(k => [k, updates[k]])),
+            ...fromCreature,
+            hp: updates.hp, maxHp: updates.maxHp,
+            abilityScores: Object.fromEntries(Object.entries(LONG_ABILITY).map(([s, l]) => [l, stats[s] ?? 10]))
+        };
+    }
+
+    characterRepo.update(char.id, updates as Partial<import('../../schema/character.js').Character>);
+    const liveTokens = pushSheetToLiveTokens(char.id, tokenFields);
+    return {
+        success: true,
+        actionType: 'set_form',
+        characterId: char.id,
+        characterName: char.name,
+        form: formName,
+        ...(source ? { source } : {}),
+        ...(char.form && formName !== 'base' ? { previousForm: char.form.name } : {}),
+        hpBefore: char.hp,
+        hp: updates.hp,
+        maxHp: updates.maxHp,
+        ac: updates.ac,
+        hpMode: args.hpMode ?? 'keep_fraction',
+        liveTokens,
+        message: formName === 'base'
+            ? `${char.name} returns to their own shape: HP ${char.hp}/${char.maxHp} -> ${updates.hp}/${updates.maxHp}.`
+            : `${char.name} takes the form of ${formName}: HP ${char.hp}/${char.maxHp} -> ${updates.hp}/${updates.maxHp}, AC ${updates.ac}.${liveTokens.length ? ` ${liveTokens.length} live token(s) updated.` : ''}`
+    };
+}
+
 export async function handleAdjustPool(args: z.input<typeof AdjustPoolSchema>): Promise<object> {
     const { characterRepo } = ensureDb();
     const char = characterRepo.findById(args.characterId);
@@ -2136,6 +2224,12 @@ const definitions: Record<CharacterAction, ActionDefinition> = {
         aliases: ['levelup', 'advance'],
         description: 'Level up a character'
     },
+    set_form: {
+        schema: SetFormSchema,
+        handler: async (args: z.infer<typeof SetFormSchema>) => setForm(args),
+        aliases: ['form', 'transform', 'shapechange'],
+        description: "Take a creature's form (a world creature rule or preset) or put it down with form: 'base'. The sheet keeps its own values to go back to; live tokens follow"
+    },
     options: {
         schema: OptionsSchema,
         handler: handleOptions,
@@ -2238,6 +2332,8 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         label: z.string().optional().describe('adjust_pool (mirror): display name for the counter'),
         show: z.boolean().optional().describe('adjust_pool (mirror): list the counter at boot and on the status block'),
         linkItem: z.string().optional().describe('adjust_pool (mirror): item template or instance id whose charges mirror the pool'),
+        form: z.string().optional().describe("set_form: a creature rule or preset to take the shape of; 'base' puts the form down"),
+        hpMode: hpModeSchema().optional().describe('set_form: keep_fraction (default) | full | keep'),
         family: z.string().optional().describe("adjust_pool: a pool_family rule — the pool moves inside its family (jealous rivals lose on a gain); returns rivals[]"),
         firesAtHour: z.number().optional().describe('schedule_change: hour of the fires-at day (0–24)'),
         firesInHours: z.number().optional().describe('schedule_change: fires N hours from currentDay(+currentTime)'),
