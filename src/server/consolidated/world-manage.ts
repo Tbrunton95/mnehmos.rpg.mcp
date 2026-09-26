@@ -430,12 +430,19 @@ async function handleAdvance(args: z.infer<typeof AdvanceSchema>): Promise<objec
         debts = (db.prepare(`SELECT COUNT(*) AS n FROM ledger_debts WHERE world_id = ? AND due_day IS NOT NULL
                              AND ((status = 'pending' AND due_day <= ?) OR (status = 'due' AND ? > due_day + grace_days))`).get(args.worldId, next.day, next.day) as { n: number }).n;
     } catch { /* no ledger table yet */ }
+    // Item 4: congregations with a whole week to process. Reported only when
+    // there are some, so worlds without cults see the same dueNow as before.
+    let congregations = 0;
+    try {
+        congregations = (db.prepare(`SELECT COUNT(*) AS n FROM congregations WHERE world_id = ? AND status = 'active'
+                                     AND last_processed_day IS NOT NULL AND ? - last_processed_day >= 7`).get(args.worldId, at) as { n: number }).n;
+    } catch { /* no congregations table yet */ }
     const label = `Day ${next.day}, ${next.time}`;
-    const due = [scheduled ? `${scheduled} scheduled row(s) due: process_scheduled {worldId}` : '', debts ? `${debts} debt(s) to move: ledger_manage process_due {worldId}` : ''].filter(Boolean);
+    const due = [scheduled ? `${scheduled} scheduled row(s) due: process_scheduled {worldId}` : '', debts ? `${debts} debt(s) to move: ledger_manage process_due {worldId}` : '', congregations ? `${congregations} congregation(s) with a week to process: congregation_manage process_weekly {worldId}` : ''].filter(Boolean);
     return {
         ...result,
         clock: label,
-        dueNow: { scheduled, debts },
+        dueNow: { scheduled, debts, ...(congregations > 0 ? { congregations } : {}) },
         message: `Clock advanced ${Math.round(hours * 100) / 100}h to ${label}${result.regenerated ? `; regenerated to full: ${(result.regenerated as Array<{ name: string }>).map(r => r.name).join(', ')}` : ''}${due.length ? ` — ${due.join('; ')}` : ''}`
     };
 }
@@ -745,7 +752,7 @@ Aliases: new→create, fetch→get, all→list, remove→delete, set→update, g
 1. generate - Create procedural world with terrain/biomes
 2. get_state - Check world status
 3. update - Set time/weather/season
-   advance {worldId, minutes?|hours?|days?} - move the clock forward; returns dueNow {scheduled, debts}
+   advance {worldId, minutes?|hours?|days?} - move the clock forward; returns dueNow {scheduled, debts, congregations?}
 4. For map operations, use world_map tool instead`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
