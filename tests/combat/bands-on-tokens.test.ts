@@ -52,3 +52,51 @@ describe('band and regeneration travel from sheet to token', () => {
         expect(tokens.find(t => t.id === 'beast')).toMatchObject({ band: 'Monster/Lord', regeneration: 10 });
     });
 });
+
+describe('the combat profile travels from sheet to token', () => {
+    beforeEach(() => {
+        closeDb();
+        const repo = new CharacterRepository(getDb(':memory:'));
+        clearCombatState();
+        const now = new Date().toISOString();
+        repo.create({
+            id: 'hydra', name: 'Hydra', stats: { str: 20, dex: 12, con: 20, int: 2, wis: 10, cha: 7 }, hp: 172, maxHp: 172, ac: 15, level: 8,
+            size: 'huge', reach: 10, attacksPerAction: 3, cr: 8, autoLegendaryResistance: true,
+            attacks: [{ name: 'bite', attackBonus: 8, damage: '1d10+5', damageType: 'piercing', part: 'middle head' }],
+            abilities: [{ name: 'Roar', recharge: 5 }],
+            legendaryActions: 3, legendaryResistances: 2, hasLairActions: true,
+            createdAt: now, updatedAt: now
+        } as any);
+    });
+    afterEach(() => closeDb());
+
+    const expectProfile = (token: any) => {
+        expect(token).toMatchObject({ size: 'huge', reach: 10, attacksPerAction: 3, cr: 8, autoLegendaryResistance: true, legendaryActions: 3, legendaryResistances: 2, hasLairActions: true });
+        expect(token.attacks[0]).toMatchObject({ name: 'bite', part: 'middle head' });
+        expect(token.abilities[0]).toMatchObject({ name: 'Roar', recharge: 5 });
+    };
+
+    it('combat create reads it from the row', async () => {
+        const created = json(await handleCombatManage({ action: 'create', participants: [
+            { id: 'hydra', name: 'Hydra', hp: 172, maxHp: 172, initiative: 10, isEnemy: true },
+            { id: 'hero', name: 'Hero', hp: 30, maxHp: 30, initiative: 12 }
+        ] }, ctx as any), 'COMBAT_MANAGE');
+        const tokens = new EncounterRepository(getDb()).loadState(created.encounterId)!.participants as any[];
+        expectProfile(tokens.find(t => t.id === 'hydra'));
+    });
+
+    it('add_participant reads it from the row; the caller still wins', async () => {
+        const created = json(await handleCombatManage({ action: 'create', participants: [
+            { id: 'hero', name: 'Hero', hp: 30, maxHp: 30, initiative: 12 }
+        ] }, ctx as any), 'COMBAT_MANAGE');
+        await handleCombatManage({ action: 'add_participant', encounterId: created.encounterId, characterId: 'hydra', isEnemy: true }, ctx as any);
+        let tokens = new EncounterRepository(getDb()).loadState(created.encounterId)!.participants as any[];
+        expectProfile(tokens.find(t => t.id === 'hydra'));
+
+        const again = json(await handleCombatManage({ action: 'create', participants: [
+            { id: 'hydra', name: 'Hydra', hp: 172, maxHp: 172, initiative: 10, isEnemy: true, size: 'gargantuan' }
+        ] }, ctx as any), 'COMBAT_MANAGE');
+        tokens = new EncounterRepository(getDb()).loadState(again.encounterId)!.participants as any[];
+        expect(tokens.find(t => t.id === 'hydra').size).toBe('gargantuan');
+    });
+});

@@ -1,4 +1,4 @@
-import { PartSchema } from './token-extras.js';
+import { PartSchema, SizeCategorySchema, AttackProfileSchema, AbilitySchema } from './token-extras.js';
 import { z } from 'zod';
 import { CharacterTypeSchema } from './party.js';
 import {
@@ -76,6 +76,17 @@ export const CharacterSchema = z.object({
     band: z.string().optional(),
     regeneration: z.number().int().min(0).optional(),
     parts: z.array(PartSchema).optional(),
+
+    // Combat profile: what a token made from this sheet starts with (size,
+    // reach, multiattack, named attacks, limited abilities, CR, automatic
+    // legendary resistance). Stored together in the combat_profile column.
+    size: SizeCategorySchema.optional(),
+    reach: z.number().int().min(0).optional(),
+    attacksPerAction: z.number().int().min(1).optional(),
+    attacks: z.array(AttackProfileSchema).optional(),
+    abilities: z.array(AbilitySchema).optional(),
+    cr: z.number().min(0).optional(),
+    autoLegendaryResistance: z.boolean().optional(),
 
     // Spellcasting fields (CRIT-002/006)
     // Flexible character class - allows any string (standard D&D classes or custom like "Chronomancer")

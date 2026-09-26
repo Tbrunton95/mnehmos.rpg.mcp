@@ -14,6 +14,7 @@
 
 import { loadRule, resolveWorldId, findPool, worldLexicon, conditionsForDisplay } from '../../engine/table-rules.js';
 import { z } from 'zod';
+import { ParticipantExtrasShape, SizeCategorySchema } from '../../schema/token-extras.js';
 import { randomUUID } from 'crypto';
 import { SessionContext } from '../types.js';
 import { getDb } from '../../storage/index.js';
@@ -98,6 +99,27 @@ const conditionSchema = () => z.object({
     pinned: z.boolean().optional()
 });
 
+/**
+ * Combat profile on the sheet: what a token made from this character starts
+ * with (combat create and add_participant read it when the caller omits it).
+ * The legendary counters and lair flag are older columns exposed here too.
+ */
+const COMBAT_PROFILE_FIELDS = ['size', 'reach', 'attacksPerAction', 'attacks', 'abilities', 'cr', 'autoLegendaryResistance',
+    'legendaryActions', 'legendaryResistances', 'legendaryResistancesRemaining', 'hasLairActions'] as const;
+const CombatProfileShape = {
+    size: ParticipantExtrasShape.size,
+    reach: ParticipantExtrasShape.reach,
+    attacksPerAction: ParticipantExtrasShape.attacksPerAction,
+    attacks: ParticipantExtrasShape.attacks,
+    abilities: ParticipantExtrasShape.abilities,
+    cr: ParticipantExtrasShape.cr,
+    autoLegendaryResistance: ParticipantExtrasShape.autoLegendaryResistance,
+    legendaryActions: ParticipantExtrasShape.legendaryActions,
+    legendaryResistances: ParticipantExtrasShape.legendaryResistances,
+    legendaryResistancesRemaining: ParticipantExtrasShape.legendaryResistancesRemaining,
+    hasLairActions: ParticipantExtrasShape.hasLairActions
+};
+
 const CreateSchema = z.object({
     action: z.literal('create'),
     // FINDINGS #93: create-lane params — resourcePools was accepted by the
@@ -152,6 +174,7 @@ const CreateSchema = z.object({
     stealthOverride: z.number().int().optional(),
     band: z.string().optional().describe("Table rules: power band, as named in the world's band rule (e.g. 'Astartes')"),
     regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
+    ...CombatProfileShape,
     skillProficiencies: z.array(z.string()).optional(),
     saveProficiencies: z.array(z.string()).optional(),
     expertise: z.array(z.string()).optional()
@@ -215,6 +238,7 @@ const UpdateSchema = z.object({
     stealthOverride: z.number().int().optional().describe('OVERRIDES the composed DEX+prof stealth column in the eavesdrop/listener layer — it does not add (#95 R4a)'),
     band: z.string().optional().describe("Table rules: power band, as named in the world's band rule (e.g. 'Astartes')"),
     regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
+    ...CombatProfileShape,
     saveProficiencies: z.array(z.string()).optional().describe('Saving throw proficiencies (str/dex/con/int/wis/cha)'),
     expertise: z.array(z.string()).optional().describe('Skills with double proficiency'),
     startingGold: z.number().int().min(0).optional().describe('Set currency to this exact amount (the world lexicon names it; RU by default) (absolute set; for deltas use inventory_manage add_currency)'),
@@ -673,6 +697,8 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         stealthBonus: args.stealthOverride ?? 0,
         band: args.band,
         regeneration: args.regeneration,
+        // Combat profile and legendary counters (tokens hydrate from these)
+        ...Object.fromEntries(COMBAT_PROFILE_FIELDS.filter(k => args[k] !== undefined).map(k => [k, args[k]])),
         // FINDINGS #93: resourcePools was accepted by BOTH schemas and never
         // read by the payload — the #33/#59/#90 anatomy on the worst possible
         // verb: a create whose banner said it worked. Honored now.
@@ -943,6 +969,9 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     if (args.stealthOverride !== undefined) updateData.stealthBonus = args.stealthOverride;
     if (args.band !== undefined) updateData.band = args.band;
     if (args.regeneration !== undefined) updateData.regeneration = args.regeneration;
+    for (const key of COMBAT_PROFILE_FIELDS) {
+        if (args[key] !== undefined) updateData[key] = args[key];
+    }
     if (args.resourcePools !== undefined) updateData.resourcePools = args.resourcePools;
 
     // FINDINGS #88: preview lane — the diff of mapped fields, zero writes.
@@ -2092,6 +2121,18 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         stealthOverride: z.number().int().optional().describe('#95 R4a: OVERRIDES composed DEX+prof in the eavesdrop layer — does not add'),
         band: z.string().optional().describe("Table rules: power band, as named in the world's band rule (e.g. 'Astartes')"),
         regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
+        // Combat profile (create/update): tokens made from this sheet start with it
+        size: SizeCategorySchema.optional().describe('create/update: tiny | small | medium | large | huge | gargantuan'),
+        reach: z.number().int().min(0).optional().describe('create/update: melee reach in feet'),
+        attacksPerAction: z.number().int().min(1).optional().describe('create/update: multiattack, attacks one Attack action allows'),
+        attacks: z.array(z.any()).optional().describe('create/update: named attack profiles [{name, attackBonus, damage, damageType?, part?, reachFt?, ranged?, default?, note?}]'),
+        abilities: z.array(z.any()).optional().describe('create/update: limited abilities [{name, recharge?, ready?, note?}]'),
+        cr: z.number().min(0).optional().describe('create/update: challenge rating'),
+        autoLegendaryResistance: z.boolean().optional().describe('create/update: spend a legendary resistance on a failed save automatically'),
+        legendaryActions: z.number().int().min(0).optional().describe('create/update: legendary actions per round'),
+        legendaryResistances: z.number().int().min(0).optional().describe('create/update: legendary resistances per day'),
+        legendaryResistancesRemaining: z.number().int().min(0).optional().describe('create/update: legendary resistances left'),
+        hasLairActions: z.boolean().optional().describe('create/update: adds a LAIR slot at initiative 20 when it joins a fight'),
         // adjust_pool fields
         pool: z.string().optional(),
         removePool: z.boolean().optional().describe('Delete the pool entirely (adjust_pool)'),

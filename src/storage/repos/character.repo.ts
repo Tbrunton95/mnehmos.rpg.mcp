@@ -3,6 +3,30 @@ import { getToolContext } from '../../server/tool-context.js';
 import { Character, CharacterSchema, NPC, NPCSchema } from '../../schema/character.js';
 import { CharacterType } from '../../schema/party.js';
 
+/** The sheet fields stored together in the combat_profile JSON column. */
+const COMBAT_PROFILE_KEYS = ['size', 'reach', 'attacksPerAction', 'attacks', 'abilities', 'cr', 'autoLegendaryResistance'] as const;
+
+/** Pack the combat profile for the column; null when the sheet sets none of it. */
+function packCombatProfile(c: Character | NPC): string | null {
+    const out: Record<string, unknown> = {};
+    for (const key of COMBAT_PROFILE_KEYS) {
+        if (c[key] !== undefined && c[key] !== null) out[key] = c[key];
+    }
+    return Object.keys(out).length ? JSON.stringify(out) : null;
+}
+
+/** Unpack the column back onto the sheet (only the known keys). */
+function unpackCombatProfile(raw: string | null | undefined): Partial<Pick<Character, typeof COMBAT_PROFILE_KEYS[number]>> {
+    if (!raw) return {};
+    let parsed: Record<string, unknown>;
+    try { parsed = JSON.parse(raw); } catch { return {}; }
+    const out: Record<string, unknown> = {};
+    for (const key of COMBAT_PROFILE_KEYS) {
+        if (parsed[key] !== undefined && parsed[key] !== null) out[key] = parsed[key];
+    }
+    return out;
+}
+
 export class CharacterRepository {
     constructor(private db: Database.Database) { }
 
@@ -18,7 +42,7 @@ export class CharacterRepository {
                                currency,
                                legendary_actions, legendary_actions_remaining, legendary_resistances,
                               legendary_resistances_remaining, has_lair_actions, resistances, vulnerabilities, immunities,
-                               current_room_id, perception_bonus, stealth_bonus, resource_pools, band, regeneration, parts,
+                               current_room_id, perception_bonus, stealth_bonus, resource_pools, band, regeneration, parts, combat_profile,
                                skill_proficiencies, save_proficiencies, expertise,
                                armor_proficiencies, weapon_proficiencies, tool_proficiencies, languages,
                                background, alignment, origin,
@@ -29,7 +53,7 @@ export class CharacterRepository {
                @currency,
                @legendaryActions, @legendaryActionsRemaining, @legendaryResistances,
               @legendaryResistancesRemaining, @hasLairActions, @resistances, @vulnerabilities, @immunities,
-               @currentRoomId, @perceptionBonus, @stealthBonus, @resourcePools, @band, @regeneration, @parts,
+               @currentRoomId, @perceptionBonus, @stealthBonus, @resourcePools, @band, @regeneration, @parts, @combatProfile,
                @skillProficiencies, @saveProficiencies, @expertise,
                @armorProficiencies, @weaponProficiencies, @toolProficiencies, @languages,
                @background, @alignment, @origin,
@@ -80,6 +104,7 @@ export class CharacterRepository {
             band: validChar.band ?? null,
             regeneration: validChar.regeneration ?? null,
             parts: validChar.parts?.length ? JSON.stringify(validChar.parts) : null,
+            combatProfile: packCombatProfile(validChar),
             skillProficiencies: JSON.stringify(validChar.skillProficiencies || []),
             saveProficiencies: JSON.stringify(validChar.saveProficiencies || []),
             expertise: JSON.stringify(validChar.expertise || []),
@@ -203,7 +228,7 @@ export class CharacterRepository {
                 legendary_resistances = ?, legendary_resistances_remaining = ?,
                  has_lair_actions = ?, resistances = ?, vulnerabilities = ?, immunities = ?,
                  current_room_id = ?, perception_bonus = ?, stealth_bonus = ?,
-                 resource_pools = ?, band = ?, regeneration = ?, parts = ?,
+                 resource_pools = ?, band = ?, regeneration = ?, parts = ?, combat_profile = ?,
                  skill_proficiencies = ?, save_proficiencies = ?, expertise = ?,
                  armor_proficiencies = ?, weapon_proficiencies = ?, tool_proficiencies = ?, languages = ?,
                  background = ?, alignment = ?, origin = ?,
@@ -253,6 +278,7 @@ export class CharacterRepository {
             validChar.band ?? null,
             validChar.regeneration ?? null,
             validChar.parts?.length ? JSON.stringify(validChar.parts) : null,
+            packCombatProfile(validChar),
             JSON.stringify(validChar.skillProficiencies || []),
             JSON.stringify(validChar.saveProficiencies || []),
             JSON.stringify(validChar.expertise || []),
@@ -329,6 +355,7 @@ export class CharacterRepository {
             band: row.band ?? undefined,
             regeneration: row.regeneration ?? undefined,
             parts: row.parts ? JSON.parse(row.parts) : undefined,
+            ...unpackCombatProfile(row.combat_profile),
             skillProficiencies: row.skill_proficiencies ? JSON.parse(row.skill_proficiencies) : [],
             saveProficiencies: row.save_proficiencies ? JSON.parse(row.save_proficiencies) : [],
             expertise: row.expertise ? JSON.parse(row.expertise) : [],
@@ -398,6 +425,7 @@ interface CharacterRow {
     band?: string | null;
     regeneration?: number | null;
     parts?: string | null;
+    combat_profile?: string | null;
     skill_proficiencies: string | null;
     save_proficiencies: string | null;
     expertise: string | null;

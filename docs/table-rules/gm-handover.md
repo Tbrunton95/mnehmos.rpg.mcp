@@ -68,6 +68,7 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Prepared weapon fires on its trigger | add `preparedAsset: 'prepared-anti-armour'` |
 | A head, limb or plate changes state | `combat_manage set_part {part, state}` |
 | A monster's full statline | `combat_manage create` / `add_participant` with `size`, `reach`, `attacksPerAction`, `attacks`, `abilities`, `legendaryActions`, `legendaryResistances`, `hasLairActions`, `cr` |
+| A recurring monster's statline, once | `character_manage update {characterId, ...}` with the same fields; tokens joined by id start with it |
 | Squad fires / is suppressed | `combat_action volley`; `combat_manage set_unit` |
 | Cut through a packed lower-band squad | add `cleave: true` |
 | Enemy telegraphs | `combat_manage set_intent`; readied actions then `trigger_readied` |
