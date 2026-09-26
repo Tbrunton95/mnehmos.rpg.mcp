@@ -90,6 +90,7 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Enemy telegraphs | `combat_manage set_intent`; readied actions then `trigger_readied` |
 | HP is wrong | `combat_manage adjust_hp {value \| delta, reason}` |
 | Conditions mid-fight | `combat_manage add_condition {condition \| name}` / `remove_condition {condition \| name \| conditionId}`; standard conditions set adv/dis/auto-crit themselves (`ranged`, `ignoreConditions` on attacks) |
+| Just the condition names | `character_manage get {characterId, fields: ['conditionNames']}` (or `fields: ['conditions.name', 'conditions.pinned']`) |
 | Turn prose into a feature | `improvisation_manage feature_from_condition` / `edit_effect` |
 | A ruling or an invention | `precedent_manage record` / `search` |
 | Who knows a secret | `knowledge_manage record` / `learn` / `can_know` |

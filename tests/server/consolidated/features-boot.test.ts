@@ -1,4 +1,5 @@
 import { handleImprovisationManage } from '../../../src/server/consolidated/improvisation-manage.js';
+import { handleCharacterManage } from '../../../src/server/consolidated/character-manage.js';
 import { handleSessionManage } from '../../../src/server/consolidated/session-manage.js';
 import { handlePrecedentManage } from '../../../src/server/consolidated/precedent-manage.js';
 import { handleCombatManage } from '../../../src/server/consolidated/combat-manage.js';
@@ -84,5 +85,18 @@ describe('field selection', () => {
     it('keeps only the named fields plus the essentials', () => {
         expect(pickFields({ success: true, actionType: 'get', hp: 5, conditions: [1, 2], name: 'x' }, ['hp'])).toEqual({ success: true, actionType: 'get', hp: 5 });
         expect(summarizeResult({ big: 'x'.repeat(400) }).big).toMatch(/400 chars/);
+    });
+
+    it('a dotted field projects into each element of a list, or into an object', () => {
+        const sheet = { success: true, hp: 5, conditions: [{ name: 'A', source: 'x'.repeat(900) }, { name: 'B', pinned: true, source: 'y' }], combat: { reach: 10, size: 'huge' } };
+        expect(pickFields(sheet, ['conditions.name', 'conditions.pinned'])).toEqual({ success: true, conditions: [{ name: 'A' }, { name: 'B', pinned: true }] });
+        expect(pickFields(sheet, ['combat.size', 'hp'])).toEqual({ success: true, hp: 5, combat: { size: 'huge' } });
+        // An undotted name still takes the whole value.
+        expect(pickFields(sheet, ['combat'])).toEqual({ success: true, combat: { reach: 10, size: 'huge' } });
+    });
+
+    it('get carries the condition names, so fields:[conditionNames] is the index', async () => {
+        const got = json(await handleCharacterManage({ action: 'get', characterId: 'luciel' }, ctx as any));
+        expect(got.conditionNames).toEqual([WARP, 'Oath of the Ninth: sworn']);
     });
 });

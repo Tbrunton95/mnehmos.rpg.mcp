@@ -917,7 +917,10 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
         if (found.length) liveEncounters = found;
     } catch { /* no encounters table */ }
     const currencyLabel = worldLexicon(db, resolveWorldId(db, { characterIds: [args.characterId] })).currency;
-    return { ...character, worldId, currency, currencyLabel, currencyNote: currency ? `${currencyLabel} ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec, ...(liveEncounters ? { liveEncounters } : {}) };
+    // The names alone: fields:['conditionNames'] is the condition index
+    // without the kilobytes of source text.
+    const conditionNames = ((character as any).conditions ?? []).map((c: { name: string }) => c.name);
+    return { ...character, conditionNames, worldId, currency, currencyLabel, currencyNote: currency ? `${currencyLabel} ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec, ...(liveEncounters ? { liveEncounters } : {}) };
 }
 
 async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object> {
@@ -1088,7 +1091,7 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
                 if (hits.length !== 1) {
                     throw new Error(hits.length === 0
                         ? `editConditions: '${edit.match}' matches no condition. Nothing was written.`
-                        : `editConditions: '${edit.match}' matches ${hits.length} conditions; use more of the text. Nothing was written.`);
+                        : `editConditions: '${edit.match}' matches ${hits.length} conditions: ${hits.map(h => `'${h.name.length > 60 ? h.name.slice(0, 59) + '…' : h.name}'`).join(', ')}; use more of the text. Nothing was written.`);
                 }
                 const c = hits[0];
                 if (edit.name !== undefined) c.name = edit.name;

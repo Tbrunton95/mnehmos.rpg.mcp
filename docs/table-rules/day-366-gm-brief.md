@@ -48,7 +48,7 @@ At the start of every session, call `session_manage boot {worldId}` and read all
 - Record every ruling and every invention with `precedent_manage record {worldId, kind: 'ruling' | 'invention', statement, scope}`. Search precedents before ruling on anything that may have come up before.
 - Before an NPC states a fact, ask `knowledge_manage can_know {worldId, key, knowerId}`. When someone learns something, record the road: `learn {key, knowerId, how: witnessed | told | position | deduced | read | rumour, fromId}`. A secret can only be told by someone who knows it.
 - Move each long prose condition into a feature with `improvisation_manage feature_from_condition {characterId, match, triggers?, cost?, mechanics?}`, and edit one clause with `edit_effect {effectId, descriptionReplace: {find, with}}`. The boot packet then lists it with its trigger and cost.
-- Ask for only what you need with `fields: ['hp', 'conditions']` on any call.
+- Ask for only what you need with `fields: ['hp', 'conditions']` on any call. Dotted names reach into lists: `fields: ['conditions.name']`; `character_manage get {characterId, fields: ['conditionNames']}` is the condition index without the source text. An ambiguous `editConditions` match lists the names it hit.
 
 ## A refusal is a rule, not an error
 If the engine refuses a called strike (the target is below the attacker's band) or reports "band unset", say so plainly and play on. A refused strike spends no action. Don't work around a refusal with a posted result.

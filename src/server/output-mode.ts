@@ -29,8 +29,31 @@ export function summarizeResult(result: Record<string, unknown>): Record<string,
     return out;
 }
 
-/** fields: [...] — only the named top-level fields, plus success/error/actionType/message. */
+/**
+ * fields: [...] — only the named top-level fields, plus success/error/actionType/message.
+ * A dotted name projects one level in: 'conditions.name' keeps just `name` of
+ * each element when `conditions` is a list, or of the object itself. Several
+ * dotted names on one head merge ('conditions.name', 'conditions.pinned').
+ * An undotted name still takes the whole value.
+ */
 export function pickFields(result: Record<string, unknown>, fields: string[]): Record<string, unknown> {
-    const keep = new Set([...fields, 'success', 'error', 'actionType', 'message']);
-    return Object.fromEntries(Object.entries(result).filter(([k]) => keep.has(k)));
+    const keep = new Set(['success', 'error', 'actionType', 'message']);
+    const sub = new Map<string, string[]>();
+    for (const f of fields) {
+        const dot = f.indexOf('.');
+        if (dot <= 0) { keep.add(f); continue; }
+        const head = f.slice(0, dot);
+        sub.set(head, [...(sub.get(head) ?? []), f.slice(dot + 1)]);
+    }
+    const project = (v: unknown, keys: string[]): unknown => {
+        if (!v || typeof v !== 'object') return v;
+        const o = v as Record<string, unknown>;
+        return Object.fromEntries(keys.filter(k => k in o).map(k => [k, o[k]]));
+    };
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(result)) {
+        if (keep.has(k)) out[k] = v;
+        else if (sub.has(k)) out[k] = Array.isArray(v) ? v.map(e => project(e, sub.get(k)!)) : project(v, sub.get(k)!);
+    }
+    return out;
 }
