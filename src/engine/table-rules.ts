@@ -12,6 +12,37 @@ import { z } from 'zod';
 import { PartSchema, UnitSchema, ParticipantExtrasShape, type AttackProfile, type Part } from '../schema/token-extras.js';
 import { expandCreatureTemplate, type CreaturePreset } from '../data/creature-presets.js';
 import { UNPRINTABLE_POOLS } from '../render/pda.js';
+import { scheduledWriteOpSchema } from './scheduled-ops.js';
+import { hpModeSchema } from './forms.js';
+import { EffectCategorySchema, EffectMechanicSchema } from '../schema/improvisation.js';
+
+/**
+ * What a roll_table entry does to the character it is rolled for, in this
+ * order: gift (an effect), condition and writes, form, then terminal death.
+ */
+const TableEntryApplySchema = z.object({
+    gift: z.object({
+        name: z.string().min(1),
+        description: z.string().optional(),
+        category: EffectCategorySchema.default('boon'),
+        powerLevel: z.number().int().min(1).max(5).default(1),
+        mechanics: z.array(EffectMechanicSchema).default([])
+    }).optional(),
+    condition: z.object({
+        name: z.string().min(1),
+        duration: z.number().int().optional(),
+        source: z.string().optional(),
+        pinned: z.boolean().optional()
+    }).optional(),
+    writes: z.array(scheduledWriteOpSchema()).optional(),
+    /** 'kill': the character dies (character_manage kill); the chain stops. */
+    terminal: z.literal('kill').optional(),
+    /** With terminal kill: leave a corpse (default false). */
+    corpse: z.boolean().optional(),
+    /** A creature rule or preset the character takes the form of; 'base' puts a form down. */
+    form: z.string().optional(),
+    hpMode: hpModeSchema().optional()
+}).passthrough();
 
 export const DEFAULT_BAND_ORDER = ['Mortal', 'Elite Mortal', 'Astartes', 'Astartes Elite', 'Monster/Lord', 'Primarch-class'];
 
@@ -130,7 +161,9 @@ export const RuleSpecSchemas = {
             weight: z.number().int().positive().optional(),
             text: z.string().min(1),
             /** Another roll_table rule rolled after this entry. */
-            chain: z.string().optional()
+            chain: z.string().optional(),
+            /** What the entry does to the character it is rolled for. */
+            apply: TableEntryApplySchema.optional()
         }).passthrough()).min(1)
     }).passthrough().superRefine(refineRollTable),
     /**
