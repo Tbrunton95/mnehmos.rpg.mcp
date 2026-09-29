@@ -64,6 +64,7 @@ At the start of every session, call `session_manage boot {worldId}` and read all
 - HP lives on the character sheet; the token mirrors it at every combat action. Token conditions, parts and intent are the fight's until you mirror them. `character_manage get` shows both sides.
 - Scheduled rows belong to a world by their own tag, or their character's. If `list_scheduled` names `unscopedOwnerUnknown` ids, place each with `character_manage scope_scheduled {worldId: <its world>, scheduleIds: [...]}`; never stamp another campaign's rows into this one.
 - Carry capacity follows the sheet's size (a Huge form carries four times as much). Set a `carry_capacity` pool only to override it.
+- A grapple break clears only that holder's conditions. Prone stays (stand up with movement), and a Restrained from a spell or net stays.
 - Read the "What's new in the engine" section at session start; it lists anything added since you last looked.
 - Record every ruling and every invention with `precedent_manage record {worldId, kind: 'ruling' | 'invention', statement, scope}`. Search precedents before ruling on anything that may have come up before.
 - Before an NPC states a fact, ask `knowledge_manage can_know {worldId, key, knowerId}`. When someone learns something, record the road: `learn {key, knowerId, how: witnessed | told | position | deduced | read | rumour, fromId}`. A secret can only be told by someone who knows it.
