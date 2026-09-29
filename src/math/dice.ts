@@ -1,6 +1,7 @@
 import seedrandom from 'seedrandom';
 import { DiceExpression, CalculationResult } from './schemas.js';
 import { freshSeed } from './seed.js';
+import { parseDiceTerms, type DiceTerm } from '../engine/combat/rng.js';
 
 export class DiceEngine {
     /** Backstop for one die's explosion chain; parse() already refuses d1!. */
@@ -14,10 +15,51 @@ export class DiceEngine {
         this.rng = seedrandom(this.seed);
     }
 
+    /** NdX, dX (1dX), NdX+M, NdXdl1, NdXkh2, NdXdl1+5, NdX! */
+    private static readonly SINGLE_TERM = /^(\d+)?d(\d+)(?:(dl|dh|kl|kh)(\d+))?([+-]\d+)?(!)?$/;
+
+    /**
+     * A sum of dice and numbers ('6d10+3d10+4', '2d6+1d4-1'): two or more
+     * terms with at least one dice term. null when the text is not one.
+     */
+    static multiTerms(expression: string): DiceTerm[] | null {
+        let terms: DiceTerm[];
+        try { terms = parseDiceTerms(expression); } catch { return null; }
+        if (terms.length < 2 || !terms.some(t => t.kind === 'dice')) return null;
+        return terms;
+    }
+
+    private rollTerms(expression: string, terms: DiceTerm[]): CalculationResult {
+        const dice: Array<{ sides: number; value: number; sign: 1 | -1 }> = [];
+        const steps: string[] = [];
+        let total = 0;
+        for (const t of terms) {
+            const sign = t.sign < 0 ? '-' : '+';
+            if (t.kind === 'dice') {
+                const values = Array.from({ length: t.count }, () => Math.floor(this.rng() * t.sides) + 1);
+                for (const value of values) dice.push({ sides: t.sides, value, sign: t.sign });
+                const sum = values.reduce((a, b) => a + b, 0);
+                total += t.sign * sum;
+                steps.push(`${sign} ${t.count}d${t.sides}: [${values.join(', ')}] = ${sum}`);
+            } else {
+                total += t.sign * t.value;
+                steps.push(`${sign} ${t.value}`);
+            }
+        }
+        steps.push(`Total: ${total}`);
+        return {
+            input: expression,
+            result: total,
+            steps,
+            timestamp: new Date().toISOString(),
+            seed: this.seed,
+            metadata: { rolls: dice.map(d => d.value), dice }
+        };
+    }
+
     // Parse string "2d6+4" into DiceExpression object
     parse(expression: string): DiceExpression {
-        // Regex supports: NdX, dX (shorthand for 1dX), NdX+M, NdXdl1, NdXkh2, NdXdl1+5, NdX!
-        const match = expression.match(/^(\d+)?d(\d+)(?:(dl|dh|kl|kh)(\d+))?([+-]\d+)?(!)?$/);
+        const match = expression.match(DiceEngine.SINGLE_TERM);
         if (!match) {
             throw new Error(`Invalid dice expression: ${expression}`);
         }
@@ -50,6 +92,13 @@ export class DiceEngine {
     }
 
     roll(expression: string | DiceExpression): CalculationResult {
+        // Play report: '6d10+3d10' was refused, which pushed the GM to an
+        // outside RNG. When the single-term grammar (keep/drop, explode)
+        // does not match, a multi-term sum rolls on this same seeded stream.
+        if (typeof expression === 'string' && !DiceEngine.SINGLE_TERM.test(expression)) {
+            const terms = DiceEngine.multiTerms(expression);
+            if (terms) return this.rollTerms(expression, terms);
+        }
         const expr = typeof expression === 'string' ? this.parse(expression) : expression;
         const rolls: number[] = [];
         const steps: string[] = [];

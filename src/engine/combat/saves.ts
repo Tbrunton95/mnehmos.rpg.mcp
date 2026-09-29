@@ -16,6 +16,7 @@ import type { CombatEngine, CombatParticipant } from './engine.js';
 import { exhaustionLevel } from './conditions.js';
 import { resolveWorldId } from '../table-rules.js';
 import { worldProgression } from '../progression.js';
+import { loggedD20 } from '../../math/logged-d20.js';
 
 export type AbilityLong = 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
 export type AbilityShort = 'str' | 'dex' | 'con' | 'int' | 'wis' | 'cha';
@@ -95,16 +96,40 @@ export function saveSourceFor(db: Database.Database | undefined, p: CombatPartic
     const tokenProfs = (p as { saveProficiencies?: string[] }).saveProficiencies;
     if (db) {
         const row = new CharacterRepository(db).findById(p.id);
-        if (row && row.id === p.id) {
-            return {
-                stats: row.stats as Record<string, number>,
-                saveProficiencies: (row as { saveProficiencies?: string[] }).saveProficiencies?.length ? (row as { saveProficiencies?: string[] }).saveProficiencies : tokenProfs,
-                level: row.level,
-                profBonus: worldProgression(db, resolveWorldId(db, { characterIds: [row.id] })).profBonus(row.level)
-            };
-        }
+        if (row && row.id === p.id) return sheetSaveSource(db, row, tokenProfs);
     }
     return { abilityScores: p.abilityScores as Record<string, number> | undefined, saveProficiencies: tokenProfs, cr: p.cr };
+}
+
+type SheetLike = { id: string; stats?: unknown; level: number; saveProficiencies?: string[] };
+
+/** A character sheet's save numbers: its stats, proficiencies and the world's proficiency curve. */
+export function sheetSaveSource(db: Database.Database, row: SheetLike, fallbackProfs?: string[]): SaveSource {
+    return {
+        stats: row.stats as Record<string, number>,
+        saveProficiencies: row.saveProficiencies?.length ? row.saveProficiencies : fallbackProfs,
+        level: row.level,
+        profBonus: worldProgression(db, resolveWorldId(db, { characterIds: [row.id] })).profBonus(row.level)
+    };
+}
+
+/**
+ * A character's save outside an encounter: the sheet's modifier and save
+ * proficiency on a seeded, logged d20 (roll_log purpose as given, forId the
+ * character). Advantage and disadvantage cancel.
+ */
+export function rollCharacterSave(
+    db: Database.Database,
+    row: SheetLike,
+    ability: string,
+    dc: number,
+    opts: { purpose?: string; advantage?: boolean; disadvantage?: boolean; tool?: string } = {}
+): ParticipantSaveResult {
+    const long = toLongAbility(ability) ?? 'dexterity';
+    const m = saveModifier(sheetSaveSource(db, row), long);
+    const die = loggedD20(db, { purpose: opts.purpose ?? `${long} save`, forId: row.id }, { advantage: opts.advantage, disadvantage: opts.disadvantage, tool: opts.tool });
+    const total = die.natural + m.total;
+    return { ability: long, dc, rolls: die.rolls, natural: die.natural, modifier: m.total, total, saved: total >= dc, parts: [...m.parts] };
 }
 
 /**

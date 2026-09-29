@@ -17,7 +17,7 @@ import { getWorldManager } from '../state/world-manager.js';
 import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
 import { persistGeneratedWorldEntities } from '../../services/generated-world-persistence.service.js';
-import { readWorldClock, clockAt, clockAfter, dayClock, clockWarning, recordsAfterClock } from '../../engine/world-clock.js';
+import { readWorldClock, clockAt, clockAfter, dayClock, clockWarning, recordsAfterClock, scheduleInWorldSql } from '../../engine/world-clock.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -463,7 +463,7 @@ export function advanceWorldClock(worldId: string, hours: number): Record<string
     // Read-only counts: what process_scheduled and process_due would act on now.
     let scheduled = 0; let debts = 0;
     try {
-        scheduled = (db.prepare('SELECT COUNT(*) AS n FROM scheduled_state_changes WHERE fired = 0 AND world_id = ? AND fires_at_day <= ?').get(args.worldId, at) as { n: number }).n;
+        scheduled = (db.prepare(`SELECT COUNT(*) AS n FROM scheduled_state_changes s WHERE s.fired = 0 AND ${scheduleInWorldSql('s')} AND s.fires_at_day <= ?`).get(args.worldId, args.worldId, at) as { n: number }).n;
     } catch { /* no schedule table yet */ }
     try {
         debts = (db.prepare(`SELECT COUNT(*) AS n FROM ledger_debts WHERE world_id = ? AND due_day IS NOT NULL

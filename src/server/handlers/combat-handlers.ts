@@ -30,7 +30,7 @@ import { compareBands } from '../../engine/table-rules.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { CombatActionLogRepository } from '../../storage/repos/combat-action-log.repo.js';
-import { startConcentration, checkConcentration, breakConcentration } from '../../engine/magic/concentration.js';
+import { startConcentration, checkConcentration, breakConcentration, concentrationAfterDamage } from '../../engine/magic/concentration.js';
 import { rollParticipantSave, toLongAbility, type ParticipantSaveResult } from '../../engine/combat/saves.js';
 import type { Character } from '../../schema/character.js';
 import { getPatternGenerator, PATTERN_DESCRIPTIONS } from '../terrain-patterns.js';
@@ -3194,6 +3194,8 @@ export interface AreaSaveOptions {
     damageType?: string;
     savingThrow?: { ability: string; dc: number };
     halfDamageOnSave?: boolean;
+    /** roll_log purpose for the damage dice (default '<purpose> damage'). */
+    damagePurpose?: string;
 }
 
 export interface AreaSaveTarget {
@@ -3207,6 +3209,13 @@ export interface AreaSaveTarget {
     defeated?: boolean;
     legendaryResisted?: boolean;
     legendaryResistanceAvailable?: number;
+    hpBefore?: number;
+    /** Set when a resistance, immunity or vulnerability changed the damage. */
+    damageModifier?: 'immune' | 'resistant' | 'vulnerable';
+    /** A concentrating sheet's CON save (or 0 HP) after the damage. */
+    concentration?: { spell: string; broken: boolean; reason: string; saveRoll?: number; saveTotal?: number; saveDC?: number };
+    /** A unit carried through its breakAt owes a break test. */
+    breakTest?: BreakTest;
 }
 
 /**
@@ -3215,30 +3224,33 @@ export interface AreaSaveTarget {
  * as 5e rolls a breath weapon once; every die and save goes through the
  * engine so it is seeded and reaches roll_log. The caller saves the state.
  */
-export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, purpose: string): { targets: AreaSaveTarget[]; damageRolled?: number; damageRolls?: number[]; lines: string[]; missing: string[] } {
+export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, purpose: string): { targets: AreaSaveTarget[]; damageRolled?: number; damageRolls?: number[]; lines: string[]; missing: string[]; breakTests: BreakTest[] } {
     const state = engine.getState()!;
     const targets: AreaSaveTarget[] = [];
+    const breakTests: BreakTest[] = [];
     const lines: string[] = [];
     const missing: string[] = [];
     let damageRolled: number | undefined;
     let damageRolls: number[] | undefined;
     if (typeof opts.damage === 'string') {
-        const rolled = engine.rollDice(opts.damage, { purpose: `${purpose} damage` });
-        damageRolled = rolled.total;
+        const rolled = engine.rollDice(opts.damage, { purpose: opts.damagePurpose ?? `${purpose} damage` });
+        damageRolled = Math.max(0, rolled.total);
         damageRolls = rolled.rolls;
     } else if (typeof opts.damage === 'number') {
         damageRolled = opts.damage;
     }
     if (!opts.targetIds?.length || (damageRolled === undefined && !opts.savingThrow)) {
-        return { targets, damageRolled, damageRolls, lines, missing };
+        return { targets, damageRolled, damageRolls, lines, missing, breakTests };
     }
     const halfOnSave = opts.halfDamageOnSave ?? true;
-    const type = opts.damageType?.toLowerCase();
-    const has = (list: string[] | undefined) => !!type && (list ?? []).some(x => x.toLowerCase() === type);
+    const db = getDb();
+    const concentrationRepo = new ConcentrationRepository(db);
+    const charRepo = new CharacterRepository(db);
     for (const targetId of opts.targetIds) {
         const target = state.participants.find(p => p.id === targetId);
         if (!target) { missing.push(targetId); lines.push(`⚠️ Target ${targetId} not found in encounter`); continue; }
         let damageTaken = damageRolled ?? 0;
+        const hpBefore = target.hp;
         let saved = false;
         let save: ParticipantSaveResult | undefined;
         if (opts.savingThrow) {
@@ -3249,17 +3261,30 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
             saved = save.saved;
             if (saved) damageTaken = halfOnSave ? Math.floor(damageTaken / 2) : 0;
         }
-        if (has(target.immunities)) damageTaken = 0;
-        else if (has(target.resistances)) damageTaken = Math.floor(damageTaken / 2);
-        else if (has(target.vulnerabilities)) damageTaken = damageTaken * 2;
+        // The one resistance rule (engine.calculateDamageWithModifiers).
+        const mod = engine.calculateDamageWithModifiers(damageTaken, opts.damageType, target);
+        damageTaken = mod.finalDamage;
         if (damageTaken > 0) engine.applyDamage(targetId, damageTaken);
         const after = engine.getState()!.participants.find(p => p.id === targetId);
+        const defeated = after ? after.hp <= 0 : false;
+        // Concentration on the encounter's d20; 0 HP ends it outright.
+        const concentration = damageTaken > 0
+            ? concentrationAfterDamage(targetId, damageTaken, defeated && hpBefore > 0, () => engine.rollD20({ purpose: 'concentration', forId: targetId }), concentrationRepo, charRepo)
+            : undefined;
+        // Item 12: a unit carried through its breakAt owes a break test.
+        const breakTest = after?.unit && damageTaken > 0
+            ? breakTestDue(after, hpBefore, { moraleBonus: moraleModifiers(after, engine.getState()!.participants, sheetSpecies(db)) })
+            : null;
+        if (breakTest) breakTests.push(breakTest);
         targets.push({
             targetId, targetName: target.name,
             saveRoll: save?.natural, saveTotal: save?.total, saved, damageTaken,
-            hpAfter: after?.hp, defeated: after ? after.hp <= 0 : undefined,
+            hpBefore, hpAfter: after?.hp, defeated: after ? defeated : undefined,
+            ...(mod.modifier !== 'normal' ? { damageModifier: mod.modifier } : {}),
             ...(save?.legendaryResisted ? { legendaryResisted: true } : {}),
-            ...(save?.legendaryResistanceAvailable ? { legendaryResistanceAvailable: save.legendaryResistanceAvailable } : {})
+            ...(save?.legendaryResistanceAvailable ? { legendaryResistanceAvailable: save.legendaryResistanceAvailable } : {}),
+            ...(concentration ? { concentration } : {}),
+            ...(breakTest ? { breakTest } : {})
         });
         let line = `🎯 ${target.name}`;
         if (opts.savingThrow && save) {
@@ -3269,11 +3294,13 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
             line += save.legendaryResisted ? ' (legendary resistance)'
                 : save.legendaryResistanceAvailable ? ` (${save.legendaryResistanceAvailable} legendary resistance(s) left)` : '';
         }
-        line += `\n   Damage: ${damageTaken}${opts.damageType ? ` ${opts.damageType}` : ''}`;
+        line += `\n   Damage: ${damageTaken}${opts.damageType ? ` ${opts.damageType}` : ''}${mod.modifier !== 'normal' ? ` (${mod.modifier})` : ''}`;
         if (after) line += `\n   HP: ${after.hp}/${after.maxHp}${after.hp <= 0 ? ' 💀 DEFEATED' : ''}`;
+        if (concentration) line += `\n   Concentration on ${concentration.spell}: ${concentration.reason === 'death' ? 'ends at 0 HP' : `CON save ${concentration.saveTotal} vs DC ${concentration.saveDC} ${concentration.broken ? '✗ BROKEN' : '✓ held'}`}`;
+        if (breakTest) line += `\n   ${breakTest.line}`;
         lines.push(line);
     }
-    return { targets, damageRolled, damageRolls, lines, missing };
+    return { targets, damageRolled, damageRolls, lines, missing, breakTests };
 }
 
 /**

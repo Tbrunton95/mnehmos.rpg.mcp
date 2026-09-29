@@ -98,13 +98,14 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Spend a legendary resistance by hand | `combat_manage legendary_resistance {participantId, reason}` |
 | Opportunity attack or readied swing | NPC opportunity attacks roll on the move; a PC's comes back in `opportunityAttacksAvailable` with the call to make (`reaction: true` on the attack) |
 | Ready an attack that fires itself | `combat_action ready {readiedAction, trigger, on: 'enters_reach' \| 'leaves_reach', watch, attack: {using?}}`; free-text readied actions fire with `combat_manage trigger_readied {participantId, targetId?}` (spends the reaction, rolls a stored attack) |
-| Grab, pin, throw or finish unarmed | `combat_action grapple {encounterId, actorId, targetId, move}` (one attack; band and size disadvantage are automatic); `control: true` pins; `move: 'execute'` finishes a pinned lower-band foe; `move: 'break'` escapes the holder named in targetId |
+| Grab, pin, throw or finish unarmed | `combat_action grapple {encounterId, actorId, targetId, move}` (one attack; band and size disadvantage are automatic); `control: true` pins; `move: 'execute'` finishes a pinned lower-band foe; `move: 'break'` escapes the holder named in targetId (clears that hold's conditions; Prone and a spell's Restrained stay) |
 | A saving throw, with advantage from a condition or feature | `math_manage roll_saving_throw {characterId, ability, dc, advantageSources: ['VAUREK']}` (logged as `wis save (adv: VAUREK)`); an exact name beats a longer one, then a prefix, then any part |
 | Cast a spell | `combat_action cast_spell {actorId, spellName, targetId \| targetIds}`: attack, damage and saves on the fight's logged dice; debuff conditions land on a failed save (`conditionsApplied`) |
 | A boss burns legendary resistance on failed saves by itself | add `autoLegendaryResistance: true` to its statline; without it, a failed save reports how many are left |
 | Squad fires / is suppressed | `combat_action volley`; `combat_manage set_unit` |
 | Cut through a packed lower-band squad | add `cleave: true` |
 | Enemy telegraphs | `combat_manage set_intent`; readied actions then `trigger_readied` |
+| Damage with no attacker (hazard, trap, an off-turn bite) | `combat_manage apply_damage {encounterId?, targetIds, dice: '6d10', source, damageType?, save?: {ability, dc}}`; no action spent; without encounterId it writes to the sheets |
 | HP is wrong | `combat_manage adjust_hp {value \| delta, reason}` |
 | Conditions mid-fight | `combat_manage add_condition {condition \| name}` / `remove_condition {condition \| name \| conditionId}`; standard conditions set adv/dis/auto-crit themselves (`ranged`, `ignoreConditions` on attacks) |
 | Just the condition names | `character_manage get {characterId, fields: ['conditionNames']}` (or `fields: ['conditions.name', 'conditions.pinned']`) |
@@ -114,11 +115,14 @@ When several steps must land together, send them as one `batch_manage execute_se
 | A ruling or an invention | `precedent_manage record` / `search` |
 | Who knows a secret | `knowledge_manage record` / `learn` / `can_know` |
 | Debts and deferred prices | `ledger_manage create` |
+| Carry capacity | STR x 15, x2 Large, x4 Huge, x8 Gargantuan, x1/2 Tiny from the sheet's size; a `carry_capacity` pool overrides it |
 | Souls taken or spent | `character_manage adjust_pool {characterId, pool: 'souls', delta, reason}` |
 | A counter shown at boot (uses left, linked token) | `character_manage adjust_pool {characterId, pool, value, max, label, show: true, linkItem?}`, then `delta: -1` |
 | Souls owed to a god | `ledger_manage create {worldId, debtor, creditor, amount, currency: 'souls', dueDay, consequence}` |
 | Time passes | `world_manage advance {worldId, hours}` (or `minutes`, `days`); set the clock once with `world_manage update {worldId, environment: {day, time}}` |
 | Clocks and debts the clock reached | `character_manage process_scheduled {worldId}`, `ledger_manage process_due {worldId}` (no day needed) |
+| Untagged scheduled rows (`unscopedOwnerUnknown`) | `character_manage scope_scheduled {worldId: <its own world>, scheduleIds: [...], preview?}`; another world's rows are refused by name |
 | The clock is wrong (not time passing) | `world_manage update {worldId, correction: true, environment: {day, time}}`; boot's CLOCK warning and `world_manage audit {worldId}` name records dated after the clock |
 | Did a timed-out call apply? | `session_manage op_status {forOpId}` |
+| A free roll with several dice terms | `math_manage roll {expression: '6d10+3d10', purpose, forId?}` (logged, every die listed) |
 | Check a past roll | `session_manage rolls {forId \| encounterId \| forOpId}` |

@@ -20,7 +20,7 @@ import { getMeta, setMeta } from '../../storage/data-migrations.js';
 import { lookupOperation } from '../operation-guard.js';
 import { queryRolls } from '../../storage/roll-log.js';
 import { buildBootPacket, renderBootPacket } from '../boot-packet.js';
-import { readWorldClock, clockWarning } from '../../engine/world-clock.js';
+import { readWorldClock, clockWarning, scheduleInWorldSql } from '../../engine/world-clock.js';
 
 /** Engine changes this database has not been shown yet. */
 function unseenChangelog(): ChangelogEntry[] {
@@ -519,13 +519,15 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
                 // FINDINGS #97 (SALT leak #2, session half): the ⏰ section scopes to
                 // this world's characters when worldId is present — a boot no longer
                 // surfaces (or tempts firing of) other campaigns' clocks.
-                const schedScope = 'JOIN characters c ON c.id = s.character_id AND c.world_id = ?';
+                // Play report: the shared filter — the row's own tag, or its
+                // character's when untagged.
+                const schedScope = `AND ${scheduleInWorldSql('s')}`;
                 const pendingTotal = (input.worldId
-                    ? (db.prepare(`SELECT COUNT(*) AS n FROM scheduled_state_changes s ${schedScope} WHERE s.fired = 0`).get(input.worldId) as { n: number }).n
+                    ? (db.prepare(`SELECT COUNT(*) AS n FROM scheduled_state_changes s WHERE s.fired = 0 ${schedScope}`).get(input.worldId, input.worldId) as { n: number }).n
                     : (db.prepare('SELECT COUNT(*) AS n FROM scheduled_state_changes WHERE fired = 0').get() as { n: number }).n);
                 const due = day !== null
                     ? (input.worldId
-                        ? db.prepare(`SELECT s.id, s.character_id, s.fires_at_day, s.note, s.writes FROM scheduled_state_changes s ${schedScope} WHERE s.fired = 0 AND s.fires_at_day <= ? ORDER BY s.fires_at_day LIMIT 10`).all(input.worldId, day)
+                        ? db.prepare(`SELECT s.id, s.character_id, s.fires_at_day, s.note, s.writes FROM scheduled_state_changes s WHERE s.fired = 0 ${schedScope} AND s.fires_at_day <= ? ORDER BY s.fires_at_day LIMIT 10`).all(input.worldId, input.worldId, day)
                         : db.prepare('SELECT id, character_id, fires_at_day, note, writes FROM scheduled_state_changes WHERE fired = 0 AND fires_at_day <= ? ORDER BY fires_at_day LIMIT 10').all(day)) as Array<{ id: number; character_id: string; fires_at_day: number; note: string | null; writes: string }>
                     : [];
                 if (due.length || pendingTotal) {

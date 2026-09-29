@@ -722,10 +722,21 @@ function grappleSide(id: string, row: GrappleRow | null, tok: CombatParticipant 
     };
 }
 
-/** A hold the escaper may clear against this holder: its source names the holder, or no grappler at all. */
-function holdFrom(source: string | undefined, holder: GrappleSide): boolean {
+/**
+ * A condition a break against this holder clears. Play report: the break
+ * matched only Clinched/Grappled/Restrained by name and treated ANY other
+ * source as fair game, so a spell's Restrained went with the hold.
+ *  - sourced 'grapple: <holder id or name>': cleared whatever its name,
+ *    except Prone (5e: escaping a grapple doesn't stand you up);
+ *  - unsourced Clinched/Grappled/Restrained (legacy rows): cleared;
+ *  - any other source (a spell, a net, another holder): never touched.
+ */
+function heldBy(name: string, source: string | undefined, holder: GrappleSide): boolean {
     const s = (source ?? '').trim().toLowerCase();
-    if (!s.startsWith('grapple:')) return true;
+    const n = name.trim().toLowerCase();
+    if (!s) return GRAPPLE_CONDITIONS.some(g => g.toLowerCase() === n);
+    if (!s.startsWith('grapple:')) return false;
+    if (n === 'prone') return false;
     const who = s.slice('grapple:'.length).trim();
     return who === holder.id.toLowerCase() || who === holder.name.toLowerCase();
 }
@@ -902,8 +913,8 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
     const repo = new CharacterRepository(db);
     let removed: string[] = [];
     if (isBreak) {
-        const rowHolds = (actor.row?.conditions ?? []).filter(c => GRAPPLE_CONDITIONS.some(n => n.toLowerCase() === c.name.toLowerCase()) && holdFrom(c.source, target));
-        const tokHolds = (actor.tok?.conditions ?? []).filter(c => GRAPPLE_CONDITIONS.some(n => n.toLowerCase() === String(c.type).toLowerCase()) && holdFrom(c.sourceId, target));
+        const rowHolds = (actor.row?.conditions ?? []).filter(c => heldBy(c.name, c.source, target));
+        const tokHolds = (actor.tok?.conditions ?? []).filter(c => heldBy(String(c.type), c.sourceId, target));
         if (actor.row && rowHolds.length) repo.update(actor.id, { conditions: (actor.row.conditions ?? []).filter(c => !rowHolds.includes(c)) } as never);
         if (actor.tok && tokHolds.length) actor.tok.conditions = actor.tok.conditions.filter(c => !tokHolds.includes(c));
         removed = [...new Set([...rowHolds.map(c => c.name), ...tokHolds.map(c => String(c.type))].map(n => GRAPPLE_CONDITIONS.find(g => g.toLowerCase() === n.toLowerCase()) ?? n))];

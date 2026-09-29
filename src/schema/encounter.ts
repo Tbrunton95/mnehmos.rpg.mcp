@@ -148,19 +148,27 @@ export function getSizeFootprint(size: SizeCategory): number {
 /** Sizes smallest first; sizeRank indexes this list. */
 export const SIZE_ORDER: readonly SizeCategory[] = SizeCategorySchema.options;
 
-/** Squares per side and natural melee reach (5e: huge and up reach 10 ft). */
-export const SIZE_TABLE: Record<SizeCategory, { squares: number; reachFt: number }> = {
-    tiny: { squares: 1, reachFt: 5 },
-    small: { squares: 1, reachFt: 5 },
-    medium: { squares: 1, reachFt: 5 },
-    large: { squares: 2, reachFt: 5 },
-    huge: { squares: 3, reachFt: 10 },
-    gargantuan: { squares: 4, reachFt: 10 }
+/**
+ * Squares per side, natural melee reach (5e: huge and up reach 10 ft) and the
+ * carrying-capacity multiplier (5e: x2 per size above Medium, x1/2 for Tiny).
+ */
+export const SIZE_TABLE: Record<SizeCategory, { squares: number; reachFt: number; carryMult: number }> = {
+    tiny: { squares: 1, reachFt: 5, carryMult: 0.5 },
+    small: { squares: 1, reachFt: 5, carryMult: 1 },
+    medium: { squares: 1, reachFt: 5, carryMult: 1 },
+    large: { squares: 2, reachFt: 5, carryMult: 2 },
+    huge: { squares: 3, reachFt: 10, carryMult: 4 },
+    gargantuan: { squares: 4, reachFt: 10, carryMult: 8 }
 };
 
 function sizeOf(size?: string | null): SizeCategory {
     const s = (size ?? '').toLowerCase() as SizeCategory;
     return s in SIZE_TABLE ? s : 'medium';
+}
+
+/** Carrying-capacity multiplier for a size; unset or unknown reads as medium (x1). */
+export function carryMultiplier(size?: string | null): number {
+    return SIZE_TABLE[sizeOf(size)].carryMult;
 }
 
 /** Position in SIZE_ORDER; unset or unknown reads as medium. */

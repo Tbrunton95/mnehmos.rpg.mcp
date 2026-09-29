@@ -16,7 +16,7 @@ import { loadRule, loadRules, findWorldRule, castingClassFor, resolveWorldId, fi
 import { worldProgression, levelCapProblem } from '../../engine/progression.js';
 import { FORM_KEYS, sheetFromCreature, snapshotBase, nextHp, hpModeSchema, type HpMode } from '../../engine/forms.js';
 import { pushSheetToLiveTokens } from '../handlers/combat-handlers.js';
-import { readWorldClock, dayClock, SET_CLOCK_HINT } from '../../engine/world-clock.js';
+import { readWorldClock, dayClock, SET_CLOCK_HINT, scheduleInWorldSql } from '../../engine/world-clock.js';
 import { scheduledWriteOpSchema, applyScheduledOps, type ScheduledWriteOp } from '../../engine/scheduled-ops.js';
 import { applyFamilyDelta, familyMember, type FamilyMove } from '../../engine/pool-family.js';
 import { z } from 'zod';
@@ -1823,6 +1823,24 @@ function ensureScheduleTable(db: ReturnType<typeof getDb>): void {
     // world seeds would fire every young-world row up to Day 47 in one call.
     // Nullable: legacy rows are unscoped until claimed via scope_scheduled.
     try { db.exec('ALTER TABLE scheduled_state_changes ADD COLUMN world_id TEXT'); } catch { /* column exists */ }
+    // The world filter reads the character's tag for untagged rows.
+    try { db.exec('ALTER TABLE characters ADD COLUMN world_id TEXT'); } catch { /* column exists */ }
+}
+
+/** The world a character is tagged to, or null (untagged or missing). */
+function characterWorld(db: ReturnType<typeof getDb>, characterId: string): string | null {
+    try {
+        return (db.prepare('SELECT world_id FROM characters WHERE id = ?').get(characterId) as { world_id: string | null } | undefined)?.world_id ?? null;
+    } catch { return null; }
+}
+
+/** Untagged, due, unfired rows whose character is untagged or gone: no world can claim them by inference. */
+function unscopedOwnerUnknownIds(db: ReturnType<typeof getDb>, effectiveDay: number | null, characterId?: string): number[] {
+    const rows = db.prepare(`SELECT s.id FROM scheduled_state_changes s LEFT JOIN characters c ON c.id = s.character_id
+                             WHERE s.fired = 0 AND s.world_id IS NULL AND c.world_id IS NULL${effectiveDay !== null ? ' AND s.fires_at_day <= ?' : ''}${characterId ? ' AND s.character_id = ?' : ''}
+                             ORDER BY s.fires_at_day, s.id`)
+        .all(...[...(effectiveDay !== null ? [effectiveDay] : []), ...(characterId ? [characterId] : [])]) as Array<{ id: number }>;
+    return rows.map(r => r.id);
 }
 
 type ScheduleRow = { id: number; character_id: string; fires_at_day: number; writes: string; note: string | null; fired: number; fired_at: string | null; created_at: string; recur_every_days: number | null; is_event?: number | null; world_id?: string | null };
@@ -1876,8 +1894,11 @@ async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>):
     } else {
         throw new Error('schedule_change needs a firing time: pass firesAtDay (optionally with firesAtHour), OR firesInHours with currentDay (+currentTime). firesAtHour alone has no day to ride on. Nothing was inserted.');
     }
+    // Play report: with no worldId the row takes its character's world, so
+    // new rows stop joining the untagged pile other campaigns trip over.
+    const rowWorld = args.worldId ?? characterWorld(db, char.id);
     const info = db.prepare('INSERT INTO scheduled_state_changes (character_id, fires_at_day, writes, note, created_at, recur_every_days, is_event, world_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(args.characterId, firesAt, JSON.stringify(args.writes), args.note ?? null, now, args.recurEveryDays ?? null, args.event ? 1 : 0, args.worldId ?? null);
+        .run(args.characterId, firesAt, JSON.stringify(args.writes), args.note ?? null, now, args.recurEveryDays ?? null, args.event ? 1 : 0, rowWorld);
 
     // FINDINGS #73: named one-off — fire in the same call, land in the ledger.
     // Same op arithmetic as the processor; a recurring row fired now re-arms
@@ -1905,7 +1926,7 @@ async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>):
         db.prepare('UPDATE scheduled_state_changes SET fired = 1, fired_at = ? WHERE id = ?').run(now, Number(info.lastInsertRowid));
         if (args.recurEveryDays && args.recurEveryDays > 0) {
             db.prepare('INSERT INTO scheduled_state_changes (character_id, fires_at_day, writes, note, created_at, recur_every_days, is_event, world_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-                .run(args.characterId, firesAt + args.recurEveryDays, JSON.stringify(args.writes), args.note ?? null, now, args.recurEveryDays, args.event ? 1 : 0, args.worldId ?? null);
+                .run(args.characterId, firesAt + args.recurEveryDays, JSON.stringify(args.writes), args.note ?? null, now, args.recurEveryDays, args.event ? 1 : 0, rowWorld);
         }
         firedNowApplied = applied;
     }
@@ -1957,14 +1978,13 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
     // optional filter on this, the one genuinely destructive global write in
     // the toolkit, was the SALT incident (cross-campaign fires + an HP write
     // onto another table's PC). characterId now genuinely narrows.
-    let scopeSql = ' AND world_id = ?';
-    const scopeParams: unknown[] = [args.worldId];
+    // Play report: a row is this world's by its own tag, or by its
+    // character's tag when it has none. Another world's untagged rows are
+    // neither fired nor counted; rows no world can claim are named by id.
+    let scopeSql = ` AND ${scheduleInWorldSql('')}`;
+    const scopeParams: unknown[] = [args.worldId, args.worldId];
     if (args.characterId) { scopeSql += ' AND character_id = ?'; scopeParams.push(args.characterId); }
-    let skippedUnscoped = 0;
-    {
-        const s = db.prepare('SELECT COUNT(*) AS n FROM scheduled_state_changes WHERE fired = 0 AND fires_at_day <= ? AND world_id IS NULL').get(effectiveDay) as { n: number };
-        skippedUnscoped = s.n;
-    }
+    const ownerUnknown = unscopedOwnerUnknownIds(db, effectiveDay, args.characterId);
     // FINDINGS #69: recurring clocks re-arm on fire, and the processor LOOPS
     // until nothing is due — five missed days of a daily hunger clock fire
     // FIVE TIMES, each its own row in results, not one collapsed tick.
@@ -1981,7 +2001,7 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
             success: true, actionType: 'process_scheduled', preview: true, writes: 'none',
             currentDay: args.currentDay, clockSource, ...(args.currentTime ? { currentTime: args.currentTime, effectiveDay } : {}),
             worldId: args.worldId, ...(args.characterId ? { characterId: args.characterId } : {}),
-            ...(skippedUnscoped > 0 ? { skippedUnscoped } : {}),
+            ...(ownerUnknown.length ? { unscopedOwnerUnknown: ownerUnknown } : {}),
             wouldFireCount: wouldFire.length, wouldFire,
             message: wouldFire.length === 0
                 ? `Preview: nothing due at Day ${args.currentDay} — no writes.`
@@ -2016,7 +2036,7 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
         let rearmedAs: number | null = null;
         if (row.recur_every_days && row.recur_every_days > 0) {
             const next = db.prepare('INSERT INTO scheduled_state_changes (character_id, fires_at_day, writes, note, created_at, recur_every_days, is_event, world_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-                .run(row.character_id, row.fires_at_day + row.recur_every_days, row.writes, row.note, now, row.recur_every_days, row.is_event ?? 0, row.world_id ?? null);
+                .run(row.character_id, row.fires_at_day + row.recur_every_days, row.writes, row.note, now, row.recur_every_days, row.is_event ?? 0, row.world_id ?? args.worldId);
             rearmedAs = Number(next.lastInsertRowid);
         }
         results.push({ scheduleId: row.id, kind: (row.is_event ?? 0) === 1 ? 'event' : 'clock', characterId: row.character_id, characterName: char.name, firesAtDay: row.fires_at_day, note: row.note, applied, ...(rearmedAs !== null ? { recurring: true, rearmedAs, nextFiresAtDay: row.fires_at_day + (row.recur_every_days ?? 0) } : {}) });
@@ -2034,7 +2054,7 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
         ...(args.currentTime ? { currentTime: args.currentTime, effectiveDay } : {}),
         ...(args.worldId ? { worldId: args.worldId } : {}),
         ...(args.characterId ? { characterId: args.characterId } : {}),
-        ...(skippedUnscoped > 0 ? { skippedUnscoped, scopeWarning: `⚠ ${skippedUnscoped} UNSCOPED row(s) due but NOT fired — claim them into their world: scope_scheduled {worldId} stamps all unscoped rows (#91/#100; global unscoped processing is retired)` } : {}),
+        ...(ownerUnknown.length ? { unscopedOwnerUnknown: ownerUnknown } : {}),
         firedCount: results.length,
         results,
         ...(backlogWarning ? { backlogWarning } : {}),
@@ -2052,7 +2072,8 @@ async function handleListScheduled(args: z.infer<typeof ListScheduledSchema>): P
     const params: unknown[] = [];
     // FINDINGS #91: list respects world scope; unscoped rows still show (null)
     // so the claim debt stays visible.
-    if (args.worldId) { where.push('(world_id = ? OR world_id IS NULL)'); params.push(args.worldId); }
+    // Play report: the shared filter — this world's tag, or its character's.
+    if (args.worldId) { where.push(scheduleInWorldSql('')); params.push(args.worldId, args.worldId); }
     if (!args.includeFired) where.push('fired = 0');
     if (args.characterId) { where.push('character_id = ?'); params.push(characterRepo.findById(args.characterId)?.id ?? args.characterId); }
     if (where.length) sql += ' WHERE ' + where.join(' AND ');
@@ -2064,7 +2085,8 @@ async function handleListScheduled(args: z.infer<typeof ListScheduledSchema>): P
         let opsCount = 0; try { opsCount = (JSON.parse(r.writes || '[]') as unknown[]).length; } catch { /* reported as 0 */ }
         return { scheduleId: r.id, kind: (r.is_event ?? 0) === 1 ? 'event' : 'clock', characterId: r.character_id, characterName: nameCache.get(r.character_id), firesAtDay: r.fires_at_day, ops: opsCount, note: r.note, recurEveryDays: r.recur_every_days ?? null, worldId: r.world_id ?? null, fired: r.fired === 1, firedAt: r.fired_at, writes: r.writes };
     });
-    return { success: true, actionType: 'list_scheduled', count: scheduled.length, scheduled, message: `${scheduled.length} scheduled change${scheduled.length === 1 ? '' : 's'}${args.characterId ? ' for that character' : ''}${args.includeFired ? ' (incl. fired)' : ''}` };
+    const ownerUnknown = args.worldId ? unscopedOwnerUnknownIds(db, null, args.characterId ? (characterRepo.findById(args.characterId)?.id ?? args.characterId) : undefined) : [];
+    return { success: true, actionType: 'list_scheduled', count: scheduled.length, scheduled, ...(ownerUnknown.length ? { unscopedOwnerUnknown: ownerUnknown } : {}), message: `${scheduled.length} scheduled change${scheduled.length === 1 ? '' : 's'}${args.characterId ? ' for that character' : ''}${args.includeFired ? ' (incl. fired)' : ''}` };
 }
 
 async function handleCancelScheduled(args: z.infer<typeof CancelScheduledSchema>): Promise<object> {
@@ -2347,30 +2369,63 @@ const definitions: Record<CharacterAction, ActionDefinition> = {
         schema: z.object({
             action: z.literal('scope_scheduled'),
             worldId: z.string().describe('World to stamp onto unscoped rows'),
-            scheduleId: z.number().int().optional().describe('Scope ONE row by id instead of all unscoped')
+            scheduleId: z.number().int().optional().describe('Scope ONE row by id (same as scheduleIds: [id])'),
+            scheduleIds: z.array(z.number().int()).optional().describe('Scope these rows by id. A row whose character belongs to another world is refused by name; an untagged character\'s row is accepted only this way'),
+            preview: z.boolean().optional().describe('Report the would-be stamps and refusals, write NOTHING')
         }),
-        handler: async (args: { action: 'scope_scheduled'; worldId: string; scheduleId?: number }) => {
+        handler: async (args: { action: 'scope_scheduled'; worldId: string; scheduleId?: number; scheduleIds?: number[]; preview?: boolean }) => {
             const { db } = ensureDb();
             ensureScheduleTable(db);
-            // FINDINGS #91: the claim verb — legacy rows predate world scoping;
-            // this stamps them ONCE, explicitly, counts from the store. Run it
-            // for the elder campaign BEFORE a second world seeds its first clock.
-            const r = args.scheduleId !== undefined
-                ? db.prepare('UPDATE scheduled_state_changes SET world_id = ? WHERE id = ? AND world_id IS NULL').run(args.worldId, args.scheduleId)
-                : db.prepare('UPDATE scheduled_state_changes SET world_id = ? WHERE world_id IS NULL').run(args.worldId);
+            // FINDINGS #91: the claim verb for untagged legacy rows. Play
+            // report: the old no-id lane stamped EVERY untagged row in the db
+            // into the caller's world — other campaigns' clocks included. Now
+            // the no-id lane takes only rows on this world's characters;
+            // explicit ids are refused when the character belongs to another
+            // world (the scope_characters pattern), and an untagged
+            // character's row comes only by explicit id.
+            const explicit = [...(args.scheduleIds ?? []), ...(args.scheduleId !== undefined ? [args.scheduleId] : [])];
+            const claims: number[] = []; const noops: number[] = []; const alreadyScoped: Array<{ scheduleId: number; worldId: string }> = [];
+            const refusedOtherWorld: Array<{ scheduleId: number; characterId: string; characterName: string | null; ownedBy: string }> = []; const missing: number[] = [];
+            if (explicit.length) {
+                for (const id of new Set(explicit)) {
+                    const row = db.prepare(`SELECT s.id, s.world_id, s.character_id, c.name, c.world_id AS owner FROM scheduled_state_changes s
+                                            LEFT JOIN characters c ON c.id = s.character_id WHERE s.id = ?`).get(id) as { id: number; world_id: string | null; character_id: string; name: string | null; owner: string | null } | undefined;
+                    if (!row) { missing.push(id); continue; }
+                    if (row.world_id === args.worldId) { noops.push(id); continue; }
+                    if (row.world_id) { alreadyScoped.push({ scheduleId: id, worldId: row.world_id }); continue; }
+                    if (row.owner && row.owner !== args.worldId) { refusedOtherWorld.push({ scheduleId: id, characterId: row.character_id, characterName: row.name, ownedBy: row.owner }); continue; }
+                    claims.push(id);
+                }
+            } else {
+                for (const r of db.prepare(`SELECT s.id FROM scheduled_state_changes s JOIN characters c ON c.id = s.character_id
+                                            WHERE s.world_id IS NULL AND c.world_id = ? ORDER BY s.id`).all(args.worldId) as Array<{ id: number }>) claims.push(r.id);
+            }
+            let stamped = 0;
+            if (!args.preview && claims.length) {
+                const stmt = db.prepare('UPDATE scheduled_state_changes SET world_id = ? WHERE id = ? AND world_id IS NULL');
+                for (const id of claims) stamped += stmt.run(args.worldId, id).changes;
+            }
+            const refusals = refusedOtherWorld.length ? ` REFUSED ${refusedOtherWorld.length}: ${refusedOtherWorld.map(r => `#${r.scheduleId} (${r.characterName ?? r.characterId} belongs to ${r.ownedBy})`).join(', ')} — scope each into its own world.` : '';
             return {
                 success: true,
                 actionType: 'scope_scheduled',
                 worldId: args.worldId,
                 ...(args.scheduleId !== undefined ? { scheduleId: args.scheduleId } : {}),
-                rowsScoped: r.changes,
-                message: r.changes === 0
-                    ? `No unscoped rows${args.scheduleId !== undefined ? ` matching id ${args.scheduleId}` : ''} — nothing stamped (already scoped rows are never restamped).`
-                    : `${r.changes} row(s) stamped to world ${args.worldId}. Boot calls for this world should now pass worldId on process_scheduled.`
+                ...(args.scheduleIds ? { scheduleIds: args.scheduleIds } : {}),
+                ...(args.preview ? { preview: true, writes: 'none', wouldScope: claims.length, wouldScopeIds: claims } : { rowsScoped: stamped, scopedIds: claims }),
+                ...(noops.length ? { alreadyThisWorld: noops } : {}),
+                ...(alreadyScoped.length ? { alreadyScoped } : {}),
+                ...(refusedOtherWorld.length ? { refusedOtherWorld } : {}),
+                ...(missing.length ? { missingIds: missing } : {}),
+                message: args.preview
+                    ? `PREVIEW — would stamp ${claims.length} row(s) to ${args.worldId}.${refusals} Nothing written.`
+                    : claims.length === 0
+                        ? `No rows stamped${explicit.length ? '' : ` — no untagged rows on ${args.worldId}'s characters`} (already scoped rows are never restamped).${refusals}`
+                        : `${stamped} row(s) stamped to world ${args.worldId}.${refusals}`
             };
         },
         aliases: ['claim_scheduled', 'stamp_scheduled'],
-        description: 'FINDINGS #91: stamp unscoped scheduler rows with a worldId — the one-time migration verb for multi-world dbs. Never restamps an already-scoped row'
+        description: 'FINDINGS #91: stamp untagged scheduler rows with a worldId. No ids: only rows on this world\'s characters. scheduleIds: explicit rows; a row whose character belongs to another world is refused by name. Never restamps an already-scoped row'
     },
     scope_characters: {
         schema: z.object({
@@ -2636,7 +2691,8 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         writes: z.preprocess(mendJsonIfString, z.array(ScheduledWriteOpSchema)).optional().describe('MEND CLOCK: ordered ops (schedule_change). ARRAY — direct calls only per batch law #16a'),
         note: z.string().optional().describe('MEND CLOCK: what this clock is (schedule_change); adjust_pool: what the counter is'),
         currentDay: z.number().optional().describe('MEND CLOCK: current in-fiction day (process_scheduled)'),
-        scheduleId: z.number().optional().describe('MEND CLOCK: row id (cancel_scheduled)'),
+        scheduleId: z.number().optional().describe('MEND CLOCK: row id (cancel_scheduled, scope_scheduled)'),
+        scheduleIds: z.array(z.number().int()).optional().describe('scope_scheduled (mirror): rows to stamp by id; another world\'s character\'s row is refused by name'),
         includeFired: z.boolean().optional().describe('MEND CLOCK: include fired rows (list_scheduled)'),
         // Level up fields
         hpIncrease: z.number().int().optional(),

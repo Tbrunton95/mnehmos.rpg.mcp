@@ -94,6 +94,17 @@ export interface ClockRecord {
 const NARRATIVE_STAMP = /── \[Day (\d+(?:\.\d+)?)(?:, (\d{1,2}):(\d{2}))?\] ──/g;
 
 /**
+ * A scheduled row belongs to a world by its own tag, or, when it has none, by
+ * its character's tag. Every scheduler read that scopes by world uses this,
+ * so a legacy row on another campaign's character never surfaces here.
+ * Binds the world id twice: `.all(..., worldId, worldId)`.
+ */
+export function scheduleInWorldSql(alias = 's'): string {
+    const a = alias ? `${alias}.` : '';
+    return `(${a}world_id = ? OR (${a}world_id IS NULL AND ${a}character_id IN (SELECT id FROM characters WHERE world_id = ?)))`;
+}
+
+/**
  * Items 14/15: records dated after the world clock — the sign of a clock
  * that went backwards (a reset epoch, a restored save, a typo). Reads fired
  * scheduled rows, precedents, knowledge roads and narrative day stamps.
@@ -109,7 +120,7 @@ export function recordsAfterClock(db: Database.Database, worldId: string, at?: n
     const tryRows = <T>(fn: () => T[]): T[] => { try { return fn(); } catch { return []; } };
     for (const r of tryRows(() => db.prepare(`SELECT s.id, s.fires_at_day AS day, s.note FROM scheduled_state_changes s
                                                 WHERE s.fired = 1 AND s.fires_at_day > ?
-                                                AND (s.world_id = ? OR (s.world_id IS NULL AND s.character_id IN (SELECT id FROM characters WHERE world_id = ?)))`).all(now + eps, worldId, worldId) as Array<{ id: number; day: number; note: string | null }>)) {
+                                                AND ${scheduleInWorldSql('s')}`).all(now + eps, worldId, worldId) as Array<{ id: number; day: number; note: string | null }>)) {
         out.push({ source: 'scheduled', day: r.day, what: `fired schedule #${r.id}${r.note ? `: ${r.note}` : ''}`, id: String(r.id) });
     }
     for (const r of tryRows(() => db.prepare('SELECT id, day, statement FROM precedents WHERE world_id = ? AND day IS NOT NULL AND day > ?').all(worldId, now + eps) as Array<{ id: string; day: number; statement: string }>)) {

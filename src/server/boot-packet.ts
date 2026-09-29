@@ -13,7 +13,7 @@ import { CharacterRepository } from '../storage/repos/character.repo.js';
 import { loadRule, findPool, conditionsForDisplay, shownCounters } from '../engine/table-rules.js';
 import { recentPrecedents } from './consolidated/precedent-manage.js';
 import { NOTE_SOFT_CAP, splitSections } from './consolidated/narrative-manage.js';
-import { readWorldClock, clockWarning } from '../engine/world-clock.js';
+import { readWorldClock, clockWarning, scheduleInWorldSql } from '../engine/world-clock.js';
 import type { Character } from '../schema/character.js';
 
 export interface BootPacket {
@@ -104,8 +104,11 @@ export function buildBootPacket(worldId: string, characterIds?: string[], journa
     const characters = ids.map(id => charRepo.findById(id)).filter((c): c is Character => !!c).map(c => digest(c, worldId));
 
     const clocks: Array<Record<string, unknown>> = [
-        ...tryAll(() => (db.prepare(`SELECT s.fires_at_day AS day, s.note, c.name AS who FROM scheduled_state_changes s JOIN characters c ON c.id = s.character_id
-                                     WHERE s.fired = 0 AND c.world_id = ? ORDER BY s.fires_at_day LIMIT 8`).all(worldId) as Array<{ day: number; note: string | null; who: string }>)
+        // Play report: rows scope by their own tag, or their character's when
+        // untagged; due rows come first so the cap never hides one.
+        ...tryAll(() => (db.prepare(`SELECT s.fires_at_day AS day, s.note, COALESCE(c.name, s.character_id) AS who FROM scheduled_state_changes s LEFT JOIN characters c ON c.id = s.character_id
+                                     WHERE s.fired = 0 AND ${scheduleInWorldSql('s')}
+                                     ORDER BY CASE WHEN ? IS NOT NULL AND s.fires_at_day <= ? THEN 0 ELSE 1 END, s.fires_at_day LIMIT 8`).all(worldId, worldId, at, at) as Array<{ day: number; note: string | null; who: string }>)
             .map(r => ({ kind: 'scheduled', day: r.day, due: at !== null && r.day <= at, what: `${r.who}: ${r.note ?? '(no note)'}` }))),
         ...tryAll(() => (db.prepare(`SELECT debtor, creditor, amount, currency, due_day, status, consequence FROM ledger_debts
                                      WHERE world_id = ? AND status IN ('pending', 'due', 'lapsed') ORDER BY COALESCE(due_day, 1e9) LIMIT 8`).all(worldId) as Array<Record<string, unknown>>)
