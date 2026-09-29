@@ -34,7 +34,12 @@ import {
     resolveAreaSave
 } from '../handlers/combat-handlers.js';
 import { budgetEncounter, describeParty, type BudgetMonster } from '../../engine/encounter-budget.js';
-import { toLongAbility } from '../../engine/combat/saves.js';
+import { toLongAbility, rollCharacterSave } from '../../engine/combat/saves.js';
+import { damageWithModifiers, type DamageDefences } from '../../engine/combat/damage-modifiers.js';
+import { concentrationAfterDamage } from '../../engine/magic/concentration.js';
+import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
+import { loggedRoll, loggedD20 } from '../../math/logged-d20.js';
+import { parseDiceTerms } from '../../engine/combat/rng.js';
 import { listAllTemplates } from '../../data/creature-presets.js';
 import { resolveCreature, creatureToParticipant, resolveWorldId, loadRules } from '../../engine/table-rules.js';
 import { getDomainServices } from '../domain-services.js';
@@ -54,7 +59,7 @@ import { freshSeed } from '../../math/seed.js';
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_intent', 'trigger_readied', 'legendary_action', 'legendary_resistance', 'use_ability', 'battle_cry', 'budget', 'get_history', 'list'] as const;
+const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_intent', 'trigger_readied', 'legendary_action', 'legendary_resistance', 'use_ability', 'apply_damage', 'battle_cry', 'budget', 'get_history', 'list'] as const;
 type CombatManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -199,6 +204,20 @@ const UseAbilitySchema = z.object({
     }).optional(),
     halfDamageOnSave: z.boolean().default(true),
     reason: z.string().optional()
+});
+
+const ApplyDamageSchema = z.object({
+    action: z.literal('apply_damage'),
+    encounterId: z.string().optional().describe('The fight whose dice, tokens and log take it; omit for damage outside a fight (a character with a live token is routed through its encounter)'),
+    targetIds: z.array(z.string()).min(1).describe('Token ids in the encounter, or character ids without one'),
+    dice: z.union([z.number().int().min(0), z.string().min(1)]).describe("Dice ('6d10', '2d6+3') rolled once for every target, or a number"),
+    damageType: z.string().optional().describe('Resistances, immunities and vulnerabilities read it'),
+    source: z.string().min(1).describe("What deals it ('falling rubble', \"An'ggrath's bite\"): the roll is logged as 'damage: <source>'"),
+    save: z.object({
+        ability: z.string().describe("'dex', 'Dexterity' or 'dexterity'"),
+        dc: z.number().int().min(1).max(30),
+        half: z.boolean().default(true).describe('A save halves the damage (false: a save takes none)')
+    }).optional().describe('Each target saves on its own die')
 });
 
 /** A dice notation ('1d4', '2d6+1') or a plain number for a buff's damage bonus. */
@@ -1521,6 +1540,15 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         aliases: ['ability', 'breath_weapon', 'recharge_ability'],
         description: "Use a limited ability (a breath weapon): spends the action, marks a recharge ability spent, and resolves damage and a save per target on the fight's dice"
     },
+    apply_damage: {
+        schema: ApplyDamageSchema,
+        handler: async (params: z.infer<typeof ApplyDamageSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            return applyDamage(params, ctx);
+        },
+        aliases: ['damage', 'deal_damage', 'environment_damage', 'hazard'],
+        description: "Damage with no actor (a hazard, a trap, a bite rolled off-turn): rolls once on logged dice, each target saves, resistances and concentration apply, units owe break tests. Never touches the action economy. Works in an encounter or on character sheets with none"
+    },
     battle_cry: {
         schema: BattleCrySchema,
         handler: async (params: z.infer<typeof BattleCrySchema>, ctx?: SessionContext) => {
@@ -1797,6 +1825,144 @@ function extractResultData(result: McpResponse, actionType: string): Record<stri
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// APPLY_DAMAGE — the no-actor damage lane
+// ═══════════════════════════════════════════════════════════════════════════
+
+type ApplyDamageParams = z.infer<typeof ApplyDamageSchema>;
+
+/**
+ * Play report: there was no damage lane without an actor. In a fight the
+ * roll, saves, resistances, concentration and break tests go through
+ * resolveAreaSave on the encounter's stream (lair_action and use_ability
+ * share it); with no fight, sheets take it on logged dice. Refusals write
+ * nothing.
+ */
+async function applyDamage(params: ApplyDamageParams, ctx: SessionContext): Promise<Record<string, unknown>> {
+    const refuse = (message: string) => ({ error: true, actionType: 'apply_damage', message: `${message} Nothing was written.`, writes: 'none' });
+    if (params.save && !toLongAbility(params.save.ability)) return refuse(`Unknown save ability '${params.save.ability}'.`);
+    if (typeof params.dice === 'string') {
+        try { parseDiceTerms(params.dice); } catch { return refuse(`Invalid dice '${params.dice}': use notation like '6d10', '2d6+3' or '6d10+3d10', or a number.`); }
+    }
+    const db = getDb();
+    let encounterId = params.encounterId;
+    let routed = false;
+    if (!encounterId) {
+        // A character with a live token takes it through that fight.
+        const homes = new Map<string, string>();
+        for (const id of params.targetIds) {
+            const enc = liveEncounterFor(db, id);
+            if (enc) homes.set(id, enc);
+        }
+        const encs = [...new Set(homes.values())];
+        if (encs.length > 1 || (encs.length === 1 && homes.size !== params.targetIds.length)) {
+            const where = params.targetIds.map(id => `${id}: ${homes.get(id) ?? 'no fight'}`).join(', ');
+            return refuse(`These targets are not all in one place (${where}). Call apply_damage once per encounter, and once for the targets outside any fight.`);
+        }
+        if (encs.length === 1) { encounterId = encs[0]; routed = true; }
+    }
+    return encounterId ? applyDamageInEncounter(params, ctx, encounterId, routed, refuse) : applyDamageToSheets(params, refuse);
+}
+
+/** The active encounter holding a token with this exact id, if any. */
+function liveEncounterFor(db: ReturnType<typeof getDb>, id: string): string | undefined {
+    try {
+        const rows = db.prepare("SELECT id, tokens FROM encounters WHERE status = 'active' AND tokens LIKE ?").all(`%"${id}"%`) as Array<{ id: string; tokens: string }>;
+        return rows.find(r => (JSON.parse(r.tokens) as Array<{ id: string }>).some(t => t.id === id))?.id;
+    } catch { return undefined; }
+}
+
+function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionContext, encounterId: string, routed: boolean, refuse: (m: string) => Record<string, unknown>): Record<string, unknown> {
+    const engine = getOrLoadEngine(ctx, encounterId);
+    const state = engine?.getState();
+    if (!engine || !state) return refuse(`Encounter ${encounterId} not found (memory or DB).`);
+    // Read character_manage HP changes before this writes HP back.
+    syncParticipantHpFromDb(state);
+    const missing = params.targetIds.filter(id => !state.participants.some(p => p.id === id));
+    if (missing.length) return refuse(`Not in encounter ${encounterId}: ${missing.join(', ')}.`);
+    const area = resolveAreaSave(engine, {
+        targetIds: params.targetIds, damage: params.dice, damageType: params.damageType,
+        savingThrow: params.save ? { ability: params.save.ability, dc: params.save.dc } : undefined,
+        halfDamageOnSave: params.save?.half ?? true,
+        damagePurpose: `damage: ${params.source}`
+    }, params.source);
+    saveEncounterState(new EncounterRepository(getDb()), encounterId, state);
+    const hpChanges: Record<string, { before: number; after: number }> = {};
+    for (const t of area.targets) if (t.hpBefore !== undefined && t.hpAfter !== undefined) hpChanges[t.targetId] = { before: t.hpBefore, after: t.hpAfter };
+    const summary = `${params.source}: ${area.targets.map(t => `${t.targetName} ${t.saved ? 'saved, ' : ''}${t.damageTaken}${params.damageType ? ` ${params.damageType}` : ''}`).join(', ')}`;
+    getDomainServices().combatActionLog.log({
+        encounterId, round: state.round, turnIndex: state.currentTurnIndex,
+        actorId: 'environment', actorName: params.source, actionType: 'apply_damage',
+        targetIds: params.targetIds, resultSummary: summary,
+        damageDealt: area.targets.reduce((a, t) => a + t.damageTaken, 0), hpChanges
+    });
+    let message = `💥 ${params.source}${typeof params.dice === 'string' ? ` (${params.dice}: ${area.damageRolled})` : ` (${area.damageRolled})`}`;
+    if (area.lines.length) message += '\n' + area.lines.join('\n');
+    return {
+        success: true, actionType: 'apply_damage', encounterId, ...(routed ? { routedToEncounter: true } : {}),
+        source: params.source, damageRolled: area.damageRolled,
+        ...(area.damageRolls ? { damageRolls: area.damageRolls } : {}),
+        ...(params.damageType ? { damageType: params.damageType } : {}),
+        targets: area.targets,
+        ...(area.breakTests.length ? { breakTests: area.breakTests } : {}),
+        message
+    };
+}
+
+function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string) => Record<string, unknown>): Record<string, unknown> {
+    const db = getDb();
+    const charRepo = new CharacterRepository(db);
+    const rows = params.targetIds.map(id => ({ id, row: charRepo.findById(id) }));
+    const missing = rows.filter(r => !r.row || r.row.id !== r.id).map(r => r.id);
+    if (missing.length) return refuse(`No character ${missing.join(', ')} (without encounterId, targets are character ids).`);
+    let damageRolled: number; let damageRolls: number[] | undefined;
+    if (typeof params.dice === 'string') {
+        const r = loggedRoll(db, { purpose: `damage: ${params.source}` }, params.dice, { tool: 'combat_manage' });
+        damageRolled = Math.max(0, r.total); damageRolls = r.rolls;
+    } else damageRolled = params.dice;
+    const concentrationRepo = new ConcentrationRepository(db);
+    const lines: string[] = [];
+    const targets = rows.map(({ id, row }) => {
+        const sheet = row!;
+        let damageTaken = damageRolled;
+        let save: ReturnType<typeof rollCharacterSave> | undefined;
+        if (params.save) {
+            save = rollCharacterSave(db, sheet, params.save.ability, params.save.dc, { purpose: `${params.source} save (${toLongAbility(params.save.ability)})`, tool: 'combat_manage' });
+            if (save.saved) damageTaken = (params.save.half ?? true) ? Math.floor(damageTaken / 2) : 0;
+        }
+        const mod = damageWithModifiers(damageTaken, params.damageType, sheet as DamageDefences);
+        damageTaken = mod.finalDamage;
+        const hpBefore = sheet.hp;
+        const hpAfter = Math.max(0, hpBefore - damageTaken);
+        if (hpAfter !== hpBefore) charRepo.update(id, { hp: hpAfter });
+        const defeated = hpAfter <= 0;
+        const concentration = damageTaken > 0
+            ? concentrationAfterDamage(id, damageTaken, defeated && hpBefore > 0, () => loggedD20(db, { purpose: 'concentration', forId: id }, { tool: 'combat_manage' }).natural, concentrationRepo, charRepo)
+            : undefined;
+        let line = `🎯 ${sheet.name}`;
+        if (save && params.save) line += ` - ${save.ability} save: ${save.natural} + ${save.modifier} = ${save.total} vs DC ${params.save.dc} ${save.saved ? '✓ SAVED' : '✗ FAILED'}`;
+        line += `\n   Damage: ${damageTaken}${params.damageType ? ` ${params.damageType}` : ''}${mod.modifier !== 'normal' ? ` (${mod.modifier})` : ''}`;
+        line += `\n   HP: ${hpAfter}/${sheet.maxHp}${defeated ? ' 💀 DOWN' : ''}`;
+        if (concentration) line += `\n   Concentration on ${concentration.spell}: ${concentration.reason === 'death' ? 'ends at 0 HP' : `CON save ${concentration.saveTotal} vs DC ${concentration.saveDC} ${concentration.broken ? '✗ BROKEN' : '✓ held'}`}`;
+        lines.push(line);
+        return {
+            targetId: id, targetName: sheet.name,
+            ...(save ? { saveRoll: save.natural, saveTotal: save.total } : {}),
+            saved: !!save?.saved, damageTaken, hpBefore, hpAfter, defeated,
+            ...(mod.modifier !== 'normal' ? { damageModifier: mod.modifier } : {}),
+            ...(concentration ? { concentration } : {})
+        };
+    });
+    let message = `💥 ${params.source}${typeof params.dice === 'string' ? ` (${params.dice}: ${damageRolled})` : ` (${damageRolled})`} — no encounter, written to the sheet${targets.length === 1 ? '' : 's'}`;
+    if (lines.length) message += '\n' + lines.join('\n');
+    return {
+        success: true, actionType: 'apply_damage', source: params.source, damageRolled,
+        ...(damageRolls ? { damageRolls } : {}),
+        ...(params.damageType ? { damageType: params.damageType } : {}),
+        targets, message
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ROUTER & TOOL DEFINITION
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1825,6 +1991,7 @@ Aliases: start/begin→create, state/status→get, finish/stop→end, restore/re
    legendary_action {participantId, cost?, description} - a non-attack legendary action off its turn (attacks: combat_action attack with legendaryCost)
    legendary_resistance {participantId, reason} - turn a failed save into a success
    use_ability {participantId, ability, targetIds?, damage?: number | dice, damageType?, savingThrow?: {ability, dc}} - a limited ability (breath weapon): spends the action, marks a recharge ability spent (it rolls a d6 at the start of its turn), saves per target
+   apply_damage {encounterId?, targetIds, dice: number | dice, source, damageType?, save?: {ability, dc, half?}} - damage with no actor (a hazard, a trap, an off-turn bite): one logged roll, a save per target, resistances, concentration and break tests; no action spent. Without encounterId it writes to the sheets
    battle_cry {participantId, name?: 'Waaagh!', range?: 60, match?: {species?, band?, tag?, nameIncludes?}, rounds?: 1, attackAdvantage?, damageBonus?: number | dice, speedBonus?, moraleBonus?, ability?, actionCost?} - buffs the caller and matching allies in range until the start of the caller's next turn; actionCost action|bonus only on the caller's turn, none (default) is free and may be called out of turn
    budget {partyLevels | partyId, creatures: [{creature | cr | xp, count?}] | encounterId} - read-only 5e XP budget: TRIVIAL/EASY/MEDIUM/HARD/DEADLY
 6. end - Finish combat
@@ -1907,7 +2074,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         confirmBury: z.boolean().optional().describe('FINDINGS #102 (mirror): override the cold-boot guard — required to bury when nothing is in process memory'),
         worldId: z.string().optional().describe('FINDINGS #105 (mirror): create — stamp the encounter to a world (else derived from first claimed participant); list — STRICT world filter, scopes the ghost sweep'),
         actionDescription: z.string().optional().describe('Lair action description'),
-        targetIds: z.array(z.string()).optional().describe('lair_action / use_ability: target IDs'),
+        targetIds: z.array(z.string()).optional().describe('lair_action / use_ability / apply_damage: target IDs'),
         damage: z.union([z.number(), z.string()]).optional().describe("lair_action / use_ability: damage, a number or dice ('8d6') rolled once for every target"),
         ability: z.string().optional().describe("use_ability: the ability's name on the token ('Fire Breath'); battle_cry: an ability it spends ('Waaagh!')"),
         range: z.number().optional().describe('battle_cry: feet from the caller (default 60)'),
@@ -1923,9 +2090,16 @@ For CORPSES after combat, use corpse_manage tool.`,
         tags: z.array(z.string()).optional().describe('add_participant: free tags nearby matches read'),
         partyLevels: z.array(z.number()).optional().describe('budget: character levels, one per member'),
         creatures: z.array(z.any()).optional().describe('budget: monsters to rate [{creature | cr | xp, count?}]'),
-        damageType: z.string().optional().describe('Damage type'),
+        damageType: z.string().optional().describe('Damage type (lair_action / use_ability / apply_damage)'),
         savingThrow: z.any().optional().describe('lair_action / use_ability: {ability, dc}'),
         halfDamageOnSave: z.boolean().optional().describe('Half damage on save'),
+        dice: z.union([z.number(), z.string()]).optional().describe("apply_damage: dice ('6d10') rolled once for every target, or a number"),
+        source: z.string().optional().describe("apply_damage: what deals it; logged as 'damage: <source>'"),
+        save: z.object({
+            ability: z.string(),
+            dc: z.number(),
+            half: z.boolean().optional()
+        }).optional().describe('apply_damage: {ability, dc, half? (default true)} each target saves'),
         // spawn_quick_enemy fields
         creature: z.string().optional().describe('spawn_quick_enemy / add_participant: a world bestiary creature (table_rules kind creature) or built-in template ("goblin", "orc:warrior")'),
         count: z.number().optional().describe('spawn_quick_enemy / add_participant creature: how many (1-10)'),

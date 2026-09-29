@@ -258,3 +258,33 @@ export function checkAutomaticConcentrationBreak(
 
     return null;
 }
+
+/**
+ * Concentration after damage, one rule for every damage lane: a
+ * concentrating character that took damage rolls the CON save on the die it
+ * is given (the encounter stream, or a logged d20 outside one) and loses the
+ * spell on a failure; dropping to 0 HP loses it outright. Returns undefined
+ * when the character was not concentrating.
+ */
+export function concentrationAfterDamage(
+    characterId: string,
+    damage: number,
+    defeated: boolean,
+    d20: () => number,
+    concentrationRepo: ConcentrationRepository,
+    characterRepo: CharacterRepository,
+    extraSaveBonus = 0
+): { spell: string; broken: boolean; reason: 'damage' | 'failed_save' | 'death'; saveRoll?: number; saveTotal?: number; saveDC?: number } | undefined {
+    if (!concentrationRepo.isConcentrating(characterId)) return undefined;
+    const character = characterRepo.findById(characterId);
+    if (!character) return undefined;
+    const spell = concentrationRepo.findByCharacterId(characterId)?.activeSpell ?? 'unknown';
+    if (defeated) {
+        breakConcentration({ characterId, reason: 'death' }, concentrationRepo, characterRepo);
+        return { spell, broken: true, reason: 'death' };
+    }
+    if (damage <= 0) return undefined;
+    const check = checkConcentration(character, damage, concentrationRepo, extraSaveBonus, d20);
+    if (check.broken) breakConcentration({ characterId, reason: 'damage', damageAmount: damage }, concentrationRepo, characterRepo);
+    return { spell, broken: check.broken, reason: check.broken ? 'failed_save' : 'damage', saveRoll: check.saveRoll, saveTotal: check.saveTotal, saveDC: check.saveDC };
+}

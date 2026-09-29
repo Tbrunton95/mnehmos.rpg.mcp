@@ -105,6 +105,7 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Squad fires / is suppressed | `combat_action volley`; `combat_manage set_unit` |
 | Cut through a packed lower-band squad | add `cleave: true` |
 | Enemy telegraphs | `combat_manage set_intent`; readied actions then `trigger_readied` |
+| Damage with no attacker (hazard, trap, an off-turn bite) | `combat_manage apply_damage {encounterId?, targetIds, dice: '6d10', source, damageType?, save?: {ability, dc}}`; no action spent; without encounterId it writes to the sheets |
 | HP is wrong | `combat_manage adjust_hp {value \| delta, reason}` |
 | Conditions mid-fight | `combat_manage add_condition {condition \| name}` / `remove_condition {condition \| name \| conditionId}`; standard conditions set adv/dis/auto-crit themselves (`ranged`, `ignoreConditions` on attacks) |
 | Just the condition names | `character_manage get {characterId, fields: ['conditionNames']}` (or `fields: ['conditions.name', 'conditions.pinned']`) |

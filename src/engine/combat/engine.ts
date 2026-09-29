@@ -1,4 +1,5 @@
 import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile, Buff } from '../../schema/token-extras.js';
+import { damageWithModifiers } from './damage-modifiers.js';
 import { findPart as findNamedPart, matchProfile } from './parts.js';
 import { CombatRNG, CheckResult } from './rng.js';
 import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS, conditionAttackModifiers, conditionSpeedFactor } from './conditions.js';
@@ -695,28 +696,7 @@ export class CombatEngine {
         damageType: string | undefined,
         target: CombatParticipant
     ): { finalDamage: number; modifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' } {
-        if (!damageType) {
-            return { finalDamage: baseDamage, modifier: 'normal' };
-        }
-
-        const typeLC = damageType.toLowerCase();
-
-        // Check immunity first (takes precedence)
-        if (target.immunities?.some(i => i.toLowerCase() === typeLC)) {
-            return { finalDamage: 0, modifier: 'immune' };
-        }
-
-        // Check resistance
-        if (target.resistances?.some(r => r.toLowerCase() === typeLC)) {
-            return { finalDamage: Math.floor(baseDamage / 2), modifier: 'resistant' };
-        }
-
-        // Check vulnerability
-        if (target.vulnerabilities?.some(v => v.toLowerCase() === typeLC)) {
-            return { finalDamage: baseDamage * 2, modifier: 'vulnerable' };
-        }
-
-        return { finalDamage: baseDamage, modifier: 'normal' };
+        return damageWithModifiers(baseDamage, damageType, target);
     }
 
     /**
