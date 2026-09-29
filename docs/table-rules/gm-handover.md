@@ -119,6 +119,7 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Souls owed to a god | `ledger_manage create {worldId, debtor, creditor, amount, currency: 'souls', dueDay, consequence}` |
 | Time passes | `world_manage advance {worldId, hours}` (or `minutes`, `days`); set the clock once with `world_manage update {worldId, environment: {day, time}}` |
 | Clocks and debts the clock reached | `character_manage process_scheduled {worldId}`, `ledger_manage process_due {worldId}` (no day needed) |
+| Untagged scheduled rows (`unscopedOwnerUnknown`) | `character_manage scope_scheduled {worldId: <its own world>, scheduleIds: [...], preview?}`; another world's rows are refused by name |
 | The clock is wrong (not time passing) | `world_manage update {worldId, correction: true, environment: {day, time}}`; boot's CLOCK warning and `world_manage audit {worldId}` name records dated after the clock |
 | Did a timed-out call apply? | `session_manage op_status {forOpId}` |
 | Check a past roll | `session_manage rolls {forId \| encounterId \| forOpId}` |
