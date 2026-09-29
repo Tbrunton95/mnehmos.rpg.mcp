@@ -124,4 +124,5 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Untagged scheduled rows (`unscopedOwnerUnknown`) | `character_manage scope_scheduled {worldId: <its own world>, scheduleIds: [...], preview?}`; another world's rows are refused by name |
 | The clock is wrong (not time passing) | `world_manage update {worldId, correction: true, environment: {day, time}}`; boot's CLOCK warning and `world_manage audit {worldId}` name records dated after the clock |
 | Did a timed-out call apply? | `session_manage op_status {forOpId}` |
+| A free roll with several dice terms | `math_manage roll {expression: '6d10+3d10', purpose, forId?}` (logged, every die listed) |
 | Check a past roll | `session_manage rolls {forId \| encounterId \| forOpId}` |

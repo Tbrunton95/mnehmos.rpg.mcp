@@ -674,11 +674,14 @@ async function handleRoll(args: z.infer<typeof RollSchema>, sessionId?: string):
 
     repo.create(calculation);
     logCalculationEvent(db, calculation.id, 'dice_roll', sessionId);
-    const diceRolled = ((result.metadata as { rolls?: number[] } | undefined)?.rolls ?? []);
+    const meta = result.metadata as { rolls?: number[]; dice?: Array<{ sides: number; value: number }> } | undefined;
+    const diceRolled = meta?.rolls ?? [];
     const sides = Number(args.expression.match(/d(\d+)/)?.[1] ?? 0);
+    // A multi-term roll ('6d10+3d10') carries each die's own sides.
+    const loggedDice = meta?.dice ? meta.dice.map(d => ({ sides: d.sides, value: d.value })) : diceRolled.map(value => ({ sides, value }));
     const rollId = logRoll(db, {
         purpose: args.purpose ?? 'roll', forId: args.forId, expression: args.expression,
-        dice: diceRolled.map(value => ({ sides, value })), result: Number(result.result), replay: calculation.seed ?? null
+        dice: loggedDice, result: Number(result.result), replay: calculation.seed ?? null
     });
 
     return {
