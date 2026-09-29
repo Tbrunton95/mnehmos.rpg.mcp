@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { Inventory, InventoryItem, InventorySchema } from '../../schema/inventory.js';
+import { carryMultiplier } from '../../schema/encounter.js';
 
 export class InventoryRepository {
     constructor(private db: Database.Database) { }
@@ -173,14 +174,20 @@ export class InventoryRepository {
         };
     }
 
-    /** D&D 5e carrying capacity: Strength score multiplied by 15 pounds. */
+    /**
+     * D&D 5e carrying capacity: Strength score x 15 pounds, scaled by size
+     * (x2 per size above Medium, x1/2 for Tiny). The size is the sheet's, in
+     * combat_profile (forms and species set it); unset reads as Medium.
+     */
     private getCapacity(characterId: string): number {
-        const row = this.db.prepare('SELECT stats FROM characters WHERE id = ?').get(characterId) as { stats: string } | undefined;
+        const row = this.db.prepare('SELECT stats, combat_profile FROM characters WHERE id = ?').get(characterId) as { stats: string; combat_profile?: string | null } | undefined;
         if (!row?.stats) return 0;
 
+        let size: string | undefined;
+        try { size = (JSON.parse(row.combat_profile || '{}') as { size?: string }).size; } catch { /* no profile: medium */ }
         try {
             const stats = JSON.parse(row.stats) as { str?: number };
-            return Math.max(0, Math.trunc(stats.str ?? 0) * 15);
+            return Math.max(0, Math.trunc(Math.trunc(stats.str ?? 0) * 15 * carryMultiplier(size)));
         } catch {
             return 0;
         }

@@ -21,7 +21,7 @@ describe('size module', () => {
         expect(sizeRank('large')).toBeGreaterThan(sizeRank('medium'));
         expect(sizeRank(undefined)).toBe(sizeRank('medium'));
         expect(sizeRank('LARGE')).toBe(sizeRank('large'));
-        expect(SIZE_TABLE.huge).toEqual({ squares: 3, reachFt: 10 });
+        expect(SIZE_TABLE.huge).toEqual({ squares: 3, reachFt: 10, carryMult: 4 });
         expect(SIZE_TABLE.large.squares).toBe(2);
     });
 
