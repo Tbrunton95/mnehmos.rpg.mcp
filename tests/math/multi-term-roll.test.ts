@@ -43,10 +43,11 @@ describe('DiceEngine multi-term', () => {
 });
 
 describe("math_manage roll '6d10+3d10'", () => {
-    it('is seeded, logs all nine dice, and replays from its seed', async () => {
-        const r = json(await math({ action: 'roll', expression: '6d10+3d10', purpose: 'volley' }));
+    it('logs all nine dice and, when seeded, replays from its seed', async () => {
+        const r = json(await math({ action: 'roll', expression: '6d10+3d10', purpose: 'volley', seed: 'volley-1' }));
         expect(r.success).toBe(true);
-        expect(r.seed).toBeTruthy();
+        expect(r.seed).toBe('volley-1');
+        expect(r.dice).toBe('seeded:volley-1');
         const logged = queryRolls(getDb(), { limit: 5 }).find((x: any) => x.purpose === 'volley') as any;
         expect(logged.dice).toHaveLength(9);
         expect(logged.dice.every((d: any) => d.sides === 10)).toBe(true);

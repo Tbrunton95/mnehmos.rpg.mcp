@@ -13,7 +13,7 @@ import { listRules, findPool, type RuleSpec, type TableRule } from '../engine/ta
 import { rollTable, type TableRoll, type RollTableEntry } from '../engine/roll-table.js';
 import { loggedRoller, type DiceRoller } from '../math/logged-d20.js';
 import { applyScheduledOps, type ScheduledWriteOp } from '../engine/scheduled-ops.js';
-import { growthFromPools, type GrowthReady } from './growth.js';
+import { applyGrowthFromPools, type GrowthReady, type GrowthApplied } from './growth.js';
 import type { HpMode } from '../engine/forms.js';
 import { CharacterRepository } from '../storage/repos/character.repo.js';
 import { CustomEffectsRepository } from '../storage/repos/custom-effects.repo.js';
@@ -62,6 +62,8 @@ export interface AppliedEntry {
     errors?: string[];
     /** Growth tracks the writes crossed: offered, never applied. */
     growthReady?: GrowthReady[];
+    /** Auto growth steps the writes crossed: applied. */
+    growthApplied?: GrowthApplied[];
 }
 
 interface ChainedRoll { table: string; depth: number; rolled: Omit<TableRoll, 'entry' | 'index' | 'rollId' | 'seed'>; entry: TableRoll['entry'] & { index: number }; rollId?: string }
@@ -76,7 +78,7 @@ function findTable(db: Database.Database, worldId: string, name: string): TableR
 }
 
 /** Apply one entry to the character. */
-async function applyEntry(db: Database.Database, worldId: string, characterId: string, table: string, index: number, entry: RollTableEntry): Promise<AppliedEntry | undefined> {
+async function applyEntry(db: Database.Database, worldId: string, characterId: string, table: string, index: number, entry: RollTableEntry, growthDepth: number, roller?: DiceRoller): Promise<AppliedEntry | undefined> {
     const spec = (entry as { apply?: EntryApply }).apply;
     if (!spec) return undefined;
     const repo = new CharacterRepository(db);
@@ -115,16 +117,18 @@ async function applyEntry(db: Database.Database, worldId: string, characterId: s
                 ...(spec.writes ?? [])
             ];
             const { applied, updates } = applyScheduledOps(char, ops, { defaultSource: source, reason: `${source}: ${entry.text}` });
-            if (updates.resourcePools) {
-                const ready = growthFromPools(db, worldId, char as never, char.resourcePools as never, updates.resourcePools as never);
-                if (ready.length) out.growthReady = ready;
-            }
             if (spec.condition?.pinned && Array.isArray(updates.conditions)) {
                 updates.conditions = (updates.conditions as Array<{ name: string; pinned?: boolean }>).map(c => c.name === spec.condition!.name ? { ...c, pinned: true } : c);
             }
             if (Object.keys(updates).length) repo.update(characterId, updates as never);
             if (spec.condition) out.condition = spec.condition.name;
             out.writes = applied;
+            if (updates.resourcePools) {
+                // Written first, so an auto growth step reads the new pool.
+                const g = await applyGrowthFromPools(db, worldId, characterId, char.resourcePools as never, updates.resourcePools as never, { depth: growthDepth, ...(roller ? { roller } : {}) });
+                if (g.readyAll?.length) out.growthReady = g.readyAll;
+                if (g.growthApplied?.length) out.growthApplied = g.growthApplied;
+            }
         }
     }
 
@@ -184,7 +188,7 @@ export async function rollAndApply(db: Database.Database, input: RollAndApplyInp
     let dead = false;
     const apply = async (table: string, r: TableRoll) => {
         if (!applying) return;
-        const a = await applyEntry(db, input.worldId, char!.id, table, r.index, r.entry);
+        const a = await applyEntry(db, input.worldId, char!.id, table, r.index, r.entry, (input.depth ?? 0) + 1, roller);
         if (!a) return;
         applied.push(a);
         if (a.errors) notes.push(...a.errors.map(e => `${table}: ${e}`));
@@ -219,6 +223,7 @@ export async function rollAndApply(db: Database.Database, input: RollAndApplyInp
         chained, text, rollId: first.rollId, seed: first.seed,
         ...(applying ? { applied } : {}),
         ...(applied.some(a => a.growthReady?.length) ? { growthReady: applied.flatMap(a => a.growthReady ?? []) } : {}),
+        ...(applied.some(a => a.growthApplied?.length) ? { growthApplied: applied.flatMap(a => a.growthApplied ?? []) } : {}),
         ...(char && !input.apply ? { preview: true } : {}),
         ...(notes.length ? { note: notes.join('; ') } : {}),
         message: `${rule.name}: ${first.dice}${first.modifier ? ` ${first.modifier >= 0 ? '+' : '-'} ${Math.abs(first.modifier)}` : ''} = ${first.total}${first.clamped ? ' (clamped)' : ''} → ${text}${appliedLine}${char && !input.apply ? ' (preview: nothing applied)' : ''}`

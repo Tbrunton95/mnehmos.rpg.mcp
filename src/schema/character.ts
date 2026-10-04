@@ -1,4 +1,4 @@
-import { PartSchema, SizeCategorySchema, AttackProfileSchema, AbilitySchema } from './token-extras.js';
+import { PartSchema, SizeCategorySchema, AttackProfileSchema, AbilitySchema, VesselProfileSchema } from './token-extras.js';
 import { z } from 'zod';
 import { CharacterTypeSchema } from './party.js';
 import {
@@ -61,6 +61,7 @@ export function resourcePoolSchema() {
         note: z.string().optional().describe('What the counter is, or to whom it is owed'),
         show: z.boolean().optional().describe('Show it in the boot digest and the status block'),
         itemInstanceId: z.string().optional().describe('Linked item instance: the pool is authoritative and its charges mirror the pool'),
+        growthApplied: z.array(z.string()).optional().describe("growth_track auto steps this pool already fired ('<track>@<at>'); a rung fires once"),
         history: z.array(z.object({
             at: z.string().optional(),
             from: z.number().optional(),
@@ -112,11 +113,18 @@ export const CharacterSchema = z.object({
     // legendary resistance). Stored together in the combat_profile column.
     size: SizeCategorySchema.optional(),
     reach: z.number().int().min(0).optional(),
+    /** Walking speed in feet (the token's movementSpeed); species rules set it at create. */
+    speed: z.number().int().min(0).optional(),
+    /** Swim speed in feet: the movement budget underwater (else half speed). */
+    swimSpeed: z.number().int().min(0).optional(),
+    flySpeed: z.number().int().min(0).optional(),
     attacksPerAction: z.number().int().min(1).optional(),
     attacks: z.array(AttackProfileSchema).optional(),
     abilities: z.array(AbilitySchema).optional(),
     cr: z.number().min(0).optional(),
     autoLegendaryResistance: z.boolean().optional(),
+    /** Request 5: the row is a vessel (character_manage create_vessel); tokens made from it run the void-combat lane. */
+    vessel: VesselProfileSchema.optional(),
     /** The form a character has taken (character_manage set_form): its name and the sheet's own values to go back to. */
     form: z.object({
         name: z.string(),

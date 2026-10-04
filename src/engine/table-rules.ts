@@ -61,11 +61,27 @@ const abilityBonusesSchema = () => z.preprocess(
     z.object({ str: z.number().int(), dex: z.number().int(), con: z.number().int(), int: z.number().int(), wis: z.number().int(), cha: z.number().int() }).partial().strict()
 );
 
+/** What a vessel section does; the engine reads crippled/dead sections by role. */
+export const VESSEL_SECTION_ROLES = ['drive', 'guns', 'bridge', 'reactor', 'hangar', 'other'] as const;
+export type VesselSectionRole = typeof VESSEL_SECTION_ROLES[number];
+
 export const DEFAULT_BAND_ORDER = ['Mortal', 'Elite Mortal', 'Astartes', 'Astartes Elite', 'Monster/Lord', 'Primarch-class'];
 
 export const RuleSpecSchemas = {
     band: z.object({
-        order: z.array(z.string().min(1)).min(2).default(DEFAULT_BAND_ORDER)
+        order: z.array(z.string().min(1)).min(2).default(DEFAULT_BAND_ORDER),
+        /**
+         * Request 11: damage scales with the band gap. Absent, damage is
+         * untouched. steps = attacker's index - target's index; the multiplier
+         * is perStepAbove^steps above, perStepBelow^-steps below, clamped to
+         * [floor, cap]; damage = max(1, floor(damage × multiplier)).
+         */
+        damageScale: z.object({
+            perStepBelow: z.number().gt(0).default(0.5),
+            perStepAbove: z.number().gt(0).default(1.25),
+            floor: z.number().gt(0).default(0.25),
+            cap: z.number().gt(0).default(2)
+        }).passthrough().optional()
     }).passthrough(),
     peer_consequence: z.object({
         thresholdFraction: z.number().gt(0).max(1).default(0.25),
@@ -166,6 +182,42 @@ export const RuleSpecSchemas = {
         parts: z.array(PartSchema).optional(),
         unit: UnitSchema.optional(),
         xpValue: z.number().min(0).optional(),
+        traits: z.array(z.string()).default([])
+    }).passthrough(),
+    /**
+     * Request 5: a void-combat vessel (a ship, a station, a war engine).
+     * character_manage create_vessel makes a character row from it: hull
+     * becomes HP, sections become `system` parts carrying a role, weapons
+     * become attack profiles tied to their section, shields a resource pool
+     * the engine drains before the hull. Data; the engine reads the row.
+     */
+    vessel: z.object({
+        displayName: z.string().optional().describe('Row name when it differs from the rule name'),
+        hull: z.number().int().positive().describe('Hull points (the row\'s HP)'),
+        ac: z.number().int().min(0),
+        shields: z.object({
+            max: z.number().int().min(0),
+            regenPerRound: z.number().int().min(0).default(0)
+        }).passthrough().optional(),
+        sections: z.array(z.object({
+            name: z.string().min(1),
+            hp: z.number().int().min(1),
+            ac: z.number().int().min(0).optional(),
+            breakAt: z.number().int().min(1).optional(),
+            role: z.enum(VESSEL_SECTION_ROLES).default('other')
+        }).passthrough()).min(1),
+        weapons: z.array(z.object({
+            name: z.string().min(1),
+            attackBonus: z.number().int(),
+            damage: z.union([z.string(), z.number()]),
+            damageType: z.string().optional(),
+            range: z.number().min(0).optional().describe('Feet; a weapon with a range fires as a ranged attack'),
+            section: z.string().optional().describe('The section (part) that mounts it: its state applies to the shot')
+        }).passthrough()).default([]),
+        speed: z.number().int().min(0).optional(),
+        band: z.string().optional(),
+        crew: z.number().int().min(0).optional(),
+        size: z.string().optional().describe("gargantuan | colossal | any label; the row stores the nearest size category and keeps the label"),
         traits: z.array(z.string()).default([])
     }).passthrough(),
     /**
@@ -271,6 +323,8 @@ export const RuleSpecSchemas = {
     species: z.object({
         size: ParticipantExtrasShape.size,
         speed: z.number().int().min(0).optional(),
+        swimSpeed: ParticipantExtrasShape.swimSpeed,
+        flySpeed: ParticipantExtrasShape.flySpeed,
         abilityBonuses: abilityBonusesSchema().optional(),
         languages: z.array(z.string()).default([]),
         traits: z.array(z.string()).default([]),
@@ -298,15 +352,34 @@ export const RuleSpecSchemas = {
     }).passthrough(),
     /**
      * A growth track: kills and victories feed a pool; crossing a step
-     * offers that step's form (growthReady) and never applies it.
+     * offers that step's form (growthReady) and never applies it, unless the
+     * step is auto: then the step's condition, table and form apply on the
+     * crossing (growthApplied), once per character and step, so a track
+     * doubles as an addiction ladder.
      */
     growth_track: z.object({
         pool: z.string().min(1),
         steps: z.array(z.object({
             at: z.number(),
-            form: z.string().min(1),
+            /** The form offered (or, with auto, taken) at this step. */
+            form: z.string().min(1).optional(),
+            /** A condition the step puts on the sheet (auto), or names in the offer. */
+            condition: z.object({
+                name: z.string().min(1),
+                /** What it does, for the GM and the offer text. */
+                effect: z.string().optional(),
+                duration: z.number().int().optional()
+            }).passthrough().optional(),
+            /** A roll_table rule rolled for the character when the step fires (auto). */
+            table: z.string().min(1).optional(),
+            /** Apply the step on the crossing instead of offering it (default false). */
+            auto: z.boolean().default(false),
             note: z.string().optional()
-        }).passthrough()).min(1),
+        }).passthrough().superRefine((s, ctx) => {
+            if (!s.form && !s.condition && !s.table) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'a step needs form, condition or table' });
+        })).min(1),
+        /** Which way a crossing counts: up (default, the pool reaching at), down (dropping below at), or both. */
+        direction: z.enum(['up', 'down', 'both']).default('up'),
         /** Added to the killer's pool for each kill in combat. */
         perKill: z.number().optional(),
         /** Added per band step the victim stands at or above the killer (same band: once). */
@@ -346,8 +419,9 @@ function refineRollTable(
  * listing them as enforced. Some kinds here arrive in later releases.
  */
 export const DATA_KINDS: ReadonlySet<string> = new Set([
-    'creature', 'roll_table', 'pool_family', 'spell', 'skill', 'species', 'char_class', 'background', 'growth_track'
+    'creature', 'roll_table', 'pool_family', 'spell', 'skill', 'species', 'char_class', 'background', 'growth_track', 'vessel'
 ]);
+export type VesselSpec = z.infer<typeof RuleSpecSchemas.vessel>;
 
 export type RuleKind = keyof typeof RuleSpecSchemas;
 export const RULE_KINDS = Object.keys(RuleSpecSchemas) as RuleKind[];
@@ -483,6 +557,37 @@ export function compareBands(order: string[], a: string | undefined | null, b: s
     return ia === ib ? 0 : ia < ib ? -1 : 1;
 }
 
+export interface BandDamageScale { steps: number; multiplier: number }
+
+/**
+ * Request 11: the damage multiplier a band gap carries under a band rule's
+ * damageScale. null when the rule has no damageScale, either band is unset
+ * or unknown to the order, or the bands are level (nothing to report).
+ */
+export function bandDamageMultiplier(
+    rule: RuleSpec<'band'> | TableRule<'band'> | undefined | null,
+    attackerBand: string | undefined | null,
+    targetBand: string | undefined | null
+): BandDamageScale | null {
+    const spec: RuleSpec<'band'> | undefined | null = rule && 'spec' in (rule as object) ? (rule as TableRule<'band'>).spec : rule as RuleSpec<'band'> | undefined | null;
+    const scale = spec?.damageScale;
+    if (!spec || !scale || !attackerBand || !targetBand) return null;
+    const idx = (x: string) => spec.order.findIndex((o: string) => o.toLowerCase() === x.trim().toLowerCase());
+    const ia = idx(attackerBand), ib = idx(targetBand);
+    if (ia < 0 || ib < 0) return null;
+    const steps = ia - ib;
+    if (steps === 0) return null;
+    const raw = steps > 0 ? Math.pow(scale.perStepAbove, steps) : Math.pow(scale.perStepBelow, -steps);
+    const multiplier = Math.min(scale.cap, Math.max(scale.floor, raw));
+    return { steps, multiplier };
+}
+
+/** The damage a band gap leaves: floor(damage × multiplier), never below 1 for a blow that landed. */
+export function scaleDamageByBand(damage: number, scale: BandDamageScale | null | undefined): number {
+    if (!scale || damage <= 0) return damage;
+    return Math.max(1, Math.floor(damage * scale.multiplier));
+}
+
 /**
  * A resource pool by name: the exact key first, then any case. Returns the
  * stored key so the block shows the name as the sheet spells it.
@@ -546,13 +651,23 @@ export function bandOrder(db: Database.Database, worldId: string | null | undefi
  * order contains every band given, else falls back to bandOrder.
  */
 export function bandOrderFor(db: Database.Database, worldId: string | null | undefined, bands: Array<string | null | undefined>): string[] {
+    return bandRuleFor(db, worldId, bands)?.spec.order ?? bandOrder(db, worldId);
+}
+
+/**
+ * The enabled band rule that ranks every band given (the first by name when
+ * none holds them all, or no bands are given); undefined when the world has
+ * no band rule. Damage scaling reads its damageScale.
+ */
+export function bandRuleFor(db: Database.Database, worldId: string | null | undefined, bands: Array<string | null | undefined>): TableRule<'band'> | undefined {
+    const rules = loadRules(db, worldId, 'band');
     const want = bands.filter((b): b is string => !!b && !!b.trim()).map(b => b.trim().toLowerCase());
     if (want.length) {
         const holds = (order: string[]) => want.every(w => order.some(o => o.toLowerCase() === w));
-        const hit = loadRules(db, worldId, 'band').find(r => holds(r.spec.order));
-        if (hit) return hit.spec.order;
+        const hit = rules.find(r => holds(r.spec.order));
+        if (hit) return hit;
     }
-    return bandOrder(db, worldId);
+    return rules[0];
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -668,7 +783,9 @@ export function creatureToParticipant(spec: CreatureSpec, opts: { id: string; na
         parts,
         unit: spec.unit ? copy(spec.unit) : undefined,
         species: spec.species,
-        tags: spec.tags ? [...spec.tags] : undefined
+        tags: spec.tags ? [...spec.tags] : undefined,
+        swimSpeed: spec.swimSpeed,
+        flySpeed: spec.flySpeed
     };
     for (const [k, v] of Object.entries(optional)) if (v !== undefined) out[k] = v;
     return out;

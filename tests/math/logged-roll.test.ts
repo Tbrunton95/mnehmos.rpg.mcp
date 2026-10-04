@@ -1,4 +1,4 @@
-import { loggedRoll, loggedRoller, engineRoller } from '../../src/math/logged-d20.js';
+import { loggedRoll, loggedRoller, engineRoller, loggedD20, loggedDice } from '../../src/math/logged-d20.js';
 import { closeDb, getDb } from '../../src/storage/index.js';
 import { queryRolls } from '../../src/storage/roll-log.js';
 import { CombatEngine } from '../../src/engine/combat/engine.js';
@@ -31,10 +31,56 @@ describe('loggedRoll', () => {
         expect(() => loggedRoll(getDb(), { purpose: 'x' }, '1d6++2')).toThrow(/Invalid dice/);
     });
 
-    it('unseeded rolls get a fresh seed each time', () => {
-        const a = loggedRoll(getDb(), { purpose: 'x' }, '1d20');
-        const b = loggedRoll(getDb(), { purpose: 'x' }, '1d20');
+    it('unseeded rolls are crypto dice with a unique crypto key each time', () => {
+        const a = loggedRoll(getDb(), { purpose: 'x', forId: 'k' }, '1d20');
+        const b = loggedRoll(getDb(), { purpose: 'x', forId: 'k' }, '1d20');
         expect(a.seed).not.toBe(b.seed);
+        expect(a.source).toBe('crypto');
+        expect(a.seed).toMatch(/^crypto:[0-9a-f]{8}$/);
+        const rows = queryRolls(getDb(), { forId: 'k' });
+        expect(rows.map((r: any) => r.source)).toEqual(['crypto', 'crypto']);
+        expect(rows.map((r: any) => r.replay).sort()).toEqual([a.seed, b.seed].sort());
+    });
+
+    it('a seeded roll is marked seeded; a crypto key is refused as a seed', () => {
+        const a = loggedRoll(getDb(), { purpose: 's', forId: 's' }, '1d20', { seed: 'again' });
+        expect(a.source).toBe('seeded');
+        expect(queryRolls(getDb(), { forId: 's' })[0]).toMatchObject({ source: 'seeded', replay: 'again' });
+        expect(() => loggedRoll(getDb(), { purpose: 's' }, '1d20', { seed: 'crypto:deadbeef' })).toThrow(/cannot be replayed/);
+    });
+});
+
+describe('loggedD20 and loggedDice', () => {
+    beforeEach(() => { closeDb(); getDb(':memory:'); });
+    afterEach(() => closeDb());
+
+    it('loggedD20 is crypto by default, keeps the right die under advantage, and logs 2d20kh1', () => {
+        for (let i = 0; i < 50; i++) {
+            const r = loggedD20(getDb(), { purpose: 'adv', forId: 'h' }, { advantage: true });
+            expect(r.rolls).toHaveLength(2);
+            expect(r.natural).toBe(Math.max(...r.rolls));
+            expect(r.source).toBe('crypto');
+        }
+        const row = queryRolls(getDb(), { forId: 'h', limit: 1 })[0] as any;
+        expect(row).toMatchObject({ expression: '2d20kh1', source: 'crypto' });
+        expect(row.replay).toMatch(/^crypto:/);
+    });
+
+    it('loggedD20 with a seed replays the same die', () => {
+        const a = loggedD20(getDb(), { purpose: 'seeded d20' }, { seed: 'd20-seed' });
+        const b = loggedD20(getDb(), { purpose: 'seeded d20' }, { seed: 'd20-seed' });
+        expect(a.natural).toBe(b.natural);
+        expect(a.source).toBe('seeded');
+        expect(a.seed).toBe('d20-seed');
+    });
+
+    it('loggedDice is crypto by default and logs count and sides', () => {
+        const r = loggedDice(getDb(), { purpose: 'surface', forId: 'd' }, 3, 6);
+        expect(r.rolls).toHaveLength(3);
+        expect(r.total).toBe(r.rolls.reduce((x, y) => x + y, 0));
+        expect(r.source).toBe('crypto');
+        const row = queryRolls(getDb(), { forId: 'd' })[0] as any;
+        expect(row).toMatchObject({ expression: '3d6', source: 'crypto', result: r.total });
     });
 });
 

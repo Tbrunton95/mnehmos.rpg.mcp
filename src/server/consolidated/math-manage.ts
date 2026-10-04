@@ -9,7 +9,6 @@ import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/a
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 import { DiceEngine } from '../../math/dice.js';
-import { freshSeed } from '../../math/seed.js';
 import { d20, logRoll } from '../../math/logged-d20.js';
 import { ProbabilityEngine } from '../../math/probability.js';
 import { AlgebraEngine } from '../../math/algebra.js';
@@ -361,7 +360,7 @@ async function handleCharacterRoll(
     const rollId = logRoll(db, {
         purpose: (kind === 'save' ? `${args.ability} save` : `${args.skill ?? args.ability} check`) + (why ? ` (${why})` : ''),
         forId: args.characterId, expression,
-        dice: roll.rolls.map(value => ({ sides: 20, value })), result: total, replay: roll.seed
+        dice: roll.rolls.map(value => ({ sides: 20, value })), result: total, replay: roll.seed, source: roll.source
     });
 
     return {
@@ -369,6 +368,7 @@ async function handleCharacterRoll(
         calculationId: calcId,
         rollId,
         seed: roll.seed,
+        dice: roll.source === 'crypto' ? 'crypto' : `seeded:${roll.seed}`,
         actionType: `roll_${kind === 'save' ? 'saving_throw' : kind + '_check'}`,
         characterId: args.characterId,
         characterName: char.name,
@@ -505,8 +505,9 @@ async function handleReroll(args: z.infer<typeof RerollSchema>, sessionId?: stri
         return { error: true, actionType: 'reroll', message: `No rerolls left (0/${budget.max}). Earn more — the GM credits pool 'rerolls'.`, rerollsLeft: 0, writes: 'none' };
     }
 
-    const rerollSeed = freshSeed('reroll');
-    const engine = new DiceEngine(rerollSeed);
+    // A declared reroll is a fresh crypto roll; its key supersedes the original's.
+    const engine = new DiceEngine();
+    const rerollSeed = engine.replayKey;
     const result = engine.roll(original.input);
 
     pools['rerolls'] = { ...budget, current: budget.current - 1 };
@@ -528,10 +529,20 @@ async function handleReroll(args: z.infer<typeof RerollSchema>, sessionId?: stri
         metadata: { ...(result.metadata as object ?? {}), supersedes: args.calculationId, ...(cr ? { characterRoll: { ...cr, total: rerollTotal } } : {}) }
     } as StoredCalculation;
     repo.create(calculation);
+    const rerollMeta = result.metadata as { rolls?: number[]; dice?: Array<{ sides: number; value: number }> } | undefined;
+    const rerollSides = Number(original.input.match(/d(\d+)/)?.[1] ?? 0);
+    const rollId = logRoll(db, {
+        purpose: `reroll${cr ? ` ${cr.kind ?? ''}${cr.skill ? ':' + cr.skill : cr.ability ? ':' + cr.ability : ''}` : ''}`.trim(),
+        forId: args.characterId, expression: original.input,
+        dice: rerollMeta?.dice ? rerollMeta.dice.map(d => ({ sides: d.sides, value: d.value })) : (rerollMeta?.rolls ?? []).map(value => ({ sides: rerollSides, value })),
+        result: rerollTotal, replay: rerollSeed
+    });
 
     return {
         success: true,
         actionType: 'reroll',
+        rollId,
+        dice: engine.describe(),
         expression: original.input,
         original: { calculationId: original.id, total: original.result, superseded: true },
         natural: Number(result.result),
@@ -604,10 +615,15 @@ async function handlePoolCheck(args: z.infer<typeof PoolCheckSchema>, sessionId?
     if (poolSize === 0) {
         return { error: true, actionType: 'roll_pool_check', message: 'Pool composed to 0 dice — pass dots as numbers or resolvable stat keys (chance die rules ride a later wave)', composition, writes: 'none' };
     }
-    const poolSeed = args.seed ?? freshSeed('pool');
-    const engine = new DiceEngine(poolSeed);
+    // Crypto dice unless the caller seeds the pool.
+    const engine = new DiceEngine(args.seed);
+    const poolSeed = engine.replayKey;
     const result = engine.roll(`${poolSize}d10`);
     const dice: number[] = ((result.metadata as { rolls?: number[] } | undefined)?.rolls ?? []);
+    const rollId = logRoll(db, {
+        purpose: `pool check ${args.poolLabel ?? 'pool'} vs ${args.difficulty}`, forId: args.characterId, expression: `${poolSize}d10`,
+        dice: dice.map(value => ({ sides: 10, value })), result: dice.filter(d => d >= args.difficulty).length, replay: poolSeed
+    });
     const tens = dice.filter(d => d === 10).length;
     const ones = dice.filter(d => d === 1).length;
     const base = dice.filter(d => d >= args.difficulty).length + (args.specialty ? tens : 0);
@@ -639,6 +655,8 @@ async function handlePoolCheck(args: z.infer<typeof PoolCheckSchema>, sessionId?
         specialty: args.specialty || undefined,
         willpowerAuto: args.willpowerAuto || undefined,
         seed: poolSeed,
+        dice_source: engine.describe(),
+        rollId,
         calculationId: calculation.id,
         message: botch
             ? `${args.poolLabel ?? 'Pool'} ${poolSize}d10 vs ${args.difficulty}: BOTCH (${ones} one${ones > 1 ? 's' : ''}, zero successes)`
@@ -688,6 +706,8 @@ async function handleRoll(args: z.infer<typeof RollSchema>, sessionId?: string):
         success: true,
         actionType: 'roll',
         rollId,
+        // 'crypto' (default) or 'seeded:<seed>': which dice rolled this.
+        dice: engine.describe(),
         expression: args.expression,
         total: result.result,
         rolls: result.steps,

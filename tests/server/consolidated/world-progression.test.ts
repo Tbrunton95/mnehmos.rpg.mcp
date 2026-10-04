@@ -122,7 +122,7 @@ describe('xp and the proficiency curve', () => {
     it('add_xp and get_progression read the world thresholds', async () => {
         await rule({ mode: 'xp', xpThresholds: [0, 100, 300] });
         const c = await char({ action: 'create', name: 'Aspirant', level: 1, worldId: W, provisionEquipment: false });
-        const x = await char({ action: 'add_xp', characterId: c.id, amount: 100 });
+        const x = await char({ action: 'add_xp', characterId: c.id, amount: 100, reason: 'test' });
         expect(x).toMatchObject({ canLevelUp: true, nextLevelXp: 100 });
         const p = await char({ action: 'get_progression', characterId: c.id });
         expect(p).toMatchObject({ xpForNextLevel: 100, readyToLevel: true });
@@ -131,7 +131,7 @@ describe('xp and the proficiency curve', () => {
     it("mode none never offers a level from XP", async () => {
         await rule({ mode: 'none' });
         const c = await char({ action: 'create', name: 'Mortal', level: 1, worldId: W, provisionEquipment: false });
-        const x = await char({ action: 'add_xp', characterId: c.id, amount: 100000 });
+        const x = await char({ action: 'add_xp', characterId: c.id, amount: 100000, reason: 'test' });
         expect(x).toMatchObject({ canLevelUp: false, progression: 'none' });
         const p = await char({ action: 'get_progression', characterId: c.id });
         expect(p).toMatchObject({ readyToLevel: false, progression: 'none' });

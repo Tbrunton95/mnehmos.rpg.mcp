@@ -29,31 +29,71 @@ export function summarizeResult(result: Record<string, unknown>): Record<string,
     return out;
 }
 
+const isPlainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+
 /**
- * fields: [...] — only the named top-level fields, plus success/error/actionType/message.
- * A dotted name projects one level in: 'conditions.name' keeps just `name` of
- * each element when `conditions` is a list, or of the object itself. Several
- * dotted names on one head merge ('conditions.name', 'conditions.pinned').
- * An undotted name still takes the whole value.
+ * Walk `parts` into `v`, keeping only what the path touches. A list maps the
+ * walk over its elements. `hit.found` flips when the path reaches a value
+ * anywhere; an element that lacks the key projects to {} as before.
+ */
+function pluck(v: unknown, parts: string[], hit: { found: boolean }): unknown {
+    if (parts.length === 0) { hit.found = true; return v; }
+    if (Array.isArray(v)) {
+        if (v.length === 0) hit.found = true;
+        return v.map(e => pluck(e, parts, hit));
+    }
+    if (!isPlainObject(v)) return undefined;
+    const [k, ...rest] = parts;
+    if (!(k in v)) return {};
+    const inner = pluck(v[k], rest, hit);
+    return inner === undefined ? {} : { [k]: inner };
+}
+
+/** Merge two projections of the same head ('world.name' with 'world.environment.weather'). */
+function mergeProjection(a: unknown, b: unknown): unknown {
+    if (a === undefined) return b;
+    if (b === undefined) return a;
+    if (Array.isArray(a) && Array.isArray(b)) return a.map((x, i) => mergeProjection(x, b[i]));
+    if (isPlainObject(a) && isPlainObject(b)) {
+        const out: Record<string, unknown> = { ...a };
+        for (const [k, v] of Object.entries(b)) out[k] = k in out ? mergeProjection(out[k], v) : v;
+        return out;
+    }
+    return a;
+}
+
+/**
+ * fields: [...] — only the named fields, plus success/error/actionType/message.
+ * A dotted name walks the full path ('world.environment.weather'); through a
+ * list it keeps that path of each element ('conditions.name'). Several names
+ * on one head merge. An undotted name takes the whole value.
+ * A name that matches nothing is reported in `fieldsNotFound`, with the
+ * reply's top-level keys in `availableFields`, so a miss never reads as a
+ * bare success.
  */
 export function pickFields(result: Record<string, unknown>, fields: string[]): Record<string, unknown> {
-    const keep = new Set(['success', 'error', 'actionType', 'message']);
-    const sub = new Map<string, string[]>();
-    for (const f of fields) {
-        const dot = f.indexOf('.');
-        if (dot <= 0) { keep.add(f); continue; }
-        const head = f.slice(0, dot);
-        sub.set(head, [...(sub.get(head) ?? []), f.slice(dot + 1)]);
-    }
-    const project = (v: unknown, keys: string[]): unknown => {
-        if (!v || typeof v !== 'object') return v;
-        const o = v as Record<string, unknown>;
-        return Object.fromEntries(keys.filter(k => k in o).map(k => [k, o[k]]));
-    };
+    const always = ['success', 'error', 'actionType', 'message'];
     const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(result)) {
-        if (keep.has(k)) out[k] = v;
-        else if (sub.has(k)) out[k] = Array.isArray(v) ? v.map(e => project(e, sub.get(k)!)) : project(v, sub.get(k)!);
+    for (const k of always) if (k in result) out[k] = result[k];
+
+    const picked: Record<string, unknown> = {};
+    const notFound: string[] = [];
+    for (const f of fields) {
+        const parts = f.split('.').filter(p => p !== '');
+        if (parts.length === 0) continue;
+        const [head, ...rest] = parts;
+        if (!(head in result)) { notFound.push(f); continue; }
+        if (rest.length === 0) { picked[head] = result[head]; continue; }
+        const hit = { found: false };
+        const projection = pluck(result[head], rest, hit);
+        if (!hit.found || projection === undefined) { notFound.push(f); continue; }
+        picked[head] = mergeProjection(picked[head], projection);
+    }
+    // Keep the reply's own key order for the fields that matched.
+    for (const k of Object.keys(result)) if (k in picked && !(k in out)) out[k] = picked[k];
+    if (notFound.length) {
+        out.fieldsNotFound = notFound;
+        out.availableFields = Object.keys(result);
     }
     return out;
 }

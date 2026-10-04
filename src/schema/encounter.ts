@@ -271,10 +271,34 @@ export type Token = z.infer<typeof TokenSchema>;
 // CRIT-003: Terrain schema for blocking obstacles
 export const TerrainSchema = z.object({
     obstacles: z.array(z.string()).default([]), // "x,y" format for blocking tiles
-    difficultTerrain: z.array(z.string()).optional() // Future: 2x movement cost
+    difficultTerrain: z.array(z.string()).optional(), // Future: 2x movement cost
+    water: z.array(z.string()).optional() // "x,y" cells a token swims in (the underwater rules apply there)
 });
 
 export type Terrain = z.infer<typeof TerrainSchema>;
+
+/**
+ * The medium a fight happens in. Water (or a token on a terrain.water cell)
+ * turns on the underwater rules: swim speed or half speed, no ranged
+ * attacks unless rangedAllowed, melee at disadvantage unless the damage
+ * type is in the list or the attacker carries the swim tag, and pressure
+ * damage at the start of each turn below the threshold.
+ */
+export const ENVIRONMENT_MEDIA = ['air', 'water', 'vacuum'] as const;
+export const EnvironmentSchema = z.object({
+    medium: z.enum(ENVIRONMENT_MEDIA).default('air'),
+    depthFt: z.number().min(0).optional().describe('Depth of the water, in feet (pressure compares against it)'),
+    pressure: z.object({
+        startsAtFt: z.number().min(0).describe('Pressure damage applies at this depth or deeper'),
+        damagePerRound: z.union([z.number().int().min(0), z.string().min(1)]).describe('Damage at the start of each turn: a number or dice'),
+        unlessTag: z.string().optional().describe('Tokens with this tag are spared (default: the swim tag)')
+    }).optional(),
+    rangedAllowed: z.boolean().optional().describe('Allow ranged attacks underwater (default false)'),
+    meleeDisadvantageUnlessDamageType: z.array(z.string()).optional().describe("Damage types that swing freely underwater (default ['piercing'])"),
+    swimTag: z.string().optional().describe("Token tag that marks a swimmer: no melee penalty, pressure-adapted (default 'aquatic')")
+});
+
+export type EncounterEnvironment = z.infer<typeof EnvironmentSchema>;
 
 export const PropSchema = z.object({
     id: z.string(),
@@ -301,6 +325,7 @@ export const EncounterSchema = z.object({
     activeTokenId: z.string().optional(),
     status: z.enum(['active', 'completed', 'paused']),
     terrain: TerrainSchema.optional(), // CRIT-003: Terrain obstacles
+    environment: EnvironmentSchema.optional(), // The medium the fight happens in (air, water, vacuum)
     props: z.array(PropSchema).optional(), // PHASE 1: Improvised props
     gridBounds: GridBoundsSchema.optional(), // BUG-001: Spatial boundary validation
     createdAt: z.string().datetime(),

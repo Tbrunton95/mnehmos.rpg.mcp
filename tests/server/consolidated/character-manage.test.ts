@@ -610,7 +610,8 @@ describe('character_manage consolidated tool', () => {
             const result = await handleCharacterManage({
                 action: 'add_xp',
                 characterId,
-                amount: 100
+                amount: 100,
+                reason: 'test'
             }, ctx);
 
             const parsed = extractJson(result.content[0].text);
@@ -623,7 +624,8 @@ describe('character_manage consolidated tool', () => {
             const result = await handleCharacterManage({
                 action: 'add_xp',
                 characterId,
-                amount: 300 // Level 2 threshold
+                amount: 300, // Level 2 threshold
+                reason: 'test'
             }, ctx);
 
             const parsed = extractJson(result.content[0].text);
@@ -636,7 +638,8 @@ describe('character_manage consolidated tool', () => {
             const result = await handleCharacterManage({
                 action: 'xp',
                 characterId,
-                amount: 50
+                amount: 50,
+                reason: 'test'
             }, ctx);
 
             const parsed = extractJson(result.content[0].text);
@@ -879,7 +882,8 @@ describe('character_manage consolidated tool', () => {
             const result = await handleCharacterManage({
                 action: 'add_xp',
                 characterId: randomUUID(),
-                amount: 100
+                amount: 100,
+                reason: 'test'
             }, ctx);
 
             const parsed = extractJson(result.content[0].text);

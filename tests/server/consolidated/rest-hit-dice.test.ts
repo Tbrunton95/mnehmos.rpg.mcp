@@ -3,6 +3,13 @@ import { getCombatManager } from '../../../src/server/state/combat-manager.js';
 import { CombatEngine } from '../../../src/engine/combat/engine.js';
 import { getDb, closeDb } from '../../../src/storage/index.js';
 import { CharacterRepository } from '../../../src/storage/repos/character.repo.js';
+import { cryptoInt } from '../../../src/math/crypto-dice.js';
+
+// Hit dice are crypto dice (loggedRoll); the first test pins every die to its maximum.
+vi.mock('../../../src/math/crypto-dice.js', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('../../../src/math/crypto-dice.js')>();
+    return { ...actual, cryptoInt: vi.fn(actual.cryptoInt) };
+});
 
 /**
  * Audit: short rests always rolled d8 whatever the class, never tracked how
@@ -31,7 +38,7 @@ describe('short rest hit dice', () => {
         JSON.parse((await handleRestManage({ characterId: 'fighter', ...args }, c as any)).content[0].text);
 
     it('rolls the class hit die', async () => {
-        vi.spyOn(Math, 'random').mockReturnValue(0.99);
+        vi.mocked(cryptoInt).mockImplementation((sides: number) => sides);
         const r = await rest({ action: 'short', hitDiceToSpend: 2 });
         expect(r.hitDieSize).toBe('d10');
         expect(r.rolls).toEqual([10, 10]);

@@ -19,6 +19,8 @@ export const ItemSchema = z.object({
     value: z.number().min(0).max(INVENTORY_LIMITS.MAX_ITEM_VALUE,
         `Item value cannot exceed ${INVENTORY_LIMITS.MAX_ITEM_VALUE.toLocaleString()} gold`).default(0),
     properties: z.record(z.any()).optional(),
+    // Nullable world scope; legacy templates are null until item_manage scope_items claims them.
+    worldId: z.string().nullable().optional(),
     createdAt: z.string().datetime(),
     updatedAt: z.string().datetime()
 });

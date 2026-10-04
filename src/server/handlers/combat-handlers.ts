@@ -2,10 +2,9 @@ import { z } from 'zod';
 import { loadAutoMechanics, autoAttackBonus, autoAcBonus, autoDamageBonus, applyDeclaredEffects } from '../../engine/effects-resolver.js';
 import * as pda from '../../render/pda.js';
 import { randomUUID } from 'crypto';
-import { freshSeed } from '../../math/seed.js';
 import { CombatEngine, CombatParticipant, CombatState, CombatActionResult } from '../../engine/combat/engine.js';
 import { normalizeConditions, normalizeCondition } from '../../engine/combat/conditions.js';
-import { ConditionInputSchema, footprintCells } from '../../schema/encounter.js';
+import { ConditionInputSchema, footprintCells, EnvironmentSchema } from '../../schema/encounter.js';
 import { SpatialEngine } from '../../engine/spatial/engine.js';
 
 import { PubSub } from '../../engine/pubsub.js';
@@ -20,7 +19,7 @@ import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../..
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
 import { PartSchema, UnitSchema, ParticipantExtrasShape, type Part, type ReadiedAttack } from '../../schema/token-extras.js';
 import { worldProgression } from '../../engine/progression.js';
-import { resolveWorldId, bandOrderFor, loadRule, loadRules, castingClassFor, findWorldRule, type TableRule } from '../../engine/table-rules.js';
+import { resolveWorldId, bandOrderFor, bandRuleFor, bandDamageMultiplier, loadRule, loadRules, castingClassFor, findWorldRule, type TableRule, type BandDamageScale } from '../../engine/table-rules.js';
 import { castWorldSpell, sheetSpecies } from './world-spell.js';
 import { creditGrowth } from '../growth.js';
 import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
@@ -78,10 +77,33 @@ export function syncParticipantHpFromDb(state: CombatState): CombatState {
             if (participant.ac === undefined && character.ac !== undefined) {
                 participant.ac = character.ac;
             }
+            // Request 5: a vessel's shields are its `shields` pool on the sheet
+            // (character_manage adjust_pool between calls is read here).
+            const pool = (character as { resourcePools?: Record<string, { current: number; max: number }> }).resourcePools?.shields;
+            if (participant.vessel && pool && (participant.shields?.current !== pool.current || participant.shields?.max !== pool.max)) {
+                participant.shields = { current: pool.current, max: pool.max };
+            }
         }
     }
 
     return state;
+}
+
+/**
+ * Request 5: write a vessel token's shields back to its row's `shields`
+ * pool. Only a token with shields that is backed by a characters row.
+ */
+export function persistShieldsToDb(participant: CombatParticipant): boolean {
+    if (!participant.vessel || !participant.shields) return false;
+    const charRepo = new CharacterRepository(getDb());
+    const character = charRepo.findById(participant.id) as (Character & { resourcePools?: Record<string, { current: number; max: number }> }) | null;
+    if (!character) return false;
+    const pools = { ...(character.resourcePools ?? {}) };
+    const prev = pools.shields;
+    if (prev && prev.current === participant.shields.current && prev.max === participant.shields.max) return false;
+    pools.shields = { ...(prev ?? {}), current: participant.shields.current, max: participant.shields.max };
+    charRepo.update(participant.id, { resourcePools: pools } as Partial<Character>);
+    return true;
 }
 
 /**
@@ -98,6 +120,7 @@ function persistParticipantHpToDb(state: CombatState): void {
         if (character && (character.hp !== participant.hp || character.maxHp !== participant.maxHp)) {
             charRepo.update(participant.id, { hp: participant.hp, maxHp: participant.maxHp });
         }
+        if (character) persistShieldsToDb(participant);
     }
 }
 
@@ -259,6 +282,8 @@ function buildStateJson(state: CombatState, encounterId: string, sessionId?: str
         lairOwnerId: state.lairOwnerId,
         // Spatial visualization data
         terrain: state.terrain ?? { obstacles: [], difficultTerrain: [], water: [] },
+        // The medium the fight happens in (only when set: air is the default)
+        ...(state.environment ? { environment: state.environment } : {}),
         props: state.props ?? [],
         gridBounds: state.gridBounds ?? null
     };
@@ -280,6 +305,9 @@ function formatCombatStateText(state: CombatState): string {
     const turnIcon = lairUp ? '🏰' : isEnemy ? '👹' : '⚔️';
     let output = `\n┌─────────────────────────────────────────┐\n`;
     output += `│ ${turnIcon} ROUND ${state.round} — ${lairUp ? 'LAIR (initiative 20)' : `${currentParticipant?.name}'s Turn`}\n`;
+    // The medium, as the PDA glyph token: ⟨water · 40 ft⟩ (nothing for air).
+    const medium = pda.environmentGlyph(state.environment);
+    if (medium) output += `│ ${medium}\n`;
     output += `└─────────────────────────────────────────┘\n\n`;
 
     // Initiative order with clear formatting
@@ -386,6 +414,7 @@ function formatAttackResult(result: CombatActionResult): string {
         damageTotal: result.damage,
         damageType: rr.damageType,
         damageModifier: result.damageModifier,
+        bandScale: result.bandScale,
         damageRolls: (result as CombatActionResult & { damageRolls?: number[] }).damageRolls,
         hpBefore: result.target?.hpBefore,
         hpAfter: result.target?.hpAfter,
@@ -803,7 +832,7 @@ Example (use real UUID from context for player character!):
   ]
 }`,
         inputSchema: z.object({
-            seed: z.string().optional().describe('Seed for deterministic combat resolution (omit for a fresh one; the id echoes it)'),
+            seed: z.string().optional().describe('Omit for crypto dice (the default; unreplayable, each roll keyed crypto:<nonce> in the roll log). Pass a seed for a deterministic, replayable stream; the id echoes it'),
             participants: z.array(z.object({
                 id: z.string(),
                 name: z.string(),
@@ -840,7 +869,8 @@ Example (use real UUID from context for player character!):
                 obstacles: z.array(z.string()).default([]).describe('Array of "x,y" strings for blocking tiles'),
                 difficultTerrain: z.array(z.string()).optional().describe('Array of "x,y" strings for difficult terrain'),
                 water: z.array(z.string()).optional().describe('Array of "x,y" strings for water terrain (streams, rivers)')
-            }).optional().describe('CRIT-003: Terrain configuration for collision')
+            }).optional().describe('CRIT-003: Terrain configuration for collision'),
+            environment: EnvironmentSchema.optional().describe("The medium of the fight: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound, unlessTag?}, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?}")
         })
     },
     GET_ENCOUNTER_STATE: {
@@ -919,6 +949,7 @@ Examples:
             legendaryCost: z.number().int().min(1).optional().describe("A legendary action: spends this many of the creature's legendary actions instead of its action (off its own turn only)"),
             reaction: z.boolean().optional().describe('An attack as a reaction (opportunity attack, readied swing): spends the reaction instead of the action'),
             volley: z.object({ dice: z.string(), reason: z.string() }).optional().describe('Internal: set by combat_action volley'),
+            bandScale: z.boolean().optional().describe("Request 11: false skips the band rule's damageScale for this swing (execute sets it). Default: applied when the world's band rule has damageScale and both bands are set"),
             declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit trail: printed in output, never re-applied'),
             declaredEffects: z.array(z.object({ name: z.string(), lane: z.string().optional() })).optional().describe('FINDINGS #60 RESOLVER v2: GM declares the conditional trait by name (+lane for multi-lane rows); engine computes the value (incl. valueFromPool) and APPLIES it to the attack bonus'),
             damageType: z.string().optional()
@@ -932,7 +963,11 @@ Examples:
             slotLevel: z.number().int().min(1).max(9).optional()
                 .describe('CRIT-006: Spell slot level to use (for upcasting)'),
             unbinderId: z.string().optional()
-                .describe("Item 9: a participant who tries to unbind a world spell (table_rules spell with contestedBy: 'unbind'): rolls the casting dice, a higher total stops it")
+                .describe("Item 9: a participant who tries to unbind a world spell (table_rules spell with contestedBy: 'unbind'): rolls the casting dice, a higher total stops it"),
+            boost: z.object({
+                pool: z.string().min(1), delta: z.number(), modifier: z.number().int().optional(), extraDice: z.string().optional(),
+                sideEffect: z.array(z.object({ pool: z.string().min(1), delta: z.number() })).optional()
+            }).optional().describe('World spell: spend a pool for +modifier / extraDice on the casting roll; sideEffect pools move too (growth-checked)')
         })
     },
     ADVANCE_TURN: {
@@ -1317,12 +1352,12 @@ MAZE WITH ROOMS:
 // Tool handlers
 export async function handleCreateEncounter(args: unknown, ctx: SessionContext) {
     const parsed = CombatTools.CREATE_ENCOUNTER.inputSchema.parse(args);
-    // An omitted seed used to default to the fixed string 'combat', so every
-    // unseeded encounter rolled the same initiative and attack dice.
-    const seed = parsed.seed ?? freshSeed('combat');
+    // Crypto dice unless the caller seeds the fight: a seed makes the stream
+    // replayable (tests, audits); without one every die is crypto.randomInt.
+    const seed = parsed.seed;
 
     // Create combat engine
-    const engine = new CombatEngine(seed, pubsub || undefined);
+    const engine = seed ? new CombatEngine(seed, pubsub || undefined) : CombatEngine.crypto(pubsub || undefined);
 
     // Convert participants to proper format (preserve isEnemy, position, and resistances)
     const participants: CombatParticipant[] = parsed.participants.map(p => {
@@ -1377,11 +1412,19 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
     if (parsed.terrain && state) {
         (state as any).terrain = parsed.terrain;
     }
+    // The medium the fight happens in; air when omitted. Water (or water
+    // cells) changes the first turn's movement budget, set before either.
+    if (parsed.environment && state) {
+        state.environment = parsed.environment;
+    }
+    if (state && (parsed.environment?.medium === 'water' || parsed.terrain?.water?.length)) {
+        for (const p of state.participants) p.movementRemaining = engine.effectiveSpeed(p);
+    }
 
     // Generate encounter ID
     // The random suffix keeps two creates with one seed in the same millisecond
     // (a batch) from colliding on id.
-    const encounterId = `encounter-${seed}-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    const encounterId = `encounter-${seed ?? 'combat'}-${Date.now()}-${randomUUID().slice(0, 8)}`;
     // Store with session namespace
     getCombatManager().create(`${ctx.sessionId}:${encounterId}`, engine);
 
@@ -1437,11 +1480,13 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
 
     // Build response with BOTH text and JSON
     // Include sessionId in state JSON so frontend knows which session to query
-    const stateJson = buildStateJson(state, encounterId, ctx.sessionId);
+    // dice: 'crypto' or 'seeded:<seed>' — which dice this fight rolls.
+    const stateJson = { ...buildStateJson(state, encounterId, ctx.sessionId), dice: engine.describeDice() };
     const formattedText = formatCombatStateText(state);
-    
+
     let output = `⚔️ COMBAT STARTED\n`;
     output += `Encounter ID: ${encounterId}\n`;
+    output += `Dice: ${engine.describeDice()}\n`;
     output += formattedText;
     
     // Append JSON for frontend parsing (marked clearly)
@@ -1586,7 +1631,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             : parsed.targetId ? parsed.targetId.split(',').map(t => t.trim()).filter(Boolean) : [];
         const cast = await castWorldSpell({
             engine, db: getDb(), rule: worldSpell.rule, worldId: worldSpell.worldId,
-            actorId: parsed.actorId, targetIds, unbinderId: parsed.unbinderId, damage: parsed.damage
+            actorId: parsed.actorId, targetIds, unbinderId: parsed.unbinderId, damage: parsed.damage, boost: parsed.boost
         });
         output = cast.output;
         result = cast.result;
@@ -1812,7 +1857,10 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         const rulesDb = getDb();
         const ruleWorld = resolveWorldId(rulesDb, { encounterId: parsed.encounterId, characterIds: [parsed.actorId, parsed.targetId ?? ''] });
         // The band ladder that holds both bands (a world may import several).
-        const ruleBands = bandOrderFor(rulesDb, ruleWorld, [actor?.band, target?.band]);
+        const bandRule = bandRuleFor(rulesDb, ruleWorld, [actor?.band, target?.band]);
+        const ruleBands = bandRule?.spec.order ?? bandOrderFor(rulesDb, ruleWorld, [actor?.band, target?.band]);
+        // Request 11: the band gap's damage multiplier, when the rule opts in.
+        const bandScale = parsed.bandScale === false ? null : bandDamageMultiplier(bandRule, actor?.band, target?.band);
         let strikeRule: TableRule<'called_strike'> | undefined;
         let preparedRule: TableRule<'prepared_asset'> | undefined;
         if (parsed.calledStrike && target?.unit) throw new Error(`Called strikes are against a single opponent; ${target.name} is a unit`);
@@ -1850,7 +1898,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             damageLaneLabel,
             outcome,
             parsed.unaffectedLimb,
-            { withPart, atPart: parsed.atPart, uncapped: !!(parsed.cleave || parsed.volley), ranged, ignoreConditions: parsed.ignoreConditions }
+            { withPart, atPart: parsed.atPart, uncapped: !!(parsed.cleave || parsed.volley), ranged, ignoreConditions: parsed.ignoreConditions, ...(bandScale ? { bandScale } : {}) }
         );
 
         // Sync HP to character database after attack
@@ -1867,6 +1915,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     charRepo.update(parsed.targetId, { hp: targetParticipant.hp });
                 }
             }
+        }
+        // Request 5: shields drained by the hit go back to the row's pool.
+        if (result.success && result.shieldsAbsorbed) {
+            const shielded = engine.getState()?.participants.find(p => p.id === parsed.targetId);
+            if (shielded) persistShieldsToDb(shielded);
         }
 
         // Check concentration if target took damage and is concentrating
@@ -1962,6 +2015,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 const part = crippledPart(strikeRule, landing);
                 // Merged, not replaced: a latch, holds or ac on that part survive.
                 targetNow.parts = upsertPart(targetNow.parts ?? [], part);
+                engine.refreshVessel(targetNow);
                 if (charRepoFor(targetNow.id)) new CharacterRepository(getDb()).update(targetNow.id, { parts: targetNow.parts } as never);
                 resultRec.calledStrike = { rule: strikeRule.name, limb, crippled: true, part: part.name, notes: part.note };
                 ruleLines.push(`RULE ${strikeRule.name}: ${targetNow.name}'s ${part.name} crippled until repaired${part.note ? ` (${part.note})` : ''}`);
@@ -1997,6 +2051,10 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             resultRec.volley = parsed.volley;
             ruleLines.unshift(`VOLLEY ${parsed.volley.dice} (${parsed.volley.reason})`);
         }
+        if (result.bandScale && bandRule) {
+            const bs = result.bandScale;
+            ruleLines.push(`RULE ${bandRule.name}: ${actorNow?.band ?? actor?.band} ${bs.steps > 0 ? `${bs.steps} above` : `${-bs.steps} below`} ${targetNow?.band ?? target?.band}: damage ×${bs.multiplier} (${bs.before} → ${bs.after})`);
+        }
         if (targetNow?.unit) {
             const t = volleyTier(targetNow);
             resultRec.targetUnit = { models: t?.models, maxModels: t?.maxModels, volley: t?.dice ?? null };
@@ -2013,10 +2071,17 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // victim of its band or above). The next form is offered, never taken.
         if (result.target && result.target.hpBefore > 0 && targetNow && targetNow.hp <= 0 && actorNow) {
             try {
-                const credit = creditGrowth(rulesDb, ruleWorld, parsed.actorId, 'kill', { victim: targetNow.name, victimBand: targetNow.band, attackerBand: actorNow.band });
+                const credit = await creditGrowth(rulesDb, ruleWorld, parsed.actorId, 'kill', { victim: targetNow.name, victimBand: targetNow.band, attackerBand: actorNow.band });
                 if (credit) {
                     resultRec.growth = credit;
-                    ruleLines.push(`GROWTH ${credit.track}: ${credit.pool} ${credit.from} → ${credit.to} (${credit.reason})${credit.growthReady ? `; ready for ${credit.growthReady.form}: ${credit.growthReady.call}` : ''}`);
+                    const fired = (credit.growthApplied ?? []).map(a => `${a.at}: ${a.condition ?? (a.form as { form?: string } | undefined)?.form ?? (a.table as { table?: string } | undefined)?.table}`).join(', ');
+                    ruleLines.push(`GROWTH ${credit.track}: ${credit.pool} ${credit.from} → ${credit.to} (${credit.reason})${fired ? `; fired ${fired}` : ''}${credit.growthReady ? `; ready for ${credit.growthReady.form ?? credit.growthReady.condition?.name ?? credit.growthReady.table}: ${credit.growthReady.call}` : ''}`);
+                    // A condition an auto step put on the sheet reaches the live token too.
+                    for (const a of credit.growthApplied ?? []) {
+                        if (!a.condition) continue;
+                        const norm = normalizeCondition({ name: a.condition, sourceId: parsed.actorId, source: a.track } as never, parsed.actorId);
+                        if (norm) { const { id: _drop, ...rest } = norm; engine.applyCondition(parsed.actorId, rest); }
+                    }
                 }
             } catch { /* no character row or rules table: no credit */ }
         }
@@ -2860,6 +2925,10 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             partHit: r.partHit,
             attackProfile: (r as { attackProfile?: unknown }).attackProfile,
             volley: (r as { volley?: unknown }).volley,
+            bandScale: r.bandScale,
+            // Request 5: what the target's shields took, and what is left.
+            shieldsAbsorbed: r.shieldsAbsorbed,
+            shields: r.shields,
             situational: r.situational,
             targetUnit: (r as { targetUnit?: unknown }).targetUnit,
             preparedEffectDue: (r as { preparedEffectDue?: unknown }).preparedEffectDue,
@@ -3196,6 +3265,8 @@ export interface AreaSaveOptions {
     halfDamageOnSave?: boolean;
     /** roll_log purpose for the damage dice (default '<purpose> damage'). */
     damagePurpose?: string;
+    /** Request 11: the band rule's multiplier for this target (apply_damage with an actor). */
+    bandScaleFor?: (target: CombatParticipant) => BandDamageScale | null;
 }
 
 export interface AreaSaveTarget {
@@ -3214,8 +3285,14 @@ export interface AreaSaveTarget {
     damageModifier?: 'immune' | 'resistant' | 'vulnerable';
     /** A concentrating sheet's CON save (or 0 HP) after the damage. */
     concentration?: { spell: string; broken: boolean; reason: string; saveRoll?: number; saveTotal?: number; saveDC?: number };
+    /** Request 5: a vessel's shields soaked this much before the hull. */
+    shieldsAbsorbed?: number;
+    /** Request 5: the vessel's shields after the hit. */
+    shields?: { current: number; max: number };
     /** A unit carried through its breakAt owes a break test. */
     breakTest?: BreakTest;
+    /** Request 11: the band gap scaled the damage. */
+    bandScale?: { steps: number; multiplier: number; before: number; after: number };
 }
 
 /**
@@ -3264,9 +3341,19 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
         // The one resistance rule (engine.calculateDamageWithModifiers).
         const mod = engine.calculateDamageWithModifiers(damageTaken, opts.damageType, target);
         damageTaken = mod.finalDamage;
+        let bandScale: AreaSaveTarget['bandScale'];
+        const scale = damageTaken > 0 ? opts.bandScaleFor?.(target) : null;
+        if (scale) {
+            const scaled = Math.max(1, Math.floor(damageTaken * scale.multiplier));
+            bandScale = { ...scale, before: damageTaken, after: scaled };
+            damageTaken = scaled;
+        }
+        const shieldsBefore = (target as { shields?: { current: number; max: number } }).shields?.current;
         if (damageTaken > 0) engine.applyDamage(targetId, damageTaken);
-        const after = engine.getState()!.participants.find(p => p.id === targetId);
+        const after = engine.getState()!.participants.find(p => p.id === targetId) as (CombatParticipant & { shields?: { current: number; max: number } }) | undefined;
         const defeated = after ? after.hp <= 0 : false;
+        // Request 5: what the shields took before the hull.
+        const shieldsAbsorbed = shieldsBefore !== undefined && after?.shields ? Math.max(0, shieldsBefore - after.shields.current) : 0;
         // Concentration on the encounter's d20; 0 HP ends it outright.
         const concentration = damageTaken > 0
             ? concentrationAfterDamage(targetId, damageTaken, defeated && hpBefore > 0, () => engine.rollD20({ purpose: 'concentration', forId: targetId }), concentrationRepo, charRepo)
@@ -3281,6 +3368,9 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
             saveRoll: save?.natural, saveTotal: save?.total, saved, damageTaken,
             hpBefore, hpAfter: after?.hp, defeated: after ? defeated : undefined,
             ...(mod.modifier !== 'normal' ? { damageModifier: mod.modifier } : {}),
+            ...(bandScale ? { bandScale } : {}),
+            ...(shieldsAbsorbed ? { shieldsAbsorbed } : {}),
+            ...(after?.shields ? { shields: { current: after.shields.current, max: after.shields.max } } : {}),
             ...(save?.legendaryResisted ? { legendaryResisted: true } : {}),
             ...(save?.legendaryResistanceAvailable ? { legendaryResistanceAvailable: save.legendaryResistanceAvailable } : {}),
             ...(concentration ? { concentration } : {}),
@@ -3294,7 +3384,8 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
             line += save.legendaryResisted ? ' (legendary resistance)'
                 : save.legendaryResistanceAvailable ? ` (${save.legendaryResistanceAvailable} legendary resistance(s) left)` : '';
         }
-        line += `\n   Damage: ${damageTaken}${opts.damageType ? ` ${opts.damageType}` : ''}${mod.modifier !== 'normal' ? ` (${mod.modifier})` : ''}`;
+        line += `\n   Damage: ${damageTaken}${opts.damageType ? ` ${opts.damageType}` : ''}${mod.modifier !== 'normal' ? ` (${mod.modifier})` : ''}${bandScale ? ` ×${bandScale.multiplier} band (${bandScale.before} → ${bandScale.after})` : ''}`;
+        if (shieldsAbsorbed && after?.shields) line += `\n   Shields: −${shieldsAbsorbed}, ${after.shields.current}/${after.shields.max} left`;
         if (after) line += `\n   HP: ${after.hp}/${after.maxHp}${after.hp <= 0 ? ' 💀 DEFEATED' : ''}`;
         if (concentration) line += `\n   Concentration on ${concentration.spell}: ${concentration.reason === 'death' ? 'ends at 0 HP' : `CON save ${concentration.saveTotal} vs DC ${concentration.saveDC} ${concentration.broken ? '✗ BROKEN' : '✓ held'}`}`;
         if (breakTest) line += `\n   ${breakTest.line}`;
@@ -4162,7 +4253,7 @@ export async function handleGenerateTerrainPatch(args: unknown, ctx: SessionCont
         // Add props
         for (const prop of result.props) {
             state.props!.push({
-                id: `prop-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+                id: `prop-${Date.now()}-${randomUUID().slice(0, 8)}`,
                 label: prop.label,
                 position: prop.position,
                 heightFeet: prop.heightFeet,
@@ -4465,7 +4556,7 @@ export async function handleGenerateTerrainPattern(args: unknown, ctx: SessionCo
     // Add props
     for (const prop of result.props) {
         state.props.push({
-            id: `prop-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+            id: `prop-${Date.now()}-${randomUUID().slice(0, 8)}`,
             label: prop.label,
             position: prop.position,
             heightFeet: prop.heightFeet,

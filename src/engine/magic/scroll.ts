@@ -15,6 +15,7 @@ import {
 } from '../../schema/scroll.js';
 import { SpellcastingClass } from '../../schema/spell.js';
 import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
+import { cryptoInt } from '../../math/crypto-dice.js';
 
 /**
  * Validate if a character can use a spell scroll
@@ -89,7 +90,7 @@ export function validateScrollUse(
  */
 export function rollArcanaCheck(character: Character, d20?: () => number): { roll: number; total: number; modifier: number } {
     // Callers with a database pass a seeded, logged d20 (loggedD20).
-    const roll = d20 ? d20() : Math.floor(Math.random() * 20) + 1;
+    const roll = d20 ? d20() : cryptoInt(20);
 
     // Calculate Intelligence modifier
     const intModifier = Math.floor((character.stats.int - 10) / 2);

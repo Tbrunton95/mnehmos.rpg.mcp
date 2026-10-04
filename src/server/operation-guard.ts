@@ -21,15 +21,30 @@ import { getTenant } from '../storage/tenant-context.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { recordRolls } from '../storage/roll-log.js';
 
-const opContext = new AsyncLocalStorage<{ opId?: string; tool: string }>();
+export interface OperationContext {
+    opId?: string;
+    tool: string;
+    /** The world the call named (args.worldId) or the tenant carries, for roll_log.world_id. */
+    worldId?: string;
+}
+
+const opContext = new AsyncLocalStorage<OperationContext>();
 
 /** The operation this code runs inside (for roll_log), if any. */
-export function currentOperation(): { opId?: string; tool: string } | undefined {
+export function currentOperation(): OperationContext | undefined {
     return opContext.getStore();
 }
 
+/** The world an encounter was stamped with, when the column and row exist. */
+function encounterWorld(db: Database.Database, encounterId: string): string | null {
+    try {
+        const row = db.prepare('SELECT world_id FROM encounters WHERE id = ?').get(encounterId) as { world_id?: string | null } | undefined;
+        return row?.world_id ?? null;
+    } catch { return null; }
+}
+
 /** Write the session's combat dice since the last drain to roll_log. */
-function flushCombatRolls(db: Database.Database, sessionId: string, op: { opId?: string; tool: string }): void {
+function flushCombatRolls(db: Database.Database, sessionId: string, op: OperationContext): void {
     const manager = getCombatManager();
     for (const key of manager.list()) {
         if (!key.startsWith(`${sessionId}:`)) continue;
@@ -37,10 +52,13 @@ function flushCombatRolls(db: Database.Database, sessionId: string, op: { opId?:
         const records = engine?.drainRollRecords?.() ?? [];
         if (!records.length) continue;
         const encounterId = key.slice(sessionId.length + 1);
+        const worldId = op.worldId ?? encounterWorld(db, encounterId);
         recordRolls(db, records.map(r => ({
-            purpose: r.purpose, forId: r.forId, targetId: r.targetId, encounterId,
+            purpose: r.purpose, forId: r.forId, targetId: r.targetId, encounterId, worldId,
             dice: r.dice, result: r.dice.reduce((a, d) => a + d.value, 0),
-            replay: r.origin !== null ? `${r.origin}@${r.startDraw}` : null
+            // Crypto rolls carry their own nonce key; seeded ones replay from origin@draw.
+            replay: r.replay ?? (r.origin !== null ? `${r.origin}@${r.startDraw}` : null),
+            source: r.source
         })), op);
     }
 }
@@ -147,7 +165,8 @@ export function withOperation(toolName: string, handler: Handler): Handler {
             }
 
             let res: ToolReply;
-            const op = { opId, tool: toolName };
+            const argWorld = typeof args?.worldId === 'string' && args.worldId ? args.worldId : undefined;
+            const op: OperationContext = { opId, tool: toolName, worldId: argWorld ?? getTenant()?.worldId };
             try {
                 res = await opContext.run(op, () => handler(args, extra));
             } catch (e) {

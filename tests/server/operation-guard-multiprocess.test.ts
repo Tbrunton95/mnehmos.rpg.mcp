@@ -37,10 +37,10 @@ afterEach(() => {
 });
 
 describe('two server processes, one database', () => {
-    it("never replays the other process's dice from a stale cache", async () => {
+    it("never replays the other process's dice from a stale cache (seeded stream)", async () => {
         closeDb();
         const db = getDb(':memory:');
-        const enc = json(await CM({ action: 'create', participants }, undefined), 'COMBAT_MANAGE').encounterId;
+        const enc = json(await CM({ action: 'create', seed: 'two-procs', participants }, undefined), 'COMBAT_MANAGE').encounterId;
         await CA({ action: 'attack', encounterId: enc, actorId: 'a', targetId: 'b', attackBonus: 5, damage: '4d6' }, undefined);
         await CM({ action: 'advance', encounterId: enc }, undefined);
         await CM({ action: 'advance', encounterId: enc }, undefined);
@@ -57,6 +57,43 @@ describe('two server processes, one database', () => {
         const last = db.prepare("SELECT replay, dice FROM roll_log WHERE purpose = 'attack' ORDER BY rowid DESC LIMIT 1").get() as { replay: string; dice: string };
         const startDraw = Number(last.replay.split('@')[1]);
         expect(startDraw).toBe(theirStart + theirs.length);
+    });
+
+    it('crypto mode: two processes never log the same replay key', async () => {
+        closeDb();
+        const db = getDb(':memory:');
+        // Unseeded: crypto dice.
+        const created = json(await CM({ action: 'create', participants }, undefined), 'COMBAT_MANAGE');
+        expect(created.dice).toBe('crypto');
+        const enc = created.encounterId;
+        await CA({ action: 'attack', encounterId: enc, actorId: 'a', targetId: 'b', attackBonus: 5, damage: '4d6' }, undefined);
+
+        // The other process: loads the same encounter, rolls, saves and logs its own dice.
+        const repo = new EncounterRepository(db);
+        const other = new CombatEngine(enc);
+        other.loadState(repo.loadState(enc)!);
+        expect(other.diceMode).toBe('crypto');
+        for (let i = 0; i < 25; i++) other.rollD20({ purpose: `other process ${i}` });
+        const theirs = other.drainRollRecords();
+        expect(theirs).toHaveLength(25);
+        repo.saveState(enc, other.getState()!);
+        const { recordRolls } = await import('../../src/storage/roll-log.js');
+        recordRolls(db, theirs.map(r => ({ purpose: r.purpose, encounterId: enc, dice: r.dice, replay: r.replay!, source: r.source })), { tool: 'other' });
+
+        for (let i = 0; i < 10; i++) {
+            await CM({ action: 'advance', encounterId: enc }, undefined);
+            await CM({ action: 'advance', encounterId: enc }, undefined);
+            const res = json(await CA({ action: 'attack', encounterId: enc, actorId: 'a', targetId: 'b', attackBonus: 5, damage: '4d6' }, undefined), 'COMBAT_ACTION');
+            expect(res.error, JSON.stringify(res)).toBeUndefined();
+        }
+        const rows = db.prepare('SELECT replay, source FROM roll_log WHERE encounter_id = ?').all(enc) as Array<{ replay: string; source: string }>;
+        expect(rows.length).toBeGreaterThanOrEqual(25 + 11 * 2);
+        for (const r of rows) { expect(r.source).toBe('crypto'); expect(r.replay).toMatch(/^crypto:[0-9a-f]{8}$/); }
+        expect(new Set(rows.map(r => r.replay)).size).toBe(rows.length);
+        // The draw count still advances across both processes.
+        const state = repo.loadState(enc)!;
+        expect((state.rngState as { mode: string; draws: number }).mode).toBe('crypto');
+        expect((state.rngState as { draws: number }).draws).toBeGreaterThanOrEqual(2 + 25 + 11 * 2);
     });
 
     it('waits for the other process to finish writing', async () => {

@@ -5,7 +5,7 @@
  * `undefined` over anything.
  */
 import type { CombatParticipant } from './engine.js';
-import type { Part, SizeCategory } from '../../schema/token-extras.js';
+import type { Part, SizeCategory, Shields } from '../../schema/token-extras.js';
 import { CREATURE_PRESETS, type CreaturePreset } from '../../data/creature-presets.js';
 
 /** Fields a caller may pass for a new participant (create, add_participant). */
@@ -13,17 +13,17 @@ export type ExtrasInput = Partial<Pick<CombatParticipant,
     'size' | 'reach' | 'movementSpeed' | 'attackBonus' | 'attackDamage' | 'attackDamageType' |
     'attacksPerAction' | 'attacks' | 'abilities' | 'legendaryActions' | 'legendaryResistances' |
     'legendaryResistancesRemaining' | 'autoLegendaryResistance' | 'hasLairActions' | 'cr' |
-    'band' | 'regeneration' | 'parts' | 'ac' | 'species' | 'tags'>>;
+    'band' | 'regeneration' | 'parts' | 'ac' | 'species' | 'tags' | 'swimSpeed' | 'flySpeed' | 'vessel' | 'shields'>>;
 
 /** The character-row fields that default a token (the sheet side of hydrateExtras). */
-export type ExtrasRow = ExtrasInput & { parts?: Part[] };
+export type ExtrasRow = ExtrasInput & { parts?: Part[]; speed?: number; resourcePools?: Record<string, { current: number; max: number }> };
 
 const ROW_KEYS = [
     'band', 'regeneration', 'parts', 'ac',
-    'size', 'reach', 'movementSpeed', 'attackBonus', 'attackDamage', 'attackDamageType',
+    'size', 'reach', 'movementSpeed', 'swimSpeed', 'flySpeed', 'attackBonus', 'attackDamage', 'attackDamageType',
     'attacksPerAction', 'attacks', 'abilities', 'legendaryActions', 'legendaryResistances',
     'legendaryResistancesRemaining', 'autoLegendaryResistance', 'hasLairActions', 'cr',
-    'species', 'tags'
+    'species', 'tags', 'vessel'
 ] as const;
 
 /** The preset side: CreaturePreset names its fields differently. */
@@ -50,10 +50,22 @@ export function hydrateExtras(p: ExtrasInput, row?: ExtrasRow | null, preset?: C
     const fromPreset = presetExtras(preset);
     const out: Record<string, unknown> = {};
     for (const key of ROW_KEYS) {
-        const value = p[key] ?? row?.[key] ?? (fromPreset as Record<string, unknown>)[key];
+        // The sheet stores walking speed as `speed`; the token calls it movementSpeed.
+        const rowValue = key === 'movementSpeed' ? (row?.movementSpeed ?? row?.speed) : row?.[key];
+        const value = p[key] ?? rowValue ?? (fromPreset as Record<string, unknown>)[key];
         if (value === undefined || value === null) continue;
         if (key === 'parts' && Array.isArray(value) && value.length === 0) continue;
         out[key] = value;
+    }
+    // Request 5: a vessel's shields ride its `shields` resource pool, and its
+    // speed lives in the vessel profile (the sheet has no speed of its own).
+    if (out.vessel) {
+        const vessel = out.vessel as { speed?: number };
+        const pool = p.shields ?? row?.resourcePools?.shields;
+        if (pool && typeof pool.current === 'number' && typeof pool.max === 'number') {
+            out.shields = { current: pool.current, max: pool.max } satisfies Shields;
+        }
+        if (out.movementSpeed === undefined && typeof vessel.speed === 'number') out.movementSpeed = vessel.speed;
     }
     return out as ExtrasInput;
 }

@@ -19,6 +19,8 @@ export interface WorldClock {
     at: number;
     /** Stored weather, for the readers that print it beside the clock. */
     weather?: string;
+    /** The era label era_jump wrote, for the readers that print it beside the clock. */
+    era?: string;
 }
 
 /** Day + 'HH:MM' as a fractional day, or null without a numeric day. */
@@ -48,7 +50,8 @@ export function readWorldClock(db: Database.Database, worldId: string | null | u
             day: env.day,
             ...(typeof env.time === 'string' ? { time: env.time } : {}),
             at,
-            ...(env.weatherConditions ? { weather: env.weatherConditions } : {})
+            ...(env.weatherConditions ? { weather: env.weatherConditions } : {}),
+            ...(env.era ? { era: env.era } : {})
         };
     } catch {
         return null;
@@ -78,6 +81,11 @@ export function clockLabel(clock: WorldClock): string {
     return clock.time ? `Day ${clock.day}, ${clock.time}` : `Day ${clock.day}`;
 }
 
+/** clockLabel plus the era when one is set: 'Day 47, 06:00 · era M42'. */
+export function clockLabelWithEra(clock: WorldClock): string {
+    return clock.era ? `${clockLabel(clock)} · era ${clock.era}` : clockLabel(clock);
+}
+
 /** The hint every refusal carries when neither a parameter nor a clock gave a day. */
 export const SET_CLOCK_HINT = "or set the world clock once with world_manage update {worldId, environment: {day, time: 'HH:MM'}}";
 
@@ -102,6 +110,16 @@ const NARRATIVE_STAMP = /── \[Day (\d+(?:\.\d+)?)(?:, (\d{1,2}):(\d{2}))?\] 
 export function scheduleInWorldSql(alias = 's'): string {
     const a = alias ? `${alias}.` : '';
     return `(${a}world_id = ? OR (${a}world_id IS NULL AND ${a}character_id IN (SELECT id FROM characters WHERE world_id = ?)))`;
+}
+
+/**
+ * Request 2: a scheduled row that is still live — unfired and not cancelled.
+ * cancel_scheduled and era_jump stamp cancelled_at instead of deleting, so
+ * the row stays on record; every reader of "what is still coming" uses this.
+ */
+export function scheduleLiveSql(alias = 's'): string {
+    const a = alias ? `${alias}.` : '';
+    return `(${a}fired = 0 AND ${a}cancelled_at IS NULL)`;
 }
 
 /**
@@ -148,6 +166,6 @@ export function clockWarning(db: Database.Database, worldId: string): string | u
     const recs = recordsAfterClock(db, worldId, clock.at);
     if (!recs.length) return undefined;
     const bySource = [...new Set(recs.map(r => r.source))].join(', ');
-    return `${recs.length} record(s) dated after the world clock (${clockLabel(clock)}): latest ${dayClock(recs[0].day)} (${recs[0].source}: ${recs[0].what.slice(0, 80)}); sources: ${bySource}. `
+    return `${recs.length} record(s) dated after the world clock (${clockLabelWithEra(clock)}): latest ${dayClock(recs[0].day)} (${recs[0].source}: ${recs[0].what.slice(0, 80)}); sources: ${bySource}. `
         + `The clock may have gone backwards: if so, set it right with world_manage update {worldId, correction: true, environment: {day, time}} (no regeneration, no time_passed). world_manage audit lists every row.`;
 }

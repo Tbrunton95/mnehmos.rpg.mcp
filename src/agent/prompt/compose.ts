@@ -6,12 +6,13 @@
  *     1. persona            — DM-authored identity / voice
  *     2. directive          — DM-authored behavioral instructions
  *     3. secrets            — agent-private knowledge
- *     4. character_state    — auto-built mechanical sheet (HP/AC/slots/etc)
- *     5. recent             — long-term memories from npc_memories
- *     6. narrative_feed     — rolling DM-curated observations
+ *     4. knowledge          — facts the character holds in the knowledge ledger (knowledge_manage)
+ *     5. character_state    — auto-built mechanical sheet (HP/AC/slots/etc)
+ *     6. recent             — long-term memories from npc_memories
+ *     7. narrative_feed     — rolling DM-curated observations
  *
  *   user message:
- *     7. situation          — DM-supplied per-invoke scene narrative
+ *     8. situation          — DM-supplied per-invoke scene narrative
  *
  * Escape hatches:
  *   - systemOverride: replaces the assembled system message entirely
@@ -21,6 +22,7 @@
  * for budget enforcement; provider returns exact counts in the response.
  */
 
+import type Database from 'better-sqlite3';
 import { ChatMessage } from '../provider/types.js';
 import { AgentRepository } from '../../storage/repos/agent.repo.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
@@ -32,6 +34,7 @@ import { SceneRepository } from '../../storage/repos/scene.repo.js';
 import { buildPersonaSlice } from './slices/persona.js';
 import { buildDirectiveSlice } from './slices/directive.js';
 import { buildSecretsSlice } from './slices/secrets.js';
+import { buildKnowledgeSlice } from './slices/knowledge.js';
 import { buildCharacterStateSlice } from './slices/character_state.js';
 import { buildRecentSlice } from './slices/recent.js';
 import { buildNarrativeFeedSlice } from './slices/narrative_feed.js';
@@ -44,6 +47,8 @@ export interface ComposeDeps {
     inventoryRepo: InventoryRepository;
     npcMemoryRepo: NpcMemoryRepository;
     sceneRepo?: SceneRepository;
+    /** The knowledge slice reads knowledge_facts / knowledge_holders from it; without it the slice is skipped. */
+    db?: Database.Database;
 }
 
 export interface ComposeInput {
@@ -100,6 +105,9 @@ export function composePrompt(input: ComposeInput, deps: ComposeDeps): ComposeRe
 
         const secrets = buildSecretsSlice(input.agentId, deps.agentRepo);
         if (secrets) { systemParts.push(secrets); slicesIncluded.push('secrets'); } else { slicesSkipped.push('secrets'); }
+
+        const knowledge = buildKnowledgeSlice(input.characterId, deps.db);
+        if (knowledge) { systemParts.push(knowledge); slicesIncluded.push('knowledge'); } else { slicesSkipped.push('knowledge'); }
 
         const characterState = buildCharacterStateSlice(input.characterId, {
             characterRepo: deps.characterRepo,

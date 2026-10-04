@@ -18,9 +18,9 @@ import { listRules, DATA_KINDS } from '../../engine/table-rules.js';
 import { CHANGELOG, type ChangelogEntry } from '../../data/changelog.js';
 import { getMeta, setMeta } from '../../storage/data-migrations.js';
 import { lookupOperation } from '../operation-guard.js';
-import { queryRolls } from '../../storage/roll-log.js';
+import { queryRolls, rollStats } from '../../storage/roll-log.js';
 import { buildBootPacket, renderBootPacket } from '../boot-packet.js';
-import { readWorldClock, clockWarning, scheduleInWorldSql } from '../../engine/world-clock.js';
+import { readWorldClock, clockWarning, scheduleInWorldSql, scheduleLiveSql } from '../../engine/world-clock.js';
 
 /** Engine changes this database has not been shown yet. */
 function unseenChangelog(): ChangelogEntry[] {
@@ -119,6 +119,10 @@ const SessionManageInputSchema = z.object({
     characterIds: z.array(z.string()).optional().describe('boot: whose digest (default: the world\'s player characters)'),
     journalLimit: z.number().int().min(0).max(20).optional().describe('boot: journal entries to include (default 5)'),
     encounterId: z.string().optional().describe('rolls: rolls in this encounter'),
+    since: z.string().optional().describe('rolls: ISO timestamp; rolls at or after it'),
+    purpose: z.string().optional().describe("rolls: purpose fragment ('save', 'attack', 'stunt')"),
+    source: z.enum(['crypto', 'seeded']).optional().describe('rolls: only crypto dice or only seeded (replayable) dice'),
+    stats: z.boolean().optional().describe('rolls: also return the d20 audit over every matching roll — count, mean, nat20/nat1, chi² over the 20 faces vs the 30.144 cutoff (95%, 19 df), face counts'),
 
     // initialize fields
     worldId: z.string().optional().describe('World ID to load'),
@@ -172,7 +176,7 @@ const SessionManageActionSchemas = {
     rolls: {
         schema: SessionManageInputSchema.extend({ action: z.literal('rolls') }),
         aliases: ['roll_log', 'dice_log', 'audit_rolls'],
-        description: 'The roll log, newest first: who each roll was for, why, the dice, and how to replay it (a seed, or an encounter stream origin@draw). Filter by forId, encounterId or forOpId'
+        description: 'The roll log, newest first: who each roll was for, why, the dice, which source rolled them (crypto by default, or a seeded stream) and the audit key (crypto:<nonce>, a seed, or an encounter stream origin@draw). Filter by forId, encounterId, forOpId, worldId, since, purpose, source; stats: true adds the d20 fairness audit (count, mean, nat20/nat1, chi² vs 30.144)'
     },
     op_status: {
         schema: SessionManageInputSchema.extend({ action: z.literal('op_status'), forOpId: z.string() }),
@@ -490,6 +494,7 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
             if (worldClock) {
                 context.world.day = worldClock.day;
                 if (worldClock.time) context.world.time = worldClock.time;
+                if (worldClock.era) context.world.era = worldClock.era;
                 // Items 14/15: records dated after the clock, advisory.
                 try {
                     const warning = clockWarning(db, world.id);
@@ -523,12 +528,12 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
                 // character's when untagged.
                 const schedScope = `AND ${scheduleInWorldSql('s')}`;
                 const pendingTotal = (input.worldId
-                    ? (db.prepare(`SELECT COUNT(*) AS n FROM scheduled_state_changes s WHERE s.fired = 0 ${schedScope}`).get(input.worldId, input.worldId) as { n: number }).n
-                    : (db.prepare('SELECT COUNT(*) AS n FROM scheduled_state_changes WHERE fired = 0').get() as { n: number }).n);
+                    ? (db.prepare(`SELECT COUNT(*) AS n FROM scheduled_state_changes s WHERE ${scheduleLiveSql('s')} ${schedScope}`).get(input.worldId, input.worldId) as { n: number }).n
+                    : (db.prepare(`SELECT COUNT(*) AS n FROM scheduled_state_changes WHERE ${scheduleLiveSql('')}`).get() as { n: number }).n);
                 const due = day !== null
                     ? (input.worldId
-                        ? db.prepare(`SELECT s.id, s.character_id, s.fires_at_day, s.note, s.writes FROM scheduled_state_changes s WHERE s.fired = 0 ${schedScope} AND s.fires_at_day <= ? ORDER BY s.fires_at_day LIMIT 10`).all(input.worldId, input.worldId, day)
-                        : db.prepare('SELECT id, character_id, fires_at_day, note, writes FROM scheduled_state_changes WHERE fired = 0 AND fires_at_day <= ? ORDER BY fires_at_day LIMIT 10').all(day)) as Array<{ id: number; character_id: string; fires_at_day: number; note: string | null; writes: string }>
+                        ? db.prepare(`SELECT s.id, s.character_id, s.fires_at_day, s.note, s.writes FROM scheduled_state_changes s WHERE ${scheduleLiveSql('s')} ${schedScope} AND s.fires_at_day <= ? ORDER BY s.fires_at_day LIMIT 10`).all(input.worldId, input.worldId, day)
+                        : db.prepare(`SELECT id, character_id, fires_at_day, note, writes FROM scheduled_state_changes WHERE ${scheduleLiveSql('')} AND fires_at_day <= ? ORDER BY fires_at_day LIMIT 10`).all(day)) as Array<{ id: number; character_id: string; fires_at_day: number; note: string | null; writes: string }>
                     : [];
                 if (due.length || pendingTotal) {
                     context.scheduled = {
@@ -727,12 +732,22 @@ export async function handleSessionManage(args: unknown, ctx: SessionContext): P
             return { content: [{ type: 'text', text: output }] };
         }
         case 'rolls': {
-            const rows = queryRolls(getDb(), { forId: input.forId, encounterId: input.encounterId, opId: input.forOpId, limit: input.limit });
-            const payload = { success: true, actionType: 'rolls', count: rows.length, rolls: rows };
+            const filter = {
+                forId: input.forId, encounterId: input.encounterId, opId: input.forOpId,
+                worldId: input.worldId, since: input.since, purpose: input.purpose, source: input.source
+            };
+            const rows = queryRolls(getDb(), { ...filter, limit: input.limit });
+            const stats = input.stats ? rollStats(getDb(), filter) : undefined;
+            const payload = { success: true, actionType: 'rolls', count: rows.length, rolls: rows, ...(stats ? { stats } : {}) };
             let output = RichFormatter.header('Roll Log', '🎲');
+            if (stats) {
+                const d = stats.d20;
+                output += `Audit: ${stats.count} rolls, ${d.n} d20s — mean ${d.mean}, nat20 ×${d.nat20}, nat1 ×${d.nat1}, χ² ${d.chi2} vs ${d.cutoff95} → ${d.biased ? 'BIASED (faces not uniform at 95%)' : 'fair'}`;
+                output += ` · sources: ${Object.entries(stats.bySource).map(([k, v]) => `${k} ${v}`).join(', ') || 'none'}\n`;
+            }
             for (const r of rows) {
                 const dice = (r.dice as Array<{ sides: number; value: number }>).map(d => `d${d.sides}:${d.value}`).join(' ');
-                output += `• ${r.created_at} ${r.purpose}${r.for_id ? ` for ${r.for_id}` : ''}${r.target_id ? ` → ${r.target_id}` : ''}: [${dice}]${r.result !== null ? ` = ${r.result}` : ''}${r.replay ? ` (replay ${r.replay})` : ''}${r.op_id ? ` op ${r.op_id}` : ''}\n`;
+                output += `• ${r.created_at} ${r.purpose}${r.for_id ? ` for ${r.for_id}` : ''}${r.target_id ? ` → ${r.target_id}` : ''}: [${dice}]${r.result !== null ? ` = ${r.result}` : ''}${r.source ? ` ${r.source}` : ''}${r.replay ? ` (${r.source === 'crypto' ? 'key' : 'replay'} ${r.replay})` : ''}${r.op_id ? ` op ${r.op_id}` : ''}\n`;
             }
             if (!rows.length) output += 'No rolls logged for that filter.\n';
             output += RichFormatter.embedJson(payload, 'SESSION_MANAGE');

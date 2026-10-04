@@ -41,13 +41,54 @@ export class EncounterRepository {
         if (!columnNames.includes('rng_state')) {
             this.db.prepare('ALTER TABLE encounters ADD COLUMN rng_state TEXT').run();
         }
+        // The medium the fight happens in (air, water, vacuum), as JSON.
+        if (!columnNames.includes('environment')) {
+            this.db.prepare('ALTER TABLE encounters ADD COLUMN environment TEXT').run();
+        }
+        // Request 5: boarding encounters link to their void fight.
+        if (!columnNames.includes('parent_id')) {
+            this.db.prepare('ALTER TABLE encounters ADD COLUMN parent_id TEXT').run();
+        }
+        if (!columnNames.includes('notes')) {
+            this.db.prepare('ALTER TABLE encounters ADD COLUMN notes TEXT').run();
+        }
+    }
+
+    /** Request 5: hang this encounter off a parent (a boarding off its void fight). */
+    setParent(encounterId: string, parentId: string | null): void {
+        this.db.prepare('UPDATE encounters SET parent_id = ? WHERE id = ?').run(parentId, encounterId);
+    }
+
+    /** The parent encounter id, or null. */
+    parentOf(encounterId: string): string | null {
+        const row = this.db.prepare('SELECT parent_id FROM encounters WHERE id = ?').get(encounterId) as { parent_id?: string | null } | undefined;
+        return row?.parent_id ?? null;
+    }
+
+    /** Ids of the encounters whose parent is this one (its boardings). */
+    childrenOf(encounterId: string): Array<{ id: string; status: string }> {
+        return this.db.prepare('SELECT id, status FROM encounters WHERE parent_id = ? ORDER BY created_at').all(encounterId) as Array<{ id: string; status: string }>;
+    }
+
+    /** The encounter's notes bag (links the tokens do not carry); {} when none. */
+    getNotes(encounterId: string): Record<string, unknown> {
+        const row = this.db.prepare('SELECT notes FROM encounters WHERE id = ?').get(encounterId) as { notes?: string | null } | undefined;
+        if (!row?.notes) return {};
+        try { return JSON.parse(row.notes) as Record<string, unknown>; } catch { return {}; }
+    }
+
+    /** Merge a patch into the notes bag (top-level keys replace). */
+    mergeNotes(encounterId: string, patch: Record<string, unknown>): Record<string, unknown> {
+        const next = { ...this.getNotes(encounterId), ...patch };
+        this.db.prepare('UPDATE encounters SET notes = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(next), new Date().toISOString(), encounterId);
+        return next;
     }
 
     create(encounter: Encounter): void {
         const validEncounter = EncounterSchema.parse(encounter);
         const stmt = this.db.prepare(`
-      INSERT INTO encounters (id, region_id, tokens, round, active_token_id, status, terrain, props, grid_bounds, created_at, updated_at)
-      VALUES (@id, @regionId, @tokens, @round, @activeTokenId, @status, @terrain, @props, @gridBounds, @createdAt, @updatedAt)
+      INSERT INTO encounters (id, region_id, tokens, round, active_token_id, status, terrain, environment, props, grid_bounds, created_at, updated_at)
+      VALUES (@id, @regionId, @tokens, @round, @activeTokenId, @status, @terrain, @environment, @props, @gridBounds, @createdAt, @updatedAt)
     `);
         stmt.run({
             id: validEncounter.id,
@@ -59,6 +100,7 @@ export class EncounterRepository {
             status: validEncounter.status,
             // PHASE 1: Persist terrain separately
             terrain: validEncounter.terrain ? JSON.stringify(validEncounter.terrain) : null,
+            environment: validEncounter.environment ? JSON.stringify(validEncounter.environment) : null,
             // PHASE 1: Persist props
             props: validEncounter.props ? JSON.stringify(validEncounter.props) : null,
             // PHASE 2: Persist grid bounds
@@ -84,6 +126,7 @@ export class EncounterRepository {
                 props: row.props ? JSON.parse(row.props) : undefined,
                 // Restoring terrain
                 terrain: row.terrain ? JSON.parse(row.terrain) : undefined,
+                environment: row.environment ? JSON.parse(row.environment) : undefined,
                 createdAt: row.created_at,
                 updatedAt: row.updated_at,
             })
@@ -99,7 +142,7 @@ export class EncounterRepository {
     saveState(encounterId: string, state: any): void {
         const stmt = this.db.prepare(`
             UPDATE encounters
-            SET tokens = ?, round = ?, active_token_id = ?, status = ?, terrain = ?, props = ?, grid_bounds = ?, rng_state = ?, updated_at = ?
+            SET tokens = ?, round = ?, active_token_id = ?, status = ?, terrain = ?, environment = ?, props = ?, grid_bounds = ?, rng_state = ?, updated_at = ?
             WHERE id = ?
         `);
 
@@ -114,6 +157,7 @@ export class EncounterRepository {
             'active',
             // PHASE 1: Persist terrain
             state.terrain ? JSON.stringify(state.terrain) : null,
+            state.environment ? JSON.stringify(state.environment) : null,
             // PHASE 1: Persist props
             state.props ? JSON.stringify(state.props) : null,
             // PHASE 2: Persist grid bounds
@@ -149,7 +193,8 @@ export class EncounterRepository {
 
         // PHASE 1: Parse terrain if present
         const terrain = row.terrain ? JSON.parse(row.terrain) : undefined;
-        
+        const environment = row.environment ? JSON.parse(row.environment) : undefined;
+
         // PHASE 1: Parse props if present
         const props = row.props ? JSON.parse(row.props) : undefined;
 
@@ -182,13 +227,17 @@ export class EncounterRepository {
             }
         }
 
+        // An encounter with no tokens yet (a boarding waiting for its boarders)
+        // starts at index 0, never -1.
+        const activeIndex = turnOrder.indexOf(row.active_token_id ?? turnOrder[0]);
         return {
             participants: participants,
             turnOrder,
-            currentTurnIndex: turnOrder.indexOf(row.active_token_id ?? turnOrder[0]),
+            currentTurnIndex: activeIndex < 0 ? 0 : activeIndex,
             round: row.round,
             // PHASE 1: Restore terrain
             terrain,
+            ...(environment ? { environment } : {}),
             props,
             // PHASE 2: Restore grid bounds
             gridBounds,
@@ -220,9 +269,12 @@ interface EncounterRow {
     status: string;
     // PHASE 1: Terrain and bounds persistence
     terrain: string | null;
+    environment?: string | null;
     props: string | null;
     grid_bounds: string | null;
     rng_state?: string | null;
+    parent_id?: string | null;
+    notes?: string | null;
     created_at: string;
     updated_at: string;
 }

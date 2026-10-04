@@ -13,6 +13,8 @@ export interface McpResponse {
 }
 import { RichFormatter } from '../utils/formatter.js';
 import { getDb } from '../../storage/index.js';
+import { loggedRoll } from '../../math/logged-d20.js';
+import { cryptoInt } from '../../math/crypto-dice.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { PartyRepository } from '../../storage/repos/party.repo.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
@@ -210,7 +212,7 @@ const SpawnManageInputSchema = z.object({
     partyLevel: z.number().int().min(1).max(20).optional(),
     partyId: z.string().optional().describe('Party ID for encounter setup'),
     partyPositions: z.array(z.string()).optional().describe('Party starting positions'),
-    seed: z.string().optional().describe('Random seed for determinism'),
+    seed: z.string().optional().describe('Seed for a deterministic, replayable encounter (omit for crypto dice, the default)'),
 
     // spawn_preset_location fields
     x: z.number().int().min(0).optional().describe('X coordinate'),
@@ -516,7 +518,9 @@ async function handleSpawnEncounter(input: SpawnManageInput, ctx: SessionContext
         }
 
         if (candidates.length > 0) {
-            encounterData = candidates[Math.floor(Math.random() * candidates.length)];
+            // Which encounter: a crypto die over the candidates, logged as 'random_encounter'.
+            const pick = loggedRoll(getDb(), { purpose: 'random_encounter' }, `1d${candidates.length}`, { tool: 'spawn_manage' }).total - 1;
+            encounterData = candidates[pick];
         }
     }
 
@@ -547,7 +551,7 @@ async function handleSpawnEncounter(input: SpawnManageInput, ctx: SessionContext
             const characterId = randomUUID();
             const pos = participant.position
                 ? parsePosition(participant.position)
-                : { x: Math.floor(Math.random() * 10), y: Math.floor(Math.random() * 10) };
+                : { x: cryptoInt(10) - 1, y: cryptoInt(10) - 1 };
 
             const character = buildCharacter({
                 id: characterId,
@@ -629,7 +633,7 @@ async function handleSpawnEncounter(input: SpawnManageInput, ctx: SessionContext
     // Create encounter
     const encounterId = `encounter-${input.seed || randomUUID()}-${Date.now()}`;
     const namespacedId = `${ctx.sessionId}:${encounterId}`;
-    const engine = new CombatEngine(input.seed || randomUUID());
+    const engine = input.seed ? new CombatEngine(input.seed) : CombatEngine.crypto();
     const encounterState = engine.startEncounter(participants);
     combatManager.create(namespacedId, engine);
 
@@ -1112,7 +1116,7 @@ async function handleSpawnTactical(input: SpawnManageInput, ctx: SessionContext)
     // Create encounter
     const encounterId = `encounter-${input.seed || randomUUID()}-${Date.now()}`;
     const namespacedId = `${ctx.sessionId}:${encounterId}`;
-    const engine = new CombatEngine(input.seed || randomUUID());
+    const engine = input.seed ? new CombatEngine(input.seed) : CombatEngine.crypto();
     const encounterState = engine.startEncounter(participants);
     (encounterState as any).terrain = terrain;
     combatManager.create(namespacedId, engine);

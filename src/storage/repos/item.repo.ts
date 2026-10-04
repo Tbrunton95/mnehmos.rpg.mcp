@@ -1,6 +1,22 @@
 import Database from 'better-sqlite3';
 import { Item, ItemSchema } from '../../schema/inventory.js';
 
+/**
+ * World scoping for reads. With `worldId`, only that world's rows come back;
+ * `includeUnscoped` adds the legacy rows whose world_id is still NULL.
+ * Without `worldId` every row is returned, as before the column existed.
+ */
+export interface ItemScope {
+    worldId?: string;
+    includeUnscoped?: boolean;
+}
+
+function scopeClause(scope: ItemScope | undefined, params: unknown[]): string {
+    if (!scope?.worldId) return '';
+    params.push(scope.worldId);
+    return scope.includeUnscoped ? ' AND (world_id = ? OR world_id IS NULL)' : ' AND world_id = ?';
+}
+
 export class ItemRepository {
     constructor(private db: Database.Database) { }
 
@@ -8,8 +24,8 @@ export class ItemRepository {
         const validItem = ItemSchema.parse(item);
 
         const stmt = this.db.prepare(`
-            INSERT INTO items (id, name, description, type, weight, value, properties, created_at, updated_at)
-            VALUES (@id, @name, @description, @type, @weight, @value, @properties, @createdAt, @updatedAt)
+            INSERT INTO items (id, name, description, type, weight, value, properties, world_id, created_at, updated_at)
+            VALUES (@id, @name, @description, @type, @weight, @value, @properties, @worldId, @createdAt, @updatedAt)
         `);
 
         stmt.run({
@@ -20,6 +36,7 @@ export class ItemRepository {
             weight: validItem.weight,
             value: validItem.value,
             properties: JSON.stringify(validItem.properties || {}),
+            worldId: validItem.worldId ?? null,
             createdAt: validItem.createdAt,
             updatedAt: validItem.updatedAt
         });
@@ -33,9 +50,10 @@ export class ItemRepository {
         return this.rowToItem(row);
     }
 
-    findAll(): Item[] {
-        const stmt = this.db.prepare('SELECT * FROM items');
-        const rows = stmt.all() as ItemRow[];
+    findAll(scope?: ItemScope): Item[] {
+        const params: unknown[] = [];
+        const stmt = this.db.prepare(`SELECT * FROM items WHERE 1=1${scopeClause(scope, params)}`);
+        const rows = stmt.all(...params) as ItemRow[];
         return rows.map(row => this.rowToItem(row));
     }
 
@@ -63,6 +81,7 @@ export class ItemRepository {
                 weight = @weight,
                 value = @value,
                 properties = @properties,
+                world_id = @worldId,
                 updated_at = @updatedAt
             WHERE id = @id
         `);
@@ -75,6 +94,7 @@ export class ItemRepository {
             weight: updated.weight,
             value: updated.value,
             properties: JSON.stringify(updated.properties || {}),
+            worldId: updated.worldId ?? null,
             updatedAt: updated.updatedAt
         });
 
@@ -87,13 +107,14 @@ export class ItemRepository {
         return rows.map(row => this.rowToItem(row));
     }
 
-    findByType(type: string): Item[] {
-        const stmt = this.db.prepare('SELECT * FROM items WHERE type = ?');
-        const rows = stmt.all(type) as ItemRow[];
+    findByType(type: string, scope?: ItemScope): Item[] {
+        const params: unknown[] = [type];
+        const stmt = this.db.prepare(`SELECT * FROM items WHERE type = ?${scopeClause(scope, params)}`);
+        const rows = stmt.all(...params) as ItemRow[];
         return rows.map(row => this.rowToItem(row));
     }
 
-    search(query: { name?: string; type?: string; minValue?: number; maxValue?: number }): Item[] {
+    search(query: { name?: string; type?: string; minValue?: number; maxValue?: number } & ItemScope): Item[] {
         let sql = 'SELECT * FROM items WHERE 1=1';
         const params: any[] = [];
 
@@ -113,10 +134,22 @@ export class ItemRepository {
             sql += ' AND value <= ?';
             params.push(query.maxValue);
         }
+        sql += scopeClause(query, params);
 
         const stmt = this.db.prepare(sql);
         const rows = stmt.all(...params) as ItemRow[];
         return rows.map(row => this.rowToItem(row));
+    }
+
+    /** Ids of every legacy (unscoped) template. */
+    findUnscopedIds(): string[] {
+        const rows = this.db.prepare('SELECT id FROM items WHERE world_id IS NULL ORDER BY created_at, id').all() as Array<{ id: string }>;
+        return rows.map(r => r.id);
+    }
+
+    /** Stamp a world onto a row only while it is still unscoped; returns rows changed (0 or 1). */
+    scopeToWorld(id: string, worldId: string): number {
+        return this.db.prepare('UPDATE items SET world_id = ? WHERE id = ? AND world_id IS NULL').run(worldId, id).changes;
     }
 
     private rowToItem(row: ItemRow): Item {
@@ -128,6 +161,7 @@ export class ItemRepository {
             weight: row.weight,
             value: row.value,
             properties: row.properties ? JSON.parse(row.properties) : undefined,
+            worldId: row.world_id ?? undefined,
             createdAt: row.created_at,
             updatedAt: row.updated_at
         });
@@ -142,6 +176,7 @@ interface ItemRow {
     weight: number;
     value: number;
     properties: string | null;
+    world_id: string | null;
     created_at: string;
     updated_at: string;
 }

@@ -16,6 +16,7 @@ import { castingClassFor, findWorldRule, resolveWorldId } from '../../engine/tab
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { findOpen5eClass } from '../../content/open5e-catalog.js';
 import { CLASS_DATA } from '../../data/class-starting-data.js';
+import { loggedRoll } from '../../math/logged-d20.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -43,8 +44,9 @@ function getAbilityModifier(score: number): number {
     return Math.floor((score - 10) / 2);
 }
 
-function rollDie(sides: number): number {
-    return Math.floor(Math.random() * sides) + 1;
+/** One hit die for the character: crypto dice, logged to roll_log as 'hit_dice'. */
+function rollHitDie(sides: number, characterId: string): number {
+    return loggedRoll(getDb(), { purpose: 'hit_dice', forId: characterId }, `1d${sides}`, { tool: 'rest_manage' }).total;
 }
 
 // The same lookup character creation uses; custom classes fall back to d8.
@@ -188,7 +190,7 @@ async function handleShortRest(args: z.infer<typeof ShortRestSchema>, ctx?: Sess
     const rolls: number[] = [];
 
     for (let i = 0; i < hitDiceToSpend; i++) {
-        const roll = rollDie(hitDieSize);
+        const roll = rollHitDie(hitDieSize, character.id);
         rolls.push(roll);
         totalHealing += Math.max(1, roll + conModifier);
     }

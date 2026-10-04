@@ -2,6 +2,7 @@ import { runDataMigrations } from './data-migrations.js';
 import Database from 'better-sqlite3';
 import { migrateClassProgression } from './migrations.class-progression.js';
 import { migrateLegacyRegionIds } from './migrations.region-ids.js';
+import { XP_AWARDS_DDL } from './xp-awards.js';
 
 /**
  * Bring a database up to the current schema.
@@ -694,6 +695,14 @@ function runMigrations(db: Database.Database) {
     db.exec(`ALTER TABLE characters ADD COLUMN character_type TEXT DEFAULT 'pc';`);
   }
 
+  // Deep One audit, request 6: item templates get a nullable world scope.
+  // Legacy rows stay NULL ("unscoped") until item_manage scope_items claims them.
+  const itemColumns = db.prepare("PRAGMA table_info(items)").all() as { name: string }[];
+  if (!itemColumns.some(col => col.name === 'world_id')) {
+    db.exec(`ALTER TABLE items ADD COLUMN world_id TEXT;`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_items_world ON items(world_id);`);
+  }
+
   // FINDINGS #34 T2.8: secrets gain a status field (active/parked/spent)
   const secretColumns = db.prepare("PRAGMA table_info(secrets)").all() as { name: string }[];
   if (!secretColumns.some(col => col.name === 'status')) {
@@ -1288,6 +1297,12 @@ function runMigrations(db: Database.Database) {
     console.error('[Migration] Adding band column to characters table');
     db.exec(`ALTER TABLE characters ADD COLUMN band TEXT;`);
   }
+  // Deep One audit request 10: exposure timers — pools that climb with the
+  // world clock, JSON list of {name, pool, perHour, cap?, thresholds?, fired?}.
+  if (!ruleCharColumns.some(col => col.name === 'exposure')) {
+    console.error('[Migration] Adding exposure column to characters table');
+    db.exec('ALTER TABLE characters ADD COLUMN exposure TEXT;');
+  }
   const effectColumns = db.prepare("PRAGMA table_info(custom_effects)").all() as { name: string }[];
   if (effectColumns.length && !effectColumns.some(col => col.name === 'cost')) {
     console.error('[Migration] Adding cost column to custom_effects table');
@@ -1307,6 +1322,10 @@ function runMigrations(db: Database.Database) {
     console.error('[Migration] Adding combat_profile column to characters table');
     db.exec(`ALTER TABLE characters ADD COLUMN combat_profile TEXT;`);
   }
+
+  // Request 3: the XP award ledger. Every XP write leaves a posted row; a
+  // narrated-but-unapplied award sits unposted until post_awards.
+  db.exec(XP_AWARDS_DDL);
 }
 
 function createPostMigrationIndexes(db: Database.Database) {
@@ -1331,6 +1350,36 @@ function createPostMigrationIndexes(db: Database.Database) {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_regions_owner_nation ON regions(owner_nation_id);`);
   } catch (e) {
     console.error('[Migration] Note: Could not create idx_regions_owner_nation:', (e as Error).message);
+  }
+
+  // Deep One audit request 9: ledger_debts gains `kind` (debt | oath | meeting |
+  // border | favour). The table itself is created lazily by ledger_manage, so
+  // only an existing table is altered here; every pre-`kind` row is a debt.
+  const ledgerColumns = db.prepare("PRAGMA table_info(ledger_debts)").all() as { name: string }[];
+  if (ledgerColumns.length && !ledgerColumns.some(col => col.name === 'kind')) {
+    console.error('[Migration] Adding kind column to ledger_debts table');
+    db.exec("ALTER TABLE ledger_debts ADD COLUMN kind TEXT NOT NULL DEFAULT 'debt';");
+  }
+
+  // Deep One audit request 2: cancel_scheduled and era_jump stamp cancelled_at
+  // instead of deleting the row; live readers filter on it (scheduleLiveSql).
+  const schedColumns = db.prepare("PRAGMA table_info(scheduled_state_changes)").all() as { name: string }[];
+  if (schedColumns.length && !schedColumns.some(col => col.name === 'cancelled_at')) {
+    console.error('[Migration] Adding cancelled_at column to scheduled_state_changes table');
+    db.exec('ALTER TABLE scheduled_state_changes ADD COLUMN cancelled_at TEXT;');
+  }
+
+  // Deep One audit request 5: a boarding encounter hangs off its void fight
+  // (parent_id); notes is a JSON bag for links the tokens do not carry
+  // (boardingFrom, boardings, boardingResults).
+  const encColumns = db.prepare("PRAGMA table_info(encounters)").all() as { name: string }[];
+  if (encColumns.length && !encColumns.some(col => col.name === 'parent_id')) {
+    console.error('[Migration] Adding parent_id column to encounters table');
+    db.exec('ALTER TABLE encounters ADD COLUMN parent_id TEXT;');
+  }
+  if (encColumns.length && !encColumns.some(col => col.name === 'notes')) {
+    console.error('[Migration] Adding notes column to encounters table');
+    db.exec('ALTER TABLE encounters ADD COLUMN notes TEXT;');
   }
 
   // POI + rooms tables for travel_manage / spawn_preset_location / spawn_location

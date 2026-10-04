@@ -21,6 +21,7 @@ import { checkConcentration, breakConcentration } from '../../engine/magic/conce
 import type { Character } from '../../schema/character.js';
 import { breakTestDue, moraleModifiers, type BreakTest } from '../../engine/combat/units.js';
 import { nearbyAllies, type SpeciesOf } from '../../engine/combat/nearby.js';
+import { applyGrowth, type GrowthOutcome } from '../growth.js';
 
 /** A token's species from its character sheet's race, for tokens that carry none. */
 export function sheetSpecies(db: Database.Database): SpeciesOf {
@@ -107,6 +108,20 @@ export function isFumble(rolls: number[]): boolean {
 
 function nameKey(s: string): string { return s.toLowerCase().replace(/[\s_-]+/g, ''); }
 
+/**
+ * A boost: the caster spends a pool (a warpstone token) for a flat modifier
+ * and/or extra dice on the casting roll, and pays any side effect pools
+ * (taint). Refused before anything is rolled when the pool cannot pay.
+ */
+export interface SpellBoost {
+    pool: string;
+    /** Signed; a spend is negative. */
+    delta: number;
+    modifier?: number;
+    extraDice?: string;
+    sideEffect?: Array<{ pool: string; delta: number }>;
+}
+
 export interface CastWorldSpellInput {
     engine: CombatEngine;
     db: Database.Database;
@@ -116,6 +131,7 @@ export interface CastWorldSpellInput {
     targetIds: string[];
     unbinderId?: string;
     damage?: number | string;
+    boost?: SpellBoost;
 }
 
 interface EffectResult {
@@ -190,28 +206,76 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
 
     const reason = `cast ${name}`;
     const costOps: Array<{ op: 'adjust_pool'; pool: string; delta: number }> = [];
-    if (spec.cost.length) {
+    const boostOps: Array<{ op: 'adjust_pool'; pool: string; delta: number }> = [];
+    const boost = input.boost;
+    if (boost && !spec.castingRoll) throw new Error(`${name} has no casting roll to boost`);
+    if (boost && boost.modifier === undefined && !boost.extraDice) throw new Error('boost needs modifier and/or extraDice');
+    if (spec.cost.length || boost) {
         if (!char) throw new Error(`${name} has a cost and ${actor.name} has no character sheet to pay it from`);
         const running: Record<string, number> = {};
-        for (const c of spec.cost) {
-            const found = findPool(char.resourcePools as Record<string, { current: number }> | undefined, c.pool);
-            const key = found?.key ?? c.pool;
+        const spend = (pool: string, delta: number, into: typeof costOps, what: string) => {
+            const found = findPool(char!.resourcePools as Record<string, { current: number }> | undefined, pool);
+            const key = found?.key ?? pool;
             const current = running[key] ?? found?.pool.current ?? 0;
-            if (c.delta < 0 && current + c.delta < 0) {
-                throw new Error(`${actor.name} cannot pay ${name}: ${key} ${current} is short of ${-c.delta}`);
+            if (delta < 0 && current + delta < 0) {
+                throw new Error(`${actor.name} cannot pay ${what}: ${key} ${current} is short of ${-delta}`);
             }
-            running[key] = current + c.delta;
-            costOps.push({ op: 'adjust_pool', pool: key, delta: c.delta });
+            running[key] = current + delta;
+            into.push({ op: 'adjust_pool', pool: key, delta });
+        };
+        for (const c of spec.cost) spend(c.pool, c.delta, costOps, name);
+        if (boost) {
+            spend(boost.pool, boost.delta, boostOps, `the boost on ${name}`);
+            for (const se of boost.sideEffect ?? []) spend(se.pool, se.delta, boostOps, `the boost on ${name}`);
         }
     }
 
-    // ── Costs: paid whether or not the cast succeeds ──
+    // ── Costs: paid whether or not the cast succeeds. Every pool move runs
+    // the growth check, so a warpstone cost climbs the taint ladder. ──
     let costLines: string[] = [];
-    if (costOps.length && char) {
-        const { applied, updates } = applyScheduledOps(char, costOps, { reason });
+    let boostLines: string[] = [];
+    const growth: GrowthOutcome[] = [];
+    const pay = async (ops: typeof costOps, why: string): Promise<string[]> => {
+        if (!ops.length || !char) return [];
+        const before = Object.fromEntries(ops.map(o => [o.pool, (findPool(char!.resourcePools as Record<string, { current: number }> | undefined, o.pool)?.pool.current) ?? 0]));
+        const { applied, updates } = applyScheduledOps(char, ops, { reason: why });
         charRepo.update(char.id, updates as never);
-        costLines = applied;
         char = charRepo.findById(char.id);
+        const after = (updates.resourcePools ?? {}) as Record<string, { current: number }>;
+        for (const o of ops) {
+            const to = after[o.pool]?.current;
+            if (typeof to !== 'number' || to === before[o.pool]) continue;
+            const g = await applyGrowth(db, worldId, actorId, o.pool, before[o.pool], to, { roller: engineRoller(engine, { forId: actorId }) });
+            if (g.growthReady || g.growthApplied) growth.push(g);
+            char = charRepo.findById(actorId);
+        }
+        return applied;
+    };
+    costLines = await pay(costOps, reason);
+    boostLines = await pay(boostOps, `boost: ${reason}`);
+    // A condition a growth rung put on the caster's sheet reaches the token too.
+    for (const g of growth) {
+        for (const a of g.growthApplied ?? []) {
+            if (!a.condition) continue;
+            const norm = normalizeCondition({ name: a.condition, sourceId: actorId, source: a.track } as never, actorId);
+            if (norm) { const { id: _drop, ...rest } = norm; engine.applyCondition(actorId, rest); }
+        }
+    }
+
+    // ── Boost: the modifier and the extra dice join the casting roll ──
+    let boostResult: { pool: string; delta: number; modifier?: number; extraDice?: string; extraRolls?: number[]; bonus: number; sideEffect: string[] } | undefined;
+    const boostExtra: Array<{ label: string; value: number }> = [];
+    if (boost) {
+        let bonus = boost.modifier ?? 0;
+        let extraRolls: number[] | undefined;
+        if (boost.extraDice) {
+            const r = engine.rollDice(boost.extraDice, { purpose: `boost ${name}`, forId: actorId });
+            extraRolls = r.rolls;
+            bonus += r.total;
+            boostExtra.push({ label: `boost ${boost.extraDice} (${r.rolls.join('+')})`, value: r.total });
+        }
+        if (boost.modifier) boostExtra.push({ label: 'boost', value: boost.modifier });
+        boostResult = { pool: boost.pool, delta: boost.delta, ...(boost.modifier !== undefined ? { modifier: boost.modifier } : {}), ...(boost.extraDice ? { extraDice: boost.extraDice, extraRolls } : {}), bonus, sideEffect: boostLines.slice(1) };
     }
 
     // ── Waaagh! energy: allies around the caster add to the casting roll ──
@@ -225,6 +289,7 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
         nearbyBonus = { count, bonus, per: near.per, ...(near.max !== undefined ? { max: near.max } : {}), range: near.range, overload: near.overloadAt !== undefined && bonus >= near.overloadAt };
         if (bonus) extra.push({ label: `nearby ${count}`, value: bonus });
     }
+    extra.push(...boostExtra);
 
     // ── Casting roll ──
     const casting = spec.castingRoll ? computeCastingTotal(engine, spec.castingRoll, actor, char, reason, extra) : undefined;
@@ -375,6 +440,11 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
     // ── Banner ──
     let output = `\n┌─────────────────────────────────────────┐\n│ ✨ ${name.toUpperCase()} (world spell)\n└─────────────────────────────────────────┘\n\n${actor.name} casts ${name}!\n`;
     if (costLines.length) output += `💠 Cost: ${costLines.join(', ')}\n`;
+    if (boostResult) output += `🟢 Boost: ${boostLines.join(', ')} → +${boostResult.bonus} on the casting roll\n`;
+    for (const g of growth) {
+        for (const a of g.growthApplied ?? []) output += `⬆ GROWTH ${a.track} ${a.at}: ${[a.condition && `condition ${a.condition}`, a.table && `table ${String((a.table as { table?: string }).table)}`, a.form && `form ${String((a.form as { form?: string }).form)}`].filter(Boolean).join(', ')}\n`;
+        if (g.growthReady) output += `⬆ GROWTH READY: ${g.growthReady.form ?? g.growthReady.condition?.name ?? g.growthReady.table} (${g.growthReady.call})\n`;
+    }
     if (casting) {
         output += `🎲 Casting: ${casting.parts.join(' ')} = ${casting.total} vs ${spec.castingRoll!.target} [${success ? 'CAST' : 'FAILED'}]${double ? ' (double)' : ''}${fumble ? ' (fumble)' : ''}\n`;
         if (nearbyBonus) output += `📣 ${nearbyBonus.count} allies within ${nearbyBonus.range} ft: +${nearbyBonus.bonus}${nearbyBonus.max !== undefined ? ` (max ${nearbyBonus.max})` : ''}${nearbyBonus.overload ? ' — OVERLOAD' : ''}\n`;
@@ -408,6 +478,9 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
             ...(casting ? { casting: { ...casting, target: spec.castingRoll!.target, success, double, fumble } } : {}),
             ...(nearbyBonus ? { nearbyBonus } : {}),
             costs: costLines,
+            ...(boostResult ? { boost: boostResult } : {}),
+            ...(growth.some(g => g.growthApplied) ? { growthApplied: growth.flatMap(g => g.growthApplied ?? []) } : {}),
+            ...(growth.find(g => g.growthReady) ? { growthReady: growth.find(g => g.growthReady)!.growthReady } : {}),
             ...(unbind ? { unbind } : {}),
             effects: effects.map(({ line: _l, ...e }) => e),
             ...(miscast ? { miscast } : {}),
