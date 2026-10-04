@@ -15,6 +15,7 @@ import { CorpseRepository } from '../../storage/repos/corpse.repo.js';
 import { SpatialRepository } from '../../storage/repos/spatial.repo.js';
 import { PoiRepository } from '../../storage/repos/poi.repo.js';
 import { SessionContext } from '../types.js';
+import { loggedD20, loggedRoll } from '../../math/logged-d20.js';
 
 export interface McpResponse {
     content: Array<{ type: 'text'; text: string }>;
@@ -169,7 +170,7 @@ async function handleTravel(input: TravelManageInput, _ctx: SessionContext): Pro
 
         if (discoverer) {
             const wisBonus = Math.floor(((discoverer.stats?.wis || 10) - 10) / 2);
-            discoveryRoll = Math.floor(Math.random() * 20) + 1 + wisBonus;
+            discoveryRoll = loggedD20(getDb(), { purpose: 'poi_discovery', forId: discoverer.id }, { tool: 'travel_manage' }).natural + wisBonus;
             const dc = poi.discoveryDc || 15;
             discovered = discoveryRoll >= dc;
         }
@@ -248,7 +249,7 @@ async function handleTravel(input: TravelManageInput, _ctx: SessionContext): Pro
             const normHas = (xs: string[], s: string) => xs.some(x => normOne(x) === normOne(s));
             if (normHas(lexpertise, 'survival')) { mod += prof * 2; rollBreakdown.push(`expertise +${prof * 2}`); }
             else if (normHas(lskills, 'survival')) { mod += prof; rollBreakdown.push(`proficiency +${prof}`); }
-            const die = Math.floor(Math.random() * 20) + 1;
+            const die = loggedD20(getDb(), { purpose: 'travel_event', forId: leadFull.id }, { tool: 'travel_manage' }).natural;
             const total = die + mod;
             const hotspot = die === 1;
             const clean = !hotspot && (die === 20 || total >= dc);
@@ -603,8 +604,8 @@ async function handleRest(input: TravelManageInput, _ctx: SessionContext): Promi
                 const conBonus = Math.floor(((char.stats?.con || 10) - 10) / 2);
                 let healing = 0;
                 for (let i = 0; i < hitDice; i++) {
-                    // Assume d8 hit die for simplicity
-                    healing += Math.max(1, Math.floor(Math.random() * 8) + 1 + conBonus);
+                    // Assume d8 hit die for simplicity; crypto dice, logged as 'hit_dice'.
+                    healing += Math.max(1, loggedRoll(getDb(), { purpose: 'hit_dice', forId: char.id }, '1d8', { tool: 'travel_manage' }).total + conBonus);
                 }
                 hpAfter = Math.min(char.maxHp, hpBefore + healing);
             }

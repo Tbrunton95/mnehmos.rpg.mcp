@@ -570,7 +570,7 @@ async function handleAfterBattle(args: z.infer<typeof AfterBattleSchema>): Promi
         for (const m of partyRepo.findMembersByParty(party.id)) {
             if (dead.has(m.characterId)) continue;
             try {
-                const credit = creditGrowth(db, resolveWorldId(db, { characterIds: [m.characterId] }), m.characterId, 'victory');
+                const credit = await creditGrowth(db, resolveWorldId(db, { characterIds: [m.characterId] }), m.characterId, 'victory');
                 if (credit) growth.push({ characterId: m.characterId, name: charRepo.findById(m.characterId)?.name ?? m.characterId, ...credit });
             } catch { /* no rules table: no growth */ }
         }

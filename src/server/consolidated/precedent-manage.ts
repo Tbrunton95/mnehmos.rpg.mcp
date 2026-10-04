@@ -59,6 +59,37 @@ export function recentPrecedents(worldId: string, limit = 5): Array<ReturnType<t
     } catch { return []; }
 }
 
+export type PrecedentCitation = { where: 'condition' | 'note' | 'item'; characterId?: string; id: string; text: string };
+
+const clip = (s: string, n = 160) => s.length > n ? `${s.slice(0, n)}…` : s;
+
+/** Every place a precedent id is cited: condition source/note, narrative note content, item instance custom names. */
+export function findCitations(db: ReturnType<typeof getDb>, precedentId: string): PrecedentCitation[] {
+    const out: PrecedentCitation[] = [];
+    const needle = precedentId.toLowerCase();
+    const cites = (s: unknown) => typeof s === 'string' && s.toLowerCase().includes(needle);
+    try {
+        const rows = db.prepare('SELECT id, conditions FROM characters WHERE LOWER(conditions) LIKE ?').all(`%${needle}%`) as Array<{ id: string; conditions: string | null }>;
+        for (const r of rows) {
+            let conds: Array<{ name?: string; source?: string; note?: string }> = [];
+            try { conds = JSON.parse(r.conditions ?? '[]'); } catch { conds = []; }
+            for (const c of conds) {
+                if (!c || !(cites(c.source) || cites(c.note))) continue;
+                out.push({ where: 'condition', characterId: r.id, id: c.name ?? '?', text: clip(`${c.name ?? '?'} — ${c.source ?? c.note ?? ''}`) });
+            }
+        }
+    } catch { /* no conditions column */ }
+    try {
+        const rows = db.prepare('SELECT id, type, content, entity_id, entity_type FROM narrative_notes WHERE LOWER(content) LIKE ?').all(`%${needle}%`) as Array<{ id: string; type: string; content: string; entity_id: string | null; entity_type: string | null }>;
+        for (const r of rows) out.push({ where: 'note', ...(r.entity_type === 'character' && r.entity_id ? { characterId: r.entity_id } : {}), id: r.id, text: clip(`[${r.type}] ${r.content.trim().split('\n')[0]}`) });
+    } catch { /* no notes table */ }
+    try {
+        const rows = db.prepare('SELECT id, owner_character_id, custom_name FROM item_instances WHERE LOWER(custom_name) LIKE ?').all(`%${needle}%`) as Array<{ id: string; owner_character_id: string | null; custom_name: string }>;
+        for (const r of rows) out.push({ where: 'item', ...(r.owner_character_id ? { characterId: r.owner_character_id } : {}), id: r.id, text: clip(r.custom_name) });
+    } catch { /* no instances table */ }
+    return out;
+}
+
 async function route(args: unknown): Promise<Record<string, unknown>> {
     const input = PrecedentInputSchema.parse(args);
     const db = pdb();
@@ -100,7 +131,16 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
             db.prepare('INSERT INTO precedents (id, world_id, kind, statement, scope, tags, context, day, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
                 .run(id, input.worldId, input.kind ?? old.kind, input.statement, input.scope ?? old.scope, JSON.stringify(input.tags ?? JSON.parse(old.tags)), input.context ?? null, day, now);
             db.prepare('UPDATE precedents SET superseded_by = ? WHERE id = ?').run(id, old.id);
-            return { success: true, actionType: 'supersede', replaced: view(find(old.id)!), precedent: view(find(id)!), message: `Superseded: ${old.statement} → ${input.statement}` };
+            // Request 4: the old id lives on in condition sources, notes and
+            // named items. Name every citation so the GM updates them now
+            // instead of reconcile finding them next session.
+            const citations = findCitations(db, old.id);
+            return {
+                success: true, actionType: 'supersede', replaced: view(find(old.id)!), precedent: view(find(id)!),
+                citations,
+                ...(citations.length ? { hint: `${citations.length} citation(s) of ${old.id} remain: conditions → character_manage update {characterId, editConditions: [{match, replaceSource: {find: "${old.id}", with: "${id}"}}]}; notes → narrative_manage update; items → inventory_manage rename or item_manage update. world_manage reconcile lists condition citations until they are fixed.` } : {}),
+                message: `Superseded: ${old.statement} → ${input.statement}${citations.length ? ` — ${citations.length} citation(s) of the old id still stand` : ''}`
+            };
         }
     }
     return { error: true, message: `Unknown action '${input.action}': ${ACTIONS.join(', ')}` };
@@ -129,7 +169,7 @@ export const PrecedentManageTool = {
 Actions: record, search, get, supersede, list
 - record {worldId, kind: 'ruling' | 'invention', statement, scope?, tags?, context?, day?}: every ruling you make and everything you invent ("[invention]") goes here.
 - search {worldId, query?, scope?, kind?}: check before ruling on something that may have come up before.
-- supersede {worldId, precedentId, statement}: a new ruling replaces an old one; the old one is kept and points to it.
+- supersede {worldId, precedentId, statement}: a new ruling replaces an old one; the old one is kept and points to it. Reply lists citations [{where: condition|note|item, characterId?, id, text}] of the old id still standing in condition sources/notes, narrative notes and item names, with a hint on updating them.
 worldId REQUIRED on every call.`,
     inputSchema: PrecedentInputSchema,
     actionSchemas: Object.fromEntries(ACTIONS.map(a => [a, { schema: PrecedentInputSchema, aliases: [] as string[] }]))

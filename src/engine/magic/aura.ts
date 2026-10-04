@@ -7,6 +7,7 @@ import { randomUUID } from 'crypto';
 import { AuraState, AuraEffect, AuraEffectResult, CreateAuraRequest, AuraTrigger } from '../../schema/aura.js';
 import { Position, Token } from '../../schema/encounter.js';
 import { AuraRepository } from '../../storage/repos/aura.repo.js';
+import { cryptoInt } from '../../math/crypto-dice.js';
 
 /**
  * Calculate distance in feet between two positions
@@ -140,18 +141,32 @@ export function shouldAffectTarget(
 }
 
 /**
+ * The dice an aura rolls on. The handler passes logged crypto dice (purpose
+ * and target id for roll_log); direct engine callers get unlogged crypto dice.
+ */
+export interface AuraDice {
+    d20(purpose: string, forId: string): number;
+    roll(notation: string, purpose: string, forId: string): number;
+}
+
+const UNLOGGED_AURA_DICE: AuraDice = {
+    d20: () => cryptoInt(20),
+    roll: notation => rollDice(notation)
+};
+
+/**
  * Roll a saving throw
  * @param abilityModifier - The ability modifier for the save
  * @returns Object with roll and total
  */
-export function rollSave(abilityModifier: number): { roll: number; total: number } {
-    const roll = Math.floor(Math.random() * 20) + 1;
+export function rollSave(abilityModifier: number, d20: () => number = () => cryptoInt(20)): { roll: number; total: number } {
+    const roll = d20();
     const total = roll + abilityModifier;
     return { roll, total };
 }
 
 /**
- * Roll damage or healing dice
+ * Roll damage or healing dice on crypto dice
  * @param dice - Dice notation (e.g., "3d8")
  * @returns Total result
  */
@@ -168,7 +183,7 @@ export function rollDice(dice: string): number {
 
     let total = bonus;
     for (let i = 0; i < numDice; i++) {
-        total += Math.floor(Math.random() * diceSize) + 1;
+        total += cryptoInt(diceSize);
     }
 
     return total;
@@ -185,7 +200,8 @@ export function applyAuraEffect(
     aura: AuraState,
     effect: AuraEffect,
     target: Token,
-    trigger: AuraTrigger
+    trigger: AuraTrigger,
+    dice: AuraDice = UNLOGGED_AURA_DICE
 ): AuraEffectResult {
     const result: AuraEffectResult = {
         auraId: aura.id,
@@ -199,7 +215,7 @@ export function applyAuraEffect(
     // Handle effects that require saving throws
     if (effect.saveType && effect.saveDC) {
         const abilityModifier = getAbilityModifier(target, effect.saveType);
-        const saveResult = rollSave(abilityModifier);
+        const saveResult = rollSave(abilityModifier, () => dice.d20(`${aura.spellName} ${effect.saveType} save`, target.id));
 
         result.saveRoll = saveResult.roll;
         result.saveDC = effect.saveDC;
@@ -219,14 +235,14 @@ export function applyAuraEffect(
     switch (effect.type) {
         case 'damage':
             if (effect.dice) {
-                result.damageDealt = rollDice(effect.dice);
+                result.damageDealt = dice.roll(effect.dice, `${aura.spellName} damage`, target.id);
                 result.damageType = effect.damageType;
             }
             break;
 
         case 'healing':
             if (effect.dice) {
-                result.healingDone = rollDice(effect.dice);
+                result.healingDone = dice.roll(effect.dice, `${aura.spellName} healing`, target.id);
             }
             break;
 
@@ -284,7 +300,8 @@ export function checkAuraEffectsForTarget(
     tokens: Token[],
     targetId: string,
     trigger: AuraTrigger,
-    auraRepo: AuraRepository
+    auraRepo: AuraRepository,
+    dice: AuraDice = UNLOGGED_AURA_DICE
 ): AuraEffectResult[] {
     const target = tokens.find(t => t.id === targetId);
     if (!target || !target.position) {
@@ -310,7 +327,7 @@ export function checkAuraEffectsForTarget(
         // Apply each effect that matches the trigger
         for (const effect of aura.effects) {
             if (effect.trigger === trigger) {
-                const result = applyAuraEffect(aura, effect, target, trigger);
+                const result = applyAuraEffect(aura, effect, target, trigger, dice);
                 results.push(result);
             }
         }

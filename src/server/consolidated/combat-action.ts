@@ -19,7 +19,7 @@ import { getDb } from '../../storage/index.js';
 import { CombatEngine } from '../../engine/combat/engine.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import type { CombatParticipant } from '../../engine/combat/engine.js';
-import { bandOrderFor, compareBands, resolveWorldId } from '../../engine/table-rules.js';
+import { bandOrderFor, bandRuleFor, bandDamageMultiplier, compareBands, resolveWorldId, type TableRule } from '../../engine/table-rules.js';
 import { sizeRank } from '../../schema/encounter.js';
 import { READIED_TRIGGERS, ReadiedAttackSchema } from '../../schema/token-extras.js';
 import { loggedD20, loggedDice } from '../../math/logged-d20.js';
@@ -65,6 +65,7 @@ const AttackSchema = z.object({
     ranged: z.boolean().optional().describe('A ranged attack (not within 5 ft): a prone target is disadvantage and paralysed/unconscious no auto-crit. Unset = from token positions, else melee'),
     ignoreConditions: z.boolean().optional().describe('Skip the automatic advantage/disadvantage/auto-crit from standard conditions (raw roll)'),
     cleave: z.boolean().optional().describe('Cleave a packed unit of a lower band: damage flows through models'),
+    bandScale: z.boolean().optional().describe("false skips the band rule's damageScale for this swing. Default: applied when the world's band rule has damageScale and both bands are set (result bandScale {steps, multiplier, before, after})"),
     legendaryCost: z.number().int().min(1).optional().describe("A legendary action: spends this many of the creature's legendary actions instead of its action (off its own turn only)"),
     reaction: z.boolean().optional().describe('An attack as a reaction (opportunity attack, readied swing): spends the reaction instead of the action'),
     advantage: z.boolean().optional(),
@@ -97,6 +98,15 @@ const DisengageSchema = z.object({
     actorId: z.string()
 });
 
+/** A fresh instance each call: the outer mirror must not hold one zod object twice. */
+const spellBoostSchema = () => z.object({
+    pool: z.string().min(1).describe("The pool spent ('warpstone')"),
+    delta: z.number().describe('Signed; a spend is negative (-1)'),
+    modifier: z.number().int().optional().describe('Flat bonus on the casting roll'),
+    extraDice: z.string().optional().describe("Extra dice added to the casting roll ('1d6')"),
+    sideEffect: z.array(z.object({ pool: z.string().min(1), delta: z.number() })).optional().describe("Pools that move with the spend ([{pool: 'warpstone_taint', delta: 1}]); each runs the growth check")
+});
+
 const CastSpellSchema = z.object({
     action: z.literal('cast_spell'),
     encounterId: z.string(),
@@ -105,7 +115,8 @@ const CastSpellSchema = z.object({
     targetId: z.string().optional(),
     targetIds: z.array(z.string()).optional(),
     slotLevel: z.number().int().min(1).max(9).optional(),
-    unbinderId: z.string().optional().describe("A world spell with contestedBy: 'unbind': this participant rolls the casting dice; a higher total stops it")
+    unbinderId: z.string().optional().describe("A world spell with contestedBy: 'unbind': this participant rolls the casting dice; a higher total stops it"),
+    boost: spellBoostSchema().optional().describe('World spell: spend a pool for +modifier and/or extraDice on the casting roll; sideEffect pools move too (growth-checked). Refused if the pool cannot pay')
 });
 
 const VolleySchema = z.object({
@@ -231,6 +242,7 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                 ranged: params.ranged,
                 ignoreConditions: params.ignoreConditions,
                 cleave: params.cleave,
+                bandScale: params.bandScale,
                 legendaryCost: params.legendaryCost,
                 reaction: params.reaction,
                 advantage: params.advantage,
@@ -345,7 +357,8 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                 targetId: params.targetId,
                 targetIds: params.targetIds,
                 slotLevel: params.slotLevel,
-                unbinderId: params.unbinderId
+                unbinderId: params.unbinderId,
+                boost: params.boost
             }, ctx);
             return extractResultData(result, 'cast_spell');
         },
@@ -596,11 +609,11 @@ DO NOT use math_manage for combat rolls - use this tool instead!
 
 ⚔️ ATTACK (minimal call):
 { action: "attack", encounterId, actorId, targetId }
-Everything else auto-calculated. Returns: roll result, damage dealt, HP change.
+Everything else auto-calculated. Returns: roll result, damage dealt, HP change. When the world's band rule carries damageScale and both bands are set, damage is scaled by the band gap (result bandScale {steps, multiplier, before, after}; bandScale: false skips it for one swing). Spells, heals and execute are never band-scaled.
 
 🔮 CAST_SPELL (minimal call):
 { action: "cast_spell", encounterId, actorId, spellName, targetId }
-Validates spell, rolls damage, applies effects, handles saves - all automatic.
+Validates spell, rolls damage, applies effects, handles saves - all automatic. A world spell (table_rules kind spell) takes boost {pool, delta, modifier?, extraDice?, sideEffect?: [{pool, delta}]}: spend a pool (warpstone -1) for +modifier / +extraDice on the casting roll, with side-effect pools (taint +1); refused if the pool cannot pay. Spell costs, boosts and side effects all run the growth check (growth_track rungs fire or are offered; result worldSpell.boost / growthApplied / growthReady).
 
 💚 SUPPORT:
 - heal - Restore HP to a target
@@ -639,6 +652,7 @@ Internal opposed check (Athletics vs better of Athletics/Acrobatics) on the figh
         weapon: z.string().optional().describe('attack (mirror): alias of using; also finds the part that holds it'),
         atPart: z.string().optional().describe('attack (mirror): the target part aimed at'),
         cleave: z.boolean().optional().describe('attack (mirror): cleave a packed lower-band unit'),
+        bandScale: z.boolean().optional().describe("attack (mirror): false skips the band rule's damageScale for this swing"),
         legendaryCost: z.number().optional().describe("attack (mirror): a legendary action costing this many of the creature's legendary actions, not its action"),
         reaction: z.boolean().optional().describe('attack (mirror): spends the reaction instead of the action (opportunity attack, readied swing)'),
         ranged: z.boolean().optional().describe('attack (mirror): a ranged attack, not within 5 ft (prone target = disadvantage; no auto-crit)'),
@@ -659,6 +673,7 @@ Internal opposed check (Athletics vs better of Athletics/Acrobatics) on the figh
         spellName: z.string().optional().describe('Spell name'),
         slotLevel: z.number().optional().describe('Spell slot level'),
         unbinderId: z.string().optional().describe("cast_spell (mirror): a participant who tries to unbind a world spell (contestedBy: 'unbind')"),
+        boost: spellBoostSchema().optional().describe("cast_spell (mirror): {pool, delta, modifier?, extraDice?, sideEffect?: [{pool, delta}]} spends a pool for a bonus on a world spell's casting roll"),
         readiedAction: z.string().optional().describe('Description of readied action'),
         trigger: z.string().optional().describe('Trigger for readied action'),
         on: z.enum(['enters_reach', 'leaves_reach']).optional().describe('ready (mirror): enters_reach | leaves_reach, the engine fires it on a move'),
@@ -747,6 +762,7 @@ type GrappleContext = {
     actor: GrappleSide;
     target: GrappleSide;
     order: string[];
+    bandRule?: TableRule<'band'>;
 };
 
 /** Load both sides (tokens first when encounterId is given; a sheet alone still works without one). */
@@ -767,8 +783,10 @@ function grappleContext(args: Record<string, unknown>, ctx: SessionContext): Gra
     if (!targetRow && !targetTok) return { error: true, writes: 'none', message: engine ? `No participant or character ${targetId}` : `No character ${targetId}` };
     const actor = grappleSide(actorId, actorRow, actorTok), target = grappleSide(targetId, targetRow, targetTok);
     // The band ladder that holds both bands (a world may import several).
-    const order = bandOrderFor(db, resolveWorldId(db, { encounterId, characterIds: [actorId, targetId] }), [actor.band, target.band]);
-    return { db, engine, actor, target, order };
+    const worldId = resolveWorldId(db, { encounterId, characterIds: [actorId, targetId] });
+    const bandRule = bandRuleFor(db, worldId, [actor.band, target.band]);
+    const order = bandRule?.spec.order ?? bandOrderFor(db, worldId, [actor.band, target.band]);
+    return { db, engine, actor, target, order, bandRule };
 }
 
 /**
@@ -889,6 +907,7 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
     const src = `grapple: ${actor.id}`;
     let applied: string[] = [];
     let surfaceDamage: number | undefined; let damageDetail: string | undefined;
+    let surfaceBandScale: { steps: number; multiplier: number; before: number; after: number } | undefined;
 
     switch (move) {
         case 'clinch': applied = ['Clinched']; break;
@@ -907,6 +926,14 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
             : loggedDice(db, tag, count, surf.die, 'combat_action').rolls;
         surfaceDamage = rolls.reduce((a, b) => a + b, 0);
         damageDetail = `${count}d${surf.die} [${rolls.join(',')}] into ${surf.label}${margin >= 5 ? ' (margin ≥5: extra die)' : ''}`;
+        // Request 11: the thrower's band gap scales what the surface deals.
+        const scale = bandDamageMultiplier(g.bandRule, actor.band, target.band);
+        if (scale && surfaceDamage > 0) {
+            const scaled = Math.max(1, Math.floor(surfaceDamage * scale.multiplier));
+            surfaceBandScale = { ...scale, before: surfaceDamage, after: scaled };
+            surfaceDamage = scaled;
+            damageDetail += ` ×${scale.multiplier} band (${surfaceBandScale.before} → ${scaled})`;
+        }
     }
 
     // Sheets first (when there is one), then the live tokens.
@@ -946,6 +973,7 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
         ...(applied.length ? { conditionsApplied: applied, onto: target.name } : {}),
         ...(isBreak ? { conditionsRemoved: removed, from: actor.name } : {}),
         ...(tokensTouched ? { encounterTokensUpdated: true } : {}),
+        ...(surfaceBandScale ? { bandScale: surfaceBandScale } : {}),
         ...(surfaceDamage !== undefined ? { surfaceDamage, damageDetail, applyNote: 'surface damage is ROLLED, not applied — post it with attack {outcome: \"hit\", damage: N} on the target (no engine d20, no crit doubling), or combat_manage adjust_hp. The encounter sheet owns mid-combat HP.' } : {}),
         message: isBreak
             ? `${actor.name} breaks ${target.name}'s hold — ${removed.length ? removed.join('/') : 'nothing'} cleared. ${breakdown}`
@@ -979,7 +1007,8 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
             const check = executeCheck(a, g);
             if ('problem' in check) return refuse(check.problem);
             execute = { note: check.note };
-            args = { action: 'attack', encounterId: a.encounterId, actorId: a.actorId, targetId: a.targetId, outcome: 'crit', damage: check.damage,
+            // Request 11: an execute already gates on band; its posted crit is never band-scaled.
+            args = { action: 'attack', encounterId: a.encounterId, actorId: a.actorId, targetId: a.targetId, outcome: 'crit', damage: check.damage, bandScale: false,
                 ...(typeof a.damageType === 'string' ? { damageType: a.damageType } : {}) };
         } else {
             const result = grappleResolve(a, g, move);

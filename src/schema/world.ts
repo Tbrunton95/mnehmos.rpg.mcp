@@ -13,6 +13,9 @@ export const WorldEnvironmentSchema = z.object({
   weatherConditions: z.string().optional(),
   temperature: z.string().optional(),
   lighting: z.string().optional(),
+  // Deep One audit request 2: the era label world_manage era_jump writes
+  // ('M42, after the Drowning'); boot, the status block and clockWarning show it.
+  era: z.string().optional(),
 }).strict();
 
 export type WorldEnvironment = z.infer<typeof WorldEnvironmentSchema>;
@@ -38,6 +41,7 @@ export function normalizeWorldEnvironment(value: unknown): WorldEnvironment {
   copy('weatherConditions', 'weather');
   copy('temperature');
   copy('lighting');
+  copy('era');
   return WorldEnvironmentSchema.parse(canonical);
 }
 

@@ -49,16 +49,31 @@ describe('roll log', () => {
         expect(redo).toEqual(damage.dice.map((d: any) => d.value));
     });
 
-    it('math rolls and checks are logged with who they were for and a replayable seed', async () => {
+    it('seeded math rolls are logged with who they were for and a replayable seed', async () => {
+        const r = json(await math({ action: 'roll', expression: '3d6', forId: 'fury', purpose: 'Fury stoop damage', seed: 'stoop-1' }, {}));
+        expect(r.dice).toBe('seeded:stoop-1');
+        const log = json(await session({ action: 'rolls', forId: 'fury' }, {})).rolls;
+        const dmg = log.find((x: any) => x.purpose === 'Fury stoop damage');
+        expect(dmg).toMatchObject({ replay: 'stoop-1', source: 'seeded' });
+        expect(new DiceEngine(dmg.replay).roll('3d6').result).toBe(r.total);
+    });
+
+    it('unseeded math rolls and checks are crypto dice: logged with a crypto key, not a seed', async () => {
         const r = json(await math({ action: 'roll', expression: '3d6', forId: 'fury', purpose: 'Fury stoop damage' }, {}));
         const s = json(await math({ action: 'roll_saving_throw', characterId: 'fury', ability: 'dex', dc: 15 }, {}));
+        expect(r.dice).toBe('crypto');
+        expect(s.dice).toBe('crypto');
         const log = json(await session({ action: 'rolls', forId: 'fury' }, {})).rolls;
         expect(log.map((x: any) => x.purpose)).toEqual(expect.arrayContaining(['Fury stoop damage', 'dex save']));
         const dmg = log.find((x: any) => x.purpose === 'Fury stoop damage');
-        expect(new DiceEngine(dmg.replay).roll('3d6').result).toBe(r.total);
+        expect(dmg).toMatchObject({ source: 'crypto', replay: r.seed });
+        expect(dmg.replay).toMatch(/^crypto:[0-9a-f]{8}$/);
         const save = log.find((x: any) => x.purpose === 'dex save');
-        expect(Math.floor(seedrandom(save.replay)() * 20) + 1).toBe(s.natural);
-        expect(save.id).toBe(s.rollId);
+        expect(save).toMatchObject({ source: 'crypto', id: s.rollId });
+        expect(save.dice[0].value).toBe(s.natural);
+        // The key is an audit handle, never a seed.
+        expect(() => new DiceEngine(dmg.replay)).toThrow(/cannot be replayed/);
+        expect(() => seedrandom).not.toThrow();
     });
 
     it('a rolled-back call leaves no roll behind', async () => {

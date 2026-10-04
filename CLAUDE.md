@@ -4,7 +4,7 @@
 
 The reference backend game engine. **47 MCP tools** (42 consolidated action-routed + 2 meta + 3 event) for complete RPG mechanics, including LLM-driven NPCs via `agent_manage` and the Operator's constraint-perception lens via `perception_manage`.
 **Philosophy:** "LLM describes, engine validates" - Database is source of truth.
-**Status:** Alpha - 2907 tests passing (7 skipped), 225 test files, MCP Protocol fully integrated
+**Status:** Alpha - 3122 tests passing (7 skipped), 249 test files, MCP Protocol fully integrated
 
 **Provenance:** This repo (`Tbrunton95/RPG-Engine`) was imported from the owner's fork `Tbrunton95/mnehmos.rpg.mcp`, which tracks upstream `Mnehmos/mnehmos.rpg.mcp`. The owner's campaign-layer work (the `FINDINGS #NN` comments; hull/siege, container, vehicle, ledger, comms, horde tools) lives on top of upstream.
 
@@ -13,6 +13,10 @@ The reference backend game engine. **47 MCP tools** (42 consolidated action-rout
 `rpg-mcp-live` (repo `Mnehmos/rpg-mcp-live`, local checkout `F:\Github\rpg mcp live`) is the hosted web product and the **only** active consumer. It calls this engine **over HTTP** — see its `src/reference-engine-client.ts` and `REFERENCE_ENGINE_URL`. It is not a submodule and does not vendor this code, so the two repos are deployed separately and share no build step. Changing a tool's contract here is a breaking change for that service.
 
 The Tauri desktop app (`mnehmos.quest-keeper.game`, "Lantern") still declares this engine as an `externalBin` sidecar, but it is **deprecated and unused** — do not treat its build or deploy steps as live.
+
+## Dice
+
+Every unseeded roll draws from `crypto.randomInt` and is logged with a `crypto:<nonce>` audit key (`docs/table-rules/dice.md`). Tests that need determinism pass an explicit `seed`; `tests/math/no-math-random.test.ts` fails the build if a `Math.random` die comes back under `src/server` or `src/engine/magic`.
 
 ## Bastion subsystems
 

@@ -10,7 +10,7 @@ import type { AttackProfile, Part } from '../schema/token-extras.js';
 
 /** The sheet fields a form sets and a revert restores. */
 export const FORM_KEYS = [
-    'stats', 'hp', 'maxHp', 'ac', 'size', 'reach', 'attacksPerAction', 'attacks', 'abilities', 'cr',
+    'stats', 'hp', 'maxHp', 'ac', 'size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'attacksPerAction', 'attacks', 'abilities', 'cr',
     'resistances', 'vulnerabilities', 'immunities', 'regeneration', 'band', 'parts',
     'legendaryActions', 'legendaryResistances'
 ] as const;
@@ -50,6 +50,10 @@ export function sheetFromCreature(spec: CreatureSpec): Partial<Record<FormKey, u
         ac: spec.ac,
         size: spec.size,
         reach: spec.reach,
+        // The sheet calls the token's movementSpeed `speed`.
+        speed: spec.movementSpeed,
+        swimSpeed: spec.swimSpeed,
+        flySpeed: spec.flySpeed,
         attacksPerAction: spec.attacksPerAction,
         attacks,
         abilities: spec.abilities?.map(a => ({ ...a, ready: true })),

@@ -1,9 +1,16 @@
 import seedrandom from 'seedrandom';
+import { assertNotCryptoKey, cryptoInt, cryptoNonce, cryptoReplayKey } from '../../math/crypto-dice.js';
 
 /**
  * Comprehensive Combat RNG system supporting multiple RPG dice mechanics.
- * Deterministic and seeded for reproducibility.
- * 
+ *
+ * Two modes:
+ * - 'crypto' (the default for an unseeded encounter): every die comes from
+ *   crypto.randomInt; each roll carries a 'crypto:<nonce>' audit key and
+ *   cannot be replayed.
+ * - 'seeded' (an explicit seed): a seedrandom ARC4 stream, deterministic and
+ *   replayable from origin seed + draw index, for tests and audits.
+ *
  * Supports:
  * - D&D 5e: Advantage, Disadvantage, Keep/Drop, Reroll, Minimum
  * - Savage Worlds: Exploding dice
@@ -11,6 +18,8 @@ import seedrandom from 'seedrandom';
  * - Shadowrun/WoD: Dice pool success counting
  * - Pathfinder 2e: Degree-of-success mechanics (in CombatEngine)
  */
+export type RngMode = 'crypto' | 'seeded';
+
 /** Who a die was rolled for, against whom, and why; set by the engine before it rolls. */
 export interface RollTag {
     purpose: string;
@@ -18,16 +27,29 @@ export interface RollTag {
     targetId?: string;
 }
 
-/** One group of dice rolled under one tag: replayable from origin seed + draw index. */
+/**
+ * One group of dice rolled under one tag. Seeded: replayable from origin
+ * seed + draw index. Crypto: `replay` is the roll's 'crypto:<nonce>' key.
+ */
 export interface RollRecord extends RollTag {
     dice: Array<{ sides: number; value: number }>;
     origin: string | null;
     startDraw: number;
+    source: RngMode;
+    /** Set for crypto rolls: the audit key, unique per roll. */
+    replay?: string;
 }
 
+/** The JSON-safe stream position persisted in encounters.rng_state. */
+export type RngSnapshot =
+    | { mode: 'seeded'; arc4: object; origin: string | null; draws: number }
+    | { mode: 'crypto'; origin: string; draws: number };
+
 export class CombatRNG {
-    private rng: seedrandom.StatefulPRNG<seedrandom.State.Arc4>;
-    /** The seed this stream started from (null for encounters saved before roll auditing). */
+    readonly mode: RngMode;
+    /** The seeded stream; null in crypto mode. */
+    private rng: seedrandom.StatefulPRNG<seedrandom.State.Arc4> | null;
+    /** The seed this stream started from (null for encounters saved before roll auditing); 'crypto-<nonce>' in crypto mode. */
     private origin: string | null;
     /** Values drawn from the stream since the seed: replay = reseed, skip this many. */
     private draws: number;
@@ -36,31 +58,59 @@ export class CombatRNG {
     private records: RollRecord[] = [];
 
     /**
-     * @param saved a snapshot() from an earlier RNG. When given, the stream
-     * resumes exactly where it was saved instead of restarting from the seed —
-     * a reloaded encounter must not replay the dice it already rolled.
+     * @param seed the seed of a seeded stream, or `{ mode: 'crypto' }` for
+     * crypto dice.
+     * @param saved a snapshot() from an earlier RNG. When given, it decides the
+     * mode and the stream resumes exactly where it was saved instead of
+     * restarting from the seed: a reloaded encounter must not replay the dice
+     * it already rolled. A legacy snapshot without `mode` is seeded.
      */
-    constructor(seed: string, saved?: object) {
-        const s = saved as { arc4?: object; origin?: string | null; draws?: number } | undefined;
-        if (s?.arc4) {
+    constructor(seed: string | { mode: 'crypto' }, saved?: object) {
+        const s = saved as { mode?: string; arc4?: object; origin?: string | null; draws?: number } | undefined;
+        if (s?.mode === 'crypto') {
+            this.mode = 'crypto';
+            this.rng = null;
+            this.origin = typeof s.origin === 'string' ? s.origin : `crypto-${cryptoNonce()}`;
+            this.draws = s.draws ?? 0;
+        } else if (s?.arc4) {
+            this.mode = 'seeded';
             this.rng = seedrandom('', { state: s.arc4 as seedrandom.State.Arc4 });
             this.origin = s.origin ?? null;
             this.draws = s.draws ?? 0;
         } else if (saved) {
             // Saved before roll auditing: the stream resumes, but its origin is unknown.
+            this.mode = 'seeded';
             this.rng = seedrandom('', { state: saved as seedrandom.State.Arc4 });
             this.origin = null;
             this.draws = 0;
+        } else if (typeof seed !== 'string') {
+            this.mode = 'crypto';
+            this.rng = null;
+            this.origin = `crypto-${cryptoNonce()}`;
+            this.draws = 0;
         } else {
+            assertNotCryptoKey(seed);
+            this.mode = 'seeded';
             this.rng = seedrandom(seed, { state: true });
             this.origin = seed;
             this.draws = 0;
         }
     }
 
+    /** A crypto-dice RNG: unseeded, unreplayable, audited by nonce. */
+    static crypto(): CombatRNG {
+        return new CombatRNG({ mode: 'crypto' });
+    }
+
+    /** 'crypto' or 'seeded:<seed>', for a reply. */
+    describe(): string {
+        return this.mode === 'crypto' ? 'crypto' : `seeded:${this.origin ?? '?'}`;
+    }
+
     /** Current stream position, JSON-safe, for persisting with the encounter. */
-    snapshot(): object {
-        return { arc4: this.rng.state(), origin: this.origin, draws: this.draws };
+    snapshot(): RngSnapshot {
+        if (this.mode === 'crypto') return { mode: 'crypto', origin: this.origin ?? `crypto-${cryptoNonce()}`, draws: this.draws };
+        return { mode: 'seeded', arc4: this.rng!.state(), origin: this.origin, draws: this.draws };
     }
 
     /** The dice rolled since the last drain, grouped by tag. */
@@ -74,12 +124,15 @@ export class CombatRNG {
      * Roll a single die with N sides
      */
     private rollDie(sides: number): number {
-        const value = Math.floor(this.rng() * sides) + 1;
+        const value = this.rng ? Math.floor(this.rng() * sides) + 1 : cryptoInt(sides);
         const last = this.records[this.records.length - 1];
         if (last && last.purpose === this.tag.purpose && last.forId === this.tag.forId && last.targetId === this.tag.targetId) {
             last.dice.push({ sides, value });
         } else {
-            this.records.push({ ...this.tag, dice: [{ sides, value }], origin: this.origin, startDraw: this.draws });
+            this.records.push({
+                ...this.tag, dice: [{ sides, value }], origin: this.origin, startDraw: this.draws, source: this.mode,
+                ...(this.mode === 'crypto' ? { replay: cryptoReplayKey() } : {})
+            });
         }
         this.draws++;
         return value;

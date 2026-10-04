@@ -16,8 +16,9 @@ import { loadRule, loadRules, findWorldRule, castingClassFor, resolveWorldId, fi
 import { worldProgression, levelCapProblem } from '../../engine/progression.js';
 import { FORM_KEYS, sheetFromCreature, snapshotBase, nextHp, hpModeSchema, type HpMode } from '../../engine/forms.js';
 import { pushSheetToLiveTokens } from '../handlers/combat-handlers.js';
-import { readWorldClock, dayClock, SET_CLOCK_HINT, scheduleInWorldSql } from '../../engine/world-clock.js';
+import { readWorldClock, dayClock, SET_CLOCK_HINT, scheduleInWorldSql, scheduleLiveSql } from '../../engine/world-clock.js';
 import { scheduledWriteOpSchema, applyScheduledOps, type ScheduledWriteOp } from '../../engine/scheduled-ops.js';
+import { exposureThresholdSchema, exposureCap, exposureSummary, ensureExposureColumn, readExposure, writeExposure, type ExposureEntry } from '../../engine/exposure.js';
 import { applyFamilyDelta, familyMember, type FamilyMove } from '../../engine/pool-family.js';
 import { z } from 'zod';
 import { ParticipantExtrasShape, SizeCategorySchema } from '../../schema/token-extras.js';
@@ -44,7 +45,8 @@ import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
 import { SceneRepository } from '../../storage/repos/scene.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { RichFormatter } from '../utils/formatter.js';
-import { growthReadyFor } from '../growth.js';
+import { applyGrowth } from '../growth.js';
+import { recordAward, listAwards, pendingTotal, postPending } from '../../storage/xp-awards.js';
 import {
     CharacterOptionCategory,
     findOpen5eBackground,
@@ -58,7 +60,7 @@ import {
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'update', 'list', 'delete', 'kill', 'add_xp', 'adjust_pool', 'get_progression', 'level_up', 'schedule_change', 'process_scheduled', 'list_scheduled', 'cancel_scheduled', 'scope_scheduled', 'scope_characters', 'get_status_block', 'options', 'set_form', 'offer'] as const;
+const ACTIONS = ['create', 'get', 'update', 'list', 'delete', 'kill', 'add_xp', 'adjust_pool', 'get_progression', 'level_up', 'schedule_change', 'process_scheduled', 'list_scheduled', 'cancel_scheduled', 'scope_scheduled', 'scope_characters', 'get_status_block', 'options', 'set_form', 'offer', 'award_note', 'post_awards', 'list_awards', 'set_exposure', 'clear_exposure', 'create_vessel'] as const;
 type CharacterAction = typeof ACTIONS[number];
 
 const CharacterTypeSchema = z.enum(['pc', 'npc', 'enemy', 'neutral']);
@@ -111,11 +113,14 @@ const conditionSchema = () => z.object({
  * with (combat create and add_participant read it when the caller omits it).
  * The legendary counters and lair flag are older columns exposed here too.
  */
-const COMBAT_PROFILE_FIELDS = ['size', 'reach', 'attacksPerAction', 'attacks', 'abilities', 'cr', 'autoLegendaryResistance',
+const COMBAT_PROFILE_FIELDS = ['size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'attacksPerAction', 'attacks', 'abilities', 'cr', 'autoLegendaryResistance',
     'legendaryActions', 'legendaryResistances', 'legendaryResistancesRemaining', 'hasLairActions'] as const;
 const CombatProfileShape = {
     size: ParticipantExtrasShape.size,
     reach: ParticipantExtrasShape.reach,
+    speed: z.number().int().min(0).optional().describe("Walking speed in feet (the token's movementSpeed; a species rule sets it at create)"),
+    swimSpeed: ParticipantExtrasShape.swimSpeed,
+    flySpeed: ParticipantExtrasShape.flySpeed,
     attacksPerAction: ParticipantExtrasShape.attacksPerAction,
     attacks: ParticipantExtrasShape.attacks,
     abilities: ParticipantExtrasShape.abilities,
@@ -335,12 +340,14 @@ const ListScheduledSchema = z.object({
     action: z.literal('list_scheduled'),
     characterId: z.string().optional().describe('Filter to one character'),
     worldId: z.string().optional().describe('FINDINGS #91: filter to one world (unscoped rows still show, world_id null)'),
-    includeFired: z.boolean().optional().describe('Include already-fired rows (default false)')
+    includeFired: z.boolean().optional().describe('Include already-fired rows (default false)'),
+    includeCancelled: z.boolean().optional().describe('Request 2: include cancelled rows (cancel_scheduled / era_jump stamp cancelled_at; default false)')
 });
 
 const CancelScheduledSchema = z.object({
     action: z.literal('cancel_scheduled'),
-    scheduleId: z.number().describe('Row id from schedule_change / list_scheduled — a wound that got surgical care heals on a different clock')
+    scheduleId: z.number().describe('Row id from schedule_change / list_scheduled — a wound that got surgical care heals on a different clock'),
+    hard: z.boolean().optional().describe('Request 2: DELETE the row instead of stamping cancelled_at (default false — cancelled rows stay on record, hidden from list/process unless includeCancelled)')
 });
 
 const GetStatusBlockSchema = z.object({
@@ -447,11 +454,21 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
     const day: number | undefined = clock?.day;
     const time: string | undefined = clock?.time;
     const weather: string | undefined = clock?.weather;
+    const era: string | undefined = clock?.era;
+    // Request 10: exposure timers in the footer — `exposure: dry_hours 7/12`.
+    const exposureEntries = readExposure(db, args.characterId);
+    const exposureFooter = exposureEntries.length ? [`exposure: ${exposureSummary(exposureEntries, pools as Record<string, { current: number; max: number }>).join(', ')}`] : [];
 
     // Table rules: a world's status_block rule asks for the tiny block: HP,
     // core pool, location, objective, one or two conditions.
     const lex = worldLexicon(db, worldId);
     const tiny = loadRule(db, worldId, 'status_block');
+    // Request 3: narrated-but-unposted XP rides the footer of either block.
+    let owed: string | undefined;
+    try {
+        const p = pendingTotal(db, { characterId: args.characterId });
+        if (p.count) owed = `xp owed +${p.total}`;
+    } catch { /* no ledger yet */ }
     if (tiny?.spec.compact) {
         const core = findPool(pools, tiny.spec.corePool);
         const counters = shownCounters(pools, core?.key).map(c => ({ name: c.name, current: c.current, max: c.max }));
@@ -473,7 +490,8 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
         // Item 18: the house knobs. Each is echoed only when set, so a block
         // without them reads exactly as before.
         const spec = tiny.spec;
-        const footer = spec.footer?.length ? statusFooter(db, spec.footer, { characterId: args.characterId, worldId, location, objective }) : undefined;
+        const footer = [...(spec.footer?.length ? statusFooter(db, spec.footer, { characterId: args.characterId, worldId, location, objective }) : []), ...exposureFooter];
+        if (owed) footer.push(owed);
         if (spec.showLocation === false) location = undefined;
         if (spec.showObjective === false) objective = undefined;
         return {
@@ -528,15 +546,65 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
         gold,
         currencyLabel: lex.currency,
         badge: lex.badge,
-        day, time, weather,
+        day, time, weather, era,
+        ...((exposureFooter.length || owed) ? { footer: [...exposureFooter, ...(owed ? [owed] : [])] } : {}),
+        ...(exposureFooter.length ? { exposure: exposureEntries.map(e => ({ name: e.name, pool: e.pool, perHour: e.perHour, current: pools[e.pool]?.current ?? 0, cap: exposureCap(e, pools[e.pool]) })) } : {}),
+        ...speedLine(char as { speed?: number; swimSpeed?: number; flySpeed?: number }),
+        ...activeEncounterEnvironment(db, args.characterId),
         message: `${char.name}: HP ${char.hp}/${char.maxHp}`
     };
+}
+
+/** The sheet's speeds, only when one is set (a block without them reads as before). */
+function speedLine(char: { speed?: number; swimSpeed?: number; flySpeed?: number }): { speed?: number; swimSpeed?: number; flySpeed?: number } {
+    const out: { speed?: number; swimSpeed?: number; flySpeed?: number } = {};
+    if (typeof char.speed === 'number') out.speed = char.speed;
+    if (typeof char.swimSpeed === 'number') out.swimSpeed = char.swimSpeed;
+    if (typeof char.flySpeed === 'number') out.flySpeed = char.flySpeed;
+    return out;
+}
+
+/** The environment of the active encounter this character is a token in, when it is not plain air. */
+function activeEncounterEnvironment(db: ReturnType<typeof getDb>, characterId: string): { environment?: { medium: string; depthFt?: number } } {
+    try {
+        const rows = db.prepare("SELECT environment FROM encounters WHERE status = 'active' AND environment IS NOT NULL AND tokens LIKE ?").all(`%"${characterId}"%`) as Array<{ environment: string }>;
+        for (const r of rows) {
+            const env = JSON.parse(r.environment) as { medium?: string; depthFt?: number };
+            if (env.medium && env.medium !== 'air') return { environment: { medium: env.medium, ...(env.depthFt !== undefined ? { depthFt: env.depthFt } : {}) } };
+        }
+    } catch { /* no encounters table or column: the line is absent */ }
+    return {};
 }
 
 const AddXpSchema = z.object({
     action: z.literal('add_xp'),
     characterId: z.string().describe('Character ID'),
-    amount: z.number().int().describe('XP delta. Findings #43: negatives allowed for corrections (double-fire reverts), result clamps at 0 — XP is no longer a ratchet')
+    amount: z.number().int().describe('XP delta. Findings #43: negatives allowed for corrections (double-fire reverts), result clamps at 0 — XP is no longer a ratchet'),
+    reason: z.string().optional().describe('Required: why this XP is given (the award ledger row keeps it). A call without one is refused')
+});
+
+// Request 3: the award ledger. A narrated award is recorded unposted and
+// shows as "XP owed" on boot and the status block until post_awards applies
+// it through the add_xp path.
+const AwardNoteSchema = z.object({
+    action: z.literal('award_note'),
+    characterId: z.string().describe('Character ID'),
+    amount: z.number().int().describe('XP narrated at the table, not yet applied'),
+    reason: z.string().min(1).describe('Why: the deed, the scene, the encounter')
+});
+
+const PostAwardsSchema = z.object({
+    action: z.literal('post_awards'),
+    characterId: z.string().optional().describe('Post this character\'s pending awards'),
+    worldId: z.string().optional().describe('Post every pending award in this world (one XP write per character)')
+}).refine(a => a.characterId || a.worldId, { message: 'post_awards needs characterId or worldId' });
+
+const ListAwardsSchema = z.object({
+    action: z.literal('list_awards'),
+    characterId: z.string().optional(),
+    worldId: z.string().optional(),
+    pendingOnly: z.boolean().optional().describe('Only unposted (narrated, not yet applied) awards'),
+    limit: z.number().int().min(1).max(500).optional().describe('Rows to return (default 50)')
 });
 
 const GetProgressionSchema = z.object({
@@ -560,6 +628,26 @@ const OptionsSchema = z.object({
     category: OptionCategorySchema.optional().default('all'),
     query: z.string().optional().describe('Optional case-insensitive name filter'),
     worldId: z.string().optional().describe("Item 8: also list the world's own classes, species, backgrounds and skills (table_rules char_class, species, background, skill)")
+});
+
+// Deep One audit request 10: exposure timers — a pool that climbs with the
+// world clock. Stored on characters.exposure; world_manage advance ticks it.
+const SetExposureSchema = z.object({
+    action: z.literal('set_exposure'),
+    characterId: z.string().describe('Character the timer runs on'),
+    name: z.string().min(1).describe("Timer name ('brine-bound'); an existing timer of this name is replaced"),
+    pool: z.string().min(1).describe('Pool the hours land in; created at 0/cap when missing'),
+    perHour: z.number().describe('Pool change per elapsed world hour (negative drains)'),
+    cap: z.number().optional().describe("Pool max; default the pool's own max, else the highest threshold, else 100"),
+    thresholds: z.array(exposureThresholdSchema()).optional().describe('[{at, condition: {name, effect?, duration?}, once?}] — the condition is added when the pool reaches `at` (once per threshold unless once: false)'),
+    note: z.string().optional().describe('What the timer is')
+});
+
+const ClearExposureSchema = z.object({
+    action: z.literal('clear_exposure'),
+    characterId: z.string().describe('Character whose timer stops'),
+    name: z.string().optional().describe('Timer to remove; omit to remove every timer'),
+    removePool: z.boolean().optional().describe('Also delete the pool the timer fed (default false: the hours stay on the sheet)')
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -794,6 +882,11 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         // Combat profile and legendary counters (tokens hydrate from these)
         ...Object.fromEntries(COMBAT_PROFILE_FIELDS.filter(k => args[k] !== undefined).map(k => [k, args[k]])),
         ...(args.size === undefined && worldSpecies?.size ? { size: worldSpecies.size } : {}),
+        // A world species rule's speeds are stored on the sheet (tokens hydrate
+        // movementSpeed from speed). An SRD species leaves the profile empty, as before.
+        ...(args.speed === undefined && worldSpecies?.speed !== undefined ? { speed: worldSpecies.speed } : {}),
+        ...(args.swimSpeed === undefined && worldSpecies?.swimSpeed !== undefined ? { swimSpeed: worldSpecies.swimSpeed } : {}),
+        ...(args.flySpeed === undefined && worldSpecies?.flySpeed !== undefined ? { flySpeed: worldSpecies.flySpeed } : {}),
         // FINDINGS #93: resourcePools was accepted by BOTH schemas and never
         // read by the payload — the #33/#59/#90 anatomy on the worst possible
         // verb: a create whose banner said it worked. Honored now.
@@ -1041,7 +1134,9 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
     // The names alone: fields:['conditionNames'] is the condition index
     // without the kilobytes of source text.
     const conditionNames = ((character as any).conditions ?? []).map((c: { name: string }) => c.name);
-    return { ...character, conditionNames, worldId, currency, currencyLabel, currencyNote: currency ? `${currencyLabel} ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec, ...(liveEncounters ? { liveEncounters } : {}) };
+    // Request 10: exposure timers ride the sheet read beside the pools they feed.
+    const exposure = readExposure(db, args.characterId);
+    return { ...character, conditionNames, worldId, currency, currencyLabel, currencyNote: currency ? `${currencyLabel} ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec, ...(exposure.length ? { exposure } : {}), ...(liveEncounters ? { liveEncounters } : {}) };
 }
 
 async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object> {
@@ -1469,6 +1564,12 @@ export function setForm(args: { characterId: string; form: string; hpMode?: HpMo
         };
     }
 
+    // The sheet's `speed` is the token's movementSpeed (swimSpeed and
+    // flySpeed share their names). A form or base that sets none leaves the
+    // creature's own value, or clears it back to the default.
+    tokenFields.movementSpeed = updates.speed ?? (formName === 'base' ? undefined : tokenFields.movementSpeed);
+    delete tokenFields.speed;
+
     characterRepo.update(char.id, updates as Partial<import('../../schema/character.js').Character>);
     const liveTokens = pushSheetToLiveTokens(char.id, tokenFields);
     return {
@@ -1488,6 +1589,96 @@ export function setForm(args: { characterId: string; form: string; hpMode?: HpMo
         message: formName === 'base'
             ? `${char.name} returns to their own shape: HP ${char.hp}/${char.maxHp} -> ${updates.hp}/${updates.maxHp}.`
             : `${char.name} takes the form of ${formName}: HP ${char.hp}/${char.maxHp} -> ${updates.hp}/${updates.maxHp}, AC ${updates.ac}.${liveTokens.length ? ` ${liveTokens.length} live token(s) updated.` : ''}`
+    };
+}
+
+
+// Request 5: VESSELS — a table_rules vessel becomes a character row, so its
+// hull, shields and sections persist across sessions like any sheet.
+const CreateVesselSchema = z.object({
+    action: z.literal('create_vessel'),
+    worldId: z.string().min(1).describe("World whose vessel rules to read; the row is stamped to it"),
+    vessel: z.string().min(1).describe("A table_rules vessel rule of the world ('Murder-class cruiser')"),
+    name: z.string().optional().describe("The ship's own name (default: the rule's displayName, else the rule name)"),
+    shields: z.object({ max: z.number().int().min(0), regenPerRound: z.number().int().min(0).optional() }).optional().describe("Override the rule's shields {max, regenPerRound?}"),
+    characterType: CharacterTypeSchema.optional().describe('Default npc (no starting kit)')
+});
+
+const SIZE_CATEGORIES = new Set(['tiny', 'small', 'medium', 'large', 'huge', 'gargantuan']);
+
+export function createVessel(args: z.infer<typeof CreateVesselSchema>): Record<string, unknown> {
+    const { db, characterRepo } = ensureDb();
+    const rule = findWorldRule(db, args.worldId, 'vessel', args.vessel);
+    if (!rule) {
+        const known = loadRules(db, args.worldId, 'vessel').map(r => r.name);
+        return { error: true, actionType: 'create_vessel', message: `No vessel rule '${args.vessel}' in world ${args.worldId}${known.length ? ` (vessels: ${known.join(', ')})` : ' (define one with table_rules define kind vessel)'}. Nothing was written.`, writes: 'none' };
+    }
+    const spec = rule.spec;
+    const name = args.name ?? spec.displayName ?? rule.name;
+    const shields = args.shields
+        ? { max: args.shields.max, regenPerRound: args.shields.regenPerRound ?? spec.shields?.regenPerRound ?? 0 }
+        : spec.shields ? { max: spec.shields.max, regenPerRound: spec.shields.regenPerRound ?? 0 } : undefined;
+    const parts = spec.sections.map(s => ({
+        name: s.name, kind: 'system' as const, state: 'intact' as const, role: s.role,
+        hp: s.hp, maxHp: s.hp,
+        ...(s.ac !== undefined ? { ac: s.ac } : {}),
+        ...(s.breakAt !== undefined ? { breakAt: s.breakAt } : {})
+    }));
+    const sectionNames = new Set(spec.sections.map(s => s.name.toLowerCase()));
+    const unmounted = spec.weapons.filter(w => w.section && !sectionNames.has(w.section.toLowerCase())).map(w => `${w.name} → ${w.section}`);
+    if (unmounted.length) {
+        return { error: true, actionType: 'create_vessel', message: `Weapon sections not among the rule's sections: ${unmounted.join(', ')}. Fix the vessel rule first. Nothing was written.`, writes: 'none' };
+    }
+    const attacks = spec.weapons.map((w, i) => ({
+        name: w.name, attackBonus: w.attackBonus, damage: w.damage,
+        ...(w.damageType ? { damageType: w.damageType } : {}),
+        ...(w.section ? { part: w.section } : {}),
+        ...(w.range !== undefined ? { ranged: true, note: `range ${w.range} ft` } : {}),
+        ...(i === 0 ? { default: true } : {})
+    }));
+    const sizeWord = (spec.size ?? 'gargantuan').toLowerCase();
+    const size = SIZE_CATEGORIES.has(sizeWord) ? sizeWord : 'gargantuan';
+    const vessel = {
+        regenPerRound: shields?.regenPerRound ?? 0,
+        roles: Object.fromEntries(spec.sections.map(s => [s.name, s.role])),
+        ...(spec.speed !== undefined ? { speed: spec.speed } : {}),
+        ...(spec.crew !== undefined ? { crew: spec.crew } : {}),
+        ...(size !== sizeWord ? { sizeLabel: sizeWord } : {}),
+        ...(spec.traits.length ? { traits: [...spec.traits] } : {}),
+        rule: rule.name
+    };
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    const row: Record<string, unknown> = {
+        id, name,
+        race: 'vessel', characterClass: 'vessel', background: undefined,
+        stats: { str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 10 },
+        hp: spec.hull, maxHp: spec.hull, ac: spec.ac, level: 1,
+        characterType: args.characterType ?? 'npc',
+        knownSpells: [], cantripsKnown: [], preparedSpells: [],
+        resistances: [], vulnerabilities: [], immunities: [],
+        band: spec.band,
+        parts, attacks, size, vessel,
+        resourcePools: shields ? { shields: { current: shields.max, max: shields.max, label: 'Shields', show: true } } : {},
+        conditions: [], xp: 0,
+        createdAt: now, updatedAt: now
+    };
+    characterRepo.create(row as never);
+    try { db.exec('ALTER TABLE characters ADD COLUMN world_id TEXT'); } catch { /* exists */ }
+    try { db.prepare('UPDATE characters SET world_id = ? WHERE id = ?').run(args.worldId, id); } catch { /* pre-migration db */ }
+    const manifest = [
+        `${name} (${rule.name}${spec.band ? `, ${spec.band}` : ''}) — hull ${spec.hull}, AC ${spec.ac}${shields ? `, shields ${shields.max} (+${shields.regenPerRound}/round)` : ', no shields'}${spec.speed !== undefined ? `, speed ${spec.speed}` : ''}`,
+        `sections: ${spec.sections.map(s => `${s.name} [${s.role}] ${s.hp} hp${s.ac !== undefined ? ` AC ${s.ac}` : ''}${s.breakAt !== undefined ? ` breaks at ${s.breakAt}` : ''}`).join('; ')}`,
+        spec.weapons.length ? `weapons: ${spec.weapons.map(w => `${w.name} +${w.attackBonus} ${w.damage}${w.damageType ? ` ${w.damageType}` : ''}${w.section ? ` @${w.section}` : ''}${w.range !== undefined ? ` (${w.range} ft)` : ''}`).join('; ')}` : 'weapons: none'
+    ].join('\n');
+    return {
+        success: true, actionType: 'create_vessel', characterId: id, id, name, vessel: rule.name, worldId: args.worldId,
+        hull: spec.hull, hp: spec.hull, maxHp: spec.hull, ac: spec.ac, band: spec.band, size, ...(vessel.sizeLabel ? { sizeLabel: vessel.sizeLabel } : {}),
+        shields: shields ? { current: shields.max, max: shields.max, regenPerRound: shields.regenPerRound } : null,
+        sections: parts.map(p => ({ name: p.name, role: p.role, hp: p.hp, ...(p.ac !== undefined ? { ac: p.ac } : {}), ...(p.breakAt !== undefined ? { breakAt: p.breakAt } : {}) })),
+        weapons: attacks.map(a => ({ name: a.name, attackBonus: a.attackBonus, damage: a.damage, ...(a.part ? { section: a.part } : {}) })),
+        manifest,
+        message: `${name} laid down (character ${id}).\n${manifest}\nAdd it to a fight with combat_manage add_participant {encounterId, characterId: '${id}'}; aim at a section with combat_action attack {atPart: '<section>'}; board it with combat_manage board.`
     };
 }
 
@@ -1596,14 +1787,19 @@ async function handleOffer(args: z.infer<typeof OfferSchema>): Promise<object> {
 
 export async function handleAdjustPool(args: z.input<typeof AdjustPoolSchema>): Promise<object> {
     const res = await adjustPoolCore(args) as Record<string, unknown>;
-    // Growth tracks: a pool that crossed a step offers the form; never applied.
+    // Growth tracks: a pool that crossed a step offers the form (never
+    // applied), or fires the step when it is auto (an addiction ladder's rung).
     if (res.success && typeof res.before === 'number' && typeof res.current === 'number' && typeof res.pool === 'string') {
         const { db, characterRepo } = ensureDb();
         const char = characterRepo.findById(String(res.characterId));
         if (char) {
             const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] });
-            const ready = growthReadyFor(db, worldId, char as never, res.pool, res.before, res.current);
-            if (ready) return { ...res, growthReady: ready, message: `${String(res.message)} · GROWTH READY: ${ready.form} (${ready.call})` };
+            const g = await applyGrowth(db, worldId, char.id, res.pool, res.before, res.current);
+            const lines = [
+                ...(g.growthApplied ?? []).map(a => `GROWTH ${a.track} ${a.at}: ${[a.condition && `condition ${a.condition}`, a.table && `table ${String((a.table as { table?: string }).table)}`, a.form && `form ${String((a.form as { form?: string }).form)}`].filter(Boolean).join(', ')}`),
+                ...(g.growthReady ? [`GROWTH READY: ${g.growthReady.form ?? g.growthReady.condition?.name ?? g.growthReady.table} (${g.growthReady.call})`] : [])
+            ];
+            if (lines.length) return { ...res, ...g, message: `${String(res.message)} · ${lines.join(' · ')}` };
         }
     }
     return res;
@@ -1825,6 +2021,8 @@ function ensureScheduleTable(db: ReturnType<typeof getDb>): void {
     try { db.exec('ALTER TABLE scheduled_state_changes ADD COLUMN world_id TEXT'); } catch { /* column exists */ }
     // The world filter reads the character's tag for untagged rows.
     try { db.exec('ALTER TABLE characters ADD COLUMN world_id TEXT'); } catch { /* column exists */ }
+    // Request 2: cancellation is a stamp, not a DELETE — the row stays on record.
+    try { db.exec('ALTER TABLE scheduled_state_changes ADD COLUMN cancelled_at TEXT'); } catch { /* column exists */ }
 }
 
 /** The world a character is tagged to, or null (untagged or missing). */
@@ -1837,13 +2035,13 @@ function characterWorld(db: ReturnType<typeof getDb>, characterId: string): stri
 /** Untagged, due, unfired rows whose character is untagged or gone: no world can claim them by inference. */
 function unscopedOwnerUnknownIds(db: ReturnType<typeof getDb>, effectiveDay: number | null, characterId?: string): number[] {
     const rows = db.prepare(`SELECT s.id FROM scheduled_state_changes s LEFT JOIN characters c ON c.id = s.character_id
-                             WHERE s.fired = 0 AND s.world_id IS NULL AND c.world_id IS NULL${effectiveDay !== null ? ' AND s.fires_at_day <= ?' : ''}${characterId ? ' AND s.character_id = ?' : ''}
+                             WHERE ${scheduleLiveSql('s')} AND s.world_id IS NULL AND c.world_id IS NULL${effectiveDay !== null ? ' AND s.fires_at_day <= ?' : ''}${characterId ? ' AND s.character_id = ?' : ''}
                              ORDER BY s.fires_at_day, s.id`)
         .all(...[...(effectiveDay !== null ? [effectiveDay] : []), ...(characterId ? [characterId] : [])]) as Array<{ id: number }>;
     return rows.map(r => r.id);
 }
 
-type ScheduleRow = { id: number; character_id: string; fires_at_day: number; writes: string; note: string | null; fired: number; fired_at: string | null; created_at: string; recur_every_days: number | null; is_event?: number | null; world_id?: string | null };
+type ScheduleRow = { id: number; character_id: string; fires_at_day: number; writes: string; note: string | null; fired: number; fired_at: string | null; created_at: string; recur_every_days: number | null; is_event?: number | null; world_id?: string | null; cancelled_at?: string | null };
 
 // FINDINGS #73: op application lives in engine/scheduled-ops.ts, shared by
 // process_scheduled, schedule_change fireNow, table entries and offerings.
@@ -1950,10 +2148,128 @@ async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>):
     };
 }
 
-async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchema>): Promise<object> {
+async function handleSetExposure(args: z.infer<typeof SetExposureSchema>): Promise<object> {
+    const { db, characterRepo } = ensureDb();
+    ensureExposureColumn(db);
+    const char = characterRepo.findById(args.characterId);
+    if (!char) throw new Error(`Character ${args.characterId} not found — a timer needs a body to run on`);
+    const entries = readExposure(db, char.id);
+    const prior = entries.find(e => e.name === args.name);
+    const entry: ExposureEntry = {
+        name: args.name, pool: args.pool, perHour: args.perHour,
+        ...(args.cap !== undefined ? { cap: args.cap } : {}),
+        ...(args.thresholds?.length ? { thresholds: args.thresholds } : {}),
+        ...(args.note ? { note: args.note } : {})
+    };
+    const next = prior ? entries.map(e => (e.name === args.name ? entry : e)) : [...entries, entry];
+    // The pool exists from the moment the timer does, so the sheet shows 0/cap
+    // before the first tick instead of nothing.
+    const pools = { ...((char as { resourcePools?: Record<string, ResourcePool> }).resourcePools ?? {}) };
+    const existing = pools[args.pool];
+    const max = exposureCap(entry, existing);
+    let poolCreated = false;
+    if (!existing) { pools[args.pool] = { current: 0, max, note: args.note ?? `exposure ${args.name}` }; poolCreated = true; }
+    else if (args.cap !== undefined && existing.max !== args.cap) pools[args.pool] = { ...existing, max: args.cap, current: Math.min(existing.current, args.cap) };
+    if (poolCreated || pools[args.pool] !== existing) characterRepo.update(char.id, { resourcePools: pools } as Partial<import('../../schema/character.js').Character>);
+    writeExposure(db, char.id, next);
+    const p = pools[args.pool];
+    return {
+        success: true, actionType: 'set_exposure', characterId: char.id, characterName: char.name,
+        replaced: !!prior, poolCreated, exposure: entry, pool: { name: args.pool, current: p.current, max: p.max },
+        message: `${prior ? 'Replaced' : 'Set'} exposure '${args.name}' on ${char.name}: ${args.pool} ${args.perHour >= 0 ? '+' : ''}${args.perHour}/h (now ${p.current}/${p.max})${entry.thresholds?.length ? `; at ${entry.thresholds.map(t => `${t.at} → ${t.condition.name}`).join(', ')}` : ''}. Ticks on world_manage advance; a correction never ticks.`
+    };
+}
+
+async function handleClearExposure(args: z.infer<typeof ClearExposureSchema>): Promise<object> {
+    const { db, characterRepo } = ensureDb();
+    ensureExposureColumn(db);
+    const char = characterRepo.findById(args.characterId);
+    if (!char) throw new Error(`Character ${args.characterId} not found`);
+    const entries = readExposure(db, char.id);
+    const removed = args.name ? entries.filter(e => e.name === args.name) : entries;
+    if (!removed.length) {
+        return { success: true, actionType: 'clear_exposure', characterId: char.id, removed: [], message: args.name ? `No exposure '${args.name}' on ${char.name} — nothing to clear.` : `No exposure timers on ${char.name}.` };
+    }
+    const kept = entries.filter(e => !removed.includes(e));
+    writeExposure(db, char.id, kept);
+    const poolsRemoved: string[] = [];
+    if (args.removePool) {
+        const pools = { ...((char as { resourcePools?: Record<string, ResourcePool> }).resourcePools ?? {}) };
+        for (const e of removed) if (pools[e.pool] && !kept.some(k => k.pool === e.pool)) { delete pools[e.pool]; poolsRemoved.push(e.pool); }
+        if (poolsRemoved.length) characterRepo.update(char.id, { resourcePools: pools } as Partial<import('../../schema/character.js').Character>);
+    }
+    return {
+        success: true, actionType: 'clear_exposure', characterId: char.id, characterName: char.name,
+        removed: removed.map(e => e.name), remaining: kept.map(e => e.name), ...(poolsRemoved.length ? { poolsRemoved } : {}),
+        message: `Cleared exposure ${removed.map(e => `'${e.name}'`).join(', ')} on ${char.name}${poolsRemoved.length ? ` and removed pool ${poolsRemoved.join(', ')}` : ' (the pool keeps its value)'}.`
+    };
+}
+
+/**
+ * Fire every live scheduled row due at or before effectiveDay in a world,
+ * re-arming recurrences and looping until nothing is due. Shared by
+ * process_scheduled and world_manage advance {fireScheduled}: one arithmetic,
+ * one ledger stamp.
+ */
+export function fireDueScheduledRows(opts: { worldId: string; effectiveDay: number; characterId?: string }): { results: Array<Record<string, unknown>>; passes: number; backlogWarning?: string } {
     const { db, characterRepo } = ensureDb();
     ensureScheduleTable(db);
     const now = new Date().toISOString();
+    let scopeSql = ` AND ${scheduleInWorldSql('')}`;
+    const scopeParams: unknown[] = [opts.worldId, opts.worldId];
+    if (opts.characterId) { scopeSql += ' AND character_id = ?'; scopeParams.push(opts.characterId); }
+    const results: Array<Record<string, unknown>> = [];
+    // FINDINGS #69: recurring clocks re-arm on fire, and the processor LOOPS
+    // until nothing is due — five missed days of a daily hunger clock fire
+    // FIVE TIMES, each its own row in results, not one collapsed tick.
+    // The pass guard only trips on a pathological backlog and says so.
+    let passes = 0;
+    const dueSql = `SELECT * FROM scheduled_state_changes WHERE ${scheduleLiveSql('')} AND fires_at_day <= ?${scopeSql} ORDER BY fires_at_day, id`;
+    let due = db.prepare(dueSql).all(opts.effectiveDay, ...scopeParams) as ScheduleRow[];
+    while (due.length > 0 && passes < 400) {
+        passes++;
+        for (const row of due) {
+            const char = characterRepo.findById(row.character_id);
+            if (!char) {
+                // Never silent (#40): the row fires into a missing body — mark and report.
+                db.prepare('UPDATE scheduled_state_changes SET fired = 1, fired_at = ? WHERE id = ?').run(now, row.id);
+                results.push({ scheduleId: row.id, characterId: row.character_id, firesAtDay: row.fires_at_day, note: row.note, applied: [], skipped: 'character no longer exists — clock retired unfired' });
+                continue;
+            }
+            let ops: ScheduledWriteOp[] = [];
+            try { ops = JSON.parse(row.writes || '[]') as ScheduledWriteOp[]; } catch { /* malformed — reported below */ }
+            // FINDINGS #82: event rows fire a NOTIFICATION, not writes — the GM's
+            // NPC-delivery timers. Marked fired and re-armed like any clock.
+            // FINDINGS #73: shared op application — one arithmetic for clocks and one-offs.
+            const isEvent = (row.is_event ?? 0) === 1;
+            const { applied, updates } = isEvent
+                ? { applied: [`📣 GM EVENT DUE${row.note ? `: ${row.note}` : ''}`], updates: {} as Record<string, unknown> }
+                : applyScheduledOps(char, ops);
+            if (Object.keys(updates).length) characterRepo.update(row.character_id, updates as Partial<import('../../schema/character.js').Character>);
+            if (updates.resourcePools) mirrorLinkedCharges(row.character_id, updates.resourcePools as Record<string, ResourcePool>);
+            db.prepare('UPDATE scheduled_state_changes SET fired = 1, fired_at = ? WHERE id = ?').run(now, row.id);
+            // FINDINGS #69: a recurring clock re-arms itself the moment it fires —
+            // the next row inherits writes, note, and recurrence. The loop above
+            // catches it this same call if it's already due.
+            let rearmedAs: number | null = null;
+            if (row.recur_every_days && row.recur_every_days > 0) {
+                const next = db.prepare('INSERT INTO scheduled_state_changes (character_id, fires_at_day, writes, note, created_at, recur_every_days, is_event, world_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+                    .run(row.character_id, row.fires_at_day + row.recur_every_days, row.writes, row.note, now, row.recur_every_days, row.is_event ?? 0, row.world_id ?? opts.worldId);
+                rearmedAs = Number(next.lastInsertRowid);
+            }
+            results.push({ scheduleId: row.id, kind: (row.is_event ?? 0) === 1 ? 'event' : 'clock', characterId: row.character_id, characterName: char.name, firesAtDay: row.fires_at_day, note: row.note, applied, ...(rearmedAs !== null ? { recurring: true, rearmedAs, nextFiresAtDay: row.fires_at_day + (row.recur_every_days ?? 0) } : {}) });
+        }
+        due = db.prepare(dueSql).all(opts.effectiveDay, ...scopeParams) as ScheduleRow[];
+    }
+    const backlogWarning = passes >= 400 && due.length > 0
+        ? `⚠ pass guard tripped at ${passes} passes with ${due.length} row(s) still due — a recurrence is probably misconfigured (interval too small for the day jump). Remaining rows fire on the next process_scheduled.`
+        : undefined;
+    return { results, passes, ...(backlogWarning ? { backlogWarning } : {}) };
+}
+
+async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchema>): Promise<object> {
+    const { db, characterRepo } = ensureDb();
+    ensureScheduleTable(db);
     // Item 14: an explicit currentDay wins; otherwise the world clock gives
     // both day and time. The world's time is used only with the world's day.
     let currentDay: number;
@@ -1973,7 +2289,6 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
         const [h, m] = currentTime.split(':').map(Number);
         effectiveDay = Math.floor(currentDay) + (h * 60 + m) / 1440;
     }
-    const results: Array<Record<string, unknown>> = [];
     // FINDINGS #100: worldId is REQUIRED at the schema and filtered here — an
     // optional filter on this, the one genuinely destructive global write in
     // the toolkit, was the SALT incident (cross-campaign fires + an HP write
@@ -1985,12 +2300,7 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
     const scopeParams: unknown[] = [args.worldId, args.worldId];
     if (args.characterId) { scopeSql += ' AND character_id = ?'; scopeParams.push(args.characterId); }
     const ownerUnknown = unscopedOwnerUnknownIds(db, effectiveDay, args.characterId);
-    // FINDINGS #69: recurring clocks re-arm on fire, and the processor LOOPS
-    // until nothing is due — five missed days of a daily hunger clock fire
-    // FIVE TIMES, each its own row in results, not one collapsed tick.
-    // The pass guard only trips on a pathological backlog and says so.
-    let passes = 0;
-    let due = db.prepare(`SELECT * FROM scheduled_state_changes WHERE fired = 0 AND fires_at_day <= ?${scopeSql} ORDER BY fires_at_day, id`).all(effectiveDay, ...scopeParams) as ScheduleRow[];
+    const due = db.prepare(`SELECT * FROM scheduled_state_changes WHERE ${scheduleLiveSql('')} AND fires_at_day <= ?${scopeSql} ORDER BY fires_at_day, id`).all(effectiveDay, ...scopeParams) as ScheduleRow[];
     // FINDINGS #100: preview — the dry-run lane. Reports the first-pass due set
     // and writes NOTHING; recurring chains that would walk forward in a live
     // run are flagged, not simulated.
@@ -2008,44 +2318,8 @@ async function handleProcessScheduled(args: z.infer<typeof ProcessScheduledSchem
                 : `Preview: ${wouldFire.length} row(s) due at Day ${args.currentDay} — NOTHING written.${chains ? ` ${chains} recurring chain(s) may fire additional times in a live run.` : ''}`
         };
     }
-    while (due.length > 0 && passes < 400) {
-        passes++;
-    for (const row of due) {
-        const char = characterRepo.findById(row.character_id);
-        if (!char) {
-            // Never silent (#40): the row fires into a missing body — mark and report.
-            db.prepare('UPDATE scheduled_state_changes SET fired = 1, fired_at = ? WHERE id = ?').run(now, row.id);
-            results.push({ scheduleId: row.id, characterId: row.character_id, firesAtDay: row.fires_at_day, note: row.note, applied: [], skipped: 'character no longer exists — clock retired unfired' });
-            continue;
-        }
-        let ops: ScheduledWriteOp[] = [];
-        try { ops = JSON.parse(row.writes || '[]') as ScheduledWriteOp[]; } catch { /* malformed — reported below */ }
-        // FINDINGS #82: event rows fire a NOTIFICATION, not writes — the GM's
-        // NPC-delivery timers. Marked fired and re-armed like any clock.
-        // FINDINGS #73: shared op application — one arithmetic for clocks and one-offs.
-        const isEvent = (row.is_event ?? 0) === 1;
-        const { applied, updates } = isEvent
-            ? { applied: [`📣 GM EVENT DUE${row.note ? `: ${row.note}` : ''}`], updates: {} as Record<string, unknown> }
-            : applyScheduledOps(char, ops);
-        if (Object.keys(updates).length) characterRepo.update(row.character_id, updates as Partial<import('../../schema/character.js').Character>);
-        if (updates.resourcePools) mirrorLinkedCharges(row.character_id, updates.resourcePools as Record<string, ResourcePool>);
-        db.prepare('UPDATE scheduled_state_changes SET fired = 1, fired_at = ? WHERE id = ?').run(now, row.id);
-        // FINDINGS #69: a recurring clock re-arms itself the moment it fires —
-        // the next row inherits writes, note, and recurrence. The loop above
-        // catches it this same call if it's already due.
-        let rearmedAs: number | null = null;
-        if (row.recur_every_days && row.recur_every_days > 0) {
-            const next = db.prepare('INSERT INTO scheduled_state_changes (character_id, fires_at_day, writes, note, created_at, recur_every_days, is_event, world_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-                .run(row.character_id, row.fires_at_day + row.recur_every_days, row.writes, row.note, now, row.recur_every_days, row.is_event ?? 0, row.world_id ?? args.worldId);
-            rearmedAs = Number(next.lastInsertRowid);
-        }
-        results.push({ scheduleId: row.id, kind: (row.is_event ?? 0) === 1 ? 'event' : 'clock', characterId: row.character_id, characterName: char.name, firesAtDay: row.fires_at_day, note: row.note, applied, ...(rearmedAs !== null ? { recurring: true, rearmedAs, nextFiresAtDay: row.fires_at_day + (row.recur_every_days ?? 0) } : {}) });
-    }
-    due = db.prepare(`SELECT * FROM scheduled_state_changes WHERE fired = 0 AND fires_at_day <= ?${scopeSql} ORDER BY fires_at_day, id`).all(effectiveDay, ...scopeParams) as ScheduleRow[];
-    }
-    const backlogWarning = passes >= 400 && due.length > 0
-        ? `⚠ pass guard tripped at ${passes} passes with ${due.length} row(s) still due — a recurrence is probably misconfigured (interval too small for the day jump). Remaining rows fire on the next process_scheduled.`
-        : undefined;
+    // The firing itself is shared with world_manage advance {fireScheduled}.
+    const { results, backlogWarning } = fireDueScheduledRows({ worldId: args.worldId, effectiveDay, characterId: args.characterId });
     return {
         success: true,
         actionType: 'process_scheduled',
@@ -2075,6 +2349,8 @@ async function handleListScheduled(args: z.infer<typeof ListScheduledSchema>): P
     // Play report: the shared filter — this world's tag, or its character's.
     if (args.worldId) { where.push(scheduleInWorldSql('')); params.push(args.worldId, args.worldId); }
     if (!args.includeFired) where.push('fired = 0');
+    // Request 2: cancelled rows are kept on record but hidden unless asked for.
+    if (!args.includeCancelled) where.push('cancelled_at IS NULL');
     if (args.characterId) { where.push('character_id = ?'); params.push(characterRepo.findById(args.characterId)?.id ?? args.characterId); }
     if (where.length) sql += ' WHERE ' + where.join(' AND ');
     sql += ' ORDER BY fires_at_day, id';
@@ -2083,10 +2359,10 @@ async function handleListScheduled(args: z.infer<typeof ListScheduledSchema>): P
     const scheduled = rows.map(r => {
         if (!nameCache.has(r.character_id)) nameCache.set(r.character_id, characterRepo.findById(r.character_id)?.name ?? '(deleted)');
         let opsCount = 0; try { opsCount = (JSON.parse(r.writes || '[]') as unknown[]).length; } catch { /* reported as 0 */ }
-        return { scheduleId: r.id, kind: (r.is_event ?? 0) === 1 ? 'event' : 'clock', characterId: r.character_id, characterName: nameCache.get(r.character_id), firesAtDay: r.fires_at_day, ops: opsCount, note: r.note, recurEveryDays: r.recur_every_days ?? null, worldId: r.world_id ?? null, fired: r.fired === 1, firedAt: r.fired_at, writes: r.writes };
+        return { scheduleId: r.id, kind: (r.is_event ?? 0) === 1 ? 'event' : 'clock', characterId: r.character_id, characterName: nameCache.get(r.character_id), firesAtDay: r.fires_at_day, ops: opsCount, note: r.note, recurEveryDays: r.recur_every_days ?? null, worldId: r.world_id ?? null, fired: r.fired === 1, firedAt: r.fired_at, ...(r.cancelled_at ? { cancelled: true, cancelledAt: r.cancelled_at } : {}), writes: r.writes };
     });
     const ownerUnknown = args.worldId ? unscopedOwnerUnknownIds(db, null, args.characterId ? (characterRepo.findById(args.characterId)?.id ?? args.characterId) : undefined) : [];
-    return { success: true, actionType: 'list_scheduled', count: scheduled.length, scheduled, ...(ownerUnknown.length ? { unscopedOwnerUnknown: ownerUnknown } : {}), message: `${scheduled.length} scheduled change${scheduled.length === 1 ? '' : 's'}${args.characterId ? ' for that character' : ''}${args.includeFired ? ' (incl. fired)' : ''}` };
+    return { success: true, actionType: 'list_scheduled', count: scheduled.length, scheduled, ...(ownerUnknown.length ? { unscopedOwnerUnknown: ownerUnknown } : {}), message: `${scheduled.length} scheduled change${scheduled.length === 1 ? '' : 's'}${args.characterId ? ' for that character' : ''}${args.includeFired ? ' (incl. fired)' : ''}${args.includeCancelled ? ' (incl. cancelled)' : ''}` };
 }
 
 async function handleCancelScheduled(args: z.infer<typeof CancelScheduledSchema>): Promise<object> {
@@ -2095,8 +2371,12 @@ async function handleCancelScheduled(args: z.infer<typeof CancelScheduledSchema>
     const row = db.prepare('SELECT * FROM scheduled_state_changes WHERE id = ?').get(args.scheduleId) as ScheduleRow | undefined;
     if (!row) return { error: true, actionType: 'cancel_scheduled', message: `No scheduled change with id ${args.scheduleId}` };
     if (row.fired === 1) return { error: true, actionType: 'cancel_scheduled', message: `Scheduled change ${args.scheduleId} already fired at ${row.fired_at} — fired clocks cannot be cancelled; write a correcting clock instead` };
-    db.prepare('DELETE FROM scheduled_state_changes WHERE id = ?').run(args.scheduleId);
-    return { success: true, actionType: 'cancel_scheduled', scheduleId: args.scheduleId, note: row.note, firesAtDay: row.fires_at_day, message: `Cancelled scheduled change ${args.scheduleId}${row.note ? ` (${row.note})` : ''} — was due Day ${row.fires_at_day}` };
+    if (row.cancelled_at && !args.hard) return { error: true, actionType: 'cancel_scheduled', message: `Scheduled change ${args.scheduleId} was already cancelled at ${row.cancelled_at}. Pass hard: true to delete the row.` };
+    // Request 2: a cancellation is a stamp, so list_scheduled {includeCancelled}
+    // still shows what was called off and when. hard: true is the old DELETE.
+    if (args.hard) db.prepare('DELETE FROM scheduled_state_changes WHERE id = ?').run(args.scheduleId);
+    else db.prepare('UPDATE scheduled_state_changes SET cancelled_at = ? WHERE id = ?').run(new Date().toISOString(), args.scheduleId);
+    return { success: true, actionType: 'cancel_scheduled', scheduleId: args.scheduleId, note: row.note, firesAtDay: row.fires_at_day, ...(args.hard ? { deleted: true } : {}), message: `${args.hard ? 'Deleted' : 'Cancelled'} scheduled change ${args.scheduleId}${row.note ? ` (${row.note})` : ''} — was due Day ${row.fires_at_day}` };
 }
 
 /** The character's world's progression (table_rules progression; default the SRD). */
@@ -2105,16 +2385,19 @@ function progressionFor(characterId: string) {
     return worldProgression(db, resolveWorldId(db, { characterIds: [characterId] }));
 }
 
-async function handleAddXp(args: z.infer<typeof AddXpSchema>): Promise<object> {
+/**
+ * The one XP write. add_xp, combat end, stunt and post_awards all land here
+ * (or mirror it): the delta is applied, level-up offered per the world's
+ * progression, and a posted ledger row recorded unless the caller already
+ * holds the rows (post_awards).
+ */
+export function applyXp(characterId: string, amount: number, ledger: { reason: string; source: string; record?: boolean }): Record<string, unknown> {
     const { characterRepo } = ensureDb();
-    const char = characterRepo.findById(args.characterId);
-
-    if (!char) {
-        throw new Error(`Character ${args.characterId} not found`);
-    }
+    const char = characterRepo.findById(characterId);
+    if (!char) throw new Error(`Character ${characterId} not found`);
 
     const currentXp = char.xp ?? 0;
-    const newXp = Math.max(0, currentXp + args.amount);   // Findings #43: corrections floor at 0
+    const newXp = Math.max(0, currentXp + amount);   // Findings #43: corrections floor at 0
     const currentLevel = char.level;
     // Table rules: milestone and none never offer a level-up for XP; the
     // thresholds and cap are the world's (item 10).
@@ -2125,6 +2408,13 @@ async function handleAddXp(args: z.infer<typeof AddXpSchema>): Promise<object> {
     const canLevelUp = prog.mode === 'xp' && nextLevelXp !== undefined && newXp >= nextLevelXp;
 
     characterRepo.update(char.id, { xp: newXp });
+    let awardId: string | undefined;
+    if (ledger.record !== false) {
+        try {
+            const db = getDb();
+            awardId = recordAward(db, { worldId: resolveWorldId(db, { characterIds: [char.id] }), characterId: char.id, amount, reason: ledger.reason, source: ledger.source }).id;
+        } catch { /* the ledger never blocks the write */ }
+    }
 
     return {
         characterId: char.id,
@@ -2133,11 +2423,80 @@ async function handleAddXp(args: z.infer<typeof AddXpSchema>): Promise<object> {
         newXp,
         level: currentLevel,
         canLevelUp,
+        reason: ledger.reason,
+        ...(awardId ? { awardId } : {}),
         ...(prog.mode !== 'xp' ? { progression: prog.mode } : {}),
         nextLevelXp: nextLevelXp || null,
         message: canLevelUp
-            ? `Added ${args.amount} XP. Total: ${newXp}. LEVEL UP AVAILABLE for Level ${currentLevel + 1}!`
-            : `Added ${args.amount} XP. Total: ${newXp}.${milestone ? ' Milestone progression: levels come on the GM\'s call, not from XP.' : prog.mode === 'none' ? ' This world has no levelling (progression none).' : ''}`
+            ? `Added ${amount} XP (${ledger.reason}). Total: ${newXp}. LEVEL UP AVAILABLE for Level ${currentLevel + 1}!`
+            : `Added ${amount} XP (${ledger.reason}). Total: ${newXp}.${milestone ? ' Milestone progression: levels come on the GM\'s call, not from XP.' : prog.mode === 'none' ? ' This world has no levelling (progression none).' : ''}`
+    };
+}
+
+async function handleAddXp(args: z.infer<typeof AddXpSchema>): Promise<object> {
+    const reason = args.reason?.trim();
+    if (!reason) {
+        throw new Error('add_xp needs a reason (why this XP is given: the encounter, the deed, the session). Nothing was written. Narrated but not yet applied? Use award_note instead.');
+    }
+    return applyXp(args.characterId, args.amount, { reason, source: 'character_manage add_xp' });
+}
+
+async function handleAwardNote(args: z.infer<typeof AwardNoteSchema>): Promise<object> {
+    const { characterRepo } = ensureDb();
+    const char = characterRepo.findById(args.characterId);
+    if (!char) throw new Error(`Character ${args.characterId} not found`);
+    const db = getDb();
+    const award = recordAward(db, { worldId: resolveWorldId(db, { characterIds: [char.id] }), characterId: char.id, amount: args.amount, reason: args.reason, source: 'character_manage award_note', posted: false });
+    const pending = pendingTotal(db, { characterId: char.id });
+    return {
+        actionType: 'award_note',
+        characterId: char.id,
+        name: char.name,
+        award,
+        pending,
+        message: `Noted +${args.amount} XP for ${char.name} (${args.reason}); not applied. XP owed: +${pending.total} (${pending.count} award${pending.count === 1 ? '' : 's'}) — character_manage post_awards to apply.`
+    };
+}
+
+async function handlePostAwards(args: z.infer<typeof PostAwardsSchema>): Promise<object> {
+    const db = getDb();
+    if (args.characterId && !ensureDb().characterRepo.findById(args.characterId)) throw new Error(`Character ${args.characterId} not found`);
+    const groups = postPending(db, { characterId: args.characterId, worldId: args.worldId });
+    const posted: Array<Record<string, unknown>> = [];
+    for (const g of groups) {
+        const reason = g.awards.map(a => a.reason).join('; ');
+        try {
+            const r = applyXp(g.characterId, g.total, { reason, source: 'character_manage post_awards', record: false });
+            posted.push({ characterId: g.characterId, name: r.name, amount: g.total, awards: g.awards.map(a => a.id), oldXp: r.oldXp, newXp: r.newXp, level: r.level, canLevelUp: r.canLevelUp, nextLevelXp: r.nextLevelXp });
+        } catch (e) {
+            // A deleted character: its rows are posted (nothing owed) but no sheet took the XP.
+            posted.push({ characterId: g.characterId, amount: g.total, awards: g.awards.map(a => a.id), error: e instanceof Error ? e.message : String(e) });
+        }
+    }
+    const total = groups.reduce((n, g) => n + g.total, 0);
+    const count = groups.reduce((n, g) => n + g.awards.length, 0);
+    return {
+        actionType: 'post_awards',
+        posted,
+        count,
+        total,
+        levelUps: posted.filter(p => p.canLevelUp).map(p => p.name),
+        message: count
+            ? `Posted ${count} award${count === 1 ? '' : 's'} (+${total} XP) to ${posted.length} character${posted.length === 1 ? '' : 's'}.${posted.some(p => p.canLevelUp) ? ` LEVEL UP AVAILABLE: ${posted.filter(p => p.canLevelUp).map(p => p.name).join(', ')}.` : ''}`
+            : 'No pending awards to post.'
+    };
+}
+
+async function handleListAwards(args: z.infer<typeof ListAwardsSchema>): Promise<object> {
+    const db = getDb();
+    const awards = listAwards(db, { characterId: args.characterId, worldId: args.worldId, pendingOnly: args.pendingOnly, limit: args.limit });
+    const pending = pendingTotal(db, { characterId: args.characterId, worldId: args.worldId });
+    return {
+        actionType: 'list_awards',
+        count: awards.length,
+        pending,
+        awards,
+        message: `${awards.length} award${awards.length === 1 ? '' : 's'}${args.pendingOnly ? ' pending' : ''}; XP owed: +${pending.total} (${pending.count} unposted).`
     };
 }
 
@@ -2357,13 +2716,13 @@ const definitions: Record<CharacterAction, ActionDefinition> = {
         schema: ListScheduledSchema,
         handler: handleListScheduled,
         aliases: ['scheduled', 'clocks'],
-        description: 'List scheduled state changes (unfired by default)'
+        description: 'List scheduled state changes (unfired, uncancelled by default; includeFired / includeCancelled widen)'
     },
     cancel_scheduled: {
         schema: CancelScheduledSchema,
         handler: handleCancelScheduled,
         aliases: ['unschedule', 'cancel_clock'],
-        description: 'Cancel an unfired scheduled change by id (surgical care re-clocks a wound)'
+        description: 'Cancel an unfired scheduled change by id — stamps cancelled_at, the row stays on record (hard: true deletes); surgical care re-clocks a wound'
     },
     scope_scheduled: {
         schema: z.object({
@@ -2495,7 +2854,25 @@ const definitions: Record<CharacterAction, ActionDefinition> = {
         schema: AddXpSchema,
         handler: handleAddXp,
         aliases: ['xp', 'award_xp', 'grant_xp'],
-        description: 'Add XP to a character'
+        description: 'Add XP to a character. reason is required (the award ledger keeps who/how much/why); an unexplained call is refused'
+    },
+    award_note: {
+        schema: AwardNoteSchema,
+        handler: handleAwardNote,
+        aliases: ['note_award', 'owe_xp'],
+        description: 'Record an XP award narrated at the table but not yet applied (unposted ledger row). Boot and the status block show it as XP owed until post_awards'
+    },
+    post_awards: {
+        schema: PostAwardsSchema,
+        handler: handlePostAwards,
+        aliases: ['apply_awards', 'settle_awards'],
+        description: 'Apply every pending award for a character or a whole world through the normal add_xp path (one XP write per character, level-up offered as usual) and mark the rows posted'
+    },
+    list_awards: {
+        schema: ListAwardsSchema,
+        handler: handleListAwards,
+        aliases: ['awards', 'xp_ledger'],
+        description: 'The XP award ledger: every XP write (add_xp, combat end, stunt) and every narrated award, by character or world; pendingOnly for what is still owed'
     },
     get_progression: {
         schema: GetProgressionSchema,
@@ -2515,11 +2892,29 @@ const definitions: Record<CharacterAction, ActionDefinition> = {
         aliases: ['form', 'transform', 'shapechange'],
         description: "Take a creature's form (a world creature rule or preset) or put it down with form: 'base'. The sheet keeps its own values to go back to; live tokens follow"
     },
+    create_vessel: {
+        schema: CreateVesselSchema,
+        handler: async (args: z.infer<typeof CreateVesselSchema>) => createVessel(args),
+        aliases: ['vessel', 'new_vessel', 'lay_down', 'commission'],
+        description: "Request 5: make a character row from a table_rules vessel rule — hull as HP, sections as system parts with roles, weapons as attack profiles, shields as a resource pool. Persists across sessions; add_participant takes it like any character"
+    },
     offer: {
         schema: OfferSchema,
         handler: handleOffer,
         aliases: ['offering', 'sacrifice', 'tithe'],
         description: "Offer an item, a kill or a deed to one pool of a pool_family: the offering is consumed, favour moves through the family (rivals grow jealous), and answerTable rolls the god's answer with the favour as its modifier"
+    },
+    set_exposure: {
+        schema: SetExposureSchema,
+        handler: handleSetExposure,
+        aliases: ['exposure', 'add_exposure', 'expose'],
+        description: 'Request 10: an exposure timer — a pool that climbs perHour with the world clock (world_manage advance / traverse advanceClock tick it; a correction never does), capped, adding threshold conditions as `at` is crossed. Upserts by name; creates the pool at 0/cap'
+    },
+    clear_exposure: {
+        schema: ClearExposureSchema,
+        handler: handleClearExposure,
+        aliases: ['remove_exposure', 'unexpose', 'stop_exposure'],
+        description: 'Request 10: stop an exposure timer by name (or all); the pool keeps its value unless removePool: true'
     },
     options: {
         schema: OptionsSchema,
@@ -2547,7 +2942,8 @@ export const CharacterManageTool = {
 1. create - Define character with class/race/stats (auto-provisions equipment)
 2. options - Read pinned SRD classes, species, backgrounds, skills, languages, or alignments
 3. get/update - View or modify properties
-4. add_xp/level_up - Advance character progression
+4. add_xp/level_up - Advance character progression (add_xp needs a reason; every XP write lands in the award ledger)
+5. award_note/post_awards/list_awards - XP owed: note an award narrated at the table, post it later, read the ledger
 
 ⚔️ FOR COMBAT:
 - Characters need HP, AC, stats for combat participation
@@ -2564,6 +2960,11 @@ export const CharacterManageTool = {
 - Wizards keep leveled spells in knownSpells as their spellbook and cast only preparedSpells.
 - Class and level determine available spell levels and slot progression; spell casting validates the saved choices and consumes the authoritative slots.
 - Use character_manage.update to change a character's durable spell choices. Do not invent spell names, slots, or class progression.
+
+⏱ EXPOSURE TIMERS (request 10):
+- set_exposure {characterId, name, pool, perHour, cap?, thresholds?: [{at, condition: {name, effect?, duration?}, once?}], note?} — the pool climbs perHour × elapsed hours on every world_manage advance (and spatial traverse advanceClock), clamped to cap; each threshold adds its condition once when at is crossed. A clock correction never ticks. clear_exposure {characterId, name?, removePool?} stops it. get and get_status_block show "exposure: dry_hours 7/12".
+🚀 VESSELS (request 5):
+- create_vessel {worldId, vessel: '<table_rules vessel rule>', name?, shields?: {max, regenPerRound?}} lays a ship down as a character row: hull = HP, sections = system parts with a role (drive | guns | bridge | reactor | hangar | other), weapons = attack profiles tied to their section, shields = a 'shields' pool the engine drains before the hull and refills at the start of its turn. Reply carries characterId and a manifest. See docs/table-rules/vessels.md.
 
 Actions: ${ACTIONS.join(', ')}
 Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
@@ -2618,7 +3019,8 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         preview: z.boolean().optional().describe('update: return the would-be changes, write NOTHING'),
         characterIds: z.array(z.string()).optional().describe('FINDINGS #105 (mirror): scope_characters — explicit rows to claim'),
         viaParties: z.boolean().optional().describe('FINDINGS #105 (mirror): scope_characters — auto-claim members of parties tagged to this world'),
-        reason: z.string().optional().describe('FINDINGS #111 (mirror): adjust_pool — why; stored on the pool history'),
+        reason: z.string().optional().describe('FINDINGS #111 (mirror): adjust_pool — why; stored on the pool history. add_xp: REQUIRED, why the XP is given (ledger row). award_note: why'),
+        pendingOnly: z.boolean().optional().describe('list_awards: only unposted (narrated, not yet applied) awards'),
         witnesses: z.array(z.string()).optional().describe('FINDINGS #111 (mirror): adjust_pool — who saw; stored on the pool history'),
         label: z.string().optional().describe('adjust_pool (mirror): display name for the counter'),
         show: z.boolean().optional().describe('adjust_pool (mirror): list the counter at boot and on the status block'),
@@ -2632,11 +3034,16 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         apply: z.boolean().optional().describe('offer: apply the answer (default true); false previews'),
         seed: z.string().optional().describe('offer: replay the answer dice'),
         form: z.string().optional().describe("set_form: a creature rule or preset to take the shape of; 'base' puts the form down"),
+        vessel: z.string().optional().describe("create_vessel: the world's vessel rule to lay down (worldId required; name optional)"),
+        shields: z.object({ max: z.number().int().min(0), regenPerRound: z.number().int().min(0).optional() }).optional().describe("create_vessel: override the rule's shields {max, regenPerRound?}"),
         hpMode: hpModeSchema().optional().describe('set_form: keep_fraction (default) | full | keep'),
         family: z.string().optional().describe("adjust_pool: a pool_family rule — the pool moves inside its family (jealous rivals lose on a gain); returns rivals[]"),
+        perHour: z.number().optional().describe('set_exposure (mirror): pool change per elapsed world hour'),
+        cap: z.number().optional().describe('set_exposure (mirror): the pool max the timer clamps to'),
+        thresholds: z.array(exposureThresholdSchema()).optional().describe('set_exposure (mirror): [{at, condition: {name, effect?, duration?}, once?}]'),
         firesAtHour: z.number().optional().describe('schedule_change: hour of the fires-at day (0–24)'),
         firesInHours: z.number().optional().describe('schedule_change: fires N hours from currentDay(+currentTime)'),
-        limit: z.number().int().optional().describe('list #93: cap returned rows'),
+        limit: z.number().int().optional().describe('list #93: cap returned rows; list_awards: rows to return (default 50)'),
         currentTime: z.string().optional().describe('schedule_change/process_scheduled: HH:MM — fractionalizes the day'),
         skillProficiencies: z.array(z.string()).optional(),
         saveProficiencies: z.array(z.string()).optional(),
@@ -2650,8 +3057,11 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         // Combat profile (create/update): tokens made from this sheet start with it
         size: SizeCategorySchema.optional().describe('create/update: tiny | small | medium | large | huge | gargantuan'),
         reach: z.number().int().min(0).optional().describe('create/update: melee reach in feet'),
+        speed: z.number().int().min(0).optional().describe("create/update: walking speed in feet (the token's movementSpeed; a species rule sets it at create)"),
+        swimSpeed: z.number().int().min(0).optional().describe('create/update: swim speed in feet, the movement budget underwater (else half speed)'),
+        flySpeed: z.number().int().min(0).optional().describe('create/update: fly speed in feet'),
         attacksPerAction: z.number().int().min(1).optional().describe('create/update: multiattack, attacks one Attack action allows'),
-        attacks: z.array(z.any()).optional().describe('create/update: named attack profiles [{name, attackBonus, damage, damageType?, part?, reachFt?, ranged?, default?, note?}]'),
+        attacks: z.array(z.any()).optional().describe('create/update: named attack profiles [{name, attackBonus, damage, damageType?, part?, item?, reachFt?, ranged?, default?, note?}] — item names the inventory item it swings, so world_manage reconcile can flag a profile whose weapon is gone'),
         abilities: z.array(z.any()).optional().describe('create/update: limited abilities [{name, recharge?, ready?, note?}]'),
         cr: z.number().min(0).optional().describe('create/update: challenge rating'),
         autoLegendaryResistance: z.boolean().optional().describe('create/update: spend a legendary resistance on a failed save automatically'),
@@ -2661,7 +3071,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         hasLairActions: z.boolean().optional().describe('create/update: adds a LAIR slot at initiative 20 when it joins a fight'),
         // adjust_pool fields
         pool: z.string().optional(),
-        removePool: z.boolean().optional().describe('Delete the pool entirely (adjust_pool)'),
+        removePool: z.boolean().optional().describe('Delete the pool entirely (adjust_pool); clear_exposure: also delete the pool the timer fed'),
         delta: z.number().optional(),
         value: z.number().optional().describe('adjust_pool #67-F: ABSOLUTE set (retry-safe) — mutually exclusive with delta'),
         max: z.number().optional(),
@@ -2689,11 +3099,13 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         fireNow: z.boolean().optional().describe('FINDINGS #73 (mirror): fire the entry immediately in the same call — ledger one-off, applied[] reported'),
         event: z.boolean().optional().describe('FINDINGS #82 (mirror): GM EVENT — a clock that fires a notification instead of writes; empty writes allowed with this flag'),
         writes: z.preprocess(mendJsonIfString, z.array(ScheduledWriteOpSchema)).optional().describe('MEND CLOCK: ordered ops (schedule_change). ARRAY — direct calls only per batch law #16a'),
-        note: z.string().optional().describe('MEND CLOCK: what this clock is (schedule_change); adjust_pool: what the counter is'),
+        note: z.string().optional().describe('MEND CLOCK: what this clock is (schedule_change); adjust_pool: what the counter is; set_exposure: what the timer is'),
         currentDay: z.number().optional().describe('MEND CLOCK: current in-fiction day (process_scheduled)'),
         scheduleId: z.number().optional().describe('MEND CLOCK: row id (cancel_scheduled, scope_scheduled)'),
         scheduleIds: z.array(z.number().int()).optional().describe('scope_scheduled (mirror): rows to stamp by id; another world\'s character\'s row is refused by name'),
         includeFired: z.boolean().optional().describe('MEND CLOCK: include fired rows (list_scheduled)'),
+        includeCancelled: z.boolean().optional().describe('list_scheduled (mirror): include cancelled rows'),
+        hard: z.boolean().optional().describe('cancel_scheduled (mirror): delete the row instead of stamping cancelled_at'),
         // Level up fields
         hpIncrease: z.number().int().optional(),
         targetLevel: z.number().int().optional(),
@@ -2915,6 +3327,24 @@ export async function handleCharacterManage(args: unknown, _ctx: SessionContext)
             }
         } else if (data.actionType === 'cancel_scheduled') {
             output = RichFormatter.header('Mend Clock — Cancelled', '⏳');
+            output += `${data.message}\n`;
+        } else if (data.actionType === 'award_note') {
+            output = RichFormatter.header(`XP Owed: ${data.name}`, '📝');
+            output += `${data.message}\n`;
+        } else if (data.actionType === 'post_awards') {
+            output = RichFormatter.header('XP Awards Posted', '⭐');
+            output += `${data.message}\n`;
+            for (const p of (data.posted ?? []) as Array<Record<string, unknown>>) {
+                output += p.error ? `• ${p.characterId}: ${p.error}\n` : `• ${p.name}: +${p.amount} → ${p.newXp} XP${p.canLevelUp ? ' — LEVEL UP AVAILABLE' : ''}\n`;
+            }
+        } else if (data.actionType === 'list_awards') {
+            output = RichFormatter.header(`XP Ledger — ${data.count} rows`, '📒');
+            output += `${data.message}\n`;
+            for (const a of (data.awards ?? []) as Array<Record<string, unknown>>) {
+                output += `• ${a.posted ? '' : 'OWED '}${a.characterId}: ${Number(a.amount) >= 0 ? '+' : ''}${a.amount} — ${a.reason} [${a.source}]\n`;
+            }
+        } else if (data.actionType === 'set_exposure' || data.actionType === 'clear_exposure') {
+            output = RichFormatter.header(data.actionType === 'set_exposure' ? 'Exposure Timer — Set' : 'Exposure Timer — Cleared', '⏱');
             output += `${data.message}\n`;
         } else {
             // Fallback for unknown actions

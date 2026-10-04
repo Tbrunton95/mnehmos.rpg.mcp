@@ -6,7 +6,6 @@
  */
 
 import { z } from 'zod';
-import seedrandom from 'seedrandom';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import * as pda from '../../render/pda.js';
 import { SessionContext } from '../types.js';
@@ -23,10 +22,15 @@ import {
     ActorType
 } from '../../schema/improvisation.js';
 import { loadAutoMechanics, autoSkillBonus, applyDeclaredEffects } from '../../engine/effects-resolver.js';
-import { freshSeed } from '../../math/seed.js';
+import { loggedD20, loggedRoller, type DiceRoller } from '../../math/logged-d20.js';
 import { resolveWorldId, worldSkillAbility } from '../../engine/table-rules.js';
 import { getOrLoadEngine, syncParticipantHpFromDb } from '../handlers/combat-handlers.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
+import { v4 as uuidv4 } from 'uuid';
+import { applyScheduledOps, scheduledWriteOpSchema } from '../../engine/scheduled-ops.js';
+import { advanceWorldClock } from './world-manage.js';
+import { readWorldClock, clockLabel } from '../../engine/world-clock.js';
+import { recordAward } from '../../storage/xp-awards.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -34,7 +38,7 @@ import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 
 const ACTIONS = [
     'stunt', 'apply_effect', 'get_effects', 'remove_effect', 'replace_effect', 'edit_effect', 'feature_from_condition',
-    'process_triggers', 'advance_durations', 'synthesize', 'get_spellbook'
+    'process_triggers', 'advance_durations', 'synthesize', 'get_spellbook', 'montage'
 ] as const;
 type ImprovisationAction = typeof ACTIONS[number];
 
@@ -106,7 +110,11 @@ function canonicalTargetId(charRepo: CharacterRepository, targetId: string): str
 // DICE HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
 
-function rollDice(notation: string, rng?: seedrandom.PRNG, crit = false): { total: number; rolls: number[]; notation: string } {
+/**
+ * Damage dice for a stunt or synthesis, on the caller's logged roller
+ * (crypto dice by default) under `tag`. A plain number is a posted total.
+ */
+function rollDice(notation: string, roll: DiceRoller, tag: string, crit = false): { total: number; rolls: number[]; notation: string } {
     const trimmed = notation.trim();
     // A plain number is a posted total: applied as given, never doubled.
     if (/^\d+$/.test(trimmed)) return { total: parseInt(trimmed, 10), rolls: [], notation: trimmed };
@@ -117,31 +125,24 @@ function rollDice(notation: string, rng?: seedrandom.PRNG, crit = false): { tota
     const count = parseInt(match[1], 10) * (crit ? 2 : 1);
     const sides = parseInt(match[2], 10);
     const modifier = match[3] ? parseInt(match[3], 10) : 0;
-    const rolls: number[] = [];
-    const random = rng || Math.random;
-
-    for (let i = 0; i < count; i++) {
-        rolls.push(Math.floor(random() * sides) + 1);
-    }
+    const r = roll(`${count}d${sides}${modifier ? (modifier > 0 ? `+${modifier}` : modifier) : ''}`, tag);
 
     return {
-        total: Math.max(0, rolls.reduce((a, b) => a + b, 0) + modifier),
-        rolls,
+        total: Math.max(0, r.total),
+        rolls: r.rolls,
         notation
     };
 }
 
-function rollD20(advantage?: boolean, disadvantage?: boolean, rng?: seedrandom.PRNG): { roll: number; rolls: number[] } {
-    const random = rng || Math.random;
-    const roll1 = Math.floor(random() * 20) + 1;
-
-    if (!advantage && !disadvantage) return { roll: roll1, rolls: [roll1] };
-
-    const roll2 = Math.floor(random() * 20) + 1;
-
-    if (advantage && !disadvantage) return { roll: Math.max(roll1, roll2), rolls: [roll1, roll2] };
-    if (disadvantage && !advantage) return { roll: Math.min(roll1, roll2), rolls: [roll1, roll2] };
-    return { roll: roll1, rolls: [roll1] };
+/** A d20 (or 2d20 keep one) on the caller's logged roller under `tag`. */
+function rollD20(advantage: boolean | undefined, disadvantage: boolean | undefined, roll: DiceRoller, tag: string): { roll: number; rolls: number[] } {
+    if (!advantage === !disadvantage) {
+        const r = roll('1d20', tag);
+        return { roll: r.rolls[0], rolls: r.rolls };
+    }
+    const r = roll('2d20', tag);
+    const [roll1, roll2] = r.rolls;
+    return { roll: advantage ? Math.max(roll1, roll2) : Math.min(roll1, roll2), rolls: [roll1, roll2] };
 }
 
 function getSkillModifier(stats: Record<string, number>, ability: string): number {
@@ -188,7 +189,7 @@ const StuntSchema = z.object({
     savingThrowAbility: z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']).optional(),
     savingThrowDc: z.number().int().optional(),
     halfDamageOnSave: z.boolean().optional(),
-    xpAward: z.number().int().optional().describe('FINDINGS #34 T4.17: XP credited to the actor on resolution')
+    xpAward: z.number().int().optional().describe('FINDINGS #34 T4.17: XP credited to the actor on resolution; recorded in the award ledger as stunt: <narrativeIntent>')
 }).superRefine((args, ctx) => {
     const hasDamageFields = Boolean(args.successDamage || args.failureDamage);
     if (args.effectType === 'damage' && !hasDamageFields) {
@@ -403,8 +404,8 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
     if (!stuntAbility) {
         throw new Error(`Skill '${args.skill}' is not an SRD skill or a skill this world defines (table_rules skill): pass ability (str, dex, con, int, wis or cha) for it. Nothing was rolled.`);
     }
-    const seed = freshSeed(`stunt-${args.encounterId || 'free'}-${args.actorId}`);
-    const rng = seedrandom(seed);
+    // Crypto dice, logged under 'stunt' for the actor.
+    const roller = loggedRoller(db, { forId: args.actorId, tool: 'improvisation_manage' });
 
     // Validate every damage target before rolling or mutating any target. This
     // keeps a multi-target stunt atomic and prevents a successful response from
@@ -528,7 +529,7 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
         contributions.push({ label: d.label, value: d.value, lane: 'SITUATIONAL' });
     }
 
-    const d20Result = rollD20(args.advantage, args.disadvantage, rng);
+    const d20Result = rollD20(args.advantage, args.disadvantage, roller, 'stunt');
     const total = d20Result.roll + skillModifier;
     const isNat20 = d20Result.roll === 20;
     const isNat1 = d20Result.roll === 1;
@@ -551,6 +552,10 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
             if (xrow) {
                 charRepo.update(args.actorId, { xp: ((xrow as { xp?: number }).xp ?? 0) + args.xpAward } as Partial<import('../../schema/character.js').Character>);
                 xpAwarded = args.xpAward;
+                // Request 3: the ledger row for this write.
+                try {
+                    recordAward(db, { worldId: resolveWorldId(db, { encounterId: args.encounterId, characterIds: [args.actorId] }), characterId: args.actorId, amount: args.xpAward, reason: `stunt: ${args.narrativeIntent}`, source: 'improvisation_manage stunt' });
+                } catch { /* never blocks */ }
             }
         } catch { /* non-blocking */ }
     }
@@ -588,7 +593,7 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
     };
 
     if (success && args.successDamage) {
-        const damageRoll = rollDice(args.successDamage, rng, criticalSuccess);
+        const damageRoll = rollDice(args.successDamage, roller, 'stunt damage', criticalSuccess);
         result.damage = damageRoll.total;
         result.damageRolls = damageRoll.rolls;
         result.damageType = args.damageType || 'bludgeoning';
@@ -612,7 +617,7 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
                 if (args.savingThrowAbility && args.savingThrowDc) {
                     const saveStats = (damageTargets[i]?.stats ?? {}) as Record<string, number>;
                     const saveMod = Math.floor(((saveStats[args.savingThrowAbility] ?? 10) - 10) / 2);
-                    const saveRoll = Math.floor(rng() * 20) + 1;
+                    const saveRoll = loggedD20(db, { purpose: 'stunt save', forId: args.targetIds[i], targetId: args.actorId }, { tool: 'improvisation_manage' }).natural;
                     saved = saveRoll + saveMod >= args.savingThrowDc;
                     save = { natural: saveRoll, modifier: saveMod, total: saveRoll + saveMod, dc: args.savingThrowDc };
                     if (saved && args.halfDamageOnSave) targetDamage = Math.floor(targetDamage / 2);
@@ -657,7 +662,7 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
             }
         }
     } else if (!success && criticalFailure && args.failureDamage) {
-        const selfDamage = rollDice(args.failureDamage, rng);
+        const selfDamage = rollDice(args.failureDamage, roller, 'stunt failure damage');
         result.selfDamage = selfDamage.total;
     }
 
@@ -904,8 +909,8 @@ async function handleAdvanceDurations(args: z.infer<typeof AdvanceDurationsSchem
 
 async function handleSynthesize(args: z.infer<typeof SynthesizeSchema>): Promise<object> {
     const { db, charRepo } = ensureDb();
-    const seed = freshSeed(`synthesis-${args.casterId}`);
-    const rng = seedrandom(seed);
+    // Crypto dice, logged under 'synthesis' for the caster.
+    const roller = loggedRoller(db, { forId: args.casterId, tool: 'improvisation_manage' });
 
     let spellcastingModifier = 0;
     let casterName = 'Caster';
@@ -973,7 +978,7 @@ async function handleSynthesize(args: z.infer<typeof SynthesizeSchema>): Promise
         }
     }
 
-    const d20Roll = Math.floor(rng() * 20) + 1;
+    const d20Roll = roller('1d20', 'synthesis').total;
     const total = d20Roll + spellcastingModifier;
     const isNat20 = d20Roll === 20;
     const isNat1 = d20Roll === 1;
@@ -1003,7 +1008,7 @@ async function handleSynthesize(args: z.infer<typeof SynthesizeSchema>): Promise
 
     if (outcome === 'mastery' || outcome === 'success') {
         if (args.effectDice) {
-            const effectRoll = rollDice(args.effectDice, rng);
+            const effectRoll = rollDice(args.effectDice, roller, 'synthesis effect');
             if (args.effectType === 'damage') result.damage = effectRoll.total;
             else if (args.effectType === 'healing') result.healing = effectRoll.total;
         }
@@ -1033,10 +1038,10 @@ async function handleSynthesize(args: z.infer<typeof SynthesizeSchema>): Promise
             } catch { result.addedToSpellbook = false; }
         }
     } else if (outcome === 'backfire') {
-        const backfireDamage = rollDice(`${args.estimatedLevel}d6`, rng);
+        const backfireDamage = rollDice(`${args.estimatedLevel}d6`, roller, 'synthesis backfire');
         result.backfireDamage = backfireDamage.total;
     } else if (outcome === 'catastrophic') {
-        const surgeRoll = Math.floor(rng() * 20) + 1;
+        const surgeRoll = roller('1d20', 'wild surge').total;
         const wildSurge = WILD_SURGE_TABLE.find(ws => ws.roll === surgeRoll) || WILD_SURGE_TABLE[0];
         result.wildSurge = wildSurge;
     }
@@ -1078,6 +1083,125 @@ async function handleGetSpellbook(args: z.infer<typeof GetSpellbookSchema>): Pro
 // ═══════════════════════════════════════════════════════════════════════════
 // ACTION ROUTER
 // ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Deep One audit request 7: MONTAGE — forty-eight cells, one roll. A long task
+// (clearing a drowned deck, a week of forge work, a night of bribes) resolves
+// on a single logged die with three fixed tiers instead of a dozen checks in
+// chat. The tier's cost is applied through the scheduled-op grammar, the
+// clock may move, and the session log gets one line so the cost is on record.
+// ═══════════════════════════════════════════════════════════════════════════
+const montageJsonIfString = (v: unknown) => { if (typeof v === 'string') { try { return JSON.parse(v); } catch { return v; } } return v; };
+const MontageSchema = z.object({
+    action: z.literal('montage'),
+    characterId: z.string().describe('Who does the work'),
+    task: z.string().min(1).describe('What the montage covers, in one line'),
+    dc: z.number().describe('Hard-won at or above this; clean at dc + cleanMargin; costly below'),
+    dice: z.string().optional().default('1d20').describe('Dice notation for the one roll (default 1d20)'),
+    ability: stuntAbilityField().optional().describe('Ability whose modifier adds to the roll (str/dex/con/int/wis/cha)'),
+    modifier: z.number().optional().default(0).describe('Flat situational modifier'),
+    cleanMargin: z.number().optional().default(5).describe('Clean tier starts at dc + cleanMargin (default 5)'),
+    costs: z.object({
+        hardWon: z.preprocess(montageJsonIfString, z.array(scheduledWriteOpSchema())).optional().describe('Writes applied on a hard-won result'),
+        costly: z.preprocess(montageJsonIfString, z.array(scheduledWriteOpSchema())).optional().describe('Writes applied on a costly result')
+    }).optional().default({}).describe('What each tier costs; clean costs nothing'),
+    hours: z.number().positive().optional().describe('Hours the montage takes; with worldId the world clock advances'),
+    worldId: z.string().optional().describe("World whose clock moves and whose session log takes the line (default: the character's world)"),
+    journal: z.boolean().optional().default(true).describe('Append a [montage] line to the latest active session_log (created if none)'),
+    seed: z.string().optional().describe('Replay seed; omit for crypto dice')
+});
+
+type MontageTier = 'clean' | 'hard_won' | 'costly';
+const MONTAGE_HOOKS: Record<MontageTier, string> = {
+    clean: 'It goes the way it was planned: describe the work done well and what was noticed along the way.',
+    hard_won: 'It gets done, but something is spent: describe what the work took out of them.',
+    costly: 'It gets done at a price: describe the slip, the loss or the mark the task leaves behind.'
+};
+
+async function handleMontage(args: z.infer<typeof MontageSchema>): Promise<object> {
+    const { db, charRepo } = ensureDb();
+    const char = charRepo.findById(args.characterId);
+    if (!char) return { error: true, actionType: 'montage', message: `Character ${args.characterId} not found — nothing rolled, nothing written` };
+    if (args.worldId) {
+        const exists = db.prepare('SELECT 1 FROM worlds WHERE id = ?').get(args.worldId);
+        if (!exists) return { error: true, actionType: 'montage', message: `World ${args.worldId} not found — nothing rolled, nothing written` };
+    }
+    const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] }) ?? undefined;
+
+    // One logged roll, purpose 'montage'. Crypto unless a seed is given.
+    const roller = loggedRoller(db, { forId: char.id, tool: 'improvisation_manage', seed: args.seed });
+    const rolled = roller(args.dice, 'montage');
+    const abilityMod = args.ability ? getSkillModifier((char.stats ?? {}) as Record<string, number>, args.ability) : 0;
+    const total = rolled.total + abilityMod + args.modifier;
+    const cleanAt = args.dc + args.cleanMargin;
+    const tier: MontageTier = total >= cleanAt ? 'clean' : total >= args.dc ? 'hard_won' : 'costly';
+
+    // The tier's cost, through the same op grammar as mend clocks and tables.
+    const ops = tier === 'hard_won' ? (args.costs.hardWon ?? []) : tier === 'costly' ? (args.costs.costly ?? []) : [];
+    let applied: string[] = [];
+    if (ops.length) {
+        const res = applyScheduledOps(char, ops, { defaultSource: `montage: ${args.task}`, reason: `montage: ${args.task} (${tier})` });
+        applied = res.applied;
+        if (Object.keys(res.updates).length) {
+            const written = charRepo.update(char.id, res.updates as Partial<import('../../schema/character.js').Character>);
+            if (!written) throw new Error(`montage cost write FAILED for ${char.id} — nothing applied`);
+        }
+    }
+
+    // Time passes, when the caller says how much and whose clock.
+    let timePassed: Record<string, unknown> | undefined;
+    if (args.hours && worldId) {
+        const adv = advanceWorldClock(worldId, args.hours);
+        timePassed = adv.error ? { error: true, message: adv.message } : { hours: args.hours, clock: adv.clock, dueNow: adv.dueNow, message: adv.message };
+    }
+
+    // One line in the session log: the latest active one for the world, or a new one.
+    const costText = applied.length ? applied.join('; ') : 'none';
+    const journalLine = `[montage] ${args.task} — ${tier.replace('_', '-')} (roll ${total} vs DC ${args.dc}) — cost: ${costText}`;
+    let journalNoteId: string | undefined;
+    let journalCreated = false;
+    if (args.journal && worldId) {
+        const now = new Date().toISOString();
+        const latest = db.prepare("SELECT id FROM narrative_notes WHERE world_id = ? AND type = 'session_log' AND status = 'active' ORDER BY updated_at DESC, created_at DESC LIMIT 1").get(worldId) as { id: string } | undefined;
+        if (latest) {
+            journalNoteId = latest.id;
+        } else {
+            journalNoteId = uuidv4();
+            db.prepare(`INSERT INTO narrative_notes (id, world_id, type, content, metadata, visibility, tags, status, created_at, updated_at)
+                        VALUES (?, ?, 'session_log', 'Session log', '{}', 'dm_only', '[]', 'active', ?, ?)`).run(journalNoteId, worldId, now, now);
+            journalCreated = true;
+        }
+        const clock = readWorldClock(db, worldId);
+        const stamp = clock ? clockLabel(clock) : now.slice(0, 10);
+        db.prepare('UPDATE narrative_notes SET content = content || ?, updated_at = ? WHERE id = ?').run(`\n\n── [${stamp}] ──\n${journalLine}`, now, journalNoteId);
+    }
+
+    const breakdown = [`${args.dice} ${rolled.total}`, ...(args.ability ? [`${args.ability} ${abilityMod >= 0 ? '+' : ''}${abilityMod}`] : []), ...(args.modifier ? [`modifier ${args.modifier >= 0 ? '+' : ''}${args.modifier}`] : [])];
+    return {
+        success: true,
+        actionType: 'montage',
+        characterId: char.id,
+        characterName: char.name,
+        task: args.task,
+        tier,
+        roll: rolled.total,
+        rolls: rolled.rolls,
+        rollId: rolled.rollId,
+        abilityModifier: abilityMod,
+        modifier: args.modifier,
+        total,
+        dc: args.dc,
+        cleanAt,
+        breakdown,
+        applied,
+        timePassed,
+        journalNoteId,
+        journalCreated: journalCreated || undefined,
+        journalLine: args.journal && worldId ? journalLine : undefined,
+        hook: MONTAGE_HOOKS[tier],
+        message: `${char.name} — ${args.task}: ${breakdown.join(' + ')} = ${total} vs DC ${args.dc} → ${tier.toUpperCase().replace('_', '-')}${applied.length ? ` (cost: ${costText})` : ''}${timePassed && !timePassed.error ? `; ${args.hours}h pass` : ''}`
+    };
+}
 
 const definitions: Record<ImprovisationAction, ActionDefinition> = {
     stunt: {
@@ -1140,6 +1264,12 @@ const definitions: Record<ImprovisationAction, ActionDefinition> = {
         aliases: ['arcane_synthesis', 'create_spell'],
         description: 'Attempt to create a spell on the fly'
     },
+    montage: {
+        schema: MontageSchema,
+        handler: handleMontage,
+        aliases: ['downtime_roll', 'long_task'],
+        description: 'Forty-eight cells, one roll: resolve a long task on one logged die with fixed tiers (clean >= dc+cleanMargin, hard_won >= dc, costly below), apply the tier\'s writes, advance the clock, log the cost. {characterId, task, dc, dice?, ability?, modifier?, cleanMargin?, costs?: {hardWon, costly}, hours?, worldId?, journal?}'
+    },
     get_spellbook: {
         schema: GetSpellbookSchema,
         handler: handleGetSpellbook,
@@ -1161,8 +1291,8 @@ const router = createActionRouter({
 export const ImprovisationManageTool = {
     name: 'improvisation_manage',
     description: `Manage improvised actions, custom effects, and arcane synthesis.
-Actions: stunt, apply_effect, get_effects, remove_effect, replace_effect, process_triggers, advance_durations, synthesize, get_spellbook
-Aliases: rule_of_cool->stunt, boon/curse->apply_effect, dispel->remove_effect, swap_effect/update_effect->replace_effect, arcane_synthesis->synthesize
+Actions: stunt, apply_effect, get_effects, remove_effect, replace_effect, process_triggers, advance_durations, synthesize, get_spellbook, montage
+Aliases: rule_of_cool->stunt, downtime_roll/long_task->montage, boon/curse->apply_effect, dispel->remove_effect, swap_effect/update_effect->replace_effect, arcane_synthesis->synthesize
 
 STUNT (Rule of Cool):
 - DC 5-30 based on difficulty
@@ -1180,6 +1310,12 @@ CUSTOM EFFECTS (apply_effect):
 - Categories: boon, curse, neutral, transformative | Power levels 1-5 | Duration types: rounds, minutes, hours, days, permanent, until_removed
 - Use custom_trigger (value 1) for narrative-only effects with no numeric rider
 - Example: { action: "apply_effect", targetId: "char_1", targetType: "character", name: "Forge Blessing", category: "boon", powerLevel: 2, durationType: "until_removed", mechanics: [{ type: "attack_bonus", value: 2, condition: "melee" }, { type: "damage_resistance", value: "fire" }] }
+
+MONTAGE (forty-eight cells, one roll):
+- montage {characterId, task, dc, dice?: '1d20', ability?, modifier?, cleanMargin?: 5, costs?: {hardWon: writes[], costly: writes[]}, hours?, worldId?, journal?: true} — one logged roll (purpose 'montage'); total = roll + ability mod + modifier
+- Tiers: clean (total ≥ dc + cleanMargin, no cost) · hard_won (≥ dc, costs.hardWon applied) · costly (below dc, costs.costly applied). Writes use the schedule_change op grammar: adjust_pool, adjust_hp, adjust_max_hp, add_condition, remove_condition
+- hours + worldId advance the world clock; journal appends '[montage] task — tier (roll X vs DC Y) — cost: …' to the latest active session_log (created as 'Session log' if none)
+- Reply: {tier, roll, total, dc, applied, timePassed?, journalNoteId?, hook} — hook is a one-line narration seed per tier for the GM to expand
 
 ARCANE SYNTHESIS:
 - DC = 10 + (spell level x 2) + modifiers
@@ -1257,7 +1393,19 @@ ARCANE SYNTHESIS:
         concentration: z.boolean().optional(),
         duration: z.string().optional(),
         circumstanceModifiers: z.array(z.string()).optional(),
-        characterId: z.string().optional().describe('get_spellbook / feature_from_condition: whose')
+        characterId: z.string().optional().describe('get_spellbook / feature_from_condition / montage: whose'),
+        // Montage params (request 7): forty-eight cells, one roll.
+        task: z.string().optional().describe('montage: what the montage covers, one line'),
+        dice: z.string().optional().describe("montage: dice notation for the one roll (default '1d20')"),
+        cleanMargin: z.number().optional().describe('montage: clean tier starts at dc + cleanMargin (default 5)'),
+        costs: z.object({
+            hardWon: z.array(z.any()).optional().describe('montage: writes applied on a hard-won result'),
+            costly: z.array(z.any()).optional().describe('montage: writes applied on a costly result')
+        }).optional().describe('montage: per-tier costs as schedule_change write ops; clean costs nothing'),
+        hours: z.number().optional().describe('montage: hours the task takes; with worldId the clock advances'),
+        worldId: z.string().optional().describe('montage: world whose clock moves and whose session log takes the line'),
+        journal: z.boolean().optional().describe('montage: append a [montage] line to the latest active session_log (default true)'),
+        seed: z.string().optional().describe('montage: replay seed; omit for crypto dice')
     })
 };
 
@@ -1353,6 +1501,14 @@ export async function handleImprovisationManage(args: unknown, ctx: SessionConte
                         spells.forEach((s: { name: string; school: string }) => output += `  - ${s.name} (${s.school})\n`);
                     }
                 }
+                break;
+
+            case 'montage':
+                output = RichFormatter.header('Montage', parsed.task ?? '');
+                output += `${parsed.message}\n`;
+                if (parsed.timePassed?.message) output += `▌ ${parsed.timePassed.message}\n`;
+                if (parsed.journalNoteId) output += `▌ logged to session_log ${parsed.journalNoteId}${parsed.journalCreated ? ' (new)' : ''}\n`;
+                if (parsed.hook) output += `▌ ${parsed.hook}\n`;
                 break;
 
             default:

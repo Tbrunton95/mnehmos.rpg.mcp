@@ -1,10 +1,11 @@
-import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile, Buff } from '../../schema/token-extras.js';
+import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile, Buff, VesselProfile, Shields } from '../../schema/token-extras.js';
+import { absorbWithShields, roleState, sectionRole } from './vessel.js';
 import { damageWithModifiers } from './damage-modifiers.js';
 import { findPart as findNamedPart, matchProfile } from './parts.js';
 import { CombatRNG, CheckResult } from './rng.js';
 import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS, conditionAttackModifiers, conditionSpeedFactor } from './conditions.js';
 
-import { SizeCategory, GridBounds, edgeDistanceSquares, effectiveReachFt } from '../../schema/encounter.js';
+import { SizeCategory, GridBounds, edgeDistanceSquares, effectiveReachFt, type EncounterEnvironment } from '../../schema/encounter.js';
 import { mobAttackBonus } from './units.js';
 
 /**
@@ -35,6 +36,8 @@ export interface CombatParticipant {
     position?: { x: number; y: number; z?: number };  // CRIT-003: Spatial position
     // Phase 4: Movement economy
     movementSpeed?: number;       // Base speed in feet (default 30)
+    swimSpeed?: number;           // Swim speed in feet: the budget underwater (else half movementSpeed)
+    flySpeed?: number;            // Fly speed in feet
     movementRemaining?: number;   // Remaining movement this turn (in feet)
     size?: SizeCategory;          // Creature size for footprint calculation
     hasDashed?: boolean;          // Whether dash action was used this turn
@@ -101,6 +104,10 @@ export interface CombatParticipant {
     species?: string;                // 'Orruk': nearby counts and battle cries match it
     tags?: string[];                 // Free tags nearby matches read
     buffs?: Buff[];                  // Battle-cry buffs (combat_manage battle_cry)
+    // REQUEST 5: the void-combat lane (a token made from a create_vessel row)
+    vessel?: VesselProfile;          // Section roles, shield regen; marks the token a vessel
+    shields?: Shields;               // Drained before the hull; regen at the start of its turn
+    reactorBreach?: boolean;         // A reactor section is dead: a d6 at each turn start, 1 destroys it
 }
 
 /**
@@ -116,8 +123,10 @@ export interface CombatState {
     terrain?: {  // CRIT-003: Terrain configuration
         obstacles: string[];  // "x,y" format blocking tiles
         difficultTerrain?: string[];
-        water?: string[];  // Water terrain (streams, rivers)
+        water?: string[];  // Water terrain (streams, rivers): a token standing there swims
     };
+    /** The medium the fight happens in (air unless set). Water turns on the underwater rules. */
+    environment?: EncounterEnvironment;
     props?: Array<{  // Improvised props/objects (trees, ladders, buildings, etc.)
         id: string;
         position: string;  // "x,y" format
@@ -155,6 +164,12 @@ export interface CombatActionResult {
     // An aimed part with its own hp or breakAt took the hit instead of the
     // body (damage is then 0): what it took and whether it broke (severed).
     partHit?: { name: string; damage: number; hpBefore?: number; hpAfter?: number; broken: boolean; state: Part['state'] };
+    // Request 11: a band rule's damageScale changed the damage (steps = the
+    // attacker's band index minus the target's; before/after the multiplier).
+    bandScale?: { steps: number; multiplier: number; before: number; after: number };
+    // Request 5: the target's shields took this much before the hull.
+    shieldsAbsorbed?: number;
+    shields?: Shields;
     
     // Heal specifics (if type === 'heal')
     healAmount?: number;
@@ -219,9 +234,28 @@ export class CombatEngine {
     private state: CombatState | null = null;
     private emitter?: EventEmitter;
 
-    constructor(seed: string, emitter?: EventEmitter) {
+    /**
+     * @param seed a seed string for a replayable (seeded) stream, or
+     * `{ mode: 'crypto' }` for crypto dice: the default for play.
+     */
+    constructor(seed: string | { mode: 'crypto' }, emitter?: EventEmitter) {
         this.rng = new CombatRNG(seed);
         this.emitter = emitter;
+    }
+
+    /** A CombatEngine on crypto dice. */
+    static crypto(emitter?: EventEmitter): CombatEngine {
+        return new CombatEngine({ mode: 'crypto' }, emitter);
+    }
+
+    /** 'crypto' or 'seeded' — which dice this encounter rolls. */
+    get diceMode(): 'crypto' | 'seeded' {
+        return this.rng.mode;
+    }
+
+    /** 'crypto' or 'seeded:<seed>', for a reply. */
+    describeDice(): string {
+        return this.rng.describe();
     }
 
     /**
@@ -749,7 +783,9 @@ export class CombatEngine {
         // ranged says the attack is not made within 5 ft (prone, auto-crit);
         // ignoreConditions skips the standard-condition modifiers entirely;
         // opportunity tags the rolls and the event as an opportunity attack.
-        partOpts?: { withPart?: string; atPart?: string; uncapped?: boolean; ranged?: boolean; ignoreConditions?: boolean; opportunity?: boolean }
+        // bandScale (request 11) is the band rule's multiplier for this pair,
+        // applied after resistance and before the part or unit caps.
+        partOpts?: { withPart?: string; atPart?: string; uncapped?: boolean; ranged?: boolean; ignoreConditions?: boolean; opportunity?: boolean; bandScale?: { steps: number; multiplier: number } }
     ): CombatActionResult {
         if (!this.state) throw new Error('No active combat');
 
@@ -773,6 +809,19 @@ export class CombatEngine {
             }
             if (usedPart.state === 'dead') throw new Error(`${actor.name}'s ${usedPart.name} is dead and cannot attack`);
             if (usedPart.state === 'latched') throw new Error(`${actor.name}'s ${usedPart.name} is latched and cannot attack while it holds`);
+            // Request 5: a vessel's guns section that is not intact fires nothing.
+            if (actor.vessel && sectionRole(actor, usedPart) === 'guns' && usedPart.state !== 'intact') {
+                throw new Error(`${actor.name}'s ${usedPart.name} (guns) is ${usedPart.state}: its weapons cannot fire. Repair the section (combat_manage set_part state: intact) or fire from another section`);
+            }
+        }
+
+        // Underwater (a water encounter, or a water cell under the attacker):
+        // no ranged attacks unless the environment allows them. Refused before
+        // anything is spent.
+        const env = this.environmentOf();
+        const submerged = this.inWater(actor);
+        if (submerged && partOpts?.ranged && !env.rangedAllowed) {
+            throw new Error(`${actor.name} is underwater: ranged attacks are refused here (combat_manage set_environment {rangedAllowed: true} to allow them). Nothing was spent.`);
         }
 
         // Dodge and Help feed the roll. Help is spent by the attack even when
@@ -790,6 +839,11 @@ export class CombatEngine {
         // a breached target part, or a latcher attacked by the one it holds,
         // is hit with advantage.
         if (usedPart?.state === 'crippled') { disadvantage = true; situational.push(`${actor.name}'s ${usedPart.name} crippled (disadvantage)`); }
+        // Request 5: a vessel with its bridge crippled or dead aims badly.
+        if (actor.vessel) {
+            const bridge = roleState(actor, 'bridge');
+            if (bridge !== 'intact') { disadvantage = true; situational.push(`${actor.name}'s bridge ${bridge} (disadvantage)`); }
+        }
         // Measure of a Body: a crippled arm's attacks are at disadvantage. With
         // no part resolved (no withPart, weapon or profile part), assume the
         // crippled arm only when no intact arm could be swinging instead.
@@ -828,6 +882,18 @@ export class CombatEngine {
         if (hampering.length && !unaffectedLimb) {
             disadvantage = true;
             situational.push(`${hampering.map(c => c.type).join(', ')} (disadvantage)`);
+        }
+
+        // Underwater melee swings at disadvantage unless the damage type is
+        // on the free list (piercing by default) or the attacker swims (the
+        // swim tag). A GM-posted result is left as posted.
+        if (submerged && !partOpts?.ranged && !resolved) {
+            const free = env.meleeDisadvantageUnlessDamageType.map(t => t.toLowerCase());
+            const typeFree = !!damageType && free.includes(damageType.toLowerCase());
+            if (!typeFree && !this.hasTag(actor, env.swimTag)) {
+                disadvantage = true;
+                situational.push(`underwater (disadvantage; ${free.join('/')} damage or the '${env.swimTag}' tag swings freely)`);
+            }
         }
 
         // The 5e standard conditions on both sides (allow-list only; homebrew
@@ -869,6 +935,8 @@ export class CombatEngine {
 
         let damageDealt = 0;
         let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
+        let bandScale: CombatActionResult['bandScale'];
+        let shieldsAbsorbed: number | undefined;
 
         // Calculate base damage from number or string
         let baseDamageVal = 0;
@@ -903,7 +971,24 @@ export class CombatEngine {
             const modResult = this.calculateDamageWithModifiers(finalBaseDamage, damageType, target);
             damageDealt = modResult.finalDamage;
             damageModifier = modResult.modifier;
-            if (armouredPart) {
+            // Request 11: the band gap scales what got through the resistance
+            // math; a blow that landed never drops below 1.
+            if (partOpts?.bandScale && damageDealt > 0) {
+                const scaled = Math.max(1, Math.floor(damageDealt * partOpts.bandScale.multiplier));
+                bandScale = { steps: partOpts.bandScale.steps, multiplier: partOpts.bandScale.multiplier, before: damageDealt, after: scaled };
+                damageDealt = scaled;
+            }
+            // Request 5: shields take the hit before the hull or any section.
+            if (target.shields && damageDealt > 0) {
+                const soak = absorbWithShields(target, damageDealt);
+                if (soak.absorbed > 0) {
+                    shieldsAbsorbed = soak.absorbed;
+                    damageDealt = soak.through;
+                    situational.push(`${target.name}'s shields absorb ${soak.absorbed} (shields ${target.shields.current}/${target.shields.max})`);
+                }
+            }
+            // A hit the shields fully absorbed never reaches the aimed section.
+            if (armouredPart && !(shieldsAbsorbed && damageDealt === 0)) {
                 partHit = this.damagePart(target, armouredPart, damageDealt);
                 situational.push(`${target.name}'s ${armouredPart.name} takes the hit${partHit.broken ? ' and is severed' : ''} (body untouched)`);
                 damageDealt = 0;
@@ -919,6 +1004,7 @@ export class CombatEngine {
                 }
             }
             target.hp = Math.max(0, target.hp - damageDealt);
+            this.refreshVessel(target);
         }
 
         const defeated = target.hp <= 0;
@@ -953,7 +1039,9 @@ export class CombatEngine {
                 modStr = ' [Vulnerable - Doubled!]';
             }
 
-            const dealtStr = `${typeStr}${damageBreakdownStr}${attackRoll.isCrit ? ' (crit)' : ''}${flatDamageBonus ? ` + ${flatDamageLabel ?? 'trait'} ${flatDamageBonus >= 0 ? '+' : ''}${flatDamageBonus}` : ''}${modStr}`;
+            const bandStr = bandScale ? ` ×${bandScale.multiplier} band (${bandScale.before} → ${bandScale.after})` : '';
+            const shieldStr = shieldsAbsorbed ? ` [shields −${shieldsAbsorbed}, ${target.shields!.current}/${target.shields!.max} left]` : '';
+            const dealtStr = `${typeStr}${damageBreakdownStr}${attackRoll.isCrit ? ' (crit)' : ''}${flatDamageBonus ? ` + ${flatDamageLabel ?? 'trait'} ${flatDamageBonus >= 0 ? '+' : ''}${flatDamageBonus}` : ''}${modStr}${bandStr}${shieldStr}`;
             if (partHit) {
                 const hpStr = partHit.hpBefore !== undefined ? `, ${partHit.hpBefore} → ${partHit.hpAfter} HP` : '';
                 breakdown += `\n\n💥 Part hit: ${partHit.name} takes ${partHit.damage}${dealtStr}${hpStr}${partHit.broken ? ' [SEVERED]' : ''}\n`;
@@ -1003,6 +1091,9 @@ export class CombatEngine {
             damageRolls: capturedDamageRolls,
             damageType,   // Findings #40: the AP-vs-expanding lane and every resistance list key off it
             damageModifier: damageModifier === 'normal' ? undefined : damageModifier,
+            ...(bandScale ? { bandScale } : {}),
+            ...(shieldsAbsorbed ? { shieldsAbsorbed } : {}),
+            ...(target.shields ? { shields: { ...target.shields } } : {}),
             success: attackRoll.isHit,
             defeated,
             message,
@@ -1107,13 +1198,57 @@ export class CombatEngine {
 
         const participant = this.state.participants.find(p => p.id === participantId);
         if (participant) {
-            participant.hp = Math.max(0, participant.hp - damage);
+            // Request 5: a vessel's shields take it first.
+            const soak = absorbWithShields(participant, damage);
+            participant.hp = Math.max(0, participant.hp - soak.through);
+            this.refreshVessel(participant);
             this.emitter?.publish('combat', {
                 type: 'damage_applied',
                 participantId,
                 amount: damage,
+                ...(soak.absorbed ? { shieldsAbsorbed: soak.absorbed } : {}),
                 newHp: participant.hp
             });
+        }
+    }
+
+    /**
+     * Request 5: derive a vessel's flags from its sections. A dead reactor
+     * sets reactorBreach (the d6 rolls at each of its turn starts). Called
+     * after damage and after part changes; harmless on anything else.
+     */
+    refreshVessel(participant: CombatParticipant): void {
+        if (!participant.vessel) return;
+        if (roleState(participant, 'reactor') === 'dead') participant.reactorBreach = true;
+        else if (participant.reactorBreach) delete participant.reactorBreach; // the reactor was repaired: breach contained
+    }
+
+    /**
+     * Request 5: the vessel's start-of-turn book-keeping. Shields regen by
+     * regenPerRound; a breached reactor rolls a logged d6 (purpose 'reactor
+     * breach'): a 1 destroys the vessel (hull 0, dead). Notes go to the
+     * advance output.
+     */
+    private processVesselTurnStart(participant: CombatParticipant): void {
+        if (!participant.vessel) return;
+        this.refreshVessel(participant);
+        const regen = participant.vessel.regenPerRound ?? 0;
+        if (participant.shields && regen > 0 && participant.shields.current < participant.shields.max) {
+            const before = participant.shields.current;
+            participant.shields.current = Math.min(participant.shields.max, before + regen);
+            this.turnStartNotes.push(`${participant.name}: shields regenerate ${participant.shields.current - before} (${before} → ${participant.shields.current}/${participant.shields.max})`);
+        }
+        if (participant.reactorBreach) {
+            const d6 = this.tagged({ purpose: 'reactor breach', forId: participant.id }, () => this.rng.roll('1d6'));
+            if (d6 === 1) {
+                participant.hp = 0;
+                participant.isDead = true;
+                if (participant.shields) participant.shields.current = 0;
+                this.turnStartNotes.push(`${participant.name}: REACTOR BREACH d6=1 — the reactor goes critical; the vessel is destroyed (hull 0)`);
+                this.emitter?.publish('combat', { type: 'vessel_destroyed', participantId: participant.id, cause: 'reactor breach' });
+            } else {
+                this.turnStartNotes.push(`${participant.name}: reactor breach holds (d6=${d6}, a 1 destroys it)`);
+            }
         }
     }
 
@@ -1401,6 +1536,36 @@ export class CombatEngine {
         for (const [name, who] of faded) this.turnStartNotes.push(`${name} fades from ${who.join(', ')}`);
     }
 
+    // ── Environment: the medium the fight happens in ──────────────────
+
+    /** The encounter's environment with its defaults filled (air when unset). */
+    environmentOf(): Required<Pick<EncounterEnvironment, 'medium' | 'swimTag' | 'meleeDisadvantageUnlessDamageType' | 'rangedAllowed'>> & EncounterEnvironment {
+        const env = this.state?.environment;
+        return {
+            ...env,
+            medium: env?.medium ?? 'air',
+            swimTag: env?.swimTag ?? 'aquatic',
+            meleeDisadvantageUnlessDamageType: env?.meleeDisadvantageUnlessDamageType ?? ['piercing'],
+            rangedAllowed: env?.rangedAllowed ?? false
+        };
+    }
+
+    /** Whether the token swims: a water encounter, or a terrain.water cell under it in an air one. */
+    inWater(participant: CombatParticipant): boolean {
+        if (!this.state) return false;
+        if (this.state.environment?.medium === 'water') return true;
+        const water = this.state.terrain?.water;
+        if (!water?.length || !participant.position) return false;
+        return water.includes(`${participant.position.x},${participant.position.y}`);
+    }
+
+    /** Whether the token carries a tag (any case). */
+    hasTag(participant: CombatParticipant, tag: string | undefined): boolean {
+        if (!tag) return false;
+        const want = tag.trim().toLowerCase();
+        return (participant.tags ?? []).some(t => t.trim().toLowerCase() === want);
+    }
+
     /**
      * Base speed after conditions whose metadata carries a speedFactor (a
      * crippled leg halves it) and the standard conditions' own speed.
@@ -1408,8 +1573,13 @@ export class CombatEngine {
     effectiveSpeed(participant: CombatParticipant): number {
         // Held by another creature's latched part: it cannot move away.
         if (this.state?.participants.some(o => o.parts?.some(pt => pt.state === 'latched' && pt.latchedTo?.participantId === participant.id))) return 0;
+        // Request 5: a vessel with its drive crippled or dead is adrift.
+        if (participant.vessel && roleState(participant, 'drive') !== 'intact') return 0;
+        // Underwater the budget is the swim speed, else half the walking speed.
+        const walk = participant.movementSpeed ?? 30;
+        const medium = this.inWater(participant) ? (participant.swimSpeed ?? Math.floor(walk / 2)) : walk;
         // Battle-cry speed adds to the base, before any halving.
-        const base = (participant.movementSpeed ?? 30) + (participant.buffs ?? []).reduce((n, b) => n + (b.speedBonus ?? 0), 0);
+        const base = medium + (participant.buffs ?? []).reduce((n, b) => n + (b.speedBonus ?? 0), 0);
         let factor = participant.conditions.reduce((f, c) => {
             const sf = c.metadata?.speedFactor;
             return typeof sf === 'number' ? f * sf : f;
@@ -1504,6 +1674,25 @@ export class CombatEngine {
             participant.hp = Math.min(participant.maxHp, participant.hp + participant.regeneration);
             this.turnStartNotes.push(`${participant.name} regenerates ${participant.hp - before} HP (${before} → ${participant.hp}/${participant.maxHp})`);
         }
+
+        // Pressure: in a water encounter at or below the threshold depth, a
+        // token that is not pressure-adapted (the unlessTag, else the swim
+        // tag) takes the stated damage at the start of each of its turns.
+        const env = this.environmentOf();
+        const pressure = env.pressure;
+        if (pressure && env.medium === 'water' && participant.hp > 0 && (env.depthFt ?? 0) >= pressure.startsAtFt
+            && !this.hasTag(participant, pressure.unlessTag ?? env.swimTag)) {
+            const amount = typeof pressure.damagePerRound === 'number'
+                ? pressure.damagePerRound
+                : this.tagged({ purpose: 'pressure', forId: participant.id }, () => this.rng.roll(pressure.damagePerRound as string));
+            if (amount > 0) {
+                const before = participant.hp;
+                this.applyDamage(participant.id, amount);
+                this.turnStartNotes.push(`${participant.name} takes ${amount} pressure damage at ${env.depthFt} ft (${before} → ${participant.hp}/${participant.maxHp})`);
+            }
+        }
+        // Request 5: shields regen and the reactor-breach die.
+        this.processVesselTurnStart(participant);
 
         // Recharge: each spent ability with a recharge number rolls a d6 on
         // the encounter stream; that number or more makes it ready again.

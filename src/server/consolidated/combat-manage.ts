@@ -7,8 +7,9 @@
 
 import { PartSchema, UnitSchema, ReadiedSchema, ReadiedAttackSchema, PART_STATES, PART_KINDS, ParticipantExtrasShape, SizeCategorySchema, nearbyMatchSchema, mobRuleSchema, type Buff } from '../../schema/token-extras.js';
 import { hydrateExtras, type ExtrasRow } from '../../engine/combat/participant-extras.js';
+import { environmentGlyph } from '../../render/pda.js';
 import { upsertPart } from '../../engine/combat/parts.js';
-import { volleyTier, describeUnit, breakTestDue, moraleModifiers } from '../../engine/combat/units.js';
+import { volleyTier, describeUnit, breakTestDue, moraleModifiers, liveModels } from '../../engine/combat/units.js';
 import { sheetSpecies } from '../handlers/world-spell.js';
 import { nearbyAllies } from '../../engine/combat/nearby.js';
 import type { CombatParticipant } from '../../engine/combat/engine.js';
@@ -41,25 +42,25 @@ import { ConcentrationRepository } from '../../storage/repos/concentration.repo.
 import { loggedRoll, loggedD20 } from '../../math/logged-d20.js';
 import { parseDiceTerms } from '../../engine/combat/rng.js';
 import { listAllTemplates } from '../../data/creature-presets.js';
-import { resolveCreature, creatureToParticipant, resolveWorldId, loadRules } from '../../engine/table-rules.js';
+import { resolveCreature, creatureToParticipant, resolveWorldId, loadRules, bandRuleFor, bandDamageMultiplier } from '../../engine/table-rules.js';
 import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { CombatEngine } from '../../engine/combat/engine.js';
-import { ConditionInputSchema, SIZE_TABLE } from '../../schema/encounter.js';
+import { ConditionInputSchema, SIZE_TABLE, EnvironmentSchema } from '../../schema/encounter.js';
 import { normalizeCondition, normalizeConditions } from '../../engine/combat/conditions.js';
 import { getCombatManager } from '../state/combat-manager.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
+import { recordAward } from '../../storage/xp-awards.js';
 import { getAgentRuntime, buildAgentRuntime } from '../../agent/runtime/deps.js';
 import { invokeAgent } from '../../agent/runtime/invoke.js';
 import { ProviderFactory } from '../../agent/provider/factory.js';
-import { freshSeed } from '../../math/seed.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_intent', 'trigger_readied', 'legendary_action', 'legendary_resistance', 'use_ability', 'apply_damage', 'battle_cry', 'budget', 'get_history', 'list'] as const;
+const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_environment', 'set_intent', 'trigger_readied', 'legendary_action', 'legendary_resistance', 'use_ability', 'apply_damage', 'battle_cry', 'budget', 'get_history', 'list', 'board'] as const;
 type CombatManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -127,11 +128,23 @@ const TerrainSchema = z.preprocess(
     }).optional()
 );
 
+/** Hosts that stringify nested objects: accept the JSON text too. */
+const environmentField = () => z.preprocess(
+    (val) => {
+        if (typeof val === 'string' && val.trim().startsWith('{')) {
+            try { return JSON.parse(val); } catch { return val; }
+        }
+        return val;
+    },
+    EnvironmentSchema
+);
+
 const CreateSchema = z.object({
     action: z.literal('create'),
-    seed: z.string().optional().describe('Seed for deterministic combat resolution (omit for a fresh one; the id echoes it)'),
+    seed: z.string().optional().describe('Omit for crypto dice (default). A seed makes the fight a deterministic, replayable stream; the id echoes it'),
     participants: z.array(ParticipantSchema).min(1),
     terrain: TerrainSchema,
+    environment: environmentField().optional().describe("The medium of the fight: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed? (default false in water), meleeDisadvantageUnlessDamageType? (default ['piercing']), swimTag? (default 'aquatic')}"),
     includeParty: z.boolean().optional().describe('T1.2 (Findings #34): prepend the active party as PC-side participants'),
     partyId: z.string().optional().describe('Party to include (defaults to the only active party)'),
     worldId: z.string().optional().describe('FINDINGS #105: stamp the encounter to this world; omitted → derived from the first participant whose character row is claimed')
@@ -145,8 +158,26 @@ const GetSchema = z.object({
 const EndSchema = z.object({
     action: z.literal('end'),
     encounterId: z.string().describe('The ID of the encounter'),
-    xpAward: z.number().int().optional().describe('FINDINGS #34 T4.17: XP credited on end — split evenly among pc-type participants unless xpRecipients given'),
-    xpRecipients: z.array(z.string()).optional().describe('Character IDs to receive xpAward (overrides the pc-participant default)')
+    xpAward: z.number().int().optional().describe('FINDINGS #34 T4.17: XP credited on end — split evenly among pc-type participants unless xpRecipients given; each share lands in the award ledger (reason: encounter <id>)'),
+    xpRecipients: z.array(z.string()).optional().describe('Character IDs to receive xpAward (overrides the pc-participant default)'),
+    winner: z.string().optional().describe("Request 5: on a boarding encounter, who won ('attackers' | 'defenders' | a participant id or name); reported to the parent fight"),
+    summary: z.string().optional().describe('Request 5: on a boarding encounter, one line for the parent fight (default: the survivors)')
+});
+
+/**
+ * Request 5: a boarding action. Both tokens must be vessels in the fight;
+ * a NEW encounter is created for the boarding party, linked to this one by
+ * encounters.parent_id, with the target's rooms noted. The void fight goes
+ * on; end on the boarding reports back to it.
+ */
+const BoardSchema = z.object({
+    action: z.literal('board'),
+    encounterId: z.string().describe('The void fight'),
+    attackerId: z.string().describe('The boarding vessel (a vessel token in this encounter)'),
+    targetId: z.string().describe('The vessel being boarded (a vessel token in this encounter)'),
+    rooms: z.array(z.string()).optional().describe("The target's rooms the boarders fight through (default: the spatial rooms of the target's deck plan, when its network exists)"),
+    name: z.string().optional().describe("A label for the boarding ('Gloriana boards the Murder-class')"),
+    seed: z.string().optional().describe('Seed the boarding encounter (default crypto dice)')
 });
 
 const LoadSchema = z.object({
@@ -210,6 +241,7 @@ const ApplyDamageSchema = z.object({
     action: z.literal('apply_damage'),
     encounterId: z.string().optional().describe('The fight whose dice, tokens and log take it; omit for damage outside a fight (a character with a live token is routed through its encounter)'),
     targetIds: z.array(z.string()).min(1).describe('Token ids in the encounter, or character ids without one'),
+    actorId: z.string().optional().describe("Who deals it (a token or character id), when something does: the band rule's damageScale then scales each target's damage by the band gap. Omit for environmental damage (never band-scaled)"),
     dice: z.union([z.number().int().min(0), z.string().min(1)]).describe("Dice ('6d10', '2d6+3') rolled once for every target, or a number"),
     damageType: z.string().optional().describe('Resistances, immunities and vulnerabilities read it'),
     source: z.string().min(1).describe("What deals it ('falling rubble', \"An'ggrath's bite\"): the roll is logged as 'damage: <source>'"),
@@ -260,7 +292,7 @@ const SpawnQuickEnemySchema = z.object({
     count: z.number().int().min(1).max(10).default(1).describe('Number of enemies to spawn'),
     position: z.object({ x: z.number(), y: z.number() }).optional().describe('Starting position (defaults to random)'),
     encounterId: z.string().optional().describe('Add to existing encounter (creates new if omitted)'),
-    seed: z.string().optional().describe('Seed for deterministic combat (auto-generated if omitted)'),
+    seed: z.string().optional().describe('Omit for crypto dice (default); a seed makes a deterministic, replayable stream'),
     includeParty: z.boolean().optional().describe('T1.2 (Findings #34): include the active party as PC-side participants in the NEW encounter'),
     partyId: z.string().optional().describe('Party to include (defaults to the only party if exactly one exists)'),
     worldId: z.string().optional().describe("The world whose bestiary (table_rules kind creature) is searched before the built-in presets; defaults to the encounter's world. Stamped on a new encounter")
@@ -346,6 +378,13 @@ const RemovePartSchema = z.object({
     reason: z.string().optional()
 });
 
+const SetEnvironmentSchema = z.object({
+    action: z.literal('set_environment'),
+    encounterId: z.string(),
+    environment: environmentField().describe("{medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?} — replaces the encounter's environment"),
+    reason: z.string().optional()
+});
+
 const SetUnitSchema = z.object({
     action: z.literal('set_unit'),
     encounterId: z.string(),
@@ -358,6 +397,8 @@ const SetUnitSchema = z.object({
     morale: z.number().int().optional().describe('The morale shown on BREAK TEST DUE'),
     breakAt: z.number().gt(0).lt(1).optional().describe('Fraction of models whose crossing owes a break test (default 0.5)'),
     mobRule: mobRuleSchema().nullable().optional().describe('{per, maxBonus?, attackBonusPer?, nearby?: {range, match}}: morale and to-hit grow with live models; null clears'),
+    models: z.number().int().min(1).optional().describe('Reinforce or reduce: the new full strength. Raising it adds the new models × hpPerModel to HP; lowering it clamps HP to the new maximum'),
+    hpPerModel: z.number().int().min(1).optional().describe('New HP per model; the maximum follows (models × hpPerModel) and HP is clamped'),
     reason: z.string().optional()
 });
 
@@ -618,7 +659,8 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     if (gated) { gateSkipped.push(`${p.name ?? pid} (${gated})`); return false; }
                     return true;
                 }),
-                terrain: params.terrain
+                terrain: params.terrain,
+                ...(params.environment ? { environment: params.environment } : {})
             };
             const result = await handleCreateEncounter(originalParams, ctx);
             const data = extractResultData(result, 'create') as Record<string, unknown>;
@@ -655,7 +697,21 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         handler: async (params: z.infer<typeof GetSchema>, ctx?: SessionContext) => {
             if (!ctx) throw new Error('No session context');
             const result = await handleGetEncounterState({ encounterId: params.encounterId }, ctx);
-            return extractResultData(result, 'get');
+            const data = extractResultData(result, 'get') as Record<string, unknown>;
+            // Request 5: linked boardings (parent) or the fight this boarding came from (child).
+            try {
+                const repo = new EncounterRepository(getDb());
+                const notes = repo.getNotes(params.encounterId);
+                const parentId = repo.parentOf(params.encounterId);
+                if (parentId) { data.parentEncounterId = parentId; if (notes.boardingFrom) data.boardingFrom = notes.boardingFrom; }
+                const children = repo.childrenOf(params.encounterId);
+                if (children.length) {
+                    const boardings = (notes.boardings as Array<Record<string, unknown>> | undefined) ?? [];
+                    data.boardings = children.map(c => ({ ...(boardings.find(b => b.childEncounterId === c.id) ?? {}), encounterId: c.id, status: c.status }));
+                    if (notes.boardingResults) data.boardingResults = notes.boardingResults;
+                }
+            } catch { /* no notes column (old db) — the state is the answer */ }
+            return data;
         },
         aliases: ['state', 'status', 'show']
     },
@@ -685,18 +741,49 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     }
                 } catch { /* fall through — no targets, no award */ }
             }
+            // Request 5: a boarding reports to its parent fight when it ends.
+            let parentId: string | null = null;
+            let survivors: string[] = [];
+            try {
+                const repo = new EncounterRepository(getDb());
+                parentId = repo.parentOf(params.encounterId);
+                if (parentId) {
+                    const persisted = repo.loadState(params.encounterId) ?? getCombatManager().get(`${ctx.sessionId}:${params.encounterId}`)?.getState();
+                    survivors = (persisted?.participants ?? []).filter((p: { hp: number }) => p.hp > 0).map((p: { name: string }) => p.name);
+                }
+            } catch { /* no parent link */ }
             const result = await handleEndEncounter({ encounterId: params.encounterId }, ctx);
             const data = extractResultData(result, 'end') as Record<string, unknown>;
+            if (parentId && !data.error) {
+                try {
+                    const repo = new EncounterRepository(getDb());
+                    const summary = params.summary ?? (survivors.length ? `survivors: ${survivors.join(', ')}` : 'no one left standing');
+                    const boardingResult = { child: params.encounterId, ...(params.winner ? { winner: params.winner } : {}), summary, endedAt: new Date().toISOString() };
+                    const parentNotes = repo.getNotes(parentId);
+                    const results = [...((parentNotes.boardingResults as unknown[] | undefined) ?? []), boardingResult];
+                    const boardings = ((parentNotes.boardings as Array<Record<string, unknown>> | undefined) ?? []).map(b => b.childEncounterId === params.encounterId ? { ...b, status: 'ended' } : b);
+                    repo.mergeNotes(parentId, { boardingResults: results, boardings });
+                    data.parentEncounterId = parentId;
+                    data.boardingResult = boardingResult;
+                    data.message = `${data.message ?? 'Boarding ended.'} Reported to the void fight ${parentId}: ${params.winner ? `${params.winner} win — ` : ''}${summary}.`;
+                } catch { /* parent gone: the boarding still ended */ }
+            }
             if (params.xpAward && xpTargets.length > 0 && !data.error) {
                 const db = getDb();
                 const charRepo = new CharacterRepository(db);
                 const each = Math.floor(params.xpAward / xpTargets.length);
                 const credited: Array<{ id: string; name: string; xp: number }> = [];
+                // Request 3: every XP write leaves a posted ledger row.
+                let encWorld: string | null = null;
+                try { encWorld = resolveWorldId(db, { encounterId: params.encounterId }); } catch { encWorld = null; }
                 for (const id of xpTargets) {
                     const row = charRepo.findById(id);
                     if (!row) continue;
                     charRepo.update(id, { xp: ((row as { xp?: number }).xp ?? 0) + each } as Partial<import('../../schema/character.js').Character>);
                     credited.push({ id, name: row.name, xp: each });
+                    try {
+                        recordAward(db, { worldId: encWorld ?? resolveWorldId(db, { characterIds: [id] }), characterId: id, amount: each, reason: `encounter ${params.encounterId}`, source: 'combat_manage end' });
+                    } catch { /* the ledger never blocks the award */ }
                 }
                 data.xpAwarded = credited;
                 data.xpNote = `${params.xpAward} XP split ${each} each among ${credited.map(cr => cr.name).join(', ')}`;
@@ -951,9 +1038,9 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     if (!existing.has(pp.id as string)) participants.unshift(pp as typeof participants[number]);
                 }
             }
-            const seed = params.seed || freshSeed('quick');
+            // Crypto dice unless the caller seeds the fight.
             const createParams = {
-                seed,
+                ...(params.seed ? { seed: params.seed } : {}),
                 participants,
                 terrain: { obstacles: [], difficultTerrain: [], water: [] }
             };
@@ -1097,6 +1184,68 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         },
         aliases: ['reinforce', 'join_combat'],
         description: 'Add a character or ad-hoc token to a RUNNING encounter — reinforcements, late arrivals, the PC joining a quick-spawned fight'
+    },
+    board: {
+        schema: BoardSchema,
+        handler: async (params: z.infer<typeof BoardSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'board', message: `${message} Nothing was written.`, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB).`);
+            const attacker = state.participants.find(p => p.id === params.attackerId);
+            const target = state.participants.find(p => p.id === params.targetId);
+            if (!attacker) return refuse(`attackerId ${params.attackerId} is not in this encounter.`);
+            if (!target) return refuse(`targetId ${params.targetId} is not in this encounter.`);
+            if (attacker.id === target.id) return refuse(`A vessel cannot board itself.`);
+            const notVessel = [attacker, target].filter(p => !p.vessel).map(p => p.name);
+            if (notVessel.length) return refuse(`Boarding is between vessels; not a vessel: ${notVessel.join(', ')} (lay ships down with character_manage create_vessel and add them with add_participant).`);
+            if (target.hp <= 0) return refuse(`${target.name} is destroyed; there is nothing to board.`);
+            const db = getDb();
+            const repo = new EncounterRepository(db);
+            // The target's deck plan: the rooms given, else the spatial rooms of
+            // its network (room_nodes.network_id = vessel.networkId ?? the character id).
+            let rooms: string[] = params.rooms ?? [];
+            let roomsSource: 'given' | 'spatial' | 'none' = params.rooms ? 'given' : 'none';
+            if (!params.rooms) {
+                try {
+                    const networkId = target.vessel?.networkId ?? target.id;
+                    const rows = db.prepare('SELECT name FROM room_nodes WHERE network_id = ? ORDER BY created_at, rowid').all(networkId) as Array<{ name: string }>;
+                    if (rows.length) { rooms = rows.map(r => r.name); roomsSource = 'spatial'; }
+                } catch { /* no network_id column */ }
+            }
+            const label = params.name ?? `${attacker.name} boards ${target.name}`;
+            // The boarding encounter starts empty (the GM adds boarders and
+            // defenders), so it is laid down here rather than through create,
+            // which needs a participant. Crypto dice unless seeded, like create.
+            const childEngine = params.seed ? new CombatEngine(params.seed) : CombatEngine.crypto();
+            const childState = childEngine.startEncounter([]);
+            const childId = `encounter-${params.seed ?? 'boarding'}-${Date.now()}-${randomUUID().slice(0, 8)}`;
+            const now = new Date().toISOString();
+            repo.create({ id: childId, tokens: [], round: childState.round, activeTokenId: undefined, status: 'active', createdAt: now, updatedAt: now });
+            repo.saveState(childId, childEngine.getState()!);
+            getCombatManager().create(`${ctx.sessionId}:${childId}`, childEngine);
+            const child = { dice: childEngine.describeDice() };
+            const boardingFrom = { encounterId: params.encounterId, attackerId: attacker.id, attackerName: attacker.name, targetId: target.id, targetName: target.name };
+            repo.setParent(childId, params.encounterId);
+            repo.mergeNotes(childId, { boarding: label, boardingFrom, rooms, roomsSource });
+            try {
+                const parentWorld = (db.prepare('SELECT world_id FROM encounters WHERE id = ?').get(params.encounterId) as { world_id?: string | null } | undefined)?.world_id;
+                if (parentWorld) db.prepare('UPDATE encounters SET world_id = ? WHERE id = ?').run(parentWorld, childId);
+            } catch { /* no world column */ }
+            const parentNotes = repo.getNotes(params.encounterId);
+            const entry = { childEncounterId: childId, name: label, attackerId: attacker.id, targetId: target.id, rooms, status: 'active', createdAt: new Date().toISOString() };
+            repo.mergeNotes(params.encounterId, { boardings: [...((parentNotes.boardings as unknown[] | undefined) ?? []), entry] });
+            logConditionChange(params.encounterId, state, 'board', target.id, `${label} → boarding encounter ${childId}${rooms.length ? ` (${rooms.join(' → ')})` : ''}`);
+            return {
+                success: true, actionType: 'board', encounterId: params.encounterId, parentEncounterId: params.encounterId,
+                childEncounterId: childId, boardingEncounterId: childId, name: label, boardingFrom, rooms, roomsSource,
+                dice: child.dice,
+                message: `${label}: boarding encounter ${childId} opened (linked to ${params.encounterId}). ${rooms.length ? `Rooms: ${rooms.join(' → ')}.` : 'No deck plan on record: pass rooms, or build one with spatial_manage.'} Add boarders and defenders with combat_manage add_participant {encounterId: '${childId}', characterId | creature}; the void fight continues in ${params.encounterId}. combat_manage end {encounterId: '${childId}', winner?, summary?} reports the result back to it.`
+            };
+        },
+        aliases: ['boarding', 'board_vessel', 'boarding_action'],
+        description: 'Request 5: open a linked boarding encounter between two vessel tokens (encounters.parent_id); the void fight goes on, end on the boarding reports back'
     },
     remove_participant: {
         schema: z.object({
@@ -1311,6 +1460,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             });
             const next = parts.find(x => x.name.toLowerCase() === params.part.toLowerCase())!;
             p.parts = parts;
+            engine.refreshVessel(p);
             new EncounterRepository(getDb()).saveState(params.encounterId, state);
             const mirrored = params.mirrorToCharacter ? mirrorPartsToRow(p.id, parts) : false;
             const summary = `${p.name}: ${next.name} ${prev ? `${prev.state} → ` : ''}${next.state}${next.latchedTo ? ` → ${next.latchedTo.participantId}${next.latchedTo.part ? ` ${next.latchedTo.part}` : ''}` : ''}`;
@@ -1358,13 +1508,57 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             }
             if (params.mobRule === null) delete (p.unit as Record<string, unknown>).mobRule;
             else if (params.mobRule !== undefined) p.unit.mobRule = params.mobRule;
+            // Reinforce: new models arrive at full HP each; a smaller unit
+            // (or thinner models) clamps HP to the new maximum.
+            let reinforced: Record<string, unknown> | undefined;
+            if (params.models !== undefined || params.hpPerModel !== undefined) {
+                const modelsBefore = p.unit.models, hpPerBefore = p.unit.hpPerModel, hpBefore = p.hp, maxBefore = p.maxHp;
+                const models = params.models ?? modelsBefore;
+                const hpPerModel = params.hpPerModel ?? hpPerBefore;
+                const added = Math.max(0, models - modelsBefore);
+                p.unit.models = models;
+                p.unit.hpPerModel = hpPerModel;
+                p.maxHp = models * hpPerModel;
+                p.hp = Math.max(0, Math.min(p.maxHp, hpBefore + added * hpPerModel));
+                reinforced = { modelsBefore, models, added, lost: Math.max(0, modelsBefore - models), hpPerModel, hpBefore, hp: p.hp, maxHpBefore: maxBefore, maxHp: p.maxHp, liveModels: liveModels(p) };
+            }
             new EncounterRepository(getDb()).saveState(params.encounterId, state);
             const tier = volleyTier(p);
-            logConditionChange(params.encounterId, state, 'set_unit', p.id, `${p.name}: ${describeUnit(p)}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
-            return { success: true, actionType: 'set_unit', encounterId: params.encounterId, participantId: p.id, unit: p.unit, volley: tier, message: `${p.name}: ${describeUnit(p)}` };
+            logConditionChange(params.encounterId, state, 'set_unit', p.id, `${p.name}: ${describeUnit(p)}${reinforced ? ` (models ${String(reinforced.modelsBefore)} → ${String(reinforced.models)}, HP ${String(reinforced.hpBefore)} → ${String(reinforced.hp)}/${String(reinforced.maxHp)})` : ''}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
+            return { success: true, actionType: 'set_unit', encounterId: params.encounterId, participantId: p.id, unit: p.unit, volley: tier, ...(reinforced ? { reinforced } : {}), message: `${p.name}: ${describeUnit(p)}${reinforced ? ` · models ${String(reinforced.modelsBefore)} → ${String(reinforced.models)}, HP ${String(reinforced.hpBefore)} → ${String(reinforced.hp)}/${String(reinforced.maxHp)}` : ''}` };
         },
         aliases: ['unit', 'suppress', 'formation'],
         description: 'Set a unit token\'s suppressed / inMelee / brokenFormation / packed flags, routed / morale / breakAt for break tests, and mobRule; reports the volley tier'
+    },
+    set_environment: {
+        schema: SetEnvironmentSchema,
+        handler: async (params: z.infer<typeof SetEnvironmentSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return { error: true, actionType: 'set_environment', message: `Encounter ${params.encounterId} not found (memory or DB)`, writes: 'none' };
+            const before = state.environment?.medium ?? 'air';
+            state.environment = params.environment;
+            // The medium changes this turn's movement budget for everyone
+            // still to move: a token that has not spent movement gets the
+            // new budget; one mid-move keeps what it has, capped at it.
+            for (const p of state.participants) {
+                const budget = engine.effectiveSpeed(p) * (p.hasDashed ? 2 : 1);
+                p.movementRemaining = Math.min(p.movementRemaining ?? budget, budget);
+            }
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            const glyph = environmentGlyph(state.environment) || 'air';
+            logConditionChange(params.encounterId, state, 'set_environment', 'GM', `environment: ${before} → ${state.environment.medium}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
+            return {
+                success: true,
+                actionType: 'set_environment',
+                encounterId: params.encounterId,
+                environment: state.environment,
+                message: `Environment: ${glyph}${state.environment.medium === 'water' ? ` — swim speed or half speed; ranged ${state.environment.rangedAllowed ? 'allowed' : 'refused'}; melee at disadvantage unless ${(state.environment.meleeDisadvantageUnlessDamageType ?? ['piercing']).join('/')} or tagged '${state.environment.swimTag ?? 'aquatic'}'${state.environment.pressure ? `; pressure ${state.environment.pressure.damagePerRound}/round at ${state.environment.pressure.startsAtFt} ft+` : ''}` : ''}`
+            };
+        },
+        aliases: ['environment', 'medium'],
+        description: "Set the encounter's environment {medium: air | water | vacuum, depthFt?, pressure?, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?}: water runs the underwater rules (swim speed or half speed, no ranged attacks, melee at disadvantage unless piercing or a swimmer, pressure damage at turn start)"
     },
     set_intent: {
         schema: SetIntentSchema,
@@ -1879,11 +2073,17 @@ function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionContext, 
     syncParticipantHpFromDb(state);
     const missing = params.targetIds.filter(id => !state.participants.some(p => p.id === id));
     if (missing.length) return refuse(`Not in encounter ${encounterId}: ${missing.join(', ')}.`);
+    // Request 11: with an actor, the band rule's damageScale reads its band.
+    const actorBand = params.actorId
+        ? state.participants.find(p => p.id === params.actorId)?.band ?? (new CharacterRepository(getDb()).findById(params.actorId) as { band?: string } | null)?.band
+        : undefined;
+    const bandRule = params.actorId ? bandRuleFor(getDb(), resolveWorldId(getDb(), { encounterId, characterIds: [params.actorId] }), [actorBand]) : undefined;
     const area = resolveAreaSave(engine, {
         targetIds: params.targetIds, damage: params.dice, damageType: params.damageType,
         savingThrow: params.save ? { ability: params.save.ability, dc: params.save.dc } : undefined,
         halfDamageOnSave: params.save?.half ?? true,
-        damagePurpose: `damage: ${params.source}`
+        damagePurpose: `damage: ${params.source}`,
+        ...(bandRule && actorBand ? { bandScaleFor: (t: { band?: string }) => bandDamageMultiplier(bandRule, actorBand, t.band) } : {})
     }, params.source);
     saveEncounterState(new EncounterRepository(getDb()), encounterId, state);
     const hpChanges: Record<string, { before: number; after: number }> = {};
@@ -1891,7 +2091,7 @@ function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionContext, 
     const summary = `${params.source}: ${area.targets.map(t => `${t.targetName} ${t.saved ? 'saved, ' : ''}${t.damageTaken}${params.damageType ? ` ${params.damageType}` : ''}`).join(', ')}`;
     getDomainServices().combatActionLog.log({
         encounterId, round: state.round, turnIndex: state.currentTurnIndex,
-        actorId: 'environment', actorName: params.source, actionType: 'apply_damage',
+        actorId: params.actorId ?? 'environment', actorName: params.source, actionType: 'apply_damage',
         targetIds: params.targetIds, resultSummary: summary,
         damageDealt: area.targets.reduce((a, t) => a + t.damageTaken, 0), hpChanges
     });
@@ -1921,6 +2121,9 @@ function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string) => R
     } else damageRolled = params.dice;
     const concentrationRepo = new ConcentrationRepository(db);
     const lines: string[] = [];
+    // Request 11: with an actor, the band rule's damageScale reads its band.
+    const actorBand = params.actorId ? (charRepo.findById(params.actorId) as { band?: string } | null)?.band : undefined;
+    const bandRule = params.actorId ? bandRuleFor(db, resolveWorldId(db, { characterIds: [params.actorId, ...params.targetIds] }), [actorBand]) : undefined;
     const targets = rows.map(({ id, row }) => {
         const sheet = row!;
         let damageTaken = damageRolled;
@@ -1931,6 +2134,13 @@ function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string) => R
         }
         const mod = damageWithModifiers(damageTaken, params.damageType, sheet as DamageDefences);
         damageTaken = mod.finalDamage;
+        let bandScale: { steps: number; multiplier: number; before: number; after: number } | undefined;
+        const scale = damageTaken > 0 && actorBand ? bandDamageMultiplier(bandRule, actorBand, (sheet as { band?: string }).band) : null;
+        if (scale) {
+            const scaled = Math.max(1, Math.floor(damageTaken * scale.multiplier));
+            bandScale = { ...scale, before: damageTaken, after: scaled };
+            damageTaken = scaled;
+        }
         const hpBefore = sheet.hp;
         const hpAfter = Math.max(0, hpBefore - damageTaken);
         if (hpAfter !== hpBefore) charRepo.update(id, { hp: hpAfter });
@@ -1940,7 +2150,7 @@ function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string) => R
             : undefined;
         let line = `🎯 ${sheet.name}`;
         if (save && params.save) line += ` - ${save.ability} save: ${save.natural} + ${save.modifier} = ${save.total} vs DC ${params.save.dc} ${save.saved ? '✓ SAVED' : '✗ FAILED'}`;
-        line += `\n   Damage: ${damageTaken}${params.damageType ? ` ${params.damageType}` : ''}${mod.modifier !== 'normal' ? ` (${mod.modifier})` : ''}`;
+        line += `\n   Damage: ${damageTaken}${params.damageType ? ` ${params.damageType}` : ''}${mod.modifier !== 'normal' ? ` (${mod.modifier})` : ''}${bandScale ? ` ×${bandScale.multiplier} band (${bandScale.before} → ${bandScale.after})` : ''}`;
         line += `\n   HP: ${hpAfter}/${sheet.maxHp}${defeated ? ' 💀 DOWN' : ''}`;
         if (concentration) line += `\n   Concentration on ${concentration.spell}: ${concentration.reason === 'death' ? 'ends at 0 HP' : `CON save ${concentration.saveTotal} vs DC ${concentration.saveDC} ${concentration.broken ? '✗ BROKEN' : '✓ held'}`}`;
         lines.push(line);
@@ -1949,6 +2159,7 @@ function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string) => R
             ...(save ? { saveRoll: save.natural, saveTotal: save.total } : {}),
             saved: !!save?.saved, damageTaken, hpBefore, hpAfter, defeated,
             ...(mod.modifier !== 'normal' ? { damageModifier: mod.modifier } : {}),
+            ...(bandScale ? { bandScale } : {}),
             ...(concentration ? { concentration } : {})
         };
     });
@@ -1991,10 +2202,12 @@ Aliases: start/begin→create, state/status→get, finish/stop→end, restore/re
    legendary_action {participantId, cost?, description} - a non-attack legendary action off its turn (attacks: combat_action attack with legendaryCost)
    legendary_resistance {participantId, reason} - turn a failed save into a success
    use_ability {participantId, ability, targetIds?, damage?: number | dice, damageType?, savingThrow?: {ability, dc}} - a limited ability (breath weapon): spends the action, marks a recharge ability spent (it rolls a d6 at the start of its turn), saves per target
-   apply_damage {encounterId?, targetIds, dice: number | dice, source, damageType?, save?: {ability, dc, half?}} - damage with no actor (a hazard, a trap, an off-turn bite): one logged roll, a save per target, resistances, concentration and break tests; no action spent. Without encounterId it writes to the sheets
+   apply_damage {encounterId?, targetIds, dice: number | dice, source, actorId?, damageType?, save?: {ability, dc, half?}} - damage with no actor (a hazard, a trap, an off-turn bite): one logged roll, a save per target, resistances, concentration and break tests; no action spent. Without encounterId it writes to the sheets. With actorId, the band rule's damageScale scales each target by the band gap (bandScale per target)
    battle_cry {participantId, name?: 'Waaagh!', range?: 60, match?: {species?, band?, tag?, nameIncludes?}, rounds?: 1, attackAdvantage?, damageBonus?: number | dice, speedBonus?, moraleBonus?, ability?, actionCost?} - buffs the caller and matching allies in range until the start of the caller's next turn; actionCost action|bonus only on the caller's turn, none (default) is free and may be called out of turn
    budget {partyLevels | partyId, creatures: [{creature | cr | xp, count?}] | encounterId} - read-only 5e XP budget: TRIVIAL/EASY/MEDIUM/HARD/DEADLY
+   set_environment {encounterId, environment: {medium: air | water | vacuum, depthFt?, pressure?: {startsAtFt, damagePerRound, unlessTag?}, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?}} - the medium of the fight (create takes environment too). Water: movement budget is swimSpeed else half speed; ranged attacks refused unless rangedAllowed; melee at disadvantage unless the damage type is listed (piercing) or the attacker carries the swim tag ('aquatic'); pressure damage at the start of each turn at depthFt >= startsAtFt unless tagged. A token on a terrain.water cell swims the same way in an air fight. get shows ⟨water · 40 ft⟩
 6. end - Finish combat
+   board {encounterId, attackerId, targetId, rooms?, name?} (request 5) - both must be vessel tokens (character_manage create_vessel rows): opens a NEW boarding encounter linked by parent_id, notes the target's rooms (given, or its spatial deck plan), and leaves the void fight running. Add boarders with add_participant on the child; end {winner?, summary?} on the child writes boardingResult to the parent; get on the parent lists boardings. Vessel tokens: shields absorb before the hull (shieldsAbsorbed), regen at turn start; sections are system parts with roles — drive crippled = speed 0, guns crippled = that weapon refused, bridge crippled = disadvantage, reactor dead = reactor breach d6 each turn (1 destroys). Aim at a section with combat_action attack atPart.
 
 For combat ACTIONS (attack, move, cast), use combat_action tool instead.
 For MAP operations (render, aoe, terrain), use combat_map tool instead.
@@ -2003,9 +2216,10 @@ For CORPSES after combat, use corpse_manage tool.`,
     inputSchema: z.object({
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
         encounterId: z.string().optional().describe('Encounter ID (required for most actions)'),
-        seed: z.string().optional().describe('Seed for new encounter (create only)'),
-        participants: z.array(z.any()).optional().describe("Array of participants (create only). Shape per entry: { id: <character UUID — always the UUID>, name, hp, maxHp, initiativeBonus?: number (default 0, #103), ac?: number (falls back to attacker-side derivation), isEnemy?: boolean, position?: {x,y}, plus optional statline: size, reach, movementSpeed, attackBonus, attackDamage, attackDamageType, attacksPerAction, attacks [{name, attackBonus, damage, damageType?, part?, reachFt?, default?}], abilities [{name, recharge?}], legendaryActions, legendaryResistances, legendaryResistancesRemaining, autoLegendaryResistance, hasLairActions, cr, band, regeneration, parts, unit, intent, species, tags }"),
-        terrain: z.any().optional().describe('Terrain configuration (create only)'),
+        seed: z.string().optional().describe('Seed for a replayable new encounter (create only; omit for crypto dice)'),
+        participants: z.array(z.any()).optional().describe("Array of participants (create only). Shape per entry: { id: <character UUID — always the UUID>, name, hp, maxHp, initiativeBonus?: number (default 0, #103), ac?: number (falls back to attacker-side derivation), isEnemy?: boolean, position?: {x,y}, plus optional statline: size, reach, movementSpeed, attackBonus, attackDamage, attackDamageType, attacksPerAction, attacks [{name, attackBonus, damage, damageType?, part?, item?, reachFt?, default?}], abilities [{name, recharge?}], legendaryActions, legendaryResistances, legendaryResistancesRemaining, autoLegendaryResistance, hasLairActions, cr, band, regeneration, parts, unit, intent, species, tags }"),
+        terrain: z.any().optional().describe('Terrain configuration (create only); water: ["x,y"] cells run the underwater rules for a token standing there'),
+        environment: z.any().optional().describe("create / set_environment: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed? (default false in water), meleeDisadvantageUnlessDamageType? (default ['piercing']), swimTag? (default 'aquatic')}"),
         characterId: z.string().optional().describe('Character ID (death_save, add_participant)'),
         // FINDINGS #34 mirror block — add_participant + includeParty params
         includeParty: z.boolean().optional().describe('Include the active party in the new encounter (create / spawn_quick_enemy)'),
@@ -2031,7 +2245,9 @@ For CORPSES after combat, use corpse_manage tool.`,
         // Participant extras (add_participant; create takes them per participant)
         size: SizeCategorySchema.optional().describe('add_participant: tiny | small | medium | large | huge | gargantuan'),
         reach: z.number().optional().describe('add_participant: melee reach in feet'),
-        movementSpeed: z.number().optional().describe('add_participant: speed in feet (default 30)'),
+        movementSpeed: z.number().optional().describe('add_participant: speed in feet (default 30; defaults from the character row\'s speed)'),
+        swimSpeed: z.number().optional().describe('add_participant: swim speed in feet, the movement budget underwater (else half speed)'),
+        flySpeed: z.number().optional().describe('add_participant: fly speed in feet'),
         attackBonus: z.number().optional().describe('add_participant: default attack bonus'),
         attackDamage: z.string().optional().describe("add_participant: default attack damage ('1d6+2')"),
         attackDamageType: z.string().optional().describe('add_participant: damage type of the default attack'),
@@ -2062,11 +2278,17 @@ For CORPSES after combat, use corpse_manage tool.`,
         packed: z.boolean().optional().describe('set_unit'),
         routed: z.boolean().optional().describe('set_unit: routed after a failed break test (no volleys); false rallies'),
         morale: z.number().int().optional().describe('set_unit: the morale shown on BREAK TEST DUE'),
+        models: z.number().int().optional().describe('set_unit: reinforce or reduce the unit to this many models (new models add hpPerModel each to HP; fewer clamps HP); result reinforced {modelsBefore, models, added, hp, maxHp}'),
+        hpPerModel: z.number().int().optional().describe('set_unit: new HP per model (maximum follows, HP clamped)'),
         intent: z.string().nullable().optional().describe('set_intent: telegraphed intent (null clears); clears when its turn ends'),
         readied: ReadiedSchema.nullable().optional().describe("set_intent: {action, trigger, on?: enters_reach | leaves_reach, watch?: id | name | 'enemy' | 'any', attack?: {using?, attackBonus?, damage?, damageType?, withPart?}}; stays until it fires or trigger_readied (null clears). With on and attack it fires itself on a move"),
         isEnemy: z.boolean().optional().describe('Hostile flag (add_participant)'),
         xpAward: z.number().optional().describe('XP credited on end'),
         xpRecipients: z.array(z.string()).optional().describe('XP recipient character IDs'),
+        winner: z.string().optional().describe("end (mirror): on a boarding encounter, who won — reported to the parent fight"),
+        summary: z.string().optional().describe('end (mirror): on a boarding encounter, one line for the parent fight'),
+        attackerId: z.string().optional().describe('board (mirror): the boarding vessel token'),
+        rooms: z.array(z.string()).optional().describe("board (mirror): the target's rooms the boarders fight through"),
         round: z.number().optional().describe('Round filter (get_history)'),
         limit: z.number().optional().describe('Max actions returned (get_history) / max rows (list)'),
         status: z.string().optional().describe('FINDINGS #80 (mirror): list filter — active | completed | all (default active, the ghost hunt)'),
@@ -2075,6 +2297,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         worldId: z.string().optional().describe('FINDINGS #105 (mirror): create — stamp the encounter to a world (else derived from first claimed participant); list — STRICT world filter, scopes the ghost sweep'),
         actionDescription: z.string().optional().describe('Lair action description'),
         targetIds: z.array(z.string()).optional().describe('lair_action / use_ability / apply_damage: target IDs'),
+        actorId: z.string().optional().describe("apply_damage: who deals it (token or character id); the band rule's damageScale then applies. Omit for environmental damage"),
         damage: z.union([z.number(), z.string()]).optional().describe("lair_action / use_ability: damage, a number or dice ('8d6') rolled once for every target"),
         ability: z.string().optional().describe("use_ability: the ability's name on the token ('Fire Breath'); battle_cry: an ability it spends ('Waaagh!')"),
         range: z.number().optional().describe('battle_cry: feet from the caller (default 60)'),
@@ -2220,6 +2443,10 @@ export async function handleCombatManage(args: unknown, ctx: SessionContext): Pr
                     break;
                 case 'budget':
                     output = RichFormatter.header('Encounter Budget', '⚖️');
+                    break;
+                case 'board':
+                    output = RichFormatter.header('Boarding Action', '🚀');
+                    if (parsed.childEncounterId) output += RichFormatter.keyValue({ 'Boarding encounter': `\`${parsed.childEncounterId}\``, 'Void fight': `\`${parsed.parentEncounterId}\`` });
                     break;
                 default:
                     output = RichFormatter.header('Combat', '⚔️');

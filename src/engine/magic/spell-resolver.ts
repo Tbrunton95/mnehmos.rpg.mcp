@@ -7,6 +7,7 @@ import type { Spell, DamageType, SpellCastResult } from '../../schema/spell.js';
 import type { Character } from '../../schema/character.js';
 import { calculateUpcastDice } from './spell-database.js';
 import { calculateSpellSaveDC, calculateSpellAttackBonus, getSpellcastingAbility } from './spell-validator.js';
+import { cryptoInt } from '../../math/crypto-dice.js';
 
 /**
  * Roll dice and return total
@@ -33,7 +34,7 @@ export function rollDice(diceNotation: string): { total: number; rolls: number[]
     const modifier = match[3] ? parseInt(match[3]) : 0;
 
     for (let i = 0; i < count; i++) {
-        const roll = Math.floor(Math.random() * size) + 1;
+        const roll = cryptoInt(size);
         rolls.push(roll);
         total += roll;
     }
@@ -69,7 +70,7 @@ export function getMagicMissileDarts(slotLevel: number): number {
 }
 
 /**
- * Dice the resolver rolls on instead of Math.random: inside an encounter the
+ * Dice the resolver rolls on instead of its own crypto dice: inside an encounter the
  * handler passes the encounter's seeded, logged stream. d20 is the spell
  * attack die (advantage and disadvantage already folded in by the roller;
  * autoCrit names a condition that turns a hit into a crit).
@@ -83,7 +84,7 @@ export interface SpellResolutionOptions {
     targetSaveRoll?: number; // For testing - mock the save roll
     targetAC?: number; // For spell attack rolls
     casterAbilityMod?: number; // Override ability modifier
-    /** Roll on these dice instead of Math.random. */
+    /** Roll on these dice instead of unlogged crypto dice. */
     dice?: SpellDice;
     /** The caller rolls each target's save: the resolver rolls none and leaves debuff conditions to it. */
     perTargetSaves?: boolean;
@@ -146,7 +147,7 @@ export function resolveSpell(
         const r = dice.roll(notation, tag);
         return { total: Math.max(0, r.total), rolls: r.rolls };
     };
-    const d20 = (tag: string): number => dice ? dice.d20(tag).natural : Math.floor(Math.random() * 20) + 1;
+    const d20 = (tag: string): number => dice ? dice.d20(tag).natural : cryptoInt(20);
 
     // Process effects
     for (const effect of spell.effects) {
@@ -175,7 +176,7 @@ export function resolveSpell(
                         totalDamage = roll(`${darts}d4+${darts}`, `${spell.name} damage`).total;
                     } else {
                         for (let i = 0; i < darts; i++) {
-                            totalDamage += Math.floor(Math.random() * 4) + 1 + 1;
+                            totalDamage += cryptoInt(4) + 1;
                         }
                     }
                     result.damage = totalDamage;
@@ -223,7 +224,7 @@ export function resolveSpell(
                     // Spell attack roll
                     const attackDie = dice
                         ? dice.d20('spell attack', options.advantage, options.disadvantage)
-                        : { natural: Math.floor(Math.random() * 20) + 1, rolls: [] as number[], autoCrit: undefined as string | undefined };
+                        : { natural: cryptoInt(20), rolls: [] as number[], autoCrit: undefined as string | undefined };
                     const attackRoll = attackDie.natural;
                     result.attackRoll = attackRoll;
                     result.attackTotal = attackRoll + spellAttackBonus;

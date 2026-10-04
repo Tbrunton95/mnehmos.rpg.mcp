@@ -4,6 +4,7 @@ import { SpatialRepository } from "../../storage/repos/spatial.repo.js";
 import { CharacterRepository } from "../../storage/repos/character.repo.js";
 import { RoomNode, Exit, NodeNetwork } from "../../schema/spatial.js";
 import { SessionContext } from "../types.js";
+import { loggedD20 } from "../../math/logged-d20.js";
 
 type LightEffectRow = {
   id: number;
@@ -273,10 +274,10 @@ function getCharacterRepo(): CharacterRepository {
 }
 
 /**
- * Simulate a d20 roll
+ * A perception d20 for the observer: crypto dice, logged to roll_log.
  */
-function rollD20(): number {
-  return Math.floor(Math.random() * 20) + 1;
+function rollPerceptionD20(observerId: string): number {
+  return loggedD20(getDb(), { purpose: "perception", forId: observerId }, { tool: "spatial_manage" }).natural;
 }
 
 /**
@@ -443,7 +444,7 @@ export async function handleLookAtSurroundings(
 
     if (exit.type === "HIDDEN") {
       // Perception check: 1d20 + WIS modifier vs DC
-      const perceptionRoll = rollD20() + perceptionModifier;
+      const perceptionRoll = rollPerceptionD20(observer.id) + perceptionModifier;
       return perceptionRoll >= (exit.dc || 15);
     }
 

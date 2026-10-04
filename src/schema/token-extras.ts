@@ -20,9 +20,34 @@ export const PartSchema = z.object({
     ac: z.number().int().min(0).optional().describe('AC to hit this part when aimed at'),
     hp: z.number().int().min(0).optional().describe('A part with its own HP takes aimed damage instead of the body'),
     maxHp: z.number().int().min(1).optional(),
-    breakAt: z.number().int().min(1).optional().describe('One aimed hit dealing at least this much breaks (severs) the part')
+    breakAt: z.number().int().min(1).optional().describe('One aimed hit dealing at least this much breaks (severs) the part'),
+    role: z.string().optional().describe("Vessel sections (kind system): drive | guns | bridge | reactor | hangar | other; the engine reads crippled or dead sections by role")
 });
 export type Part = z.infer<typeof PartSchema>;
+
+/**
+ * Request 5: what makes a token a vessel. Hull is its HP, sections are its
+ * `system` parts, shields a {current, max} pool the engine drains before
+ * the hull and refills by regenPerRound at the start of its turn.
+ */
+export const VesselProfileSchema = z.object({
+    regenPerRound: z.number().int().min(0).default(0),
+    /** sectionName → role, for parts that carry no role of their own. */
+    roles: z.record(z.string(), z.string()).default({}),
+    speed: z.number().int().min(0).optional(),
+    crew: z.number().int().min(0).optional(),
+    sizeLabel: z.string().optional().describe("The rule's size word when it is not a 5e category ('colossal')"),
+    traits: z.array(z.string()).optional(),
+    /** A spatial network (room_nodes.network_id) holding the vessel's deck plan; board lists its rooms. */
+    networkId: z.string().optional()
+}).passthrough();
+export type VesselProfile = z.infer<typeof VesselProfileSchema>;
+
+export const ShieldsSchema = z.object({
+    current: z.number().min(0),
+    max: z.number().min(0)
+});
+export type Shields = z.infer<typeof ShieldsSchema>;
 
 /**
  * Creature size (D&D 5e categories). One enum instance, shared by tokens,
@@ -45,6 +70,7 @@ export const AttackProfileSchema = z.object({
     damage: z.union([z.number(), z.string()]).describe("Flat damage or dice ('2d8+6')"),
     damageType: z.string().optional(),
     part: z.string().optional().describe('The part that makes this attack (its state applies)'),
+    item: z.string().optional().describe("The inventory item this profile swings ('Chainsword', an item id or instance id). world_manage reconcile flags a profile whose item the character no longer holds"),
     reachFt: z.number().int().min(0).optional().describe('Reach in feet when longer than the creature\'s own'),
     ranged: z.boolean().optional(),
     default: z.boolean().optional().describe('Used when an attack names no profile'),
@@ -100,6 +126,8 @@ export const ParticipantExtrasShape = {
     size: SizeCategorySchema.optional().describe('tiny | small | medium | large | huge | gargantuan (default medium)'),
     reach: z.number().int().min(0).optional().describe('Melee reach in feet (default from size: 5, or 10 for huge and up)'),
     movementSpeed: z.number().int().min(0).optional().describe('Speed in feet (default 30)'),
+    swimSpeed: z.number().int().min(0).optional().describe('Swim speed in feet: the movement budget underwater (else half speed)'),
+    flySpeed: z.number().int().min(0).optional().describe('Fly speed in feet'),
     attackBonus: z.number().int().optional().describe('Default attack bonus'),
     attackDamage: z.string().optional().describe("Default attack damage ('1d6+2')"),
     attackDamageType: z.string().optional().describe('Damage type of the default attack'),

@@ -17,6 +17,8 @@ import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 import * as pda from '../../render/pda.js';
 import { getLightSourceProfile } from '../../services/light-source.service.js';
+import { loggedRoll } from '../../math/logged-d20.js';
+import { randomBytes } from 'node:crypto';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -67,7 +69,8 @@ function allowedEquipSlots(item: {
     return [];
 }
 
-function rollHealing(value: unknown): { amount: number; notation?: string; rolls?: number[] } | null {
+/** A potion's healing: a flat amount, or dice rolled on crypto dice and logged as 'potion' for the drinker. */
+function rollHealing(value: unknown, forId?: string): { amount: number; notation?: string; rolls?: number[]; rollId?: string } | null {
     if (value === undefined || value === null) return null;
     if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
         return { amount: Math.floor(value) };
@@ -79,11 +82,13 @@ function rollHealing(value: unknown): { amount: number; notation?: string; rolls
         const count = Number(match[1]);
         const sides = Number(match[2]);
         const modifier = match[4] ? Number(match[4]) * (match[3] === '-' ? -1 : 1) : 0;
-        const rolls = Array.from({ length: count }, () => Math.floor(Math.random() * sides) + 1);
+        const notation = `${count}d${sides}${modifier ? (modifier > 0 ? `+${modifier}` : modifier) : ''}`;
+        const roll = loggedRoll(getDb(), { purpose: 'potion', forId }, notation, { tool: 'inventory_manage' });
         return {
-            amount: Math.max(0, rolls.reduce((sum, roll) => sum + roll, modifier)),
-            notation: `${count}d${sides}${modifier ? (modifier > 0 ? `+${modifier}` : modifier) : ''}`,
-            rolls
+            amount: Math.max(0, roll.total),
+            notation,
+            rolls: roll.rolls,
+            rollId: roll.rollId
         };
     }
 
@@ -269,7 +274,7 @@ export function mintInstance(db: ReturnType<typeof getDb>, characterId: string, 
     const tpl = db.prepare('SELECT properties FROM items WHERE id = ?').get(templateId) as { properties?: string } | undefined;
     const tplProps = tpl?.properties ? JSON.parse(tpl.properties) : {};
     const now = new Date().toISOString();
-    const id = `inst-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
+    const id = `inst-${randomBytes(5).toString('hex').slice(0, 8)}-${Date.now().toString(36)}`;
     db.prepare('INSERT INTO item_instances (id, template_id, owner_character_id, condition, attachments, custom_name, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)')
         .run(id, templateId, characterId, typeof tplProps.condition === 'number' ? tplProps.condition : null, '{}', null, now, now);
     return db.prepare('SELECT * FROM item_instances WHERE id = ?').get(id) as ItemInstance;
@@ -656,8 +661,8 @@ const definitions: Record<InventoryAction, ActionDefinition> = {
             if (healingValue === undefined && typeof effect === 'string' && /heal|restore|regain/i.test(effect)) {
                 healingValue = effect;
             }
-            const healing = rollHealing(healingValue);
             const targetId = params.targetId || params.characterId;
+            const healing = rollHealing(healingValue, targetId);
             const target = healing ? charRepo.findById(targetId) : null;
             if (healing && !target) {
                 throw new Error(`Healing target not found: ${targetId}`);

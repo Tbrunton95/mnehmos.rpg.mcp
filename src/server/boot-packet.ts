@@ -12,15 +12,19 @@ import { CustomEffectsRepository } from '../storage/repos/custom-effects.repo.js
 import { CharacterRepository } from '../storage/repos/character.repo.js';
 import { loadRule, findPool, conditionsForDisplay, shownCounters } from '../engine/table-rules.js';
 import { recentPrecedents } from './consolidated/precedent-manage.js';
+import { reconcileWorld, reconcileLine } from './reconcile.js';
 import { NOTE_SOFT_CAP, splitSections } from './consolidated/narrative-manage.js';
-import { readWorldClock, clockWarning, scheduleInWorldSql } from '../engine/world-clock.js';
+import { readWorldClock, clockWarning, scheduleInWorldSql, scheduleLiveSql } from '../engine/world-clock.js';
 import type { Character } from '../schema/character.js';
+import { pendingTotal } from '../storage/xp-awards.js';
 
 export interface BootPacket {
     worldId: string;
     day: number | null;
     /** 'HH:MM' when the world keeps a time. */
     time?: string;
+    /** Request 2: the era label era_jump wrote. */
+    era?: string;
     characters: Array<Record<string, unknown>>;
     clocks: Array<Record<string, unknown>>;
     /** A grown thread reads as its first line, then its newest section; `long` past the soft cap. */
@@ -30,6 +34,10 @@ export interface BootPacket {
     precedents: Array<{ kind: string; statement: string; scope: string | null }>;
     /** Items 14/15: records dated after the world clock (advisory), absent when none. */
     clockWarning?: string;
+    /** Request 3: narrated awards not yet applied; absent when none. */
+    xpOwed?: { total: number; count: number; line: string };
+    /** Request 4: sheet drift (world_manage reconcile), absent when clean. */
+    reconcile?: { count: number; first: string[] };
 }
 
 const clip = (s: string, n: number) => s.length > n ? `${s.slice(0, n)}…` : s;
@@ -107,12 +115,17 @@ export function buildBootPacket(worldId: string, characterIds?: string[], journa
         // Play report: rows scope by their own tag, or their character's when
         // untagged; due rows come first so the cap never hides one.
         ...tryAll(() => (db.prepare(`SELECT s.fires_at_day AS day, s.note, COALESCE(c.name, s.character_id) AS who FROM scheduled_state_changes s LEFT JOIN characters c ON c.id = s.character_id
-                                     WHERE s.fired = 0 AND ${scheduleInWorldSql('s')}
+                                     WHERE ${scheduleLiveSql('s')} AND ${scheduleInWorldSql('s')}
                                      ORDER BY CASE WHEN ? IS NOT NULL AND s.fires_at_day <= ? THEN 0 ELSE 1 END, s.fires_at_day LIMIT 8`).all(worldId, worldId, at, at) as Array<{ day: number; note: string | null; who: string }>)
             .map(r => ({ kind: 'scheduled', day: r.day, due: at !== null && r.day <= at, what: `${r.who}: ${r.note ?? '(no note)'}` }))),
-        ...tryAll(() => (db.prepare(`SELECT debtor, creditor, amount, currency, due_day, status, consequence FROM ledger_debts
+        // Request 9: `kind` is the ledger kind (debt | oath | meeting | border | favour);
+        // the SELECT names its columns so a ledger that predates `kind` still reads.
+        ...tryAll(() => (db.prepare(`SELECT COALESCE(kind, 'debt') AS kind, debtor, creditor, amount, currency, due_day, status, consequence, note FROM ledger_debts
                                      WHERE world_id = ? AND status IN ('pending', 'due', 'lapsed') ORDER BY COALESCE(due_day, 1e9) LIMIT 8`).all(worldId) as Array<Record<string, unknown>>)
-            .map(r => ({ kind: 'debt', day: r.due_day, status: r.status, due: day !== null && typeof r.due_day === 'number' && r.due_day <= day, what: `${r.debtor} owes ${r.creditor} ${r.currency}${r.amount}${r.consequence ? `; if not: ${r.consequence}` : ''}` })))
+            .map(r => ({ kind: r.kind, day: r.due_day, status: r.status, due: day !== null && typeof r.due_day === 'number' && r.due_day <= day,
+                what: r.kind === 'debt'
+                    ? `${r.debtor} owes ${r.creditor} ${r.currency}${r.amount}${r.consequence ? `; if not: ${r.consequence}` : ''}`
+                    : `${r.kind} · ${r.note ? `${r.note} · ` : ''}${r.debtor} → ${r.creditor}${r.consequence ? `; if not: ${r.consequence}` : ''}` })))
     ];
 
     const threads = tryAll(() => (db.prepare(`SELECT id, content FROM narrative_notes WHERE world_id = ? AND type = 'plot_thread' AND status = 'active'
@@ -132,14 +145,39 @@ export function buildBootPacket(worldId: string, characterIds?: string[], journa
 
     let warning: string | undefined;
     try { warning = clockWarning(db, worldId); } catch { warning = undefined; }
+    // Request 2: clocks with nothing to compare against. Scheduled rows and
+    // open ledger rows wait on a day the world never set; say so once.
+    if (day === null && clocks.some(c => c.kind === 'scheduled' || ['pending', 'due', 'lapsed'].includes(String(c.status)))) {
+        warning = 'no world day set — world_manage update {environment:{day,time}} or era_jump';
+    }
 
-    return { worldId, day, ...(clock?.time ? { time: clock.time } : {}), ...(warning ? { clockWarning: warning } : {}), characters, clocks, threads, telegraphs, journal, precedents };
+    let xpOwed: BootPacket['xpOwed'];
+    try {
+        const p = pendingTotal(db, { worldId });
+        if (p.count) xpOwed = { ...p, line: `XP owed: +${p.total} (${p.count} award${p.count === 1 ? '' : 's'}) — character_manage post_awards` };
+    } catch { xpOwed = undefined; }
+
+    // Request 4: the same read world_manage reconcile makes; the count and
+    // the first five lines, nothing when every sheet agrees with itself.
+    let reconcile: BootPacket['reconcile'];
+    try {
+        const r = reconcileWorld(db, worldId);
+        if (r.count > 0) reconcile = { count: r.count, first: r.findings.slice(0, 5).map(reconcileLine) };
+    } catch { reconcile = undefined; }
+
+    return { worldId, day, ...(clock?.time ? { time: clock.time } : {}), ...(clock?.era ? { era: clock.era } : {}), ...(warning ? { clockWarning: warning } : {}), ...(xpOwed ? { xpOwed } : {}), ...(reconcile ? { reconcile } : {}), characters, clocks, threads, telegraphs, journal, precedents };
 }
 
 export function renderBootPacket(p: BootPacket): string {
     let out = '';
     const section = (title: string) => `\n## ${title}\n`;
     if (p.clockWarning) out += `\n⚠ CLOCK: ${p.clockWarning}\n`;
+    if (p.xpOwed) out += `\n${p.xpOwed.line}\n`;
+    if (p.reconcile) {
+        out += `\n⚠ RECONCILE: ${p.reconcile.count} finding${p.reconcile.count === 1 ? '' : 's'} — world_manage reconcile {worldId} lists each with its fix\n`;
+        for (const line of p.reconcile.first) out += `  • ${line}\n`;
+        if (p.reconcile.count > p.reconcile.first.length) out += `  … ${p.reconcile.count - p.reconcile.first.length} more\n`;
+    }
     if (p.characters.length) {
         out += section('Characters');
         for (const c of p.characters) {
@@ -155,8 +193,8 @@ export function renderBootPacket(p: BootPacket): string {
         }
     }
     if (p.clocks.length) {
-        out += section(`Clocks${p.day !== null ? ` (day ${p.day}${p.time ? `, ${p.time}` : ''})` : ''}`);
-        for (const c of p.clocks) out += `• ${c.due || c.status === 'due' || c.status === 'lapsed' ? 'DUE ' : ''}${c.kind === 'debt' ? `[${c.status}] ` : ''}${c.day !== null && c.day !== undefined ? `day ${c.day}: ` : ''}${c.what}\n`;
+        out += section(`Clocks${p.day !== null ? ` (day ${p.day}${p.time ? `, ${p.time}` : ''}${p.era ? ` · era ${p.era}` : ''})` : p.era ? ` (era ${p.era})` : ''}`);
+        for (const c of p.clocks) out += `• ${c.due || c.status === 'due' || c.status === 'lapsed' ? 'DUE ' : ''}${c.kind !== 'scheduled' ? `[${c.status}] ` : ''}${c.day !== null && c.day !== undefined ? `day ${c.day}: ` : ''}${c.what}\n`;
     }
     if (p.telegraphs.length) {
         out += section('Live telegraphs');

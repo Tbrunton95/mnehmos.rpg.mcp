@@ -44,10 +44,22 @@ Luciel fights An'ggrath (Monster/Lord) on the mountain. Every fight follows this
 
 When several steps must land together, send them as one `batch_manage execute_sequence {atomic: true, steps}`. If any step fails, none apply. A step with an array param (a precedent's `tags`, a knowledge record's `knowers`) is refused inside a batch, so make those calls directly.
 
+## Between sessions, and after a fight ran in chat
+
+The Deep One campaign ran four days of fights outside the engine because its dice were seeded. They are crypto now (`docs/table-rules/dice.md`), so fights go back through `combat_manage`. For everything that drifted while they didn't:
+
+1. **Set the day.** A world with clocks and no day gets a `CLOCK` warning at boot. Years passing between arcs is `world_manage era_jump {worldId, day, time?, label, dryRun: true}` first, then without `dryRun`: the clock corrects (no regeneration), threads park, stale scheduled rows cancel, abilities and legendary pools refill.
+2. **Reconcile the sheets.** `world_manage reconcile {worldId}` names every drift with the call that fixes it: equipped items that no longer exist, duplicate attack profiles, a profile whose `item` is gone, conditions citing a superseded ruling, abilities still spent with no fight on, XP owed. Boot shows the count when it is not zero.
+3. **Post the XP you said aloud.** `character_manage add_xp` needs a `reason` now. An award narrated at the table goes in at once as `award_note {characterId, amount, reason}` and lands with `post_awards {worldId}`. The status block footer shows `xp owed` until it does.
+4. **Long stretches are one roll.** `improvisation_manage montage {characterId, task, dc, costs: {hardWon, costly}, hours, worldId}`: clean, hard-won or costly, the cost written, the clock moved, the line in the session log.
+5. **Clocks that tick by the hour** are exposure timers: `character_manage set_exposure {characterId, name, pool, perHour, cap, thresholds: [{at, condition}]}`; every `world_manage advance` moves them and adds the condition when a threshold is crossed. `advance {fireScheduled: true}` fires due scheduled rows in the same call.
+6. **Oaths, owed meetings and borders** are ledger rows with `kind: 'oath' | 'meeting' | 'border' | 'favour'` and a `consequence`; they lapse on the clock like a debt and need no amount.
+7. **Damage by band** is opt-in: give the band rule `damageScale: {}` for the defaults and a Mortal's blow on a Monster/Lord halves per step while the reverse grows. Grapples and executes already scaled; attacks now can.
+
 ## Never do these
 
 - **Never fake a result with a huge `attackBonus`.** Post it with `outcome`.
-- **Never pass `seed` to a roll.** A fixed seed replays identical dice.
+- **Never pass `seed` to a roll.** Dice are crypto by default; a seed replays identical dice and is for audits only.
 - **Never retry a timed-out write with a new `opId` or none.** Retry with the same `opId`, or check `session_manage op_status {forOpId}`.
 - **Never fix HP by healing or damaging.** Use `combat_manage adjust_hp {value | delta, reason}`.
 - **Never remove and re-add a condition to change its text.** Use `editConditions`, or `feature_from_condition`.
@@ -126,3 +138,16 @@ When several steps must land together, send them as one `batch_manage execute_se
 | Did a timed-out call apply? | `session_manage op_status {forOpId}` |
 | A free roll with several dice terms | `math_manage roll {expression: '6d10+3d10', purpose, forId?}` (logged, every die listed) |
 | Check a past roll | `session_manage rolls {forId \| encounterId \| forOpId}` |
+| Years pass between arcs | `world_manage era_jump {worldId, day, label, dryRun?}` |
+| After fights ran in chat | `world_manage reconcile {worldId}`; fix each finding with the call it names |
+| XP said aloud, not yet applied | `character_manage award_note {characterId, amount, reason}` then `post_awards {worldId}` |
+| Forty-eight cells, one roll | `improvisation_manage montage {characterId, task, dc, costs, hours, worldId}` |
+| Hours of exposure | `character_manage set_exposure {characterId, name, pool, perHour, cap, thresholds}`; `world_manage advance` ticks it |
+| An oath or an owed meeting | `ledger_manage create {worldId, kind: 'oath' \| 'meeting' \| 'border' \| 'favour', debtor, creditor, consequence, dueDay?}` |
+| A fight in the water | `combat_manage create {..., environment: {medium: 'water', depthFt}}` or `set_environment`; give swimmers `swimSpeed` and the tag `aquatic` |
+| A Skaven campaign | `table_rules import {worldId, preset: 'skaven-horned-rat'}`; guide in `skaven-horned-rat.md` |
+| Spend a warpstone token on a cast | `combat_action cast_spell {..., boost: {pool: 'warpstone', delta: -1, modifier: 2, sideEffect: [{pool: 'warpstone_taint', delta: 1}]}}` |
+| Reinforce a unit | `combat_manage set_unit {encounterId, participantId, models}` |
+| A ship in the fight | `table_rules define {kind: 'vessel', ...}` then `character_manage create_vessel {worldId, vessel, name}`; strike a section with `atPart`; `combat_manage board {encounterId, attackerId, targetId}` for the boarding (`vessels.md`) |
+| Is the d20 fair? | `session_manage rolls {worldId, stats: true}` |
+| Damage with no attacker, or from a named one | `combat_manage apply_damage {targetIds, dice, source, actorId?}` |

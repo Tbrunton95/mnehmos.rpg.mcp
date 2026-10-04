@@ -630,7 +630,56 @@ async function handleGetTemplate(input: BatchManageInput, _ctx: SessionContext):
 }
 
 /**
- * Resolve parameter references like {{step1.characterId}} from previous step results
+ * Deep One audit: an unresolved {{…}} reference fails its step loudly. The
+ * old resolver passed an unknown step id through as the literal string and
+ * turned a dead path into `undefined` (the arg silently vanished), so the
+ * downstream tool refused for the wrong reason or ran without the value.
+ */
+export class UnresolvedRefError extends Error {
+    readonly unresolvedRef: string;
+    readonly knownSteps: string[];
+    readonly availableKeys?: string[];
+    readonly hint?: string;
+    constructor(ref: string, knownSteps: string[], availableKeys?: string[], hint?: string) {
+        const where = availableKeys
+            ? `path has no value; the step's result has keys [${availableKeys.join(', ')}]`
+            : `unknown step id; known steps [${knownSteps.join(', ')}]`;
+        super(`unresolved reference ${ref}: ${where}.${hint ? ` ${hint}` : ''} Step not executed.`);
+        this.name = 'UnresolvedRefError';
+        this.unresolvedRef = ref;
+        this.knownSteps = knownSteps;
+        this.availableKeys = availableKeys;
+        this.hint = hint;
+    }
+}
+
+function resolveOneReference(value: string, stepResults: Map<string, unknown>): unknown {
+    // Extract reference like "step1.characterId" or "step1.created[0].id"
+    const refPath = value.slice(2, -2).trim();
+    const knownSteps = [...stepResults.keys()];
+    const dotIndex = refPath.search(/[.[]/);
+    const stepId = dotIndex > 0 ? refPath.slice(0, dotIndex) : refPath;
+    const propertyPath = dotIndex > 0 ? refPath.slice(dotIndex).replace(/^\./, '') : '';
+
+    if (!stepResults.has(stepId)) {
+        // {{step.1.item.id}} is a common misspelling of {{step1.item.id}}.
+        const m = refPath.match(/^step\.(\d+)(?:\.(.*))?$/);
+        const hint = m ? `did you mean {{step${m[1]}${m[2] ? `.${m[2]}` : ''}}}` : undefined;
+        throw new UnresolvedRefError(value, knownSteps, undefined, hint);
+    }
+    const stepResult = stepResults.get(stepId);
+    if (!propertyPath) return stepResult;
+    const found = getNestedValue(stepResult as Record<string, unknown>, propertyPath);
+    if (found === undefined) {
+        const keys = stepResult && typeof stepResult === 'object' ? Object.keys(stepResult as object) : [];
+        throw new UnresolvedRefError(value, knownSteps, keys);
+    }
+    return found;
+}
+
+/**
+ * Resolve parameter references like {{step1.characterId}} from previous step results.
+ * Throws UnresolvedRefError for an unknown step id or a path with no value.
  */
 function resolveStepReferences(
     args: Record<string, unknown>,
@@ -640,24 +689,7 @@ function resolveStepReferences(
 
     for (const [key, value] of Object.entries(args)) {
         if (typeof value === 'string' && value.startsWith('{{') && value.endsWith('}}')) {
-            // Extract reference like "step1.characterId" or "step1.created[0].id"
-            const refPath = value.slice(2, -2).trim();
-            const dotIndex = refPath.indexOf('.');
-            if (dotIndex > 0) {
-                const stepId = refPath.slice(0, dotIndex);
-                const propertyPath = refPath.slice(dotIndex + 1);
-
-                const stepResult = stepResults.get(stepId);
-                if (stepResult) {
-                    // Navigate the property path
-                    resolved[key] = getNestedValue(stepResult as Record<string, unknown>, propertyPath);
-                } else {
-                    // Reference not found, keep original
-                    resolved[key] = value;
-                }
-            } else {
-                resolved[key] = value;
-            }
+            resolved[key] = resolveOneReference(value, stepResults);
         } else if (typeof value === 'object' && value !== null) {
             // Recursively resolve nested objects
             resolved[key] = resolveStepReferences(value as Record<string, unknown>, stepResults);
@@ -733,6 +765,10 @@ async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContex
         success: boolean;
         result?: unknown;
         error?: string;
+        unresolvedRef?: string;
+        knownSteps?: string[];
+        availableKeys?: string[];
+        hint?: string;
     }> = [];
 
     let output = RichFormatter.header('Executing Sequence', '⚙️');
@@ -890,12 +926,19 @@ async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContex
             const error = (err instanceof Error ? err.message : String(err)) || 'Unknown error';
             output += `  ❌ Error: ${error}\n`;
 
+            const ref = err instanceof UnresolvedRefError ? {
+                unresolvedRef: err.unresolvedRef,
+                knownSteps: err.knownSteps,
+                ...(err.availableKeys ? { availableKeys: err.availableKeys } : {}),
+                ...(err.hint ? { hint: err.hint } : {})
+            } : {};
             executedSteps.push({
                 stepIndex: i,
                 stepId,
                 tool: step.tool,
                 success: false,
-                error
+                error,
+                ...ref
             });
 
             if (stopOnError) {
@@ -911,6 +954,7 @@ async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContex
     // count as succeeded (the write landed) but are tallied separately so a
     // batch containing undeclared payloads never reads as fully clean.
     const ambiguousCount = executedSteps.filter(s => (s as { ambiguous?: boolean }).ambiguous).length;
+    const unresolvedRefs = executedSteps.flatMap(s => s.unresolvedRef ? [s.unresolvedRef] : []);
 
     output += RichFormatter.section('Summary');
     output += RichFormatter.keyValue({
@@ -918,7 +962,8 @@ async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContex
         'Executed': executedSteps.length,
         'Succeeded': successCount,
         'Failed': failureCount,
-        ...(ambiguousCount ? { 'Ambiguous ⚠': ambiguousCount } : {})
+        ...(ambiguousCount ? { 'Ambiguous ⚠': ambiguousCount } : {}),
+        ...(unresolvedRefs.length ? { 'Unresolved refs': unresolvedRefs.join(', ') } : {})
     });
 
     // atomic: an error reply makes the operation guard roll back every step.
@@ -933,6 +978,7 @@ async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContex
         successCount,
         failureCount,
         ...(ambiguousCount ? { ambiguousCount } : {}),
+        ...(unresolvedRefs.length ? { unresolvedRefs } : {}),
         steps: executedSteps,
         stepResults: Object.fromEntries(stepResults)
     };
@@ -990,7 +1036,7 @@ export const BatchManageTool = {
 
 🔗 WORKFLOW ORCHESTRATION:
 Use execute_sequence to chain ANY tools together with parameter passing.
-Results from step N can be referenced in step N+1 using {{stepId.property}}.
+Results from step N can be referenced in step N+1 using {{stepId.property}}: steps are step1, step2, … unless given an id, so item_manage create in step 1 yields {{step1.item.id}} (not {{step.1.item.id}}, not {{step1.itemId}}). An unresolved reference fails that step with unresolvedRef, knownSteps and the result's availableKeys.
 
 Actions:
 • execute_sequence - Chain multiple tools with parameter passing (NEW!)

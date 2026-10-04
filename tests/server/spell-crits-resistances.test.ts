@@ -47,9 +47,14 @@ function wizard(id: string): any {
 describe('spell attack crits', () => {
     afterEach(() => vi.restoreAllMocks());
 
+    // The resolver's own fallback dice are crypto; the tests inject the die.
+    const fixedDice = (natural: number) => ({
+        d20: () => ({ natural, rolls: [natural] }),
+        roll: (notation: string) => maxDice(notation)
+    });
+
     it('a natural 20 hits any AC and doubles the damage dice', () => {
-        vi.spyOn(Math, 'random').mockReturnValue(0.99);
-        const r = resolveSpell(getSpell('Fire Bolt')!, wizard('w'), 0, { targetAC: 99 });
+        const r = resolveSpell(getSpell('Fire Bolt')!, wizard('w'), 0, { targetAC: 99, dice: fixedDice(20) });
         expect(r.attackRoll).toBe(20);
         expect(r.hit).toBe(true);
         expect(r.critical).toBe(true);
@@ -58,8 +63,7 @@ describe('spell attack crits', () => {
     });
 
     it('a natural 1 misses any AC', () => {
-        vi.spyOn(Math, 'random').mockReturnValue(0);
-        const r = resolveSpell(getSpell('Fire Bolt')!, wizard('w'), 0, { targetAC: 1 });
+        const r = resolveSpell(getSpell('Fire Bolt')!, wizard('w'), 0, { targetAC: 1, dice: fixedDice(1) });
         expect(r.attackRoll).toBe(1);
         expect(r.hit).toBe(false);
         expect(r.damage).toBe(0);

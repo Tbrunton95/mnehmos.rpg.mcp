@@ -30,10 +30,10 @@ describe('milestone XP, tiny status, principles at boot', () => {
     const importDay366 = () => handleTableRules({ action: 'import', worldId: W, preset: 'day-366' }, ctx as any);
 
     it('XP offers a level-up without the rule, and never under milestone progression', async () => {
-        const plain = tagJson((await handleCharacterManage({ action: 'add_xp', characterId: 'luciel', amount: 1000 }, ctx as any)).content[0].text, 'CHARACTER_MANAGE');
+        const plain = tagJson((await handleCharacterManage({ action: 'add_xp', characterId: 'luciel', amount: 1000, reason: 'test' }, ctx as any)).content[0].text, 'CHARACTER_MANAGE');
         expect(plain.canLevelUp).toBe(true);
         await importDay366();
-        const milestone = tagJson((await handleCharacterManage({ action: 'add_xp', characterId: 'luciel', amount: 1000 }, ctx as any)).content[0].text, 'CHARACTER_MANAGE');
+        const milestone = tagJson((await handleCharacterManage({ action: 'add_xp', characterId: 'luciel', amount: 1000, reason: 'test' }, ctx as any)).content[0].text, 'CHARACTER_MANAGE');
         expect(milestone.canLevelUp).toBe(false);
         expect(milestone.message).toMatch(/Milestone progression/);
     });

@@ -8,6 +8,7 @@
  */
 import type { RuleKind } from '../../engine/table-rules.js';
 import { ORRUK_WAAAGH_PRESET } from './orruk-waaagh.js';
+import { SKAVEN_HORNED_RAT_PRESET } from './skaven-horned-rat.js';
 
 export interface RulePresetEntry {
     kind: RuleKind;
@@ -61,4 +62,5 @@ export const DAY_366_PRESET: RulePresetEntry[] = [
 export const RULE_PRESETS: Record<string, RulePresetEntry[]> = {
     'day-366': DAY_366_PRESET,
     'orruk-waaagh': ORRUK_WAAAGH_PRESET,
+    'skaven-horned-rat': SKAVEN_HORNED_RAT_PRESET,
 };

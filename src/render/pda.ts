@@ -345,10 +345,11 @@ export function refuseFromPayload(p: { message?: string; hint?: string; writes?:
 // ── THE STRIP — scene-block chrome; the dosimeter is always visible ────
 // The 8-cell bar maps the 01 §2 band table — load-bearing, not decor.
 // ПДА is the one Cyrillic residue (Tom's language ruling).
-export function renderStrip(ctx: { callsign?: string; day?: number | string; time?: string; rads?: number; badge?: string }): string {
+export function renderStrip(ctx: { callsign?: string; day?: number | string; time?: string; era?: string; rads?: number; badge?: string }): string {
     const g = G();
     const cs = (ctx.callsign ?? '???').toUpperCase();
-    const clock = ctx.day !== undefined && ctx.time ? ` ─ D${ctx.day} ${g.sep} ${ctx.time} ─` : ' ─';
+    // Request 2: the era label rides the date segment ('D3 │ 06:00 │ M42').
+    const clock = ctx.day !== undefined && ctx.time ? ` ─ D${ctx.day} ${g.sep} ${ctx.time}${ctx.era ? ` ${g.sep} ${ctx.era}` : ''} ─` : ' ─';
     const dosim = typeof ctx.rads === 'number' ? ` ${g.rad} ${bar(ctx.rads, 8, 1000)} ${ctx.rads} ─` : ' ─';
     const badge = ctx.badge === undefined ? g.badge : ctx.badge;
     const head = badge ? `${badge} ─── ` : '';
@@ -370,7 +371,7 @@ export interface StatusInput {
     weaponAttachments?: Array<{ slot: string; name: string }>;
     conditions?: Array<{ name?: string; duration?: number } | string>;
     effects?: string[]; gold?: number; currencyLabel?: string; badge?: string;
-    day?: number | string; time?: string; weather?: string;
+    day?: number | string; time?: string; weather?: string; era?: string;
     // Table rules status_block: the tiny block.
     compact?: boolean;
     corePool?: { name: string; current: number; max: number };
@@ -380,6 +381,29 @@ export interface StatusInput {
     // Item 18: house-format knobs from the status_block rule.
     conditionLayout?: 'rows' | 'line'; conditionLabel?: string; showMore?: boolean;
     footer?: string[];
+    // Speeds from the sheet (shown when one is set) and the medium of the
+    // active encounter the character is in (shown when it is not air).
+    speed?: number; swimSpeed?: number; flySpeed?: number;
+    environment?: { medium: string; depthFt?: number };
+}
+
+/**
+ * The medium of a fight as one glyph token: ⟨water · 40 ft⟩. Empty for air
+ * (the default) so a dry fight shows nothing new.
+ */
+export function environmentGlyph(env?: { medium?: string; depthFt?: number } | null): string {
+    if (!env?.medium || env.medium === 'air') return '';
+    const depth = typeof env.depthFt === 'number' ? ` ${G().sep} ${env.depthFt} ft` : '';
+    return plain() ? `<${env.medium}${depth.replace(G().sep, '-')}>` : `⟨${env.medium}${depth}⟩`;
+}
+
+/** 'spd 30 / swim 40 / fly 60' from whichever speeds are set; empty when none is. */
+export function speedText(d: { speed?: number; swimSpeed?: number; flySpeed?: number }): string {
+    const parts: string[] = [];
+    if (typeof d.speed === 'number') parts.push(String(d.speed));
+    if (typeof d.swimSpeed === 'number') parts.push(`swim ${d.swimSpeed}`);
+    if (typeof d.flySpeed === 'number') parts.push(`fly ${d.flySpeed}`);
+    return parts.join(' / ');
 }
 /**
  * Close a strip and its rows into one box: the strip's rule and the bottom
@@ -420,7 +444,7 @@ export function renderStatusBlock(d: StatusInput): string {
         // The footer rides under the frame, outside it.
         return d.footer?.length ? `${box}${d.footer.join(` ${g.sep} `)}\n` : box;
     }
-    let out = renderStrip({ callsign: callsign(d.characterName ?? '???'), day: d.day, time: d.time, rads: d.rads, badge: d.badge });
+    let out = renderStrip({ callsign: callsign(d.characterName ?? '???'), day: d.day, time: d.time, era: d.era, rads: d.rads, badge: d.badge });
     const rows: Cell[][] = [];
     rows.push([L('HP '), V(`${d.hp ?? '?'}/${d.maxHp ?? '?'}`)]);
     if (typeof d.rads === 'number')
@@ -444,6 +468,14 @@ export function renderStatusBlock(d: StatusInput): string {
             rows.push(mount);
         }
     }
+    const spd = speedText(d);
+    const env = environmentGlyph(d.environment);
+    if (spd || env) {
+        const move: Cell[] = [];
+        if (spd) move.push(L('SPD '), V(spd));
+        if (env) move.push(L(spd ? '   ' : ''), V(env));
+        rows.push(move);
+    }
     const conds = (d.conditions ?? []).map(c => typeof c === 'string' ? c : `${c.name}${c.duration ? ` (${c.duration}d)` : ''}`);
     rows.push([L('WOUNDS: '), conds.length ? V(conds.join(` ${g.sep} `)) : L('none')]);
     if (d.effects?.length) rows.push([L('EFFECTS: '), V(d.effects.join(` ${g.sep} `))]);
@@ -451,7 +483,9 @@ export function renderStatusBlock(d: StatusInput): string {
     if (typeof d.gold === 'number') tail.push(L(`${d.currencyLabel ?? 'RU'} `), V(d.gold));
     if (d.weather) tail.push(L(tail.length ? `   ${g.sep} ` : ''), L('WEATHER '), V(d.weather));
     if (tail.length) rows.push(tail);
-    return framed(out, emit(rows));
+    const full = framed(out, emit(rows));
+    // The footer rides under the frame here too (exposure timers, request 10).
+    return d.footer?.length ? `${full}${d.footer.join(` ${g.sep} `)}\n` : full;
 }
 
 // ── honest fallback — an unknown actionType can never render empty ───
@@ -471,6 +505,8 @@ export interface ContactInput {
     targetAc?: number; hit?: boolean; crit?: boolean;
     damageTotal?: number; damageType?: string; damageRolls?: number[];
     damageModifier?: 'immune' | 'resistant' | 'vulnerable';
+    /** Request 11: the band gap scaled the damage (before → after). */
+    bandScale?: { multiplier: number; before: number; after: number };
     jamCheckOwed?: { weapon?: string; condition?: number; jamsOn?: string };
     hpBefore?: number; hpAfter?: number; defeated?: boolean;
     /** The GM resolved the attack at the table; the engine rolled no d20. */
@@ -519,6 +555,8 @@ export function renderContact(c: ContactInput): string {
         if (c.damageModifier)
             dmg.push(L(` ${g.sep} `), V(c.damageModifier === 'immune' ? 'IMMUNE (no damage)'
                 : c.damageModifier === 'resistant' ? 'RESISTANT (halved)' : 'VULNERABLE (doubled)'));
+        if (c.bandScale)
+            dmg.push(L(` ${g.sep} `), V(`×${c.bandScale.multiplier} band (${c.bandScale.before} → ${c.bandScale.after})`));
         if (typeof c.hpBefore === 'number' && typeof c.hpAfter === 'number')
             dmg.push(L('         '), V(callsign(c.targetName ?? '???')), L(' '), V(c.hpBefore), L(` ${g.to} `), V(c.hpAfter));
         rows.push(dmg);

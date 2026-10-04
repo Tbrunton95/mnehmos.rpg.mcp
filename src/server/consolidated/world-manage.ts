@@ -17,13 +17,17 @@ import { getWorldManager } from '../state/world-manager.js';
 import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
 import { persistGeneratedWorldEntities } from '../../services/generated-world-persistence.service.js';
-import { readWorldClock, clockAt, clockAfter, dayClock, clockWarning, recordsAfterClock, scheduleInWorldSql } from '../../engine/world-clock.js';
+import { readWorldClock, clockAt, clockAfter, dayClock, clockLabel, clockWarning, recordsAfterClock, scheduleInWorldSql, scheduleLiveSql } from '../../engine/world-clock.js';
+import { parseExposure, tickExposure, type ExposureTickLine } from '../../engine/exposure.js';
+import { CharacterRepository } from '../../storage/repos/character.repo.js';
+import { fireDueScheduledRows } from './character-manage.js';
+import { reconcileWorld, reconcileLine, RECONCILE_KINDS, type ReconcileFinding } from '../reconcile.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'list', 'delete', 'update', 'generate', 'get_state', 'snapshot', 'restore', 'list_snapshots', 'delete_snapshot', 'audit', 'advance'] as const;
+const ACTIONS = ['create', 'get', 'list', 'delete', 'update', 'generate', 'get_state', 'snapshot', 'restore', 'list_snapshots', 'delete_snapshot', 'audit', 'advance', 'era_jump', 'reconcile'] as const;
 type WorldManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -338,7 +342,7 @@ const LARGE_JUMP_HOURS = 72;
  * The one write path for the world clock: update and advance both land here,
  * so elapsedHours, regeneration and the time_passed note never diverge.
  */
-function writeEnvironment(worldId: string, patch: Partial<z.infer<typeof WorldEnvironmentSchema>>, actionType: 'update' | 'advance', opts: { correction?: boolean } = {}): Record<string, unknown> {
+function writeEnvironment(worldId: string, patch: Partial<z.infer<typeof WorldEnvironmentSchema>>, actionType: 'update' | 'advance' | 'era_jump', opts: { correction?: boolean } = {}): Record<string, unknown> {
     const worldRepo = getWorldRepo();
     // FINDINGS #88: elapsedHours — the world clock and the emission timer must
     // never disagree. The PRIOR clock is read before the write; the delta is
@@ -426,7 +430,8 @@ const AdvanceSchema = z.preprocess(
         id: z.string().optional().describe('Alias of worldId'),
         minutes: z.number().min(0).optional().describe('Minutes to advance'),
         hours: z.number().min(0).optional().describe('Hours to advance'),
-        days: z.number().min(0).optional().describe('Days to advance')
+        days: z.number().min(0).optional().describe('Days to advance'),
+        fireScheduled: z.boolean().optional().describe('Request 10: after the clock moves, fire the due live scheduled rows of this world in the same call (what process_scheduled does); reply carries fired[]. Default false: due rows are only counted')
     })
 );
 
@@ -435,7 +440,37 @@ async function handleAdvance(args: z.infer<typeof AdvanceSchema>): Promise<objec
     if (!(hours > 0)) {
         return { error: true, actionType: 'advance', message: 'advance needs minutes, hours or days greater than zero. Nothing was written.' };
     }
-    return advanceWorldClock(args.worldId, hours);
+    return advanceWorldClock(args.worldId, hours, { fireScheduled: args.fireScheduled === true });
+}
+
+/**
+ * Request 10: tick every exposure timer in the world by the elapsed hours.
+ * Only the advance path calls this: a correction moves the clock without
+ * time passing, so nothing dries out.
+ */
+function tickWorldExposure(db: ReturnType<typeof getDb>, worldId: string, hours: number): ExposureTickLine[] {
+    let rows: Array<{ id: string; exposure: string }>;
+    try {
+        rows = db.prepare("SELECT id, exposure FROM characters WHERE world_id = ? AND exposure IS NOT NULL AND exposure != '[]'").all(worldId) as Array<{ id: string; exposure: string }>;
+    } catch { return []; /* exposure or world_id column not present on this database */ }
+    if (!rows.length) return [];
+    const repo = new CharacterRepository(db);
+    const lines: ExposureTickLine[] = [];
+    const now = new Date().toISOString();
+    for (const row of rows) {
+        const entries = parseExposure(row.exposure);
+        if (!entries.length) continue;
+        const char = repo.findById(row.id) as { resourcePools?: Record<string, { current: number; max: number }>; conditions?: Array<{ name: string; duration?: number; source?: string }> } | null;
+        if (!char) continue;
+        const tick = tickExposure(row.id, entries, char.resourcePools ?? {}, char.conditions ?? [], hours);
+        const updates: Record<string, unknown> = {};
+        if (tick.poolsTouched) updates.resourcePools = tick.pools;
+        if (tick.condsTouched) updates.conditions = tick.conditions;
+        if (Object.keys(updates).length) repo.update(row.id, updates as Partial<import('../../schema/character.js').Character>);
+        db.prepare('UPDATE characters SET exposure = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(tick.entries), now, row.id);
+        lines.push(...tick.lines);
+    }
+    return lines;
 }
 
 /**
@@ -443,7 +478,7 @@ async function handleAdvance(args: z.infer<typeof AdvanceSchema>): Promise<objec
  * (regeneration, elapsed note) and count what came due. world_manage advance
  * and spatial_manage traverse {advanceClock} both call it.
  */
-export function advanceWorldClock(worldId: string, hours: number): Record<string, unknown> {
+export function advanceWorldClock(worldId: string, hours: number, opts: { fireScheduled?: boolean } = {}): Record<string, unknown> {
     const args = { worldId };
     const db = getDb();
     const clock = readWorldClock(db, args.worldId);
@@ -460,10 +495,18 @@ export function advanceWorldClock(worldId: string, hours: number): Record<string
     const result = writeEnvironment(args.worldId, next, 'advance');
     if (result.error) return result;
     const at = clockAt(next)!;
+    // Request 10: exposure timers tick with the clock; a correction never lands here.
+    const exposure = tickWorldExposure(db, args.worldId, hours);
+    // Request 10: fireScheduled fires the due rows here instead of only counting them.
+    let fired: Array<Record<string, unknown>> | undefined; let firedWarning: string | undefined;
+    if (opts.fireScheduled) {
+        const f = fireDueScheduledRows({ worldId: args.worldId, effectiveDay: at });
+        fired = f.results; firedWarning = f.backlogWarning;
+    }
     // Read-only counts: what process_scheduled and process_due would act on now.
     let scheduled = 0; let debts = 0;
     try {
-        scheduled = (db.prepare(`SELECT COUNT(*) AS n FROM scheduled_state_changes s WHERE s.fired = 0 AND ${scheduleInWorldSql('s')} AND s.fires_at_day <= ?`).get(args.worldId, args.worldId, at) as { n: number }).n;
+        scheduled = (db.prepare(`SELECT COUNT(*) AS n FROM scheduled_state_changes s WHERE ${scheduleLiveSql('s')} AND ${scheduleInWorldSql('s')} AND s.fires_at_day <= ?`).get(args.worldId, args.worldId, at) as { n: number }).n;
     } catch { /* no schedule table yet */ }
     try {
         debts = (db.prepare(`SELECT COUNT(*) AS n FROM ledger_debts WHERE world_id = ? AND due_day IS NOT NULL
@@ -478,11 +521,168 @@ export function advanceWorldClock(worldId: string, hours: number): Record<string
     } catch { /* no congregations table yet */ }
     const label = `Day ${next.day}, ${next.time}`;
     const due = [scheduled ? `${scheduled} scheduled row(s) due: process_scheduled {worldId}` : '', debts ? `${debts} debt(s) to move: ledger_manage process_due {worldId}` : '', congregations ? `${congregations} congregation(s) with a week to process: congregation_manage process_weekly {worldId}` : ''].filter(Boolean);
+    const exposureNote = exposure.length
+        ? `; exposure: ${exposure.map(e => `${e.name} ${e.pool} ${e.from}→${e.to}${e.conditionsAdded.length ? ` +${e.conditionsAdded.join(', ')}` : ''}`).join('; ')}`
+        : '';
     return {
         ...result,
         clock: label,
         dueNow: { scheduled, debts, ...(congregations > 0 ? { congregations } : {}) },
-        message: `Clock advanced ${Math.round(hours * 100) / 100}h to ${label}${result.regenerated ? `; regenerated to full: ${(result.regenerated as Array<{ name: string }>).map(r => r.name).join(', ')}` : ''}${due.length ? ` — ${due.join('; ')}` : ''}`
+        ...(exposure.length ? { exposure } : {}),
+        ...(fired ? { fired, firedCount: fired.length, ...(firedWarning ? { backlogWarning: firedWarning } : {}) } : {}),
+        message: `Clock advanced ${Math.round(hours * 100) / 100}h to ${label}${result.regenerated ? `; regenerated to full: ${(result.regenerated as Array<{ name: string }>).map(r => r.name).join(', ')}` : ''}${exposureNote}${fired ? `; fired ${fired.length} scheduled row(s)` : ''}${due.length ? ` — ${due.join('; ')}` : ''}`
+    };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Deep One audit request 2: ERA JUMP — a campaign skips years (M42 → the next
+// era) and nothing from the old age should fire, stay armed or read as live.
+// The clock moves through the correction path (no regeneration, no elapsed
+// note); the era label is written beside it; active plot threads are parked
+// with a dated section; unfired scheduled rows are cancelled (stamped, not
+// deleted); row-level ability state resets; wall-clock effects expire. One
+// report of ids and counts; dryRun computes the same report and writes nothing.
+// ═══════════════════════════════════════════════════════════════════════════
+const EraJumpSchema = z.object({
+    action: z.literal('era_jump'),
+    worldId: z.string().describe('World whose clock jumps'),
+    day: z.number().describe('The new campaign day'),
+    time: z.string().regex(/^\d{1,2}:\d{2}$/).optional().describe("HH:MM at the new day (default: the world's stored time)"),
+    label: z.string().min(1).describe("Era label written to environment.era, e.g. 'M42, after the Drowning' — shown at boot, on the status block date line and in clockWarning"),
+    threads: z.enum(['dormant', 'archived', 'keep']).optional().default('dormant').describe("What happens to every ACTIVE plot_thread: dormant (default) or archived, each with a '[era: <label>] parked at day N' section appended; keep leaves them active"),
+    scheduled: z.enum(['cancel', 'keep']).optional().default('cancel').describe("Unfired scheduled rows for the world: cancel (default; stamps cancelled_at — list_scheduled {includeCancelled} still shows them) or keep"),
+    resetAbilities: z.boolean().optional().default(true).describe('Default true: every character in the world gets combat_profile.abilities[].ready = true, legendary actions/resistances remaining back to their maxima, and wall-clock custom_effects (those with expires_at) expired'),
+    dryRun: z.boolean().optional().default(false).describe('Compute the full report and write NOTHING')
+});
+
+async function handleEraJump(args: z.infer<typeof EraJumpSchema>): Promise<object> {
+    const db = getDb();
+    const worldRow = db.prepare('SELECT id FROM worlds WHERE id = ?').get(args.worldId);
+    if (!worldRow) return { error: true, actionType: 'era_jump', message: `World not found: ${args.worldId}` };
+    const prior = readWorldClock(db, args.worldId);
+    const now = new Date().toISOString();
+    const tryRows = <T>(fn: () => T[]): T[] => { try { return fn(); } catch { return []; } };
+
+    // 2. Active plot threads: title is the first line of the note's head.
+    const threadRows = tryRows(() => db.prepare("SELECT id, content FROM narrative_notes WHERE world_id = ? AND type = 'plot_thread' AND status = 'active' ORDER BY updated_at DESC")
+        .all(args.worldId) as Array<{ id: string; content: string }>);
+    const threadStatus = args.threads === 'keep' ? 'active' : args.threads;
+    const threads = threadRows.map(r => ({ id: r.id, title: r.content.trim().split('\n')[0].slice(0, 100), status: threadStatus }));
+
+    // 3. Unfired, uncancelled scheduled rows of this world (own tag or character's).
+    const scheduledRows = args.scheduled === 'cancel'
+        ? tryRows(() => db.prepare(`SELECT s.id FROM scheduled_state_changes s WHERE ${scheduleLiveSql('s')} AND ${scheduleInWorldSql('s')} ORDER BY s.id`).all(args.worldId, args.worldId) as Array<{ id: number }>)
+        : [];
+    const scheduledCancelled = scheduledRows.map(r => r.id);
+
+    // 4. Row-level ability state: ready flags in the combat_profile JSON and
+    // the legendary *_remaining columns (maxima live in legendary_actions /
+    // legendary_resistances). Only rows that actually change are counted.
+    type CharRow = { id: string; combat_profile: string | null; legendary_actions: number | null; legendary_actions_remaining: number | null; legendary_resistances: number | null; legendary_resistances_remaining: number | null };
+    const resets: Array<{ id: string; profile: string | null }> = [];
+    let effectsCleared = 0;
+    if (args.resetAbilities) {
+        const chars = tryRows(() => db.prepare('SELECT id, combat_profile, legendary_actions, legendary_actions_remaining, legendary_resistances, legendary_resistances_remaining FROM characters WHERE world_id = ?').all(args.worldId) as CharRow[]);
+        for (const c of chars) {
+            let profile: string | null = null;
+            let changed = false;
+            if (c.combat_profile) {
+                try {
+                    const parsed = JSON.parse(c.combat_profile) as { abilities?: Array<{ ready?: boolean }> };
+                    if (Array.isArray(parsed.abilities) && parsed.abilities.some(a => a && a.ready === false)) {
+                        for (const a of parsed.abilities) if (a) a.ready = true;
+                        profile = JSON.stringify(parsed);
+                        changed = true;
+                    }
+                } catch { /* unreadable profile: left alone */ }
+            }
+            if (c.legendary_actions !== null && c.legendary_actions_remaining !== c.legendary_actions) changed = true;
+            if (c.legendary_resistances !== null && c.legendary_resistances_remaining !== c.legendary_resistances) changed = true;
+            if (changed) resets.push({ id: c.id, profile });
+        }
+        try {
+            effectsCleared = (db.prepare('SELECT COUNT(*) AS n FROM custom_effects WHERE is_active = 1 AND expires_at IS NOT NULL AND target_id IN (SELECT id FROM characters WHERE world_id = ?)').get(args.worldId) as { n: number }).n;
+        } catch { effectsCleared = 0; }
+    }
+
+    const toTime = args.time ?? prior?.time;
+    const from = { day: prior?.day ?? null, ...(prior?.time ? { time: prior.time } : {}) };
+    const report = {
+        success: true,
+        actionType: 'era_jump',
+        worldId: args.worldId,
+        dryRun: args.dryRun,
+        from,
+        to: { day: args.day, ...(toTime ? { time: toTime } : {}), era: args.label },
+        threadsAction: args.threads,
+        threads,
+        scheduledAction: args.scheduled,
+        scheduledCancelled,
+        abilitiesReset: resets.length,
+        effectsCleared
+    };
+    const summary = `${threads.length} thread(s) ${args.threads === 'keep' ? 'kept active' : `→ ${threadStatus}`}, ${scheduledCancelled.length} scheduled row(s) ${args.scheduled === 'cancel' ? 'cancelled' : 'kept'}, ${resets.length} character(s) reset, ${effectsCleared} wall-clock effect(s) expired`;
+    if (args.dryRun) {
+        return { ...report, message: `DRY RUN — era '${args.label}' would start at ${dayClock(clockAt({ day: args.day, time: toTime }) ?? args.day)} (from ${prior ? clockLabel(prior) : 'no clock'}): ${summary}. Nothing was written.` };
+    }
+
+    // 1. The clock, through the correction path: no regeneration, no elapsed note.
+    const clockResult = writeEnvironment(args.worldId, { day: args.day, ...(args.time ? { time: args.time } : {}), era: args.label }, 'era_jump', { correction: true });
+    if (clockResult.error) return clockResult;
+    // 2. Park the threads with a section stamped at the OLD clock.
+    if (threads.length && args.threads !== 'keep') {
+        const stamp = prior ? clockLabel(prior) : now.slice(0, 10);
+        const section = `\n\n── [${stamp}] ──\n[era: ${args.label}] parked at day ${prior?.day ?? 'unset'}`;
+        const park = db.prepare('UPDATE narrative_notes SET status = ?, content = content || ?, updated_at = ? WHERE id = ?');
+        for (const t of threads) park.run(threadStatus, section, now, t.id);
+    }
+    // 3. Cancel the scheduled rows — a stamp, never a DELETE.
+    if (scheduledCancelled.length) {
+        const cancel = db.prepare('UPDATE scheduled_state_changes SET cancelled_at = ? WHERE id = ?');
+        for (const id of scheduledCancelled) cancel.run(now, id);
+    }
+    // 4. Abilities ready, legendary pools full, wall-clock effects expired.
+    if (args.resetAbilities) {
+        const resetProfile = db.prepare('UPDATE characters SET combat_profile = ?, legendary_actions_remaining = legendary_actions, legendary_resistances_remaining = legendary_resistances, updated_at = ? WHERE id = ?');
+        const resetLegendary = db.prepare('UPDATE characters SET legendary_actions_remaining = legendary_actions, legendary_resistances_remaining = legendary_resistances, updated_at = ? WHERE id = ?');
+        for (const r of resets) {
+            if (r.profile !== null) resetProfile.run(r.profile, now, r.id);
+            else resetLegendary.run(now, r.id);
+        }
+        if (effectsCleared) {
+            try { db.prepare('UPDATE custom_effects SET is_active = 0 WHERE is_active = 1 AND expires_at IS NOT NULL AND target_id IN (SELECT id FROM characters WHERE world_id = ?)').run(args.worldId); } catch { /* counted above; table absent */ }
+        }
+    }
+    const after = readWorldClock(db, args.worldId);
+    return {
+        ...report,
+        ...(clockResult.clockWarning ? { clockWarning: clockResult.clockWarning } : {}),
+        message: `Era '${args.label}' begins at ${after ? clockLabel(after) : `Day ${args.day}`} (from ${prior ? clockLabel(prior) : 'no clock'}; no time passed, no regeneration): ${summary}.`
+    };
+}
+
+// Deep One audit request 4: RECONCILE — sheet drift from fights run in chat.
+// Lanes live in ../reconcile.ts (boot reads the same report). Read-only.
+// ═══════════════════════════════════════════════════════════════════════════
+const ReconcileSchema = z.object({
+    action: z.literal('reconcile'),
+    worldId: z.string().describe('World whose characters are checked'),
+    characterId: z.string().optional().describe('Check one character instead of every character in the world')
+});
+
+async function handleReconcile(args: z.infer<typeof ReconcileSchema>): Promise<object> {
+    const db = getDb();
+    if (!db.prepare('SELECT id FROM worlds WHERE id = ?').get(args.worldId)) return { error: true, actionType: 'reconcile', message: `World not found: ${args.worldId}` };
+    const report = reconcileWorld(db, args.worldId, args.characterId);
+    const kinds = Object.entries(report.byKind).map(([k, n]) => `${k} ×${n}`).join(', ');
+    return {
+        success: true,
+        actionType: 'reconcile',
+        ...report,
+        kinds: RECONCILE_KINDS,
+        message: report.count === 0
+            ? `Reconcile clean — ${args.characterId ? 'the sheet agrees' : 'every sheet agrees'} with inventory, encounters and the precedent ledger.${report.scope === 'all-characters' ? ' (characters carry no world_id on this db — every character was read)' : ''}`
+            : `${report.count} finding(s): ${kinds}. Each carries the fix call; fixing is a decision, not an auto-repair.${report.scope === 'all-characters' ? ' (characters carry no world_id on this db — every character was read)' : ''}`
     };
 }
 
@@ -540,8 +740,8 @@ async function handleAudit(args: { worldId?: string }): Promise<object> {
         () => db.prepare(`SELECT id, name, current_room_id AS roomId FROM characters WHERE world_id = ? AND current_room_id IS NOT NULL AND current_room_id NOT IN (SELECT id FROM room_nodes) AND current_room_id NOT IN (SELECT id FROM rooms)`).all(W),
         () => db.prepare(`SELECT id, name, current_room_id AS roomId FROM characters WHERE current_room_id IS NOT NULL AND current_room_id NOT IN (SELECT id FROM room_nodes) AND current_room_id NOT IN (SELECT id FROM rooms)`).all());
     runW('scheduled rows for missing characters',
-        () => db.prepare(`SELECT id AS scheduleId, character_id AS characterId, note, fires_at_day AS firesAtDay FROM scheduled_state_changes WHERE fired = 0 AND world_id = ? AND character_id NOT IN (SELECT id FROM characters)`).all(W),
-        () => db.prepare(`SELECT id AS scheduleId, character_id AS characterId, note, fires_at_day AS firesAtDay FROM scheduled_state_changes WHERE fired = 0 AND character_id NOT IN (SELECT id FROM characters)`).all());
+        () => db.prepare(`SELECT id AS scheduleId, character_id AS characterId, note, fires_at_day AS firesAtDay FROM scheduled_state_changes WHERE ${scheduleLiveSql('')} AND world_id = ? AND character_id NOT IN (SELECT id FROM characters)`).all(W),
+        () => db.prepare(`SELECT id AS scheduleId, character_id AS characterId, note, fires_at_day AS firesAtDay FROM scheduled_state_changes WHERE ${scheduleLiveSql('')} AND character_id NOT IN (SELECT id FROM characters)`).all());
     runW('active effects on missing characters', null,
         // FINDINGS #103b: dead since #88 — queried character_id; the column is target_id. First run ever.
         () => db.prepare(`SELECT id, name, target_id AS characterId FROM custom_effects WHERE is_active = 1 AND target_id NOT IN (SELECT id FROM characters)`).all());
@@ -726,7 +926,19 @@ const definitions: Record<WorldManageAction, ActionDefinition> = {
         schema: AdvanceSchema,
         handler: async (args) => handleAdvance(args as z.infer<typeof AdvanceSchema>),
         aliases: ['pass_time', 'tick'],
-        description: 'Move the world clock forward by minutes, hours or days (midnight rollover handled); same side effects as update, plus dueNow counts'
+        description: 'Move the world clock forward by minutes, hours or days (midnight rollover handled); same side effects as update, plus exposure timers ticked, dueNow counts, and fireScheduled: true fires the due scheduled rows'
+    },
+    era_jump: {
+        schema: EraJumpSchema,
+        handler: async (args) => handleEraJump(args as z.infer<typeof EraJumpSchema>),
+        aliases: ['new_era', 'epoch', 'time_skip'],
+        description: "Request 2: skip to a new era — clock moves by the correction path, environment.era = label, active plot threads parked (dormant/archived) with a dated section, unfired scheduled rows cancelled, abilities/legendary pools reset, wall-clock effects expired; dryRun reports without writing"
+    },
+    reconcile: {
+        schema: ReconcileSchema,
+        handler: async (args) => handleReconcile(args as z.infer<typeof ReconcileSchema>),
+        aliases: ['drift', 'check_sheets'],
+        description: 'Request 4: sheet drift — equipped rows with no item, duplicate attack profiles, attack items not held, conditions citing superseded/missing precedents, abilities/legendary pools spent outside combat, unposted XP awards. Read-only; every finding names its fix call'
     },
     audit: {
         schema: z.preprocess(
@@ -789,22 +1001,25 @@ const router = createActionRouter({
 export const WorldManageTool = {
     name: 'world_manage',
     description: `Manage RPG worlds - creation, retrieval, and procedural generation.
-Actions: create, get, list, delete, update (environment), advance (clock), generate (procedural), get_state, snapshot, restore, list_snapshots
+Actions: create, get, list, delete, update (environment), advance (clock), era_jump (new era), audit, reconcile (sheet drift), generate (procedural), get_state, snapshot, restore, list_snapshots
 Aliases: new→create, fetch→get, all→list, remove→delete, set→update, gen→generate, state→get_state
 
 🌍 WORLD WORKFLOW:
 1. generate - Create procedural world with terrain/biomes
 2. get_state - Check world status
 3. update - Set time/weather/season; correction:true when fixing a wrong clock (no regeneration, no time_passed)
-   advance {worldId, minutes?|hours?|days?} - move the clock forward; returns dueNow {scheduled, debts, congregations?}
+   advance {worldId, minutes?|hours?|days?, fireScheduled?} - move the clock forward; ticks every exposure timer in the world (character_manage set_exposure; reply exposure: [{characterId, name, pool, from, to, conditionsAdded}]); returns dueNow {scheduled, debts, congregations?}; fireScheduled: true also fires the due scheduled rows (reply fired[]) instead of only counting them
+   era_jump {worldId, day, time?, label, threads?: dormant|archived|keep, scheduled?: cancel|keep, resetAbilities?: true, dryRun?} - years pass between campaigns: clock corrected (no regeneration), environment.era = label, active threads parked with a '[era: label]' section, unfired scheduled rows cancelled (stamped; list_scheduled {includeCancelled} shows them), abilities ready and legendary pools full, wall-clock effects expired. Reply: {from, to, threads, scheduledCancelled, abilitiesReset, effectsCleared}; dryRun writes nothing
+   reconcile {worldId, characterId?} - after fights run in chat: {findings: [{kind, characterId, characterName, detail, fix}], count}. Kinds: equipped_missing (equipped row with quantity ≤ 0 or no item), attack_duplicate (two profiles share a name), attack_item_missing (profile.item not in inventory), condition_stale_precedent (source/note cites a prec-id that is superseded or missing), ability_spent_outside_combat, legendary_depleted_outside_combat, xp_unposted. Read-only; boot shows 'RECONCILE: n findings' when n > 0
 4. For map operations, use world_map tool instead`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
-        label: z.string().optional().describe('Snapshot label (for snapshot/restore)'),
+        label: z.string().optional().describe('Snapshot label (for snapshot/restore); era_jump: the era label written to environment.era'),
         confirmGlobal: z.boolean().optional().describe('FINDINGS #111 (mirror): restore — accept rolling back OTHER worlds with newer writes; refused without it when collateral exists'),
         id: z.string().optional().describe('World ID'),
-        worldId: z.string().optional().describe('World ID (for get_state)'),
+        worldId: z.string().optional().describe('World ID (for get_state, audit, era_jump, reconcile)'),
+        characterId: z.string().optional().describe('reconcile: check one character instead of the whole world'),
         name: z.string().optional().describe('World name (for create)'),
         seed: z.string().optional().describe('Seed for generation'),
         width: z.number().optional().describe('World width'),
@@ -816,7 +1031,14 @@ Aliases: new→create, fetch→get, all→list, remove→delete, set→update, g
         correction: z.boolean().optional().describe('update: the clock was wrong, not time passing — no regeneration, no elapsed note; returns correction {from, to, deltaHours}'),
         minutes: z.number().optional().describe('advance: minutes to move the clock forward'),
         hours: z.number().optional().describe('advance: hours to move the clock forward'),
-        days: z.number().optional().describe('advance: days to move the clock forward')
+        days: z.number().optional().describe('advance: days to move the clock forward'),
+        fireScheduled: z.boolean().optional().describe('advance: fire the due live scheduled rows of the world after the clock moves (reply fired[]); default false, counts only'),
+        day: z.number().optional().describe('era_jump: the new campaign day'),
+        time: z.string().optional().describe('era_jump: HH:MM at the new day'),
+        threads: z.enum(['dormant', 'archived', 'keep']).optional().describe('era_jump: what active plot threads become (default dormant)'),
+        scheduled: z.enum(['cancel', 'keep']).optional().describe('era_jump: cancel (default) or keep unfired scheduled rows'),
+        resetAbilities: z.boolean().optional().describe('era_jump: reset abilities/legendary pools and expire wall-clock effects (default true)'),
+        dryRun: z.boolean().optional().describe('era_jump: compute the report, write nothing')
     })
 };
 
@@ -881,7 +1103,38 @@ export async function handleWorldManage(args: unknown, _ctx: SessionContext): Pr
             case 'advance':
                 output = RichFormatter.header('Clock Advanced', '🕰️');
                 output += RichFormatter.keyValue({ 'World ID': `\`${parsed.worldId}\``, 'Now': parsed.clock, 'Elapsed': `${parsed.elapsedHours}h` });
+                if (parsed.exposure?.length) {
+                    output += RichFormatter.section('Exposure');
+                    output += RichFormatter.list((parsed.exposure as Array<{ characterId: string; name: string; pool: string; from: number; to: number; conditionsAdded: string[] }>).map(e => `${e.characterId} · ${e.name}: ${e.pool} ${e.from} → ${e.to}${e.conditionsAdded.length ? ` (+${e.conditionsAdded.join(', ')})` : ''}`));
+                }
+                if (parsed.fired?.length) {
+                    output += RichFormatter.section(`Fired (${parsed.fired.length})`);
+                    output += RichFormatter.list((parsed.fired as Array<{ scheduleId: number; characterName?: string; note?: string | null; applied?: string[] }>).map(f => `#${f.scheduleId} ${f.characterName ?? ''}${f.note ? `: ${f.note}` : ''} — ${(f.applied ?? []).join('; ')}`));
+                }
                 if (parsed.message) output += RichFormatter.alert(parsed.message, 'info');
+                break;
+            case 'era_jump':
+                output = RichFormatter.header(parsed.dryRun ? 'Era Jump (dry run)' : 'Era Jump', '⌛');
+                output += RichFormatter.keyValue({
+                    'World ID': `\`${parsed.worldId}\``,
+                    'From': parsed.from?.day !== null && parsed.from?.day !== undefined ? `Day ${parsed.from.day}${parsed.from.time ? `, ${parsed.from.time}` : ''}` : 'no clock',
+                    'To': `Day ${parsed.to?.day}${parsed.to?.time ? `, ${parsed.to.time}` : ''} · era ${parsed.to?.era}`,
+                    'Threads': `${(parsed.threads ?? []).length} → ${parsed.threadsAction}`,
+                    'Scheduled cancelled': (parsed.scheduledCancelled ?? []).length,
+                    'Characters reset': parsed.abilitiesReset,
+                    'Effects expired': parsed.effectsCleared
+                });
+                if (parsed.message) output += RichFormatter.alert(parsed.message, parsed.dryRun ? 'warning' : 'info');
+                if (parsed.clockWarning) output += RichFormatter.alert(parsed.clockWarning, 'warning');
+                break;
+            case 'reconcile':
+                output = RichFormatter.header('Sheet Reconcile', '🧮');
+                output += RichFormatter.keyValue({ 'World ID': `\`${parsed.worldId}\``, ...(parsed.characterId ? { 'Character': `\`${parsed.characterId}\`` } : {}), 'Findings': parsed.count });
+                for (const f of (parsed.findings ?? []).slice(0, 12) as ReconcileFinding[]) {
+                    output += `• ${reconcileLine(f)}\n  fix: ${f.fix}\n`;
+                }
+                if ((parsed.findings ?? []).length > 12) output += `… ${parsed.findings.length - 12} more in the JSON\n`;
+                if (parsed.message) output += RichFormatter.alert(parsed.message, parsed.count > 0 ? 'warning' : 'info');
                 break;
             case 'audit':
                 output = RichFormatter.header('Consistency Audit', '🩺');

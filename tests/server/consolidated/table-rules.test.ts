@@ -1,6 +1,6 @@
 import { handleTableRules } from '../../../src/server/consolidated/table-rules.js';
 import { closeDb, getDb } from '../../../src/storage/index.js';
-import { loadRule, loadRules, compareBands, resolveWorldId, DEFAULT_BAND_ORDER } from '../../../src/engine/table-rules.js';
+import { loadRule, loadRules, compareBands, resolveWorldId, DEFAULT_BAND_ORDER, bandDamageMultiplier, scaleDamageByBand, parseRuleSpec } from '../../../src/engine/table-rules.js';
 import { WorldRepository } from '../../../src/storage/repos/world.repo.js';
 import { DAY_366_PRESET } from '../../../src/data/table-rules/day-366.js';
 
@@ -94,6 +94,41 @@ describe('band helpers', () => {
         expect(compareBands(DEFAULT_BAND_ORDER, 'Primarch-class', 'Monster/Lord')).toBe(1);
         expect(compareBands(DEFAULT_BAND_ORDER, undefined, 'Astartes')).toBeNull();
         expect(compareBands(DEFAULT_BAND_ORDER, 'Ork', 'Astartes')).toBeNull();
+    });
+
+    it('band.damageScale parses with defaults, and stays absent when not given (request 11)', () => {
+        const plain = parseRuleSpec('band', { order: ['a', 'b'] });
+        expect(plain.damageScale).toBeUndefined();
+        const scaled = parseRuleSpec('band', { order: ['a', 'b'], damageScale: {} });
+        expect(scaled.damageScale).toEqual({ perStepBelow: 0.5, perStepAbove: 1.25, floor: 0.25, cap: 2 });
+        const custom = parseRuleSpec('band', { order: ['a', 'b'], damageScale: { perStepAbove: 1.5, cap: 3 } });
+        expect(custom.damageScale).toEqual({ perStepBelow: 0.5, perStepAbove: 1.5, floor: 0.25, cap: 3 });
+        expect(() => parseRuleSpec('band', { order: ['a', 'b'], damageScale: { perStepBelow: 0 } })).toThrow();
+    });
+
+    it('bandDamageMultiplier: steps from the order, powered, clamped, null when it cannot apply', () => {
+        const spec = parseRuleSpec('band', { order: DEFAULT_BAND_ORDER, damageScale: {} });
+        expect(bandDamageMultiplier(spec, 'Elite Mortal', 'Astartes')).toEqual({ steps: -1, multiplier: 0.5 });
+        expect(bandDamageMultiplier(spec, 'mortal', 'astartes')).toEqual({ steps: -2, multiplier: 0.25 });
+        expect(bandDamageMultiplier(spec, 'Mortal', 'Primarch-class')).toEqual({ steps: -5, multiplier: 0.25 });
+        expect(bandDamageMultiplier(spec, 'Astartes', 'Mortal')).toEqual({ steps: 2, multiplier: 1.5625 });
+        expect(bandDamageMultiplier(spec, 'Primarch-class', 'Mortal')).toEqual({ steps: 5, multiplier: 2 });
+        expect(bandDamageMultiplier(spec, 'Astartes', 'Astartes')).toBeNull();
+        expect(bandDamageMultiplier(spec, undefined, 'Astartes')).toBeNull();
+        expect(bandDamageMultiplier(spec, 'Ork', 'Astartes')).toBeNull();
+        expect(bandDamageMultiplier(parseRuleSpec('band', { order: DEFAULT_BAND_ORDER }), 'Mortal', 'Astartes')).toBeNull();
+        expect(bandDamageMultiplier(undefined, 'Mortal', 'Astartes')).toBeNull();
+        // A TableRule works as well as its spec.
+        expect(bandDamageMultiplier({ id: 'r', worldId: W, kind: 'band', name: 'bands', enabled: true, spec } as any, 'Mortal', 'Astartes')).toEqual({ steps: -2, multiplier: 0.25 });
+    });
+
+    it('scaleDamageByBand floors and never drops a landed blow below 1', () => {
+        expect(scaleDamageByBand(20, { steps: -1, multiplier: 0.5 })).toBe(10);
+        expect(scaleDamageByBand(7, { steps: -1, multiplier: 0.5 })).toBe(3);
+        expect(scaleDamageByBand(1, { steps: -5, multiplier: 0.25 })).toBe(1);
+        expect(scaleDamageByBand(0, { steps: -5, multiplier: 0.25 })).toBe(0);
+        expect(scaleDamageByBand(16, { steps: 2, multiplier: 1.5625 })).toBe(25);
+        expect(scaleDamageByBand(16, null)).toBe(16);
     });
 
     it('resolveWorldId tolerates missing columns and rows', () => {

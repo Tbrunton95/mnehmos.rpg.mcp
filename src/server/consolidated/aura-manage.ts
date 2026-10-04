@@ -24,6 +24,7 @@ import {
     getAurasAtPosition,
 } from '../../engine/magic/aura.js';
 import { startConcentration, breakConcentration } from '../../engine/magic/concentration.js';
+import { loggedD20, loggedRoll } from '../../math/logged-d20.js';
 import { AuraTriggerSchema } from '../../schema/aura.js';
 import { Token } from '../../schema/encounter.js';
 
@@ -249,11 +250,17 @@ async function handleProcess(args: z.infer<typeof ProcessSchema>): Promise<objec
         ? JSON.parse(encounter.tokens)
         : encounter.tokens;
 
+    // Aura saves and dice on logged crypto dice, for the target.
+    const db = getDb();
     const results = checkAuraEffectsForTarget(
         tokens,
         args.targetId,
         args.trigger,
-        auraRepo
+        auraRepo,
+        {
+            d20: (purpose, forId) => loggedD20(db, { purpose, forId }, { tool: 'aura_manage' }).natural,
+            roll: (notation, purpose, forId) => Math.max(0, loggedRoll(db, { purpose, forId }, notation, { tool: 'aura_manage' }).total)
+        }
     );
 
     return {

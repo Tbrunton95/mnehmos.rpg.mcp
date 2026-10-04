@@ -1,18 +1,48 @@
 import seedrandom from 'seedrandom';
 import { DiceExpression, CalculationResult } from './schemas.js';
-import { freshSeed } from './seed.js';
+import { assertNotCryptoKey, cryptoInt, cryptoReplayKey } from './crypto-dice.js';
 import { parseDiceTerms, type DiceTerm } from '../engine/combat/rng.js';
 
+/**
+ * Dice for math_manage and other rolls outside an encounter. Without a seed
+ * the engine rolls crypto dice (the table default) and its `seed` is the
+ * roll's 'crypto:<nonce>' audit key; with a seed it is a replayable
+ * seedrandom stream.
+ */
 export class DiceEngine {
     /** Backstop for one die's explosion chain; parse() already refuses d1!. */
     static readonly MAX_EXPLOSIONS = 100;
 
-    private rng: seedrandom.PRNG;
+    readonly mode: 'crypto' | 'seeded';
+    private rng: seedrandom.PRNG | null;
+    /** The seed (seeded) or the 'crypto:<nonce>' audit key (crypto) written to roll_log.replay. */
     private seed: string;
 
     constructor(seed?: string) {
-        this.seed = seed || freshSeed('dice');
-        this.rng = seedrandom(this.seed);
+        if (seed) {
+            assertNotCryptoKey(seed);
+            this.mode = 'seeded';
+            this.seed = seed;
+            this.rng = seedrandom(seed);
+        } else {
+            this.mode = 'crypto';
+            this.seed = cryptoReplayKey();
+            this.rng = null;
+        }
+    }
+
+    /** 'crypto' or 'seeded:<seed>', for a reply. */
+    describe(): string {
+        return this.mode === 'crypto' ? 'crypto' : `seeded:${this.seed}`;
+    }
+
+    /** The replay key this engine's rolls log: the seed, or 'crypto:<nonce>'. */
+    get replayKey(): string {
+        return this.seed;
+    }
+
+    private die(sides: number): number {
+        return this.rng ? Math.floor(this.rng() * sides) + 1 : cryptoInt(sides);
     }
 
     /** NdX, dX (1dX), NdX+M, NdXdl1, NdXkh2, NdXdl1+5, NdX! */
@@ -36,7 +66,7 @@ export class DiceEngine {
         for (const t of terms) {
             const sign = t.sign < 0 ? '-' : '+';
             if (t.kind === 'dice') {
-                const values = Array.from({ length: t.count }, () => Math.floor(this.rng() * t.sides) + 1);
+                const values = Array.from({ length: t.count }, () => this.die(t.sides));
                 for (const value of values) dice.push({ sides: t.sides, value, sign: t.sign });
                 const sum = values.reduce((a, b) => a + b, 0);
                 total += t.sign * sum;
@@ -164,7 +194,7 @@ export class DiceEngine {
         const rolls: number[] = [];
 
         for (let i = 0; i < expr.count; i++) {
-            let roll = Math.floor(this.rng() * expr.sides) + 1;
+            let roll = this.die(expr.sides);
             rolls.push(roll);
 
             if (expr.explode && roll === expr.sides) {
@@ -172,7 +202,7 @@ export class DiceEngine {
                 let exploded = roll;
                 let explosions = 0;
                 while (exploded === expr.sides && explosions++ < DiceEngine.MAX_EXPLOSIONS) {
-                    exploded = Math.floor(this.rng() * expr.sides) + 1;
+                    exploded = this.die(expr.sides);
                     rolls.push(exploded);
                 }
             }

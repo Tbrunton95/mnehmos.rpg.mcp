@@ -8,6 +8,7 @@ import { Character, NPC } from '../../schema/character.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { saveModifier } from '../combat/saves.js';
+import { cryptoInt } from '../../math/crypto-dice.js';
 
 /**
  * Calculate the DC for a concentration save after taking damage
@@ -21,9 +22,9 @@ export function calculateConcentrationDC(damageAmount: number): number {
 /**
  * Roll a constitution saving throw for concentration. Callers pass the die:
  * the encounter's seeded stream in combat, a logged d20 outside it.
- * Math.random is only the last-resort default for direct engine callers.
+ * Unlogged crypto dice are only the last-resort default for direct engine callers.
  */
-export function rollConcentrationSave(constitutionModifier: number, d20: () => number = () => Math.floor(Math.random() * 20) + 1): { roll: number; total: number } {
+export function rollConcentrationSave(constitutionModifier: number, d20: () => number = () => cryptoInt(20)): { roll: number; total: number } {
     const roll = d20();
     const total = roll + constitutionModifier;
     return { roll, total };

@@ -13,6 +13,7 @@ import { RichFormatter } from '../utils/formatter.js';
 import { getDb } from '../../storage/index.js';
 import { TheftRepository } from '../../storage/repos/theft.repo.js';
 import { HeatLevelSchema, HEAT_VALUES, compareHeatLevels, HeatLevel } from '../../schema/theft.js';
+import { loggedRoll } from '../../math/logged-d20.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -230,7 +231,8 @@ async function handleRecognize(args: z.infer<typeof RecognizeSchema>): Promise<o
     // Guards check based on heat and bounty
     const heatValue = HEAT_VALUES[record.heatLevel];
     const recognitionChance = Math.min(100, heatValue + record.bounty / 10);
-    const roll = Math.random() * 100;
+    // A percentile die (0–99) on crypto dice, logged as 'theft' for the NPC against the item.
+    const roll = loggedRoll(getDb(), { purpose: 'theft', forId: args.npcId, targetId: args.itemId }, '1d100', { tool: 'theft_manage' }).total - 1;
 
     if (roll < recognitionChance) {
         return {
