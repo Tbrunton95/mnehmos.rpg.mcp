@@ -1,5 +1,6 @@
 import { AuditRepository } from '../storage/audit.repo.js';
 import { getDb } from '../storage/index.js';
+import { replyJson } from './reply-status.js';
 
 const REDACTED = '[REDACTED]';
 const MAX_STRING_LENGTH = 2000;
@@ -42,16 +43,12 @@ function detectSoftError(result: unknown): string | undefined {
     const text = content?.[0]?.text;
     if (!text) return undefined;
 
-    try {
-        const parsed = JSON.parse(text);
-        if (parsed?.error === true || typeof parsed?.error === 'string') {
-            return parsed.message || parsed.error;
-        }
-    } catch {
-        // Rich text responses can embed JSON later; leave them as successful
-        // unless the handler threw an exception.
+    // The embed behind a banner counts too (#11): a validation failure under
+    // a rendered header is a failure in the audit log as well.
+    const parsed = replyJson(text);
+    if (parsed && (parsed.error === true || (typeof parsed.error === 'string' && parsed.error !== ''))) {
+        return String(parsed.message || parsed.error);
     }
-
     return undefined;
 }
 

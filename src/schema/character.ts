@@ -1,4 +1,4 @@
-import { PartSchema, SizeCategorySchema, AttackProfileSchema, AbilitySchema, VesselProfileSchema } from './token-extras.js';
+import { PartSchema, SizeCategorySchema, AttackProfileSchema, AbilitySchema, VesselProfileSchema, FightingStyleSchema } from './token-extras.js';
 import { z } from 'zod';
 import { CharacterTypeSchema } from './party.js';
 import {
@@ -57,6 +57,7 @@ export function resourcePoolSchema() {
         current: z.number(),
         max: z.number(),
         lastRefilledAt: z.string().optional(),
+        refresh: z.enum(['short', 'long', 'none']).optional().describe('Refilled to max by a rest (rest_manage, travel_manage rest): short = on a short or long rest, long = long rest only; unset or none = never (hit_dice has its own rule)'),
         label: z.string().optional().describe('Display name for the counter ("An\'ggrath\'s calls"); the key stays the id'),
         note: z.string().optional().describe('What the counter is, or to whom it is owed'),
         show: z.boolean().optional().describe('Show it in the boot digest and the status block'),
@@ -96,11 +97,14 @@ export const CharacterSchema = z.object({
     xp: z.number().int().min(0).default(0).describe('Current experience points'),
     characterType: CharacterTypeSchema.optional().default('pc'),
 
-    // PHASE-2: Social Hearing Mechanics - skill bonuses for opposed rolls
-    perceptionBonus: z.number().int().optional().default(0)
-        .describe('Proficiency bonus for Perception checks (WIS-based)'),
-    stealthBonus: z.number().int().optional().default(0)
-        .describe('Proficiency bonus for Stealth checks (DEX-based)'),
+    // Play report 2 #5: tri-state skill overrides. null/absent = the number is
+    // COMPUTED from the sheet (WIS/DEX + proficiency, doubled by expertise);
+    // any number, 0 included, is an authoritative override that REPLACES the
+    // computed value everywhere it is rolled. No default: a sheet is born null.
+    perceptionBonus: z.number().int().nullable().optional()
+        .describe('Absolute Perception modifier that REPLACES WIS + proficiency (+ expertise); null/absent = computed from the sheet'),
+    stealthBonus: z.number().int().nullable().optional()
+        .describe('Absolute Stealth modifier that REPLACES DEX + proficiency (+ expertise); null/absent = computed from the sheet'),
 
     // Table rules: power band (named in the world's band rule) and the HP a
     // regenerating creature heals at the start of each of its rounds.
@@ -121,6 +125,12 @@ export const CharacterSchema = z.object({
     attacksPerAction: z.number().int().min(1).optional(),
     attacks: z.array(AttackProfileSchema).optional(),
     abilities: z.array(AbilitySchema).optional(),
+    /** Item 17: the fighting style the engine applies on this character's attacks (defense: on attacks against it). */
+    fightingStyle: FightingStyleSchema.optional(),
+    /** Item 16: the Battle Master's superiority die; the dice themselves are resourcePools.superiority (refresh short). */
+    superiorityDie: z.enum(['1d6', '1d8', '1d10', '1d12']).optional(),
+    /** Item 16: the ability behind manoeuvre save DCs (8 + proficiency + its modifier); default the higher of STR and DEX. */
+    maneuverAbility: z.enum(['str', 'dex']).optional(),
     cr: z.number().min(0).optional(),
     autoLegendaryResistance: z.boolean().optional(),
     /** Request 5: the row is a vessel (character_manage create_vessel); tokens made from it run the void-combat lane. */

@@ -18,9 +18,12 @@ export interface RulePresetEntry {
 
 const principles: Array<[string, string]> = [
     ['fix-the-system', 'When rules and fiction disagree repeatedly, stop play and fix the system once; no local patches mid-encounter.'],
-    ['character-fantasy', 'Luciel is an Astartes-scale warlord who dominates ordinary mortals physically. Peer transhumans are serious fights capable of maiming him. Chaos offers genuine shortcuts to power that become increasingly difficult to refuse. If a mechanic repeatedly contradicts these, change the mechanic.'],
+    // Play report 2, item 11: generic text — a shared preset names no table
+    // character. Personalise with table_rules define {kind: 'principle', name,
+    // spec: {text}}; a re-import keeps the rewrite (overwrite: true replaces it).
+    ['character-fantasy', 'The player character is a top-band warlord who dominates ordinary mortals physically. Peers (same band or higher) are serious fights capable of maiming them. Dark powers offer genuine shortcuts to power that become increasingly difficult to refuse. If a mechanic repeatedly contradicts these, change the mechanic.'],
     ['fiction-first', 'Roll only for real uncertainty; a roll never turns a meaningful fictional advantage into nothing unless total failure makes sense.'],
-    ['mortal-units', 'Mortal units: one initiative, one move, one action; fixed volley tiers (healthy Scions 3d6-4d6; reduced by casualties, suppression, melee, broken formation); size affects staying power, area, lanes, splitting, suppression, objectives, not dice.'],
+    ['mortal-units', 'Mortal units: one initiative, one move, one action; fixed volley tiers (healthy units 3d6-4d6; reduced by casualties, suppression, melee, broken formation); size affects staying power, area, lanes, splitting, suppression, objectives, not dice.'],
     ['cleave', 'Cleave through packed lower-band targets in a plausible arc; spacing prevents it; never on peers.'],
     ['peers', 'Peers are individual; significant hits create physical consequences (crippled joints, breached plate, thrown out of position); HP is endurance, not permission to ignore the body.'],
     ['geometry', 'Geometry before initiative; LOS binary; partial cover +2, hard +5; narrow exposure = disadvantage or no shot; no free fire through friends; melee disrupts a unit\'s fire.'],
@@ -28,7 +31,7 @@ const principles: Array<[string, string]> = [
     ['success-stays-success', 'Success stays success; failure complicates.'],
     ['dice-resolve-intent', 'Dice resolve intent, not morality.'],
     ['chaos-pays-first', 'Chaos pays first; costs arrive later.'],
-    ['npcs-are-characters', 'NPCs are characters, not consultants; no conscience chorus; no italic thoughts grading Luciel.'],
+    ['npcs-are-characters', 'NPCs are characters, not consultants; no conscience chorus; no italic thoughts grading the player characters.'],
     ['threat-telegraphed', 'Threat intent is telegraphed.'],
     ['boss-phases', 'Bosses use phases.'],
     ['no-infinite-reinforcements', 'No infinite reinforcements; destroyed stays destroyed, broken rites stay broken.'],

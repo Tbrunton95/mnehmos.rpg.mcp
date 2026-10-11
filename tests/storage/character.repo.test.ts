@@ -208,3 +208,60 @@ describe('CharacterRepository', () => {
         });
     });
 });
+
+/**
+ * Play report 2 #5: the stealth/perception columns are tri-state. NULL means
+ * "compute from the sheet"; a number (0 included) is an authoritative
+ * override. The repo never turns an absent value into 0.
+ */
+describe('CharacterRepository skill override columns', () => {
+    let db: ReturnType<typeof initDB>;
+    let repo: CharacterRepository;
+    const base: Character = {
+        id: 'c1', name: 'Shade', stats: { str: 10, dex: 16, con: 10, int: 10, wis: 10, cha: 10 },
+        hp: 10, maxHp: 10, ac: 13, level: 5, characterType: 'pc', createdAt: FIXED_TIMESTAMP, updatedAt: FIXED_TIMESTAMP
+    };
+    const column = (id: string) => db.prepare('SELECT stealth_bonus AS s, perception_bonus AS p FROM characters WHERE id = ?').get(id) as { s: number | null; p: number | null };
+
+    beforeEach(() => {
+        db = initDB(':memory:');
+        migrate(db);
+        repo = new CharacterRepository(db);
+    });
+    afterEach(() => db.close());
+
+    it('create without the fields stores NULL and reads back undefined', () => {
+        repo.create(base);
+        expect(column('c1')).toEqual({ s: null, p: null });
+        const read = repo.findById('c1')!;
+        expect(read.stealthBonus).toBeUndefined();
+        expect(read.perceptionBonus).toBeUndefined();
+    });
+
+    it('an unrelated update keeps NULL', () => {
+        repo.create(base);
+        repo.update('c1', { hp: 7 });
+        expect(column('c1')).toEqual({ s: null, p: null });
+    });
+
+    it('an explicit 0 round-trips as 0, and null clears an override', () => {
+        repo.create({ ...base, stealthBonus: 0, perceptionBonus: 7 });
+        expect(column('c1')).toEqual({ s: 0, p: 7 });
+        expect(repo.findById('c1')!.stealthBonus).toBe(0);
+        repo.update('c1', { perceptionBonus: null } as any);
+        expect(column('c1')).toEqual({ s: 0, p: null });
+        expect(repo.findById('c1')!.perceptionBonus).toBeUndefined();
+    });
+
+    it('override writes leave a write_audit row; an unrelated update on a NULL column does not', () => {
+        repo.create(base);
+        repo.update('c1', { hp: 9 });
+        repo.update('c1', { stealthBonus: 4 } as any);
+        repo.update('c1', { stealthBonus: null } as any);
+        const rows = db.prepare("SELECT field, old_value, new_value FROM write_audit WHERE character_id = 'c1' AND field IN ('stealthBonus', 'perceptionBonus') ORDER BY id").all();
+        expect(rows).toEqual([
+            { field: 'stealthBonus', old_value: 'null', new_value: '4' },
+            { field: 'stealthBonus', old_value: '4', new_value: 'null' }
+        ]);
+    });
+});

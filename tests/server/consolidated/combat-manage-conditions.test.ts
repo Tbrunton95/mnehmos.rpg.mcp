@@ -158,3 +158,78 @@ describe('grapple with an encounterId', () => {
         expect(JSON.parse(row.tokens).find((t: any) => t.id === 'luciel').actionUsed).toBe(true);
     });
 });
+
+/**
+ * Play report 2, item 2: the GM had to type the canonical 'grapple: <id>'
+ * source by hand for execute and break to see a hold. add_condition
+ * {fromGrapple: <holder id or name>} writes it.
+ */
+describe('add_condition fromGrapple', () => {
+    let encounterId: string;
+    let repo: CharacterRepository;
+    beforeEach(async () => {
+        closeDb(); repo = new CharacterRepository(getDb(':memory:')); clearCombatState();
+        const now = new Date().toISOString();
+        repo.create({ id: 'luciel', name: 'Luciel', stats: { str: 24, dex: 14, con: 22, int: 14, wis: 14, cha: 18 }, hp: 200, maxHp: 200, ac: 20, level: 12, band: 'Astartes', createdAt: now, updatedAt: now } as any);
+        const created = await call({ action: 'create', seed: 'from-grapple', participants: [
+            { id: 'luciel', name: 'Luciel', hp: 200, maxHp: 200, initiative: 20, band: 'Astartes', attacksPerAction: 2 },
+            { id: 'token-scion', name: 'Scion Squad', hp: 30, maxHp: 30, initiative: 5, isEnemy: true, band: 'Mortal' }
+        ] });
+        encounterId = created.encounterId;
+    });
+    afterEach(() => { vi.restoreAllMocks(); closeDb(); });
+
+    it('by name writes the canonical source and reports the holder; execute then lands', async () => {
+        const a = await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: 'restrained', fromGrapple: 'Luciel' });
+        expect(a.success).toBe(true);
+        expect(a.condition.sourceId).toBe('grapple: luciel');
+        expect(a.heldBy).toEqual({ id: 'luciel', name: 'Luciel' });
+        expect(a.message).toMatch(/held by Luciel/);
+        expect(tokenConditions(encounterId, 'token-scion')[0]).toMatchObject({ type: 'restrained', sourceId: 'grapple: luciel' });
+        const ex = json(await handleCombatAction({ action: 'grapple', move: 'execute', encounterId, actorId: 'luciel', targetId: 'token-scion' }, ctx as any)) as any;
+        expect(ex.error).toBeFalsy();
+        const row = getDb().prepare('SELECT tokens FROM encounters WHERE id = ?').get(encounterId) as { tokens: string };
+        expect(JSON.parse(row.tokens).find((t: any) => t.id === 'token-scion').hp).toBe(0);
+    });
+
+    it('by participant id, and the mirror writes the same source on the sheet', async () => {
+        const a = await call({ action: 'add_condition', encounterId, participantId: 'luciel', condition: { name: 'Grappled' }, fromGrapple: 'token-scion', mirrorToCharacter: true });
+        expect(a.success).toBe(true);
+        expect(a.condition.sourceId).toBe('grapple: token-scion');
+        expect(repo.findById('luciel')!.conditions).toEqual([expect.objectContaining({ name: 'grappled', source: 'grapple: token-scion' })]);
+    });
+
+    it('a condition source that names the same holder is accepted; a different one is refused', async () => {
+        const ok = await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: { name: 'restrained', source: 'pinned by Luciel' }, fromGrapple: 'luciel' });
+        expect(ok.success).toBe(true);
+        expect(ok.condition.sourceId).toBe('grapple: luciel');
+        const bad = await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: { name: 'restrained', source: 'spell: Web' }, fromGrapple: 'luciel' });
+        expect(bad.error).toBeTruthy();
+        expect(bad.writes).toBe('none');
+        expect(tokenConditions(encounterId, 'token-scion')).toHaveLength(1);
+        // An empty source is no source: the holder's canonical one is written.
+        const blank = await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: { name: 'grappled', source: '  ' }, fromGrapple: 'luciel' });
+        expect(blank.success).toBe(true);
+        expect(blank.condition.sourceId).toBe('grapple: luciel');
+    });
+
+    it('an unknown holder is refused with no write', async () => {
+        const r = await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: 'restrained', fromGrapple: 'Nobody' });
+        expect(r.error).toBeTruthy();
+        expect(r.writes).toBe('none');
+        expect(String(r.message)).toMatch(/Nobody/);
+        expect(tokenConditions(encounterId, 'token-scion')).toEqual([]);
+    });
+
+    it('an ambiguous name is refused, naming both ids; the exact id still resolves', async () => {
+        await call({ action: 'add_participant', encounterId, name: 'Luciel', hp: 10, maxHp: 10 });
+        const r = await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: 'restrained', fromGrapple: 'Luciel' });
+        expect(r.error).toBeTruthy();
+        expect(r.writes).toBe('none');
+        expect(String(r.message)).toMatch(/ambiguous/i);
+        expect(String(r.message)).toMatch(/Luciel \(luciel\)/);
+        expect(tokenConditions(encounterId, 'token-scion')).toEqual([]);
+        const byId = await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: 'restrained', fromGrapple: 'luciel' });
+        expect(byId.heldBy).toEqual({ id: 'luciel', name: 'Luciel' });
+    });
+});

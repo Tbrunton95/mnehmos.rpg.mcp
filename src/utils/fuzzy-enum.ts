@@ -358,7 +358,9 @@ export function formatGuidingError(error: GuidingError): {
                 message: error.message,
                 input: error.input,
                 suggestions: error.suggestions,
-                hint: 'Try one of the suggested values above'
+                hint: 'Try one of the suggested values above',
+                // A guiding error precedes every handler: nothing was written.
+                writes: (error as { writes?: string }).writes ?? 'none'
             }, null, 2)
         }]
     };

@@ -120,6 +120,23 @@ describe('readers use the world clock', () => {
     it('the full status block shows the clock and weather in a two-world save', async () => {
         const b = await char({ action: 'get_status_block', characterId: 'marcus' });
         expect(b).toMatchObject({ day: 47, time: '06:00', weather: 'sleet' });
+        expect(b.location).toBeUndefined();
+    });
+
+    it('the full status block shows the world location as an AT row, clipped', async () => {
+        await world({ action: 'update', worldId: W, environment: { location: 'Vorago docks, under the crane that never stops turning' } });
+        const res = await handleCharacterManage({ action: 'get_status_block', characterId: 'marcus' }, ctx as any);
+        const b = json(res);
+        expect(b.location).toBe('Vorago docks, under the crane that never…');
+        expect(res.content[0].text).toMatch(/▌ AT  Vorago docks, under the crane/);
+        expect(res.content[0].text).toMatch(/WEATHER sleet/);
+    });
+
+    it('weather and location show on a world that keeps no clock', async () => {
+        getDb().prepare('UPDATE worlds SET environment = ? WHERE id = ?').run(JSON.stringify({ weatherConditions: 'fog', location: 'the mill' }), W);
+        const b = await char({ action: 'get_status_block', characterId: 'marcus' });
+        expect(b.day).toBeUndefined();
+        expect(b).toMatchObject({ weather: 'fog', location: 'the mill' });
     });
 
     it('boot flags a debt the world day has reached as DUE', async () => {
@@ -137,5 +154,11 @@ describe('readers use the world clock', () => {
     it('get_context reports the stored day and time', async () => {
         const r = json(await handleSessionManage({ action: 'get_context', worldId: W, includeWorld: true }, ctx as any));
         expect(r.world ?? r.context?.world).toMatchObject({ day: 47, time: '06:00' });
+    });
+
+    it('get_context reports weather and the world location', async () => {
+        await world({ action: 'update', worldId: W, environment: { location: 'Vorago docks' } });
+        const r = json(await handleSessionManage({ action: 'get_context', worldId: W, includeWorld: true }, ctx as any));
+        expect(r.world ?? r.context?.world).toMatchObject({ weather: 'sleet', location: 'Vorago docks' });
     });
 });

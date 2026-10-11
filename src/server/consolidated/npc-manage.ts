@@ -18,6 +18,9 @@ import { ConcentrationRepository } from '../../storage/repos/concentration.repo.
 import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
 import { calculateHearingRadius, VolumeLevel } from '../../engine/social/hearing.js';
 import { rollStealthVsPerception, isDeafened, getEnvironmentModifier } from '../../engine/social/stealth-perception.js';
+import { loggedD20 } from '../../math/logged-d20.js';
+import { worldProgression } from '../../engine/progression.js';
+import { resolveWorldId } from '../../engine/table-rules.js';
 import { handleCreate as handleCharacterCreate } from './character-manage.js';
 import {
     handleCreate as handleAgentCreate,
@@ -74,9 +77,14 @@ const NewCreateSchema = z.object({
     name: z.string().min(1).describe('NPC name (required)'),
     class: z.string().optional().default('Commoner'),
     race: z.string().optional().default('Human'),
-    background: z.string().optional().default('Stalker'),
+    // Play report 2 #9: no 'Stalker' placeholder default; omitted = none.
+    background: z.string().optional().describe('Background: a world background rule first, then the SRD; omitted = none'),
     alignment: z.string().optional(),
-    stats: StatsSchema.optional().default({ str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 10 }),
+    // Play report 2 #8: no default — undefined is forwarded so character_manage
+    // create can tell omitted stats (10 baseline + species bonuses) from placed
+    // ones (final), and its statsNote is honest.
+    stats: StatsSchema.optional().describe('Ability scores. Given: final. Omitted: 10 baseline + species bonuses'),
+    applySpeciesAbilityBonuses: z.boolean().optional().describe('Species ability bonuses: default true when stats are omitted, false when given (final). true adds them to the stats you pass (raw rolled scores); the reply says which in statsNote'),
     hp: z.number().int().min(1).optional(),
     maxHp: z.number().int().min(1).optional(),
     ac: z.number().int().min(0).optional().default(10),
@@ -233,6 +241,7 @@ async function handleCreateNpc(args: z.infer<typeof NewCreateSchema>): Promise<o
         background: args.background,
         alignment: args.alignment,
         stats: args.stats,
+        applySpeciesAbilityBonuses: args.applySpeciesAbilityBonuses,
         hp: args.hp,
         maxHp: args.maxHp,
         ac: args.ac,
@@ -391,6 +400,8 @@ async function handleCreateNpc(args: z.infer<typeof NewCreateSchema>): Promise<o
         actionType: 'create',
         characterId,
         character: characterSummary,
+        // Play report 2 #8: what happened to the species bonuses (only when the species has any)
+        ...(charResult.statsNote ? { statsNote: charResult.statsNote } : {}),
         agentId,
         agent: agentRecord,
         relationshipSeeded,
@@ -1010,8 +1021,17 @@ async function handleInteract(args: z.infer<typeof InteractSchema>): Promise<obj
         listener.id !== args.targetId && !isDeafened(listener)
     );
 
+    // Play report 2 #5: the eavesdrop dice are logged (roll_log, crypto audit
+    // key, one row per side) and the modifiers are each sheet's ONE
+    // stealth/perception number on the world's proficiency curve.
+    const progression = worldProgression(db, resolveWorldId(db, { characterIds: [speaker.id] }));
+    const opposedOpts = {
+        profBonus: (level: number) => progression.profBonus(level),
+        roll: (purpose: 'stealth' | 'perception', forId: string) =>
+            loggedD20(db, { purpose: `eavesdrop_${purpose}`, forId }, { tool: 'npc_manage' }).natural
+    };
     for (const listener of eavesdroppers) {
-        const roll = rollStealthVsPerception(speaker, listener, envModifier);
+        const roll = rollStealthVsPerception(speaker, listener, envModifier, opposedOpts);
 
         hearingResults.push({
             listenerId: listener.id,
@@ -1204,6 +1224,7 @@ Actions: create, get_full_context, get_relationship, update_relationship, record
         background: z.string().optional(),
         alignment: z.string().optional(),
         stats: StatsSchema.partial().optional(),
+        applySpeciesAbilityBonuses: z.boolean().optional().describe('create: add the species bonuses to the stats you pass (default: only when stats are omitted)'),
         hp: z.number().int().optional(),
         maxHp: z.number().int().optional(),
         ac: z.number().int().optional(),

@@ -45,7 +45,7 @@ export function matchProfile(profiles: AttackProfile[], name: string): AttackPro
 }
 
 /** The part whose holds names this weapon or slot. */
-function holdingPart(who: HasParts, weapon: string): Part | undefined {
+export function holdingPart(who: HasParts, weapon: string): Part | undefined {
     const key = norm(weapon);
     return (who.parts ?? []).find(p => p.holds?.some(h => norm(h) === key));
 }

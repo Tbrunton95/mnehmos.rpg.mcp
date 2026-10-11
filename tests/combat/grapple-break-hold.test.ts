@@ -81,3 +81,58 @@ describe('breaking a hold clears exactly that hold', () => {
         expect(tok('hero').conditions.map((c: any) => c.sourceId)).toEqual(['grapple: b']);
     });
 });
+
+/**
+ * Play report 2, item 2: a break reads the same holder matcher as execute.
+ * A hold sourced to the holder's bare id or name clears, Pinned clears, and
+ * a Frightened (or anything else) sourced to the holder's bare name stays:
+ * only the hold names go on a bare source; a 'grapple: <holder>' source
+ * takes the hold's own extras with it, as before.
+ */
+describe('break on the shared holder matcher', () => {
+    it('clears bare-name holds and Pinned, keeps Frightened of the holder, still clears the prefixed extras', async () => {
+        const created = await manage({ action: 'create', seed: 'break-hold-4', participants: [
+            { id: 'hero', name: 'Hero', hp: 30, maxHp: 30, initiative: 20, conditions: [
+                { name: 'Grappled', source: 'Brute' }, { name: 'Pinned', source: 'brute' }, { name: 'Frightened', source: 'brute' },
+                { name: 'Choked', source: 'grapple: brute' }, { name: 'Marked', source: 'Brute' }, { name: 'prone', source: 'Brute' }
+            ] },
+            { id: 'brute', name: 'Brute', hp: 30, maxHp: 30, initiative: 5, isEnemy: true }
+        ] });
+        encounterId = created.encounterId;
+        dice(20, 1);
+        const br = await act({ action: 'grapple', move: 'break', encounterId, actorId: 'hero', targetId: 'brute' });
+        expect(br.hit).toBe(true);
+        expect(br.conditionsRemoved.map((n: string) => n.toLowerCase()).sort()).toEqual(['choked', 'grappled', 'pinned']);
+        expect(tok('hero').conditions.map((c: any) => String(c.type).toLowerCase()).sort()).toEqual(['frightened', 'marked', 'prone']);
+    });
+
+    it('a prefixed hold naming another participant stays', async () => {
+        const created = await manage({ action: 'create', seed: 'break-hold-5', participants: [
+            { id: 'hero', name: 'Hero', hp: 30, maxHp: 30, initiative: 20, conditions: [
+                { name: 'Restrained', source: 'pinned by Brute' }, { name: 'Restrained', source: 'held by Other' }
+            ] },
+            { id: 'brute', name: 'Brute', hp: 30, maxHp: 30, initiative: 5, isEnemy: true },
+            { id: 'other', name: 'Other', hp: 30, maxHp: 30, initiative: 4, isEnemy: true }
+        ] });
+        encounterId = created.encounterId;
+        dice(20, 1);
+        const br = await act({ action: 'grapple', move: 'break', encounterId, actorId: 'hero', targetId: 'brute' });
+        expect(br.hit).toBe(true);
+        expect(tok('hero').conditions.map((c: any) => c.sourceId)).toEqual(['held by Other']);
+    });
+
+    it('a stunned holder cannot keep the hold: the break succeeds with no roll (item 3)', async () => {
+        const created = await manage({ action: 'create', seed: 'break-hold-6', participants: [
+            { id: 'hero', name: 'Hero', hp: 30, maxHp: 30, initiative: 20, conditions: [{ name: 'grappled', source: 'grapple: brute' }] },
+            { id: 'brute', name: 'Brute', hp: 30, maxHp: 30, initiative: 5, isEnemy: true, conditions: ['stunned'] }
+        ] });
+        encounterId = created.encounterId;
+        const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
+        const br = await act({ action: 'grapple', move: 'break', encounterId, actorId: 'hero', targetId: 'brute' });
+        expect(br.hit).toBe(true);
+        expect(br.autoWin.reason).toMatch(/Brute is stunned/);
+        expect(spy).not.toHaveBeenCalled();
+        expect(tok('hero').conditions).toEqual([]);
+        expect(tok('hero').actionUsed).toBe(true);
+    });
+});

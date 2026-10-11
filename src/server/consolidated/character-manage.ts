@@ -14,14 +14,17 @@
 
 import { loadRule, loadRules, findWorldRule, castingClassFor, resolveWorldId, findPool, worldLexicon, conditionsForDisplay, shownCounters, resolveCreature, creatureToParticipant } from '../../engine/table-rules.js';
 import { worldProgression, levelCapProblem } from '../../engine/progression.js';
+import { computedSkillModifier } from '../../engine/skill-modifier.js';
 import { FORM_KEYS, sheetFromCreature, snapshotBase, nextHp, hpModeSchema, type HpMode } from '../../engine/forms.js';
-import { pushSheetToLiveTokens } from '../handlers/combat-handlers.js';
-import { readWorldClock, dayClock, SET_CLOCK_HINT, scheduleInWorldSql, scheduleLiveSql } from '../../engine/world-clock.js';
+import { pushSheetToLiveTokens, pushAbilityStateToLiveTokens } from '../handlers/combat-handlers.js';
+import { findAbility } from '../../engine/combat/abilities.js';
+import { readWorldClock, readWorldConditions, dayClock, SET_CLOCK_HINT, scheduleInWorldSql, scheduleLiveSql } from '../../engine/world-clock.js';
 import { scheduledWriteOpSchema, applyScheduledOps, type ScheduledWriteOp } from '../../engine/scheduled-ops.js';
 import { exposureThresholdSchema, exposureCap, exposureSummary, ensureExposureColumn, readExposure, writeExposure, type ExposureEntry } from '../../engine/exposure.js';
 import { applyFamilyDelta, familyMember, type FamilyMove } from '../../engine/pool-family.js';
 import { z } from 'zod';
-import { ParticipantExtrasShape, SizeCategorySchema } from '../../schema/token-extras.js';
+import { ParticipantExtrasShape, SizeCategorySchema, FightingStyleSchema } from '../../schema/token-extras.js';
+import { SUPERIORITY_DICE } from '../../engine/combat/maneuvers.js';
 import { randomUUID } from 'crypto';
 import { SessionContext } from '../types.js';
 import { getDb } from '../../storage/index.js';
@@ -60,7 +63,7 @@ import {
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'update', 'list', 'delete', 'kill', 'add_xp', 'adjust_pool', 'get_progression', 'level_up', 'schedule_change', 'process_scheduled', 'list_scheduled', 'cancel_scheduled', 'scope_scheduled', 'scope_characters', 'get_status_block', 'options', 'set_form', 'offer', 'award_note', 'post_awards', 'list_awards', 'set_exposure', 'clear_exposure', 'create_vessel'] as const;
+const ACTIONS = ['create', 'get', 'update', 'list', 'delete', 'kill', 'add_xp', 'adjust_pool', 'get_progression', 'level_up', 'schedule_change', 'process_scheduled', 'list_scheduled', 'cancel_scheduled', 'scope_scheduled', 'scope_characters', 'get_status_block', 'options', 'set_form', 'spend_ability', 'restore_ability', 'offer', 'award_note', 'post_awards', 'list_awards', 'set_exposure', 'clear_exposure', 'create_vessel'] as const;
 type CharacterAction = typeof ACTIONS[number];
 
 const CharacterTypeSchema = z.enum(['pc', 'npc', 'enemy', 'neutral']);
@@ -107,13 +110,29 @@ const conditionSchema = () => z.object({
     source: z.string().optional(),
     pinned: z.boolean().optional()
 });
+type SheetCondition = z.infer<ReturnType<typeof conditionSchema>>;
+
+/**
+ * Play report 2 #10: ONE merge rule for addConditions, on create and update.
+ * Merged by name (case-insensitive): a same-named entry is updated field by
+ * field (later wins); a new name is appended. Never mutates its inputs.
+ */
+export function mergeConditions(current: SheetCondition[], add: SheetCondition[]): SheetCondition[] {
+    const out = current.map(c => ({ ...c }));
+    for (const next of add) {
+        const idx = out.findIndex(c => c.name.toLowerCase() === next.name.toLowerCase());
+        if (idx >= 0) out[idx] = { ...out[idx], ...next };
+        else out.push({ ...next });
+    }
+    return out;
+}
 
 /**
  * Combat profile on the sheet: what a token made from this character starts
  * with (combat create and add_participant read it when the caller omits it).
  * The legendary counters and lair flag are older columns exposed here too.
  */
-const COMBAT_PROFILE_FIELDS = ['size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'attacksPerAction', 'attacks', 'abilities', 'cr', 'autoLegendaryResistance',
+const COMBAT_PROFILE_FIELDS = ['size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'attacksPerAction', 'attacks', 'abilities', 'fightingStyle', 'superiorityDie', 'maneuverAbility', 'cr', 'autoLegendaryResistance',
     'legendaryActions', 'legendaryResistances', 'legendaryResistancesRemaining', 'hasLairActions'] as const;
 const CombatProfileShape = {
     size: ParticipantExtrasShape.size,
@@ -124,6 +143,9 @@ const CombatProfileShape = {
     attacksPerAction: ParticipantExtrasShape.attacksPerAction,
     attacks: ParticipantExtrasShape.attacks,
     abilities: ParticipantExtrasShape.abilities,
+    fightingStyle: ParticipantExtrasShape.fightingStyle,
+    superiorityDie: z.enum(SUPERIORITY_DICE).optional().describe("Item 16: the Battle Master's superiority die (1d6 | 1d8 | 1d10 | 1d12); the dice are adjust_pool {pool: 'superiority', value: 4, max: 4, refresh: 'short'}"),
+    maneuverAbility: z.enum(['str', 'dex']).optional().describe('Item 16: the ability behind manoeuvre save DCs, 8 + proficiency + its modifier (default: the higher of STR and DEX)'),
     cr: ParticipantExtrasShape.cr,
     autoLegendaryResistance: ParticipantExtrasShape.autoLegendaryResistance,
     legendaryActions: ParticipantExtrasShape.legendaryActions,
@@ -139,13 +161,22 @@ const CreateSchema = z.object({
     // how the silent drop happened (tsc caught the fix reaching for it).
     resourcePools: z.record(resourcePoolSchema()).optional().describe('Named numeric pools written AT CREATE (resolve, corruption, fatigue…) — #93: honored now, was silently dropped'),
     conditions: z.array(conditionSchema()).optional().describe('FINDINGS #107: conditions written AT CREATE (wound clocks, THAW states…) — was the #93 anatomy repeated: outer schema accepted, create schema stripped, banner printed a clean card, and a GM could play six sessions off a condition that was never there'),
+    // Play report 2 #10: the update-lane alias, accepted at create too (it was
+    // outer-accepted and silently stripped); merged into conditions by name.
+    addConditions: z.array(conditionSchema()).optional().describe('Same shape as conditions; merged into them by name (a same-named entry is updated, a new name appended). The update lane\'s alias, honoured at create too'),
+    xp: z.number().int().min(0).optional().describe('Starting XP (default 0). Was outer-accepted and silently zeroed at create'),
     worldId: z.string().optional().describe('FINDINGS #93: tag this character to a world — list {worldId} filters by it (nullable #91 pattern; untagged rows show everywhere)'),
     name: z.string().min(1).describe('Character name (required)'),
     class: z.string().optional().default('Adventurer'),
     race: z.string().optional().default('Human'),
-    background: z.string().optional().default('Stalker'),
+    // Play report 2 #9: no default. 'Stalker' was a campaign placeholder that
+    // every create without a background was stored under, and a world with a
+    // background rule of that name handed its skills and gold to everyone.
+    background: z.string().optional().describe('Background: a world background rule first (table_rules background), then the SRD; omitted = none'),
     alignment: z.string().optional(),
-    stats: StatsSchema.optional().default({ str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 10 }),
+    // Play report 2 #8: no default — the handler must tell placed stats from
+    // omitted stats (omitted = 10 baseline + species bonuses; given = final).
+    stats: StatsSchema.optional().describe('Ability scores. Given: taken as FINAL (species bonuses not added unless applySpeciesAbilityBonuses: true). Omitted: 10 baseline + species bonuses'),
     hp: z.number().int().min(1).optional(),
     maxHp: z.number().int().min(1).optional(),
     ac: z.number().int().min(0).optional(),
@@ -164,8 +195,8 @@ const CreateSchema = z.object({
     weaponProficiencies: z.array(z.string()).optional(),
     toolProficiencies: z.array(z.string()).optional(),
     languages: z.array(z.string()).optional(),
-    applySpeciesAbilityBonuses: z.boolean().optional().default(true)
-        .describe('Apply source species ability bonuses exactly once; set false only when stats already include them'),
+    applySpeciesAbilityBonuses: z.boolean().optional()
+        .describe('Species ability bonuses (SRD or the world species rule). Default: true when stats are omitted (10 baseline + bonuses), false when stats are given (taken as final). true adds them to the stats you pass (raw rolled/point-buy scores); false refuses them even on the baseline. The reply says which in statsNote'),
     origin: CharacterOriginSchema.optional(),
     provisionEquipment: z.boolean().optional().default(true),
     customEquipment: z.array(z.string()).optional(),
@@ -178,8 +209,8 @@ const CreateSchema = z.object({
     // Override names are the live lane.
     perceptionBonus: z.number().int().optional(),
     stealthBonus: z.number().int().optional(),
-    perceptionOverride: z.number().int().optional(),
-    stealthOverride: z.number().int().optional(),
+    perceptionOverride: z.number().int().optional().describe("Stat-block Perception total: REPLACES the computed WIS + proficiency everywhere it is rolled (checks, stunts, eavesdrop). Omit to compute from the sheet; 0 is an authoritative zero (play report 2 #5)"),
+    stealthOverride: z.number().int().optional().describe("Stat-block Stealth total: REPLACES the computed DEX + proficiency everywhere it is rolled. Omit to compute from the sheet; 0 is an authoritative zero (play report 2 #5)"),
     band: z.string().optional().describe("Table rules: power band, as named in the world's band rule (e.g. 'Astartes')"),
     regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
     ...CombatProfileShape,
@@ -236,14 +267,14 @@ const UpdateSchema = z.object({
         source: z.string().optional(),
         pinned: z.boolean().optional().describe('Pin it: shown first in the tiny status block and the boot digest')
     })).optional().describe('Edit one condition in place without resending its text. Nothing is written if a match finds zero or several conditions'),
-    background: z.string().optional(),
+    background: z.string().nullable().optional().describe('Background name; null clears it (play report 2 #9)'),
     alignment: z.string().optional(),
     origin: CharacterOriginSchema.optional(),
     skillProficiencies: z.array(z.string()).optional().describe('Skills the character is proficient in (validated against the skill enum on persist)'),
     perceptionBonus: z.number().int().optional().describe('RENAMED (#95): use perceptionOverride — this REFUSES loudly'),
     stealthBonus: z.number().int().optional().describe('RENAMED (#95): use stealthOverride — this REFUSES loudly'),
-    perceptionOverride: z.number().int().optional().describe('OVERRIDES the composed WIS+prof perception column in the eavesdrop/listener layer — it does not add (#95 R4a)'),
-    stealthOverride: z.number().int().optional().describe('OVERRIDES the composed DEX+prof stealth column in the eavesdrop/listener layer — it does not add (#95 R4a)'),
+    perceptionOverride: z.number().int().nullable().optional().describe('OVERRIDES the computed WIS+prof perception number everywhere it is rolled (checks, stunts, eavesdrop) — it does not add (#95 R4a). 0 is an authoritative zero; null clears the override so the sheet computes again (play report 2 #5)'),
+    stealthOverride: z.number().int().nullable().optional().describe('OVERRIDES the computed DEX+prof stealth number everywhere it is rolled — it does not add (#95 R4a). 0 is an authoritative zero; null clears the override so the sheet computes again (play report 2 #5)'),
     band: z.string().optional().describe("Table rules: power band, as named in the world's band rule (e.g. 'Astartes')"),
     regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
     ...CombatProfileShape,
@@ -277,6 +308,7 @@ const AdjustPoolSchema = z.object({
     note: z.string().optional().describe('What the counter is, or to whom it is owed'),
     show: z.boolean().optional().describe('true: list it in the boot digest and the status block; false hides it again'),
     linkItem: z.string().optional().describe("Item template or instance id the character owns (a token, a charm). The pool is authoritative: the item's charges mirror it on every write, and inventory_manage adjust_charges on it is refused"),
+    refresh: z.enum(['short', 'long', 'none']).optional().describe("Item 18: when a rest refills the pool to max — short (any rest), long (long rest only), none (never; the default). superiority dice: short; rages: long"),
     family: z.string().optional().describe("A pool_family rule (the gods' favour): the pool moves inside its family, so a gain makes jealous rivals lose and the family's floor/max clamp. Delta only; returns rivals[]"),
     worldId: z.string().optional().describe("family: the world whose pool_family rule to read (default: the character's)")
 });
@@ -447,14 +479,19 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
 
     // World clock — the #62 honesty rule: day/time render only for the
     // character's own world (resolveWorldId: its tag, else the only world);
-    // a scratch world never puts a wrong clock on the glass. Weather is
-    // stored as weatherConditions.
+    // a scratch world never puts a wrong clock on the glass. Weather and
+    // location (#14) come from readWorldConditions, so they show on a world
+    // that keeps no clock.
     const worldId = resolveWorldId(db, { characterIds: [args.characterId] });
     const clock = readWorldClock(db, worldId);
+    const worldCond = readWorldConditions(db, worldId);
     const day: number | undefined = clock?.day;
     const time: string | undefined = clock?.time;
-    const weather: string | undefined = clock?.weather;
-    const era: string | undefined = clock?.era;
+    const weather: string | undefined = worldCond?.weather;
+    const era: string | undefined = worldCond?.era;
+    // AT: the room the character is seated in, else the world's location.
+    const roomName = roomNameFor(db, char as { currentRoomId?: string });
+    const atLocation = clipStatus(roomName ?? worldCond?.location, 40);
     // Request 10: exposure timers in the footer — `exposure: dry_hours 7/12`.
     const exposureEntries = readExposure(db, args.characterId);
     const exposureFooter = exposureEntries.length ? [`exposure: ${exposureSummary(exposureEntries, pools as Record<string, { current: number; max: number }>).join(', ')}`] : [];
@@ -472,12 +509,8 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
     if (tiny?.spec.compact) {
         const core = findPool(pools, tiny.spec.corePool);
         const counters = shownCounters(pools, core?.key).map(c => ({ name: c.name, current: c.current, max: c.max }));
-        let location: string | undefined;
+        let location: string | undefined = atLocation;
         let objective: string | undefined;
-        try {
-            const roomId = (char as { currentRoomId?: string }).currentRoomId;
-            if (roomId) location = (db.prepare('SELECT name FROM rooms WHERE id = ?').get(roomId) as { name?: string } | undefined)?.name;
-        } catch { /* no rooms table */ }
         try {
             const log = db.prepare('SELECT active_quests FROM quest_logs WHERE character_id = ?').get(args.characterId) as { active_quests?: string } | undefined;
             const firstId = (JSON.parse(log?.active_quests || '[]') as string[])[0];
@@ -547,12 +580,27 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
         currencyLabel: lex.currency,
         badge: lex.badge,
         day, time, weather, era,
+        ...(atLocation ? { location: atLocation } : {}),
         ...((exposureFooter.length || owed) ? { footer: [...exposureFooter, ...(owed ? [owed] : [])] } : {}),
         ...(exposureFooter.length ? { exposure: exposureEntries.map(e => ({ name: e.name, pool: e.pool, perHour: e.perHour, current: pools[e.pool]?.current ?? 0, cap: exposureCap(e, pools[e.pool]) })) } : {}),
         ...speedLine(char as { speed?: number; swimSpeed?: number; flySpeed?: number }),
         ...activeEncounterEnvironment(db, args.characterId),
         message: `${char.name}: HP ${char.hp}/${char.maxHp}`
     };
+}
+
+/** The name of the room a character is seated in, when there is one. */
+function roomNameFor(db: ReturnType<typeof getDb>, char: { currentRoomId?: string }): string | undefined {
+    try {
+        if (!char.currentRoomId) return undefined;
+        return (db.prepare('SELECT name FROM rooms WHERE id = ?').get(char.currentRoomId) as { name?: string } | undefined)?.name;
+    } catch { return undefined; /* no rooms table */ }
+}
+
+/** A status-block value clipped to the frame: a long location never runs it off the edge. */
+function clipStatus(s: string | undefined, n: number): string | undefined {
+    if (s === undefined) return undefined;
+    return s.length > n ? `${s.slice(0, n).trimEnd()}…` : s;
 }
 
 /** The sheet's speeds, only when one is set (a block without them reads as before). */
@@ -798,17 +846,27 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
     const backgroundSkills = worldBackground ? worldBackground.skills : validSkillProficiencies(backgroundSource?.skillProficiencies);
 
     const stats = { ...(args.stats ?? { str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 10 }) };
+    const statsGiven = args.stats !== undefined;
     const worldSpeciesBonuses = (worldSpecies?.abilityBonuses ?? {}) as Partial<Record<keyof typeof stats, number>>;
-    const speciesAbilityBonusesApplied = Boolean(args.applySpeciesAbilityBonuses && (speciesSource || Object.keys(worldSpeciesBonuses).length));
-    if (speciesAbilityBonusesApplied && speciesSource) {
-        for (const ability of Object.keys(speciesSource.abilityBonuses) as Array<keyof typeof stats>) {
-            stats[ability] += speciesSource.abilityBonuses[ability];
-        }
-    } else if (speciesAbilityBonusesApplied) {
-        for (const [ability, bonus] of Object.entries(worldSpeciesBonuses) as Array<[keyof typeof stats, number]>) {
-            stats[ability] += bonus;
-        }
+    // Play report 2 #8: placed stats are FINAL. The species bonuses (SRD or
+    // the world species rule) apply when stats are omitted (10 baseline) or
+    // on an explicit applySpeciesAbilityBonuses: true; an explicit false
+    // refuses them even on the baseline. The old Zod default (true) bumped a
+    // GM's placed array by the bonuses with no note in the banner.
+    const speciesBonusEntries = (Object.entries(speciesSource ? speciesSource.abilityBonuses : worldSpeciesBonuses) as Array<[keyof typeof stats, number]>)
+        .filter(([ability, bonus]) => ability in stats && typeof bonus === 'number' && bonus !== 0);
+    const speciesHasBonuses = speciesBonusEntries.length > 0;
+    const applyBonuses = args.applySpeciesAbilityBonuses ?? !statsGiven;
+    const speciesAbilityBonusesApplied = Boolean(applyBonuses && speciesHasBonuses);
+    if (speciesAbilityBonusesApplied) {
+        for (const [ability, bonus] of speciesBonusEntries) stats[ability] += bonus;
     }
+    const bonusList = speciesBonusEntries.map(([ability, bonus]) => `${bonus > 0 ? '+' : ''}${bonus} ${ability.toUpperCase()}`).join(', ');
+    const statsNote = !speciesHasBonuses ? undefined
+        : args.applySpeciesAbilityBonuses === false ? `${raceName} bonuses (${bonusList}) not added (applySpeciesAbilityBonuses: false).`
+        : !statsGiven ? `No stats given: 10 baseline + ${raceName} bonuses (${bonusList}).`
+        : applyBonuses ? `${raceName} bonuses (${bonusList}) added to the stats you passed.`
+        : `Stats taken as final: ${raceName} ability bonuses (${bonusList}) were NOT added. If these are raw rolled/point-buy scores, pass applySpeciesAbilityBonuses: true.`;
 
     // Source-backed classes own hit-die HP. Custom classes retain the d8 fallback.
     const conModifier = Math.floor((stats.con - 10) / 2);
@@ -833,7 +891,7 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         ...(speciesMaxHpBonus > 0 && args.maxHp === undefined ? ['max_hp_per_level'] : [])
     ];
     const deferredSpeciesMechanics = [
-        ...(!speciesAbilityBonusesApplied && speciesSource ? ['ability_score_increases'] : []),
+        ...(!speciesAbilityBonusesApplied && speciesHasBonuses ? ['ability_score_increases'] : []),
         ...(speciesMaxHpBonus > 0 && args.maxHp !== undefined ? ['max_hp_per_level:maxHp_override'] : [])
     ];
     const unsupportedSpeciesFeatures = (speciesSource?.featureNames ?? [])
@@ -875,8 +933,11 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         resistances: args.resistances || [],
         vulnerabilities: args.vulnerabilities || [],
         immunities: args.immunities || [],
-        perceptionBonus: args.perceptionOverride ?? 0,
-        stealthBonus: args.stealthOverride ?? 0,
+        // Play report 2 #5: the override columns are born NULL (computed from
+        // the sheet). Only an explicit perceptionOverride/stealthOverride
+        // writes a number — never 0 by default.
+        ...(args.perceptionOverride !== undefined ? { perceptionBonus: args.perceptionOverride } : {}),
+        ...(args.stealthOverride !== undefined ? { stealthBonus: args.stealthOverride } : {}),
         band: args.band,
         regeneration: args.regeneration,
         // Combat profile and legendary counters (tokens hydrate from these)
@@ -893,10 +954,11 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         resourcePools: args.resourcePools || {},
         // FINDINGS #107: conditions at create — the repo INSERT always had the
         // column; the schema and this mapping were the strippers.
-        conditions: args.conditions || [],
+        // Play report 2 #10: addConditions merges in by name; xp is honoured.
+        conditions: mergeConditions(args.conditions ?? [], args.addConditions ?? []),
         spellSlots: undefined,
         pactMagicSlots: undefined,
-        xp: 0,
+        xp: args.xp ?? 0,
         createdAt: now,
         updatedAt: now
     };
@@ -984,6 +1046,9 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
     const response: Record<string, unknown> = {
         ...character,
         success: true,
+        // Play report 2 #8: what happened to the species bonuses, in words
+        // (only when the species has any).
+        ...(statsNote ? { statsNote } : {}),
         _rules: {
             rulesVersion: provenance.rulesVersion,
             sourcePackHash: provenance.packHash,
@@ -1178,7 +1243,8 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     if (args.level !== undefined) updateData.level = args.level;
     if (args.xp !== undefined) updateData.xp = args.xp;   // Findings #43: the correction verb
     if (args.characterType !== undefined) updateData.characterType = args.characterType;
-    if (args.background !== undefined) updateData.background = args.background;
+    // Play report 2 #9: null clears the background (the repo binds undefined as NULL).
+    if (args.background !== undefined) updateData.background = args.background ?? undefined;
     if (args.behavior !== undefined) updateData.behavior = args.behavior;
     if (args.factionId !== undefined) updateData.factionId = args.factionId;
     if (args.alignment !== undefined) updateData.alignment = args.alignment;
@@ -1236,7 +1302,7 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     // columns (Kroshka +7) keep their offset and TRACK stat changes instead
     // of being clobbered; default columns follow the sheet exactly.
     let columnSync: Record<string, { from: number; to: number; offset: number }> | undefined;
-    if (args.stats !== undefined || args.level !== undefined || args.skillProficiencies !== undefined) {
+    if (args.stats !== undefined || args.level !== undefined || args.skillProficiencies !== undefined || args.expertise !== undefined) {
         const old = characterRepo.findById(args.characterId);
         if (old) {
             const oldStats = old.stats as Record<string, number>;
@@ -1244,15 +1310,19 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
             const oldLevel = old.level, newLevel = args.level ?? old.level;
             const oldSkills = (old as { skillProficiencies?: string[] }).skillProficiencies || [];
             const newSkills = args.skillProficiencies ?? oldSkills;
-            const m = (s: number) => Math.floor((s - 10) / 2);
-            const pb = (l: number) => Math.floor((l - 1) / 4) + 2;
-            const compose = (ability: 'dex' | 'wis', skill: string, stats: Record<string, number>, lvl: number, skills: string[]) =>
-                m(stats[ability] ?? 10) + (skills.includes(skill) ? pb(lvl) : 0);
-            const oldRow = getDb().prepare('SELECT stealth_bonus AS s, perception_bonus AS p FROM characters WHERE id = ?').get(args.characterId) as { s?: number | null; p?: number | null } | undefined;
+            const oldExpertise = (old as { expertise?: string[] }).expertise || [];
+            const newExpertise = args.expertise ?? oldExpertise;
+            // Play report 2 #5: compose through the one skill helper (case-folded
+            // proficiency, expertise, the world's proficiency curve) — the old
+            // inline compose was case-sensitive and SRD-only.
+            const progression = worldProgression(getDb(), resolveWorldId(getDb(), { characterIds: [old.id] }));
+            const compose = (ability: 'dex' | 'wis', skill: string, stats: Record<string, number>, lvl: number, skills: string[], expertise: string[]) =>
+                computedSkillModifier({ stats, level: lvl, skillProficiencies: skills, expertise }, skill, ability, progression.profBonus(lvl)).value;
+            const oldRow = getDb().prepare('SELECT stealth_bonus AS s, perception_bonus AS p FROM characters WHERE id = ?').get(old.id) as { s?: number | null; p?: number | null } | undefined;
             const sync = (colVal: number | null | undefined, ability: 'dex' | 'wis', skill: string): { from: number; to: number; offset: number } | null => {
-                if (typeof colVal !== 'number') return null; // never-set columns stay unset
-                const oldComposed = compose(ability, skill, oldStats, oldLevel, oldSkills);
-                const newComposed = compose(ability, skill, newStats, newLevel, newSkills);
+                if (typeof colVal !== 'number') return null; // a NULL column is computed — nothing to track
+                const oldComposed = compose(ability, skill, oldStats, oldLevel, oldSkills, oldExpertise);
+                const newComposed = compose(ability, skill, newStats, newLevel, newSkills, newExpertise);
                 const offset = colVal - oldComposed;
                 const to = newComposed + offset;
                 return to !== colVal ? { from: colVal, to, offset } : null;
@@ -1332,16 +1402,7 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
         }
 
         if (args.addConditions?.length) {
-            for (const newCond of args.addConditions) {
-                const existingIdx = currentConditions.findIndex(
-                    c => c.name.toLowerCase() === newCond.name.toLowerCase()
-                );
-                if (existingIdx >= 0) {
-                    currentConditions[existingIdx] = { ...currentConditions[existingIdx], ...newCond };
-                } else {
-                    currentConditions.push(newCond);
-                }
-            }
+            currentConditions = mergeConditions(currentConditions, args.addConditions);
         }
 
         updateData.conditions = currentConditions;
@@ -1352,12 +1413,25 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
         throw new Error(`Failed to update character: ${args.characterId}`);
     }
 
+    // Play report 2 #5: an explicit override write is the GM's decision on a
+    // column the 2026-10-11 migration moved — the fix call the reconcile
+    // finding names. Mark that skill's ledger rows seen so the finding clears.
+    const ledgerAcknowledged: string[] = [];
+    for (const skill of ['stealth', 'perception'] as const) {
+        if (args[`${skill}Override`] === undefined) continue;
+        try {
+            const n = getDb().prepare('UPDATE skill_override_migrations SET acknowledged = 1 WHERE acknowledged = 0 AND character_id = ? AND skill = ?').run(updated.id, skill).changes;
+            if (n > 0) ledgerAcknowledged.push(skill);
+        } catch { /* no ledger on this db */ }
+    }
+
     return {
         ...updated,
         success: true,
         changed: Object.keys(updateData).filter(k => k !== 'updatedAt'),
         ...(columnSync && { columnSync }),
-        message: `Character updated successfully${columnSync ? ` — column sync: ${Object.entries(columnSync).map(([k, v]) => `${k} ${v.from}→${v.to} (offset ${v.offset >= 0 ? '+' : ''}${v.offset} preserved)`).join(', ')}` : ''}`
+        ...(ledgerAcknowledged.length && { ledgerAcknowledged }),
+        message: `Character updated successfully${columnSync ? ` — column sync: ${Object.entries(columnSync).map(([k, v]) => `${k} ${v.from}→${v.to} (offset ${v.offset >= 0 ? '+' : ''}${v.offset} preserved)`).join(', ')}` : ''}${ledgerAcknowledged.length ? ` — the skill_override_migrated finding for ${ledgerAcknowledged.join('/')} is acknowledged` : ''}`
     };
 }
 
@@ -1592,6 +1666,82 @@ export function setForm(args: { characterId: string; form: string; hpMode?: HpMo
     };
 }
 
+
+// Play report 2 (item 15): per-ability verbs on the sheet. Bookkeeping only:
+// spending here grants no action (combat_manage use_ability or combat_action
+// attack {actionSurge} do that in a fight); the ready flag is patched by name
+// on the sheet and on the character's live tokens.
+const SpendAbilitySchema = z.object({
+    action: z.literal('spend_ability'),
+    characterId: z.string(),
+    name: z.string().min(1).describe("The ability's name on the sheet (any case)"),
+    reason: z.string().optional().describe('Why — kept in the reply')
+});
+
+const RestoreAbilitySchema = z.object({
+    action: z.literal('restore_ability'),
+    characterId: z.string(),
+    name: z.string().min(1).optional().describe("One spent ability's name (any case)"),
+    all: z.boolean().optional().describe('Ready every spent ability instead of naming one')
+});
+
+type SheetAbility = { name: string; ready?: boolean; recharge?: number; grantsAction?: boolean };
+
+/** Mark one sheet ability spent; the same ability on its live tokens follows. */
+export function spendAbility(args: { characterId: string; name: string; reason?: string }): Record<string, unknown> {
+    const { characterRepo } = ensureDb();
+    const refuse = (message: string) => ({ error: true, actionType: 'spend_ability', message: `${message} Nothing was written.`, writes: 'none' });
+    const char = characterRepo.findById(args.characterId);
+    if (!char) return refuse(`Character ${args.characterId} not found.`);
+    const abilities: SheetAbility[] = (char.abilities ?? []).map(a => ({ ...a }));
+    const ability = findAbility(abilities, args.name);
+    if (!ability) {
+        const known = abilities.map(a => a.name);
+        return refuse(`${char.name} has no ability '${args.name}'${known.length ? `; it has ${known.join(', ')}` : ' (give it abilities: [{name, recharge?, grantsAction?}] with update)'}.`);
+    }
+    if (ability.ready === false) return refuse(`${char.name}'s ${ability.name} is already spent.`);
+    ability.ready = false;
+    characterRepo.update(char.id, { abilities } as never);
+    const live = pushAbilityStateToLiveTokens(char.id, [{ name: ability.name, ready: false }]);
+    return {
+        success: true, actionType: 'spend_ability', characterId: char.id, characterName: char.name,
+        ability: ability.name, ready: false, liveTokens: live.liveTokens, tokensWithoutAbility: live.tokensWithoutAbility, bookkeeping: true,
+        message: `✴ ${char.name}: ${ability.name} marked spent — bookkeeping only; it grants no action (use combat_manage use_ability or combat_action attack {actionSurge} in a fight)${args.reason ? ` — ${args.reason}` : ''}${live.liveTokens.length ? `. ${live.liveTokens.length} live token(s) updated.` : ''}`
+    };
+}
+
+/** Ready one spent sheet ability by name, or every spent one; live tokens follow by name. */
+export function restoreAbility(args: { characterId: string; name?: string; all?: boolean }): Record<string, unknown> {
+    const { characterRepo } = ensureDb();
+    const refuse = (message: string) => ({ error: true, actionType: 'restore_ability', message: `${message} Nothing was written.`, writes: 'none' });
+    if ((args.name && args.all) || (!args.name && !args.all)) return refuse('Pass name (one ability) or all: true (every spent ability), not both or neither.');
+    const char = characterRepo.findById(args.characterId);
+    if (!char) return refuse(`Character ${args.characterId} not found.`);
+    const abilities: SheetAbility[] = (char.abilities ?? []).map(a => ({ ...a }));
+    let restored: string[];
+    if (args.all) {
+        const spent = abilities.filter(a => a.ready === false);
+        if (!spent.length) return refuse(`${char.name} has no spent ability.`);
+        for (const a of spent) a.ready = true;
+        restored = spent.map(a => a.name);
+    } else {
+        const ability = findAbility(abilities, args.name!);
+        if (!ability) {
+            const known = abilities.map(a => a.name);
+            return refuse(`${char.name} has no ability '${args.name}'${known.length ? `; it has ${known.join(', ')}` : ''}.`);
+        }
+        if (ability.ready !== false) return refuse(`${char.name}'s ${ability.name} is already ready.`);
+        ability.ready = true;
+        restored = [ability.name];
+    }
+    characterRepo.update(char.id, { abilities } as never);
+    const live = pushAbilityStateToLiveTokens(char.id, restored.map(name => ({ name, ready: true })));
+    return {
+        success: true, actionType: 'restore_ability', characterId: char.id, characterName: char.name,
+        restored, ready: true, liveTokens: live.liveTokens, tokensWithoutAbility: live.tokensWithoutAbility, bookkeeping: true,
+        message: `✴ ${char.name}: ${restored.join(', ')} ready again${live.liveTokens.length ? ` (reaches ${live.liveTokens.length} live token(s))` : ''}.`
+    };
+}
 
 // Request 5: VESSELS — a table_rules vessel becomes a character row, so its
 // hull, shields and sections persist across sessions like any sheet.
@@ -1871,6 +2021,7 @@ async function adjustPoolCore(args: z.input<typeof AdjustPoolSchema>): Promise<o
         ...(args.label !== undefined ? { label: args.label } : {}),
         ...(args.note !== undefined ? { note: args.note } : {}),
         ...(args.show !== undefined ? { show: args.show } : {}),
+        ...(args.refresh !== undefined ? { refresh: args.refresh } : {}),
         ...(linked ? { itemInstanceId: linked.instanceId } : {})
     };
     // FINDINGS #111: the witness ledger. A respect number is not the fiction —
@@ -1906,6 +2057,7 @@ async function adjustPoolCore(args: z.input<typeof AdjustPoolSchema>): Promise<o
         ...(p.label ? { label: p.label } : {}),
         ...(p.note ? { note: p.note } : {}),
         ...(p.show !== undefined ? { show: p.show } : {}),
+        ...(p.refresh ? { refresh: p.refresh } : {}),
         ...(item ? { item } : {}),
         message: `${args.pool}: ${before} -> ${current} (of ${max})${args.value !== undefined ? ' [set]' : ''}${args.witnesses?.length ? ` — witnessed by ${args.witnesses.length}` : ''}${item ? ` · ${item.name} charges ${item.charges}/${item.max}` : ''}`
     };
@@ -1937,6 +2089,7 @@ function adjustFamilyPool(
         ...(args.label !== undefined ? { label: args.label } : {}),
         ...(args.note !== undefined ? { note: args.note } : {}),
         ...(args.show !== undefined ? { show: args.show } : {}),
+        ...(args.refresh !== undefined ? { refresh: args.refresh } : {}),
         ...(linkedId ? { itemInstanceId: linkedId } : {})
     } as ResourcePool;
     characterRepo.update(char.id, { resourcePools: moved } as Partial<import('../../schema/character.js').Character>);
@@ -1963,6 +2116,7 @@ function adjustFamilyPool(
         ...(p.label ? { label: p.label } : {}),
         ...(p.note ? { note: p.note } : {}),
         ...(p.show !== undefined ? { show: p.show } : {}),
+        ...(p.refresh ? { refresh: p.refresh } : {}),
         ...(item ? { item } : {}),
         message: `${main.pool}: ${main.from} -> ${main.to} (of ${p.max})${rivals.length ? ` · jealous: ${rivals.map(r => `${r.pool} ${r.from} -> ${r.to}`).join(', ')}` : ''}${item ? ` · ${item.name} charges ${item.charges}/${item.max}` : ''}`
     };
@@ -1973,7 +2127,7 @@ function adjustFamilyPool(
  * an item instance pushes current/max onto that instance's charges, scoped
  * to the owner so a traded token is never written through a stale link.
  */
-function mirrorLinkedCharges(characterId: string, pools: Record<string, ResourcePool | undefined>): Array<{ pool: string; instanceId: string; name: string; charges: number; max: number }> {
+export function mirrorLinkedCharges(characterId: string, pools: Record<string, ResourcePool | undefined>): Array<{ pool: string; instanceId: string; name: string; charges: number; max: number }> {
     const { db } = ensureDb();
     const out: Array<{ pool: string; instanceId: string; name: string; charges: number; max: number }> = [];
     for (const [key, pool] of Object.entries(pools)) {
@@ -2662,7 +2816,20 @@ const definitions: Record<CharacterAction, ActionDefinition> = {
         schema: CreateSchema,
         handler: handleCreate,
         aliases: ['new', 'add', 'spawn'],
-        description: 'Create a new character'
+        description: 'Create a new character',
+        // Play report 2 #10: the outer schema is shared by every action, so a
+        // key create does not declare used to vanish between the tool boundary
+        // and the handler under a success banner. Create says what it ignored.
+        unknownKeys: 'warn',
+        unknownKeyHints: {
+            preview: 'update-only — create always writes; dry-run changes with update {characterId, preview: true}',
+            removeConditions: 'update-only — a new character has no conditions to remove; pass conditions (or addConditions) to start with some',
+            editConditions: 'update-only — pass the final condition text in conditions instead',
+            expectName: 'update-only guard — create has no existing row to guard',
+            characterId: 'create mints the id; to change an existing character use update {characterId, ...}',
+            currency: 'kill-only — set starting money with startingGold',
+            composureSpec: 'update-only — create first, then update {characterId, composureSpec}'
+        }
     },
     get: {
         schema: GetSchema,
@@ -2698,7 +2865,7 @@ const definitions: Record<CharacterAction, ActionDefinition> = {
         schema: AdjustPoolSchema,
         handler: handleAdjustPool,
         aliases: ['pool', 'pool_delta'],
-        description: 'Adjust a named resource pool by a delta (resolve, corruption, souls...) with 0..max clamping'
+        description: 'Adjust a named resource pool by a delta or set it (resolve, corruption, souls, superiority dice...) with 0..max clamping; refresh short|long|none says which rest refills it'
     },
     schedule_change: {
         schema: ScheduleChangeSchema,
@@ -2892,6 +3059,18 @@ const definitions: Record<CharacterAction, ActionDefinition> = {
         aliases: ['form', 'transform', 'shapechange'],
         description: "Take a creature's form (a world creature rule or preset) or put it down with form: 'base'. The sheet keeps its own values to go back to; live tokens follow"
     },
+    spend_ability: {
+        schema: SpendAbilitySchema,
+        handler: async (args: z.infer<typeof SpendAbilitySchema>) => spendAbility(args),
+        aliases: ['spend', 'mark_spent'],
+        description: 'Mark one sheet ability spent (ready: false) by name: bookkeeping only, it grants no action (combat_manage use_ability or combat_action attack {actionSurge} do that in a fight). The same ability on the character\'s live tokens follows; token-only abilities are untouched'
+    },
+    restore_ability: {
+        schema: RestoreAbilitySchema,
+        handler: async (args: z.infer<typeof RestoreAbilitySchema>) => restoreAbility(args),
+        aliases: ['ready_ability', 'recharge_ability_sheet'],
+        description: 'Ready one spent sheet ability by name, or every spent one with all: true. Reaches the character\'s live tokens by name (a recharge ability spent mid-fight is readied there too)'
+    },
     create_vessel: {
         schema: CreateVesselSchema,
         handler: async (args: z.infer<typeof CreateVesselSchema>) => createVessel(args),
@@ -2965,6 +3144,8 @@ export const CharacterManageTool = {
 - set_exposure {characterId, name, pool, perHour, cap?, thresholds?: [{at, condition: {name, effect?, duration?}, once?}], note?} — the pool climbs perHour × elapsed hours on every world_manage advance (and spatial traverse advanceClock), clamped to cap; each threshold adds its condition once when at is crossed. A clock correction never ticks. clear_exposure {characterId, name?, removePool?} stops it. get and get_status_block show "exposure: dry_hours 7/12".
 🚀 VESSELS (request 5):
 - create_vessel {worldId, vessel: '<table_rules vessel rule>', name?, shields?: {max, regenPerRound?}} lays a ship down as a character row: hull = HP, sections = system parts with a role (drive | guns | bridge | reactor | hangar | other), weapons = attack profiles tied to their section, shields = a 'shields' pool the engine drains before the hull and refills at the start of its turn. Reply carries characterId and a manifest. See docs/table-rules/vessels.md.
+✴ ABILITIES (bookkeeping):
+- spend_ability {characterId, name, reason?} marks one sheet ability spent (ready: false); it grants no action — in a fight use combat_manage use_ability or combat_action attack {actionSurge}. restore_ability {characterId, name | all: true} readies one or every spent ability. Both patch the same ability by name on the character's live tokens (liveTokens; tokensWithoutAbility lists encounters whose token lacks it) and never resend the whole abilities array. An ability {name, recharge?, perRest?: short | long, grantsAction?, actionCost?} lives in the combat profile (update {abilities: [...]}); a perRest ability is spent on use and readied by rest_manage (short readies on any rest, long on a long rest).
 
 Actions: ${ACTIONS.join(', ')}
 Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
@@ -2980,18 +3161,19 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         worldId: z.string().optional().describe("kill: world for the corpse row; create: the world whose classes, species and backgrounds to read first; options: also list the world's own entries; get_progression table mode: the world's progression rule"),
         currency: z.record(z.number()).optional().describe('kill: currency on the corpse (e.g. {gold: 150})'),
         // Create fields
-        name: z.string().optional(),
+        name: z.string().optional().describe("create: the character's name; spend_ability / restore_ability: the ability's name on the sheet (any case)"),
+        all: z.boolean().optional().describe('restore_ability: ready every spent ability instead of naming one'),
         class: z.string().optional(),
         race: z.string().optional(),
-        background: z.string().optional(),
+        background: z.string().nullable().optional().describe('create: a world background rule first, then the SRD; omitted = none. update: null clears it'),
         alignment: z.string().optional(),
         origin: CharacterOriginSchema.optional(),
-        stats: StatsSchema.optional(),
+        stats: StatsSchema.optional().describe('create: given = final (species bonuses not added unless applySpeciesAbilityBonuses: true); omitted = 10 baseline + species bonuses'),
         hp: z.number().int().optional(),
         maxHp: z.number().int().optional(),
         ac: z.number().int().optional(),
         level: z.number().int().min(1).optional().describe("Character level, 1 to the world's max (20 unless a table_rules progression rule sets maxLevel; null = no cap)"),
-        xp: z.number().optional().describe('Absolute XP set (update) — Findings #43'),
+        xp: z.number().optional().describe('Absolute XP set (update) — Findings #43; create: starting XP (default 0)'),
         characterType: CharacterTypeSchema.optional(),
         factionId: z.string().optional(),
         behavior: z.string().optional(),
@@ -3002,7 +3184,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         weaponProficiencies: z.array(z.string()).optional(),
         toolProficiencies: z.array(z.string()).optional(),
         languages: z.array(z.string()).optional(),
-        applySpeciesAbilityBonuses: z.boolean().optional(),
+        applySpeciesAbilityBonuses: z.boolean().optional().describe('create: default true when stats are omitted (10 baseline + species bonuses), false when stats are given (final). true adds the bonuses to the stats you pass; the reply says which in statsNote'),
         resistances: z.array(z.string()).optional(),
         vulnerabilities: z.array(z.string()).optional(),
         immunities: z.array(z.string()).optional(),
@@ -3050,8 +3232,8 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         expertise: z.array(z.string()).optional(),
         perceptionBonus: z.number().int().optional().describe('RENAMED (#95): use perceptionOverride — REFUSES loudly'),
         stealthBonus: z.number().int().optional().describe('RENAMED (#95): use stealthOverride — REFUSES loudly'),
-        perceptionOverride: z.number().int().optional().describe('#95 R4a: OVERRIDES composed WIS+prof in the eavesdrop layer — does not add'),
-        stealthOverride: z.number().int().optional().describe('#95 R4a: OVERRIDES composed DEX+prof in the eavesdrop layer — does not add'),
+        perceptionOverride: z.number().int().nullable().optional().describe('#95 R4a: OVERRIDES the computed WIS+prof perception number everywhere it is rolled — does not add. update: null clears it (computed again); 0 is an authoritative zero'),
+        stealthOverride: z.number().int().nullable().optional().describe('#95 R4a: OVERRIDES the computed DEX+prof stealth number everywhere it is rolled — does not add. update: null clears it (computed again); 0 is an authoritative zero'),
         band: z.string().optional().describe("Table rules: power band, as named in the world's band rule (e.g. 'Astartes')"),
         regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
         // Combat profile (create/update): tokens made from this sheet start with it
@@ -3061,8 +3243,11 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         swimSpeed: z.number().int().min(0).optional().describe('create/update: swim speed in feet, the movement budget underwater (else half speed)'),
         flySpeed: z.number().int().min(0).optional().describe('create/update: fly speed in feet'),
         attacksPerAction: z.number().int().min(1).optional().describe('create/update: multiattack, attacks one Attack action allows'),
-        attacks: z.array(z.any()).optional().describe('create/update: named attack profiles [{name, attackBonus, damage, damageType?, part?, item?, reachFt?, ranged?, default?, note?}] — item names the inventory item it swings, so world_manage reconcile can flag a profile whose weapon is gone'),
-        abilities: z.array(z.any()).optional().describe('create/update: limited abilities [{name, recharge?, ready?, note?}]'),
+        attacks: z.array(z.any()).optional().describe('create/update: named attack profiles [{name, attackBonus, damage, damageType?, part?, item?, reachFt?, ranged?, twoHanded?, default?, note?}] — item names the inventory item it swings, so world_manage reconcile can flag a profile whose weapon is gone; ranged and twoHanded decide which fighting style applies'),
+        fightingStyle: FightingStyleSchema.optional().describe('create/update: great_weapon | dueling | archery | defense, applied by the engine on this character\'s attacks (defense: +1 AC against it while armour is worn, when its AC is derived; do not set it if the sheet\'s ac already counts it)'),
+        superiorityDie: z.enum(SUPERIORITY_DICE).optional().describe("create/update (mirror): the superiority die for combat_action attack {maneuver}; the dice are adjust_pool {pool: 'superiority', value, max, refresh: 'short'}"),
+        maneuverAbility: z.enum(['str', 'dex']).optional().describe('create/update (mirror): the ability behind manoeuvre save DCs (default the higher of STR and DEX)'),
+        abilities: z.array(z.any()).optional().describe('create/update: limited abilities [{name, recharge?, perRest?: short | long, grantsAction?, actionCost?, ready?, note?}]; perRest ones are spent on use and readied by rest_manage'),
         cr: z.number().min(0).optional().describe('create/update: challenge rating'),
         autoLegendaryResistance: z.boolean().optional().describe('create/update: spend a legendary resistance on a failed save automatically'),
         legendaryActions: z.number().int().min(0).optional().describe('create/update: legendary actions per round'),
@@ -3075,6 +3260,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         delta: z.number().optional(),
         value: z.number().optional().describe('adjust_pool #67-F: ABSOLUTE set (retry-safe) — mutually exclusive with delta'),
         max: z.number().optional(),
+        refresh: z.enum(['short', 'long', 'none']).optional().describe('adjust_pool (mirror): which rest refills the pool to max — short (any rest), long (long rest only), none'),
         // Get/Update/Delete fields
         characterId: z.string().optional(),
         // Update condition fields
@@ -3188,6 +3374,10 @@ export async function handleCharacterManage(args: unknown, _ctx: SessionContext)
                 output += `STR: ${stats.str} | DEX: ${stats.dex} | CON: ${stats.con}\n`;
                 output += `INT: ${stats.int} | WIS: ${stats.wis} | CHA: ${stats.cha}\n`;
             }
+            // Play report 2 #8: say what happened to the species bonuses.
+            if (data.statsNote) output += RichFormatter.alert(String(data.statsNote), 'info');
+            // Play report 2 #10: keys create dropped — loud, with the nearest valid key.
+            if (Array.isArray(data.ignoredParams) && data.ignoredParams.length) output += RichFormatter.alert(String(data.message), 'warning');
             output += RichFormatter.section('Combat');
             output += RichFormatter.keyValue({
                 'HP': `${data.hp}/${data.maxHp}`,
@@ -3345,6 +3535,9 @@ export async function handleCharacterManage(args: unknown, _ctx: SessionContext)
             }
         } else if (data.actionType === 'set_exposure' || data.actionType === 'clear_exposure') {
             output = RichFormatter.header(data.actionType === 'set_exposure' ? 'Exposure Timer — Set' : 'Exposure Timer — Cleared', '⏱');
+            output += `${data.message}\n`;
+        } else if (data.actionType === 'spend_ability' || data.actionType === 'restore_ability') {
+            output = RichFormatter.header(data.actionType === 'spend_ability' ? 'Ability — spent' : 'Ability — restored', '✴');
             output += `${data.message}\n`;
         } else {
             // Fallback for unknown actions

@@ -24,6 +24,8 @@ import {
 import { loadAutoMechanics, autoSkillBonus, applyDeclaredEffects } from '../../engine/effects-resolver.js';
 import { loggedD20, loggedRoller, type DiceRoller } from '../../math/logged-d20.js';
 import { resolveWorldId, worldSkillAbility } from '../../engine/table-rules.js';
+import { worldProgression } from '../../engine/progression.js';
+import { skillModifier as sheetSkillModifier, overrideColumn, signed, type SkillSheet, type ShortAbility } from '../../engine/skill-modifier.js';
 import { getOrLoadEngine, syncParticipantHpFromDb } from '../handlers/combat-handlers.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -434,43 +436,31 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
         const actor = charRepo.findById(args.actorId);
         if (actor?.stats) {
             actorName = actor.name;
-            const abilityPart = getSkillModifier(actor.stats as Record<string, number>, stuntAbility);
             const skillKey = (args.skill || '').toLowerCase().replace(/ /g, '_');
-            // #67-E: stealth/perception columns are authoritative on stunts too —
-            // same displacement rule as roll_skill_check; one number per character.
-            const colName = skillKey === 'stealth' ? 'stealth_bonus' : skillKey === 'perception' ? 'perception_bonus' : null;
-            let colVal: number | null = null;
-            if (colName) {
-                const r = db.prepare(`SELECT ${colName} AS v FROM characters WHERE id = ?`).get(args.actorId) as { v?: number | null } | undefined;
-                if (typeof r?.v === 'number') colVal = r.v;
-            }
-            if (colVal !== null) {
-                skillModifier = colVal;
-                modifierBreakdown.push(`${skillKey} column ${colVal >= 0 ? '+' : ''}${colVal} (authoritative)`);
-                contributions.push({ label: `${skillKey}Bonus column`, value: colVal, lane: 'SHEET', source: colName ?? undefined });
+            // Play report 2 #5: the stunt rolls the SAME number roll_skill_check
+            // rolls (src/engine/skill-modifier.ts) — ability + proficiency
+            // (+ expertise, case-folded, #104-D) on the world's curve, or the
+            // stealth/perception override (a number, 0 included) that replaces it.
+            const ability = stuntAbility.substring(0, 3).toLowerCase() as ShortAbility;
+            const prof = worldProgression(db, resolveWorldId(db, { encounterId: args.encounterId, characterIds: [actor.id] })).profBonus(actor.level);
+            const sm = sheetSkillModifier(actor as SkillSheet, skillKey, ability, prof);
+            if (sm.source === 'override') {
+                skillModifier = sm.value;
+                modifierBreakdown.push(`${skillKey} override ${signed(sm.value)} (replaces computed ${signed(sm.computed)})`);
+                contributions.push({ label: `${skillKey} override`, value: sm.value, lane: 'SHEET', source: overrideColumn(skillKey) ?? undefined });
             } else {
-            skillModifier = abilityPart;
-            modifierBreakdown.push(`ability ${abilityPart >= 0 ? '+' : ''}${abilityPart}`);
-            contributions.push({ label: 'ability modifier', value: abilityPart, lane: 'SHEET', source: args.skill });
-            const skills = (actor as { skillProficiencies?: string[] }).skillProficiencies || [];
-            const expertise = (actor as { expertise?: string[] }).expertise || [];
-            const prof = Math.floor((actor.level - 1) / 4) + 2;
-            // FINDINGS #104-D: the SAME case-sensitivity hole #104 closed in
-            // math_manage survived here — the stunt lane composed its own
-            // membership tests. Normalize both sides (case-fold, strip
-            // spaces/underscores); the pattern is fixed everywhere it exists,
-            // not just where it was caught.
-            const normOne = (s: string) => s.toLowerCase().replace(/[ _]/g, '');
-            const normHas = (xs: string[], s: string) => xs.some(x => normOne(x) === normOne(s));
-            if (normHas(expertise, skillKey)) {
-                skillModifier += prof * 2;
-                modifierBreakdown.push(`expertise +${prof * 2}`);
-                contributions.push({ label: 'expertise', value: prof * 2, lane: 'SHEET' });
-            } else if (normHas(skills, skillKey)) {
-                skillModifier += prof;
-                modifierBreakdown.push(`proficiency +${prof}`);
-                contributions.push({ label: 'proficiency', value: prof, lane: 'SHEET' });
-            }
+                skillModifier = sm.abilityMod;
+                modifierBreakdown.push(`ability ${signed(sm.abilityMod)}`);
+                contributions.push({ label: 'ability modifier', value: sm.abilityMod, lane: 'SHEET', source: args.skill });
+                if (sm.expertise) {
+                    skillModifier += sm.proficiency;
+                    modifierBreakdown.push(`expertise +${sm.proficiency}`);
+                    contributions.push({ label: 'expertise', value: sm.proficiency, lane: 'SHEET' });
+                } else if (sm.proficiency) {
+                    skillModifier += sm.proficiency;
+                    modifierBreakdown.push(`proficiency +${sm.proficiency}`);
+                    contributions.push({ label: 'proficiency', value: sm.proficiency, lane: 'SHEET' });
+                }
             }
         }
     } catch { /* use defaults */ }

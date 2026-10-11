@@ -38,6 +38,13 @@ describe('rest_manage consolidated tool', () => {
             expect(RestManageTool.description).toContain('rest');
         });
 
+        it('says what a rest refreshes: pools by refresh policy, perRest abilities, legendary resistances', () => {
+            expect(RestManageTool.description).toContain('refresh');
+            expect(RestManageTool.description).toContain('perRest');
+            expect(RestManageTool.description).toMatch(/legendary resistances/i);
+            expect(RestManageTool.description).toMatch(/active encounter/i);
+        });
+
         it('should list both actions in description', () => {
             expect(RestManageTool.description).toContain('long');
             expect(RestManageTool.description).toContain('short');

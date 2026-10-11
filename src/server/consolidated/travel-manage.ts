@@ -8,7 +8,9 @@ import { z } from 'zod';
 import { matchAction, isGuidingError } from '../../utils/fuzzy-enum.js';
 import { RichFormatter } from '../utils/formatter.js';
 import { getDb } from '../../storage/index.js';
-import { characterLexicon, DEFAULT_LEXICON } from '../../engine/table-rules.js';
+import { characterLexicon, DEFAULT_LEXICON, resolveWorldId } from '../../engine/table-rules.js';
+import { worldProgression } from '../../engine/progression.js';
+import { skillModifier, type SkillSheet } from '../../engine/skill-modifier.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { PartyRepository } from '../../storage/repos/party.repo.js';
 import { CorpseRepository } from '../../storage/repos/corpse.repo.js';
@@ -16,6 +18,7 @@ import { SpatialRepository } from '../../storage/repos/spatial.repo.js';
 import { PoiRepository } from '../../storage/repos/poi.repo.js';
 import { SessionContext } from '../types.js';
 import { loggedD20, loggedRoll } from '../../math/logged-d20.js';
+import { refreshForRest, restoreSlotsForRest, describeRefilled, mirrorLinkedForRest, type Refilled } from './rest-manage.js';
 
 export interface McpResponse {
     content: Array<{ type: 'text'; text: string }>;
@@ -169,8 +172,17 @@ async function handleTravel(input: TravelManageInput, _ctx: SessionContext): Pro
             : party.members?.find(m => m.role === 'leader')?.character || party.members?.[0]?.character;
 
         if (discoverer) {
-            const wisBonus = Math.floor(((discoverer.stats?.wis || 10) - 10) / 2);
-            discoveryRoll = loggedD20(getDb(), { purpose: 'poi_discovery', forId: discoverer.id }, { tool: 'travel_manage' }).natural + wisBonus;
+            // Play report 2 #5: the sheet's ONE perception number (WIS +
+            // proficiency on the world's curve, or the perceptionOverride).
+            // The party roster carries a summary row (stats, level, hp) with
+            // no proficiencies and no override column: read the full sheet.
+            const tdb = getDb();
+            const sheet = (charRepo.findById(discoverer.id) ?? discoverer) as unknown as SkillSheet;
+            const perceptionMod = skillModifier(
+                sheet, 'perception', 'wis',
+                worldProgression(tdb, resolveWorldId(tdb, { characterIds: [discoverer.id] })).profBonus(sheet.level ?? discoverer.level ?? 1)
+            ).value;
+            discoveryRoll = loggedD20(tdb, { purpose: 'poi_discovery', forId: discoverer.id }, { tool: 'travel_manage' }).natural + perceptionMod;
             const dc = poi.discoveryDc || 15;
             discovered = discoveryRoll >= dc;
         }
@@ -582,9 +594,14 @@ async function handleRest(input: TravelManageInput, _ctx: SessionContext): Promi
         hpBefore: number;
         hpAfter: number;
         healed: number;
+        refilled: Refilled[];
+        spellSlotsRestored?: unknown;
+        pactSlotsRestored?: unknown;
+        legendaryResistancesRestored?: { from: number; to: number };
     }> = [];
 
     const isLongRest = input.restType === 'long';
+    const kind = isLongRest ? 'long' : 'short';
 
     for (const member of party.members || []) {
         const char = member.character;
@@ -611,16 +628,33 @@ async function handleRest(input: TravelManageInput, _ctx: SessionContext): Promi
             }
         }
 
-        // Update character
-        charRepo.update(char.id, { hp: hpAfter } as any);
+        // Item 18: the same rest rules as rest_manage — pools by refresh
+        // policy, perRest abilities, legendary resistances (long), slots.
+        // The roster carries a slim projection of each member; the rest rules read the full sheet.
+        const full = charRepo.findById(char.id) ?? char;
+        const refresh = refreshForRest(full as never, kind);
+        const slots = restoreSlotsForRest(db, full as never, kind);
+        charRepo.update(char.id, {
+            hp: hpAfter,
+            ...(refresh.refilled.some(r => r.kind === 'pool') ? { resourcePools: refresh.pools } : {}),
+            ...(refresh.refilled.some(r => r.kind === 'ability') ? { abilities: refresh.abilities } : {}),
+            ...(refresh.legendaryResistancesRestored ? { legendaryResistancesRemaining: refresh.legendaryResistancesRestored.to } : {}),
+            ...slots.updates
+        } as any);
+        mirrorLinkedForRest(char.id, refresh);
 
         restResults.push({
             characterId: char.id,
             characterName: char.name,
             hpBefore,
             hpAfter,
-            healed: hpAfter - hpBefore
-        });
+            healed: hpAfter - hpBefore,
+            refilled: refresh.refilled,
+            ...(slots.spellSlotsRestored ? { spellSlotsRestored: slots.spellSlotsRestored } : {}),
+            ...(slots.pactSlotsRestored ? { pactSlotsRestored: slots.pactSlotsRestored } : {}),
+            ...(refresh.legendaryResistancesRestored ? { legendaryResistancesRestored: refresh.legendaryResistancesRestored } : {}),
+            _refreshLine: describeRefilled(refresh)
+        } as typeof restResults[number] & { _refreshLine: string });
     }
 
     const totalHealed = restResults.reduce((sum, r) => sum + r.healed, 0);
@@ -637,14 +671,22 @@ async function handleRest(input: TravelManageInput, _ctx: SessionContext): Promi
     const rows = restResults.map(r => [
         r.characterName,
         `${r.hpBefore} → ${r.hpAfter}`,
-        `+${r.healed}`
+        `+${r.healed}`,
+        [(r as { _refreshLine?: string })._refreshLine, r.spellSlotsRestored ? 'spell slots' : r.pactSlotsRestored ? 'pact slots' : ''].filter(Boolean).join('; ') || '—'
     ]);
-    output += RichFormatter.table(['Character', 'HP', 'Healed'], rows);
+    output += RichFormatter.table(['Character', 'HP', 'Healed', 'Refreshed'], rows);
 
+    // Honest footer: only what was written is claimed.
+    const casters = restResults.filter(r => r.spellSlotsRestored || r.pactSlotsRestored).map(r => r.characterName);
     if (isLongRest) {
-        output += '\n*All spell slots restored. Concentration cleared.*\n';
+        output += casters.length
+            ? `\n*Spell slots restored and concentration cleared for ${casters.join(', ')}.*\n`
+            : '\n*No spellcaster in the party: no slots to restore.*\n';
+    } else if (casters.length) {
+        output += `\n*Pact slots restored for ${casters.join(', ')}.*\n`;
     }
 
+    const members = restResults.map(({ _refreshLine: _l, ...r }: typeof restResults[number] & { _refreshLine?: string }) => r);
     const result = {
         success: true,
         actionType: 'rest',
@@ -652,7 +694,7 @@ async function handleRest(input: TravelManageInput, _ctx: SessionContext): Promi
         partyName: party.name,
         restType: input.restType,
         totalHealed,
-        members: restResults
+        members
     };
 
     output += RichFormatter.embedJson(result, 'TRAVEL_MANAGE');
@@ -710,8 +752,8 @@ After combat ends, use loot action to:
 - Auto-removes looted corpses
 
 ⏰ PARTY REST:
-- Long rest (8h): Full HP + all spell slots restored
-- Short rest (1h): hitDicePerMember controls healing
+- Long rest (8h): Full HP, spell slots, pools with refresh short/long, perRest abilities, legendary resistances (the rest_manage rules, per member)
+- Short rest (1h): hitDicePerMember controls healing (a flat d8 here; rest_manage short rolls the class die); pools with refresh short and perRest short abilities come back
 
 🔄 TYPICAL FLOW:
 combat_manage (end) → travel_manage (loot) → travel_manage (rest) → travel_manage (travel)

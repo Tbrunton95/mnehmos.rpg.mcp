@@ -4,7 +4,7 @@
 
 The reference backend game engine. **47 MCP tools** (42 consolidated action-routed + 2 meta + 3 event) for complete RPG mechanics, including LLM-driven NPCs via `agent_manage` and the Operator's constraint-perception lens via `perception_manage`.
 **Philosophy:** "LLM describes, engine validates" - Database is source of truth.
-**Status:** Alpha - 3122 tests passing (7 skipped), 249 test files, MCP Protocol fully integrated
+**Status:** Alpha - 3402 tests passing (7 skipped), 263 test files, MCP Protocol fully integrated
 
 **Provenance:** This repo (`Tbrunton95/RPG-Engine`) was imported from the owner's fork `Tbrunton95/mnehmos.rpg.mcp`, which tracks upstream `Mnehmos/mnehmos.rpg.mcp`. The owner's campaign-layer work (the `FINDINGS #NN` comments; hull/siege, container, vehicle, ledger, comms, horde tools) lives on top of upstream.
 

@@ -71,6 +71,47 @@ describe('character_manage consolidated tool', () => {
     });
 
     describe('action: create', () => {
+        // Play report 2 #10: keys the outer schema accepts but create does not
+        // declare used to vanish silently under a success banner.
+        it('writes conditions, merges addConditions by name, and honours xp', async () => {
+            const created = extractJson((await handleCharacterManage({
+                action: 'create', name: 'Marked', provisionEquipment: false, xp: 300,
+                conditions: [{ name: 'Wound clock: 2/6', source: 'the ambush' }, { name: 'Shaken' }],
+                addConditions: [{ name: 'shaken', duration: 3, pinned: true }, { name: 'THAW: hour 3' }]
+            }, ctx)).content[0].text);
+            expect(created.success).toBe(true);
+            expect(created.ignoredParams).toBeUndefined();
+            const got = extractJson((await handleCharacterManage({ action: 'get', characterId: created.id }, ctx)).content[0].text);
+            expect(got.xp).toBe(300);
+            expect(got.conditions).toEqual([
+                { name: 'Wound clock: 2/6', source: 'the ambush' },
+                { name: 'shaken', duration: 3, pinned: true },
+                { name: 'THAW: hour 3' }
+            ]);
+        });
+
+        it('says loudly which keys it ignored, with the nearest valid key or the update-only hint', async () => {
+            const res = await handleCharacterManage({
+                action: 'create', name: 'Noisy', provisionEquipment: false, sessionId: 'envelope-key',
+                preview: true, removeConditions: ['Poisoned'], conditons: [{ name: 'typo' }]
+            }, ctx);
+            const parsed = extractJson(res.content[0].text);
+            expect(parsed.success).toBe(true);
+            expect(parsed.ignoredParams).toEqual(['preview', 'removeConditions', 'conditons']);
+            expect(parsed.message).toMatch(/^Created character: Noisy\. Ignored params \(not create parameters; nothing was written for them\): /);
+            expect(parsed.message).toMatch(/preview — update-only — create always writes/);
+            expect(parsed.message).toMatch(/removeConditions — update-only/);
+            expect(parsed.message).toMatch(/conditons — nearest valid key 'conditions'/);
+            expect(res.content[0].text).toContain('Ignored params');
+            // The row exists and carries none of the ignored keys' effects.
+            const row = characterRepo.findById(parsed.id)!;
+            expect(row.conditions).toEqual([]);
+            // Only create opted in: an unknown key on update is dropped as before, with no ignoredParams in the reply.
+            const upd = extractJson((await handleCharacterManage({ action: 'update', characterId: parsed.id, hp: 5, bogusKey: 1 }, ctx)).content[0].text);
+            expect(upd.success).toBe(true);
+            expect(upd.ignoredParams).toBeUndefined();
+        });
+
         it('should create a character with minimal params', async () => {
             const result = await handleCharacterManage({
                 action: 'create',
@@ -83,6 +124,10 @@ describe('character_manage consolidated tool', () => {
             expect(parsed.name).toBe('Test Hero');
             expect(parsed.characterType).toBe('pc');
             expect(parsed.level).toBe(1);
+            // Play report 2 #9: no 'Stalker' placeholder background.
+            expect(parsed.background).toBeUndefined();
+            expect(parsed._rules.background).toBeNull();
+            expect(characterRepo.findById(parsed.id)!.background).toBeUndefined();
         });
 
         it('should create a character with full params', async () => {
@@ -468,6 +513,19 @@ describe('character_manage consolidated tool', () => {
             expect(parsed.name).toBe('Updated Name');
             expect(parsed.hp).toBe(15);
             expect(parsed.level).toBe(2);
+        });
+
+        // Play report 2 #9: background: null clears it (the row goes NULL).
+        it('sets and clears the background', async () => {
+            const set = extractJson((await handleCharacterManage({ action: 'update', characterId, background: 'Soldier' }, ctx)).content[0].text);
+            expect(set.success).toBe(true);
+            expect(set.background).toBe('Soldier');
+            expect(set.changed).toContain('background');
+            const cleared = extractJson((await handleCharacterManage(CharacterManageTool.inputSchema.parse({ action: 'update', characterId, background: null }), ctx)).content[0].text);
+            expect(cleared.success).toBe(true);
+            expect(cleared.changed).toContain('background');
+            expect(cleared.background).toBeUndefined();
+            expect(db.prepare('SELECT background FROM characters WHERE id = ?').get(characterId)).toEqual({ background: null });
         });
 
         it('should add conditions', async () => {

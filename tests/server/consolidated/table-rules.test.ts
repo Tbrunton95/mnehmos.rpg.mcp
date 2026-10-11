@@ -57,10 +57,28 @@ describe('table_rules', () => {
         expect(first.created).toBe(DAY_366_PRESET.length);
         const again = await call({ action: 'import', preset: 'day-366' });
         expect(again.created).toBe(0);
-        expect(again.updated).toBe(DAY_366_PRESET.length);
+        // Play report 2, item 11: enforced kinds update in place; principles the world already has are kept.
+        const principles = DAY_366_PRESET.filter(e => e.kind === 'principle').length;
+        expect(again.updated).toBe(DAY_366_PRESET.length - principles);
+        expect(again.kept).toBe(principles);
+        expect(again.message).toMatch(/kept \(principles this world already has; overwrite: true replaces them\)/);
         const list = await call({ action: 'list', kind: 'principle' });
         expect(list.rules.some((r: any) => /Chaos pays first/i.test(r.spec.text))).toBe(true);
         expect(loadRule(getDb(), W, 'called_strike')!.spec.limbs.leg.speed).toBe(0.5);
+    });
+
+    it('the Day 366 principles name no table character; a GM rewrite survives a re-import unless overwrite: true', async () => {
+        for (const p of DAY_366_PRESET.filter(e => e.kind === 'principle')) expect(String((p.spec as any).text)).not.toMatch(/Luciel|Scions/);
+        await call({ action: 'import', preset: 'day-366' });
+        const mine = 'Our warlord is a Primarch-class brute; his peers are the Lords of the Wall.';
+        await call({ action: 'define', kind: 'principle', name: 'character-fantasy', spec: { text: mine } });
+        const kept = await call({ action: 'import', preset: 'day-366' });
+        expect(kept.kept).toBeGreaterThan(0);
+        expect((await call({ action: 'get', name: 'character-fantasy' })).rule.spec.text).toBe(mine);
+        const replaced = await call({ action: 'import', preset: 'day-366', overwrite: true });
+        expect(replaced.kept).toBe(0);
+        expect(replaced.updated).toBe(DAY_366_PRESET.length);
+        expect((await call({ action: 'get', name: 'character-fantasy' })).rule.spec.text).toMatch(/^The player character is a top-band warlord/);
     });
 
     it('an import with one bad entry writes nothing', async () => {

@@ -101,6 +101,30 @@ describe('multiattack: attacksPerAction', () => {
         expect(tok('karanak').attacksMade).toBe(1);
     });
 
+    it('attacks 2/2, then {actionSurge: true} opens a fresh Attack action from a grantsAction ability', async () => {
+        await setup({ abilities: [{ name: 'Action Surge', grantsAction: true }] });
+        await act({ actorId: 'karanak', targetId: 'luciel', using: 'axe' });
+        await act({ actorId: 'karanak', targetId: 'luciel', using: 'whip' });
+        const surged = await act({ actorId: 'karanak', targetId: 'luciel', using: 'axe', actionSurge: true });
+        expect(surged.text).toMatch(/⚡ Action Surge spent/);
+        expect(surged.r.actionSurge).toMatchObject({ spent: true, ability: 'Action Surge', source: 'token', extraActions: 0 });
+        expect(surged.r.multiattack).toEqual({ made: 1, of: 2 });
+        expect(tok('karanak').abilities[0].ready).toBe(false);
+        // The open Attack action finishes; a fifth swing is refused.
+        expect((await act({ actorId: 'karanak', targetId: 'luciel', using: 'whip' })).r.multiattack).toEqual({ made: 2, of: 2 });
+        expect((await act({ actorId: 'karanak', targetId: 'luciel', using: 'axe', actionSurge: true })).text).toMatch(/attacks 2\/2.*Action Surge is spent/);
+    });
+
+    it('{actionSurge: true} without an action-granting ability is refused with the hint; nothing is spent', async () => {
+        await setup();
+        await act({ actorId: 'karanak', targetId: 'luciel', using: 'axe' });
+        await act({ actorId: 'karanak', targetId: 'luciel', using: 'whip' });
+        const refused = await act({ actorId: 'karanak', targetId: 'luciel', using: 'axe', actionSurge: true });
+        expect(refused.text).toMatch(/Action already used this turn \(attacks 2\/2\); no ready action-granting ability; give it abilities: \[\{name: 'Action Surge', grantsAction: true\}\]/);
+        expect(tok('karanak').attacksMade).toBe(2);
+        expect(tok('luciel').hp).toBe(tok('luciel').hp);
+    });
+
     it('the state view shows the attacks used', async () => {
         await setup();
         await act({ actorId: 'karanak', targetId: 'luciel', using: 'axe' });

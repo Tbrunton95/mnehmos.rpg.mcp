@@ -36,6 +36,7 @@ const TableRulesInputSchema = z.object({
     enabled: z.boolean().optional().describe('define: start enabled (default true)'),
     preset: z.string().optional().describe(`import: a bundled rule set (${Object.keys(RULE_PRESETS).join(', ')})`),
     rules: z.array(RuleEntrySchema).optional().describe('import: rules given inline, [{kind, name, spec}]'),
+    overwrite: z.boolean().optional().describe("import: also replace principle rows the world already has. Default false: an existing principle is kept (counted as kept), so a GM's rewrite survives a re-import"),
     fromToken: z.object({ encounterId: z.string(), participantId: z.string() }).optional()
         .describe('define kind creature: capture the statline of a live combat token; spec is merged on top'),
     fromCharacterId: z.string().optional().describe('define kind creature: capture the statline of a character sheet; spec is merged on top'),
@@ -208,14 +209,21 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
                 if (!(RULE_KINDS as string[]).includes(e.kind)) throw new Error(`Rule '${e.name}': unknown kind '${e.kind}'`);
                 parseRuleSpec(e.kind as RuleKind, e.spec ?? {});
             }
-            let created = 0, updated = 0;
+            // Play report 2, item 11: a principle the world already has is a
+            // GM's text (reference, never enforced) — a re-import keeps it
+            // unless overwrite: true. Enforced kinds still update in place.
+            let created = 0, updated = 0, kept = 0;
             db.transaction(() => {
                 for (const e of entries!) {
+                    if (e.kind === 'principle' && !input.overwrite && findRule(input.worldId, e.name)) { kept++; continue; }
                     const r = upsert({ worldId: input.worldId, kind: e.kind, name: e.name, spec: e.spec, enabled: e.enabled });
                     if (r.created) created++; else updated++;
                 }
             })();
-            return { success: true, actionType: 'import', preset: input.preset, created, updated, message: `Imported ${entries.length} rule(s): ${created} new, ${updated} updated` };
+            return {
+                success: true, actionType: 'import', preset: input.preset, created, updated, kept,
+                message: `Imported ${entries.length} rule(s): ${created} new, ${updated} updated${kept ? `, ${kept} kept (principles this world already has; overwrite: true replaces them)` : ''}`
+            };
         }
     }
     return { error: true, message: `Unknown action '${input.action}': ${ACTIONS.join(', ')}` };
@@ -265,7 +273,7 @@ Kinds:
 - growth_track {pool, steps: [{at, form?, condition?: {name, effect?, duration?}, table?, auto?, note?}], direction: up|down|both, perKill?, perBandAbove?, perVictory?}: a kill in combat adds perKill (+ perBandAbove per band step the victim is at or above the killer) to the killer's pool, party_manage after_battle {victory: true} adds perVictory to each survivor with the pool. Crossing a step (by kills, adjust_pool, offer, spell costs and boosts, or table writes) returns growthReady {form|condition|table, call}: the call to make; it is never applied by itself. A step with auto: true is applied on the crossing instead (its condition goes on the sheet and any live token, its table rolls for the character, its form is taken) and reported as growthApplied; a rung fires once per character (the pool's growthApplied list). direction up (default) fires when the pool reaches at, down when it drops below. An addiction ladder is a track with auto rungs.
 roll {worldId, name, characterId?, modifier?, modifierPool?, apply?, seed?}: rolls a roll_table on seeded, logged dice. The modifier (plus the character's modifierPool ÷ poolDivisor) shifts the total, clamped to the table; an entry's chain rolls the next table (5 deep). With characterId, each entry's apply acts on the character (apply: false previews and writes nothing); a death stops the chain. Returns rolled, entry, chained, text, rollId and applied[].
 A name is unique per world across kinds: define refuses to change an existing rule's kind.
-import {worldId, preset: 'day-366' | 'orruk-waaagh' | 'skaven-horned-rat'} loads a bundled rule set: the Day 366 table rules; the Orruk Waaagh! (Gorkamorka favour, teef, Orruk and Grot, Brute / Ardboy / Wurrgog Prophet / Weirdnob Shaman, Ardboy-to-Great Warboss forms, the Getting Bigga track, the Waaagh! Overload table and three spells); or the Skaven of the Horned Rat (Age of Sigmar: the Clanrat-to-Horned-Rat band ladder with damageScale, warp-tokens, the favour family horned_rat_favour / clan_standing / warpstone_taint, Skaven species, Grey Seer class, the Ascension track to Verminlord forms, the Warpstone Hunger ladder with auto rungs, Boneripper, Clanrat tide, Stormvermin, Rat Ogor, Plague Monks, Warp Lightning Cannon, the Warp Lightning Miscast / Horned Rat's Judgement / Mutation / Gnawhole tables, seven Lore of Ruin spells with (warpstone) variants, and the Scheme / Blame / Flee principles). worldId REQUIRED on every call.`,
+import {worldId, preset: 'day-366' | 'orruk-waaagh' | 'skaven-horned-rat', overwrite?} loads a bundled rule set (a re-import updates enforced kinds in place but KEEPS principle rows the world already has, so a GM's rewrite survives; overwrite: true replaces them too): the Day 366 table rules; the Orruk Waaagh! (Gorkamorka favour, teef, Orruk and Grot, Brute / Ardboy / Wurrgog Prophet / Weirdnob Shaman, Ardboy-to-Great Warboss forms, the Getting Bigga track, the Waaagh! Overload table and three spells); or the Skaven of the Horned Rat (Age of Sigmar: the Clanrat-to-Horned-Rat band ladder with damageScale, warp-tokens, the favour family horned_rat_favour / clan_standing / warpstone_taint, Skaven species, Grey Seer class, the Ascension track to Verminlord forms, the Warpstone Hunger ladder with auto rungs, Boneripper, Clanrat tide, Stormvermin, Rat Ogor, Plague Monks, Warp Lightning Cannon, the Warp Lightning Miscast / Horned Rat's Judgement / Mutation / Gnawhole tables, seven Lore of Ruin spells with (warpstone) variants, and the Scheme / Blame / Flee principles). worldId REQUIRED on every call.`,
     inputSchema: TableRulesInputSchema,
     // Every action shares the one input schema; the switch dispatcher validates per action.
     actionSchemas: Object.fromEntries(ACTIONS.map(a => [a, { schema: TableRulesInputSchema, aliases: [] as string[] }]))

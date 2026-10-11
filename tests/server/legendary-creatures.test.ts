@@ -472,6 +472,32 @@ describe('Legendary creatures at the table (tools)', () => {
         expect(text).toMatch(/LA 2\/3 · LR 2\/3/);
     });
 
+    it('a surprised legendary creature takes no legendary action and no legendaryCost attack until its slot passes', async () => {
+        await setup();
+        closeDb();
+        const db = getDb(':memory:');
+        clearCombatState();
+        const now = new Date().toISOString();
+        new CharacterRepository(db).create({ id: 'dragon', name: 'Dragon', stats: { str: 27, dex: 10, con: 25, int: 16, wis: 13, cha: 21 },
+            hp: 256, maxHp: 256, ac: 19, level: 1, legendaryActions: 3, legendaryResistances: 3, legendaryResistancesRemaining: 3,
+            createdAt: now, updatedAt: now } as any);
+        enc = tag((await handleCombatManage({ action: 'create', participants: [
+            { id: 'hero', name: 'Valeros', hp: 50, maxHp: 50, initiative: 25, ac: 10 },
+            { id: 'dragon', name: 'Dragon', hp: 256, maxHp: 256, initiative: 10, isEnemy: true, ac: 19 }
+        ], surprised: ['dragon'] }, ctx as any)).content[0].text, 'COMBAT_MANAGE').encounterId;
+        const la = await manage({ action: 'legendary_action', participantId: 'dragon', description: 'tail' });
+        expect(la.d).toMatchObject({ error: true, writes: 'none' });
+        expect(la.d.message).toMatch(/Dragon is surprised/);
+        expect(tok('dragon').legendaryActionsRemaining).toBe(3);
+        const bite = await attack({ actorId: 'dragon', targetId: 'hero', attackBonus: 14, damage: 5, legendaryCost: 1 });
+        expect(bite.text).toMatch(/Dragon is surprised/);
+        expect(tok('dragon').legendaryActionsRemaining).toBe(3);
+        expect(tok('hero').hp).toBe(50);
+        // Its slot passes on advance; the hero is up in round 2 and the dragon may act off-turn.
+        await manage({ action: 'advance' });
+        expect((await manage({ action: 'legendary_action', participantId: 'dragon', description: 'tail' })).d).toMatchObject({ success: true, remaining: 2 });
+    });
+
     it('reaction:true spends the reaction, not the action, and a second reaction is refused', async () => {
         await setup();
         const { text } = await attack({ actorId: 'dragon', targetId: 'hero', attackBonus: 14, damage: 3, reaction: true });

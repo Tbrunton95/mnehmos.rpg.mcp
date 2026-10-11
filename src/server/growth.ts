@@ -13,6 +13,7 @@
 import type Database from 'better-sqlite3';
 import { loadRules, findPool, bandOrderFor, type TableRule } from '../engine/table-rules.js';
 import { applyScheduledOps, type ScheduledWriteOp } from '../engine/scheduled-ops.js';
+import { normalizeCondition, type Condition } from '../engine/combat/conditions.js';
 import type { DiceRoller } from '../math/logged-d20.js';
 import { CharacterRepository } from '../storage/repos/character.repo.js';
 
@@ -232,6 +233,40 @@ export async function applyGrowthFromPools(
         if (r.growthApplied) applied.push(...r.growthApplied);
     }
     return { ...(ready.length ? { growthReady: ready[0], readyAll: ready } : {}), ...(applied.length ? { growthApplied: applied } : {}) };
+}
+
+/** The GROWTH rule line a kill credit prints; attack, apply_damage and execute share it. */
+export function growthLine(c: GrowthCredit): string {
+    const fired = (c.growthApplied ?? []).map(a => `${a.at}: ${a.condition ?? (a.form as { form?: string } | undefined)?.form ?? (a.table as { table?: string } | undefined)?.table}`).join(', ');
+    return `GROWTH ${c.track}: ${c.pool} ${c.from} → ${c.to} (${c.reason})${fired ? `; fired ${fired}` : ''}${c.growthReady ? `; ready for ${c.growthReady.form ?? c.growthReady.condition?.name ?? c.growthReady.table}: ${c.growthReady.call}` : ''}`;
+}
+
+/**
+ * Play report 2, item 6: the one kill hook. Credits a kill to the killer's
+ * growth track (perKill plus perBandAbove); undefined for a self-kill, when
+ * no track applies, or when anything throws (no character row, no rules
+ * table) — a kill credit never fails the call that made the kill.
+ */
+export async function creditKill(
+    db: Database.Database, worldId: string | null | undefined, killerId: string | undefined,
+    victim: { id: string; name: string; band?: string | null }, attackerBand?: string | null
+): Promise<GrowthCredit | undefined> {
+    if (!killerId || victim.id === killerId) return undefined;
+    try {
+        return await creditGrowth(db, worldId, killerId, 'kill', { victim: victim.name, victimBand: victim.band, attackerBand });
+    } catch { return undefined; }
+}
+
+/** A condition an auto rung put on the killer's sheet reaches its live token too. */
+export function growthConditionsOnToken(
+    engine: { applyCondition(participantId: string, condition: Omit<Condition, 'id'>): unknown },
+    actorId: string, credit: GrowthCredit
+): void {
+    for (const a of credit.growthApplied ?? []) {
+        if (!a.condition) continue;
+        const norm = normalizeCondition({ name: a.condition, sourceId: actorId, source: a.track } as never, actorId);
+        if (norm) { const { id: _drop, ...rest } = norm; void _drop; engine.applyCondition(actorId, rest); }
+    }
 }
 
 /**

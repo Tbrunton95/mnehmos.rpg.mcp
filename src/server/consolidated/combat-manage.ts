@@ -5,10 +5,11 @@
  * advance_turn, roll_death_save, execute_lair_action
  */
 
-import { PartSchema, UnitSchema, ReadiedSchema, ReadiedAttackSchema, PART_STATES, PART_KINDS, ParticipantExtrasShape, SizeCategorySchema, nearbyMatchSchema, mobRuleSchema, type Buff } from '../../schema/token-extras.js';
+import { PartSchema, UnitSchema, ReadiedSchema, ReadiedAttackSchema, PART_STATES, PART_KINDS, ParticipantExtrasShape, SizeCategorySchema, FightingStyleSchema, nearbyMatchSchema, mobRuleSchema, type Buff } from '../../schema/token-extras.js';
 import { hydrateExtras, type ExtrasRow } from '../../engine/combat/participant-extras.js';
 import { environmentGlyph } from '../../render/pda.js';
 import { upsertPart } from '../../engine/combat/parts.js';
+import { patchRowAbility, perRestSpentNote } from '../../engine/combat/abilities.js';
 import { volleyTier, describeUnit, breakTestDue, moraleModifiers, liveModels } from '../../engine/combat/units.js';
 import { sheetSpecies } from '../handlers/world-spell.js';
 import { nearbyAllies } from '../../engine/combat/nearby.js';
@@ -27,6 +28,7 @@ import {
     handleRollDeathSave,
     handleExecuteLairAction,
     getOrLoadEngine,
+    liveEncounterFor,
     syncParticipantHpFromDb,
     saveEncounterState,
     mirrorConditionToRow,
@@ -48,10 +50,11 @@ import { getDb } from '../../storage/index.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { CombatEngine } from '../../engine/combat/engine.js';
 import { ConditionInputSchema, SIZE_TABLE, EnvironmentSchema } from '../../schema/encounter.js';
-import { normalizeCondition, normalizeConditions } from '../../engine/combat/conditions.js';
+import { normalizeCondition, normalizeConditions, sourceNamesHolder, grappleSource } from '../../engine/combat/conditions.js';
 import { getCombatManager } from '../state/combat-manager.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { recordAward } from '../../storage/xp-awards.js';
+import { creditKill, growthLine, growthConditionsOnToken, type GrowthCredit } from '../growth.js';
 import { getAgentRuntime, buildAgentRuntime } from '../../agent/runtime/deps.js';
 import { invokeAgent } from '../../agent/runtime/invoke.js';
 import { ProviderFactory } from '../../agent/provider/factory.js';
@@ -60,7 +63,7 @@ import { ProviderFactory } from '../../agent/provider/factory.js';
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_environment', 'set_intent', 'trigger_readied', 'legendary_action', 'legendary_resistance', 'use_ability', 'apply_damage', 'battle_cry', 'budget', 'get_history', 'list', 'board'] as const;
+const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_environment', 'set_intent', 'trigger_readied', 'legendary_action', 'legendary_resistance', 'use_ability', 'apply_damage', 'battle_cry', 'set_surprised', 'budget', 'get_history', 'list', 'board'] as const;
 type CombatManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -147,7 +150,8 @@ const CreateSchema = z.object({
     environment: environmentField().optional().describe("The medium of the fight: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed? (default false in water), meleeDisadvantageUnlessDamageType? (default ['piercing']), swimTag? (default 'aquatic')}"),
     includeParty: z.boolean().optional().describe('T1.2 (Findings #34): prepend the active party as PC-side participants'),
     partyId: z.string().optional().describe('Party to include (defaults to the only active party)'),
-    worldId: z.string().optional().describe('FINDINGS #105: stamp the encounter to this world; omitted → derived from the first participant whose character row is claimed')
+    worldId: z.string().optional().describe('FINDINGS #105: stamp the encounter to this world; omitted → derived from the first participant whose character row is claimed'),
+    surprised: z.array(z.string()).optional().describe('Participant ids caught flat-footed: their round-1 turn passes and they cannot react, act or take legendary actions until it has')
 });
 
 const GetSchema = z.object({
@@ -241,7 +245,7 @@ const ApplyDamageSchema = z.object({
     action: z.literal('apply_damage'),
     encounterId: z.string().optional().describe('The fight whose dice, tokens and log take it; omit for damage outside a fight (a character with a live token is routed through its encounter)'),
     targetIds: z.array(z.string()).min(1).describe('Token ids in the encounter, or character ids without one'),
-    actorId: z.string().optional().describe("Who deals it (a token or character id), when something does: the band rule's damageScale then scales each target's damage by the band gap. Omit for environmental damage (never band-scaled)"),
+    actorId: z.string().optional().describe("Who deals it (a token or character id), when something does: the band rule's damageScale then scales each target's damage by the band gap, and every target it drops to 0 is a kill on the actor's growth track (perKill, perBandAbove; growth[] and a GROWTH line). Omit for environmental damage (never band-scaled, never credited)"),
     dice: z.union([z.number().int().min(0), z.string().min(1)]).describe("Dice ('6d10', '2d6+3') rolled once for every target, or a number"),
     damageType: z.string().optional().describe('Resistances, immunities and vulnerabilities read it'),
     source: z.string().min(1).describe("What deals it ('falling rubble', \"An'ggrath's bite\"): the roll is logged as 'damage: <source>'"),
@@ -327,6 +331,7 @@ const AddConditionSchema = z.object({
     name: z.string().optional().describe('Shorthand for condition: a bare condition name'),
     replace: z.boolean().optional().describe('Drop existing conditions of the same type first'),
     mirrorToCharacter: z.boolean().optional().describe('Also add it to the character sheet (upsert by name)'),
+    fromGrapple: z.string().optional().describe("Holder (participant id or name): writes source 'grapple: <holder id>' so grapple execute and break recognise the hold; refused when ambiguous or when condition.source names someone else"),
     reason: z.string().optional().describe('Why — recorded in the combat log')
 }).refine(p => Boolean(p.condition || p.name), { message: 'Pass condition or name', path: ['condition'] });
 
@@ -416,7 +421,15 @@ const TriggerReadiedSchema = z.object({
     participantId: z.string(),
     note: z.string().optional().describe('What happened when it fired'),
     targetId: z.string().optional().describe("Who the readied attack strikes (default: the readied action's watch, when it names a participant)"),
-    attack: ReadiedAttackSchema.optional().describe('{using?, attackBonus?, damage?, damageType?, withPart?}: the attack to roll, over the stored one')
+    attack: ReadiedAttackSchema.optional().describe('{using?, attackBonus?, damage?, damageType?, withPart?, twoHanded?}: the attack to roll, over the stored one (twoHanded: great weapon fighting applies, dueling does not)')
+});
+
+const SetSurprisedSchema = z.object({
+    action: z.literal('set_surprised'),
+    encounterId: z.string(),
+    participantIds: z.array(z.string()).min(1).describe('Who is caught flat-footed (or, with surprised: false, who no longer is)'),
+    surprised: z.boolean().default(true).describe('true (default) flags them; false clears a flag set by mistake'),
+    reason: z.string().optional().describe('Why — logged')
 });
 
 const LegendaryActionSchema = z.object({
@@ -660,8 +673,17 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     return true;
                 }),
                 terrain: params.terrain,
-                ...(params.environment ? { environment: params.environment } : {})
+                ...(params.environment ? { environment: params.environment } : {}),
+                ...(params.surprised?.length ? { surprised: params.surprised } : {})
             };
+            // Surprise names participants of this fight (the party included).
+            if (params.surprised?.length) {
+                const ids = new Set(originalParams.participants.map(p => p.id as string));
+                const unknown = params.surprised.filter(id => !ids.has(id));
+                if (unknown.length) {
+                    return { error: true, actionType: 'create', message: `surprised names no participant: ${unknown.join(', ')} (participants: ${[...ids].join(', ')}). Nothing was written.`, writes: 'none' };
+                }
+            }
             const result = await handleCreateEncounter(originalParams, ctx);
             const data = extractResultData(result, 'create') as Record<string, unknown>;
             // T1.3 (Findings #34): print the wall before the party hits it.
@@ -1369,6 +1391,27 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
             const normalized = normalizeCondition(params.condition ?? params.name!, p.id);
             if (!normalized) return refuse('Condition needs a name');
+            // Play report 2, item 2: fromGrapple names the holder; the source
+            // becomes the canonical 'grapple: <holder id>' that execute and
+            // break read. A participant by id, else by name (one match only),
+            // else a character row.
+            let heldBy: { id: string; name: string } | undefined;
+            if (params.fromGrapple) {
+                const want = params.fromGrapple.trim();
+                const byId = state.participants.find(x => x.id === want);
+                const byName = byId ? [] : state.participants.filter(x => x.name.trim().toLowerCase() === want.toLowerCase());
+                if (byName.length > 1) return refuse(`fromGrapple '${want}' is ambiguous: ${byName.map(x => `${x.name} (${x.id})`).join(', ')} — use the id`);
+                const row = byId || byName.length ? null : new CharacterRepository(getDb()).findById(want);
+                const holder = byId ?? byName[0] ?? (row ? { id: row.id, name: row.name } : undefined);
+                if (!holder) return refuse(`fromGrapple: no participant or character '${want}'`);
+                const given = typeof params.condition === 'object' && params.condition ? (params.condition.sourceId ?? params.condition.source) : undefined;
+                // A blank source is no source; only one that names someone else is refused.
+                if (given !== undefined && String(given).trim() && !sourceNamesHolder(given, holder)) {
+                    return refuse(`condition.source '${given}' does not name the holder ${holder.name} (${holder.id}); drop it, or write the holder's id or name`);
+                }
+                normalized.sourceId = grappleSource(holder.id);
+                heldBy = { id: holder.id, name: holder.name };
+            }
             let replaced = 0;
             if (params.replace) {
                 const before = p.conditions.length;
@@ -1380,16 +1423,18 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             const applied = engine.applyCondition(p.id, rest);
             new EncounterRepository(getDb()).saveState(params.encounterId, state);
             const mirrored = params.mirrorToCharacter ? mirrorConditionToRow(p.id, 'add', applied.type, normalized.duration, normalized.sourceId) : false;
-            logConditionChange(params.encounterId, state, 'add_condition', p.id, `${p.name} gains ${applied.type}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
+            const held = heldBy ? ` (held by ${heldBy.name})` : '';
+            logConditionChange(params.encounterId, state, 'add_condition', p.id, `${p.name} gains ${applied.type}${held}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
             return {
                 success: true, actionType: 'add_condition', encounterId: params.encounterId,
                 participantId: p.id, condition: applied, replaced, mirroredToCharacter: mirrored,
+                ...(heldBy ? { heldBy } : {}),
                 conditions: p.conditions.map(c => c.type),
-                message: `${p.name}: +${applied.type}${replaced ? ` (replaced ${replaced})` : ''}`
+                message: `${p.name}: +${applied.type}${held}${replaced ? ` (replaced ${replaced})` : ''}`
             };
         },
         aliases: ['apply_condition', 'inflict', 'condition'],
-        description: 'Add a condition to a live encounter participant (condition: name or {name, duration, durationType, save..., level}; or top-level name); optional mirror to the character sheet'
+        description: "Add a condition to a live encounter participant (condition: name or {name, duration, durationType, save..., level}; or top-level name); optional mirror to the character sheet. fromGrapple: <holder id or name> writes the source 'grapple: <holder id>' that grapple execute and break read"
     },
     remove_condition: {
         schema: RemoveConditionSchema,
@@ -1543,7 +1588,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             // still to move: a token that has not spent movement gets the
             // new budget; one mid-move keeps what it has, capped at it.
             for (const p of state.participants) {
-                const budget = engine.effectiveSpeed(p) * (p.hasDashed ? 2 : 1);
+                const budget = engine.moveBudget(p);
                 p.movementRemaining = Math.min(p.movementRemaining ?? budget, budget);
             }
             new EncounterRepository(getDb()).saveState(params.encounterId, state);
@@ -1595,7 +1640,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
             if (!p.readied) return refuse(`${p.name} has no readied action`);
             // A readied action is the reactor's reaction (item 11).
-            if (!engine.canTakeReactions(p.id)) return refuse(`${p.name} cannot take reactions (down, or a condition such as stunned or incapacitated)`);
+            if (!engine.canTakeReactions(p.id)) return refuse(`${p.name} cannot take reactions (down, surprised, or a condition such as stunned or incapacitated)`);
             if (p.reactionUsed) return refuse(`${p.name} has already used its reaction this round`);
             const fired = p.readied;
             const spec = params.attack ?? fired.attack;
@@ -1630,6 +1675,44 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         },
         aliases: ['fire_readied', 'readied_fires'],
         description: 'A readied action\'s trigger happened: spends the reaction, rolls its stored attack (targetId) in the same call, clears and logs it'
+    },
+    set_surprised: {
+        schema: SetSurprisedSchema,
+        handler: async (params: z.infer<typeof SetSurprisedSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'set_surprised', message: `${message} Nothing was written.`, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB).`);
+            const targets: CombatParticipant[] = [];
+            for (const id of params.participantIds) {
+                const p = state.participants.find(x => x.id === id);
+                if (!p) return refuse(`Participant ${id} not in this encounter.`);
+                targets.push(p);
+            }
+            // Surprise is a round-1 state set before the creature's first turn;
+            // clearing a flag set by mistake is allowed at any time.
+            if (params.surprised) {
+                if (state.round !== 1) return refuse(`Round ${state.round}: surprise is a round-1 state, set before the creature's first turn (create {surprised: [ids]} or set_surprised before it acts).`);
+                for (const p of targets) {
+                    if (state.turnOrder.indexOf(p.id) <= state.currentTurnIndex) return refuse(`${p.name}'s turn has started: surprise is set before it.`);
+                }
+            }
+            for (const p of targets) p.surprised = params.surprised;
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            const names = targets.map(p => p.name).join(', ');
+            const summary = params.surprised
+                ? `${names} surprised: the round-1 turn passes, no reactions or actions until then${params.reason ? ` — ${params.reason}` : ''}`
+                : `${names} no longer surprised${params.reason ? ` — ${params.reason}` : ''}`;
+            for (const p of targets) logConditionChange(params.encounterId, state, 'set_surprised', p.id, summary, params.reason);
+            return {
+                success: true, actionType: 'set_surprised', encounterId: params.encounterId,
+                participantIds: targets.map(p => p.id), surprised: params.surprised,
+                message: `😲 ${summary}`
+            };
+        },
+        aliases: ['surprise', 'surprised'],
+        description: "Catch participants flat-footed after create (round 1, before their first turn): their turn passes on advance and they cannot react, act or take legendary actions until it has; surprised: false clears it. Logged"
     },
     legendary_action: {
         schema: LegendaryActionSchema,
@@ -1696,34 +1779,76 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             syncParticipantHpFromDb(state);
             const p = state.participants.find(x => x.id === params.participantId);
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            // Caught flat-footed: nothing, not even a free ability, until its first turn has passed.
+            if (p.surprised) return refuse(`${p.name} is surprised: no action until its first turn passes`);
             const ability = (p.abilities ?? []).find(a => a.name.toLowerCase() === params.ability.trim().toLowerCase());
             if (!ability) {
                 const known = (p.abilities ?? []).map(a => a.name);
                 return refuse(`${p.name} has no ability '${params.ability}'${known.length ? `; it has ${known.join(', ')}` : ' (give it abilities: [{name, recharge?}])'}`);
             }
             if (ability.ready === false) {
-                return refuse(`${p.name}'s ${ability.name} is spent and not recharged (recharge ${ability.recharge ?? '?'}+ on a d6 at the start of its turn)`);
+                return refuse(ability.recharge
+                    ? `${p.name}'s ${ability.name} is spent and not recharged (recharge ${ability.recharge}+ on a d6 at the start of its turn)`
+                    : ability.perRest
+                        ? `${p.name}'s ${perRestSpentNote(ability)}`
+                        : `${p.name}'s ${ability.name} is spent (character_manage restore_ability or a rest readies it)`);
             }
-            const economy = engine.validateActionEconomy(p.id, 'action');
-            if (!economy.valid) return refuse(`${p.name}: ${economy.error ?? 'action unavailable'}`);
+            // What the use costs: nothing when it grants an action (Action
+            // Surge), else its actionCost (the action by default). An action
+            // or bonus action is spent on the user's own turn: off it, the
+            // flag would be reset at its turn start, a free use in disguise.
+            // A reaction or a free ability may happen off-turn.
+            const grants = ability.grantsAction === true;
+            const cost: 'action' | 'bonus' | 'reaction' | 'none' = grants ? 'none' : (ability.actionCost ?? 'action');
+            const activeId = state.turnOrder[state.currentTurnIndex];
+            const offTurn = !!activeId && activeId !== p.id;
+            if (offTurn && (grants || cost === 'action' || cost === 'bonus')) {
+                const active = activeId === 'LAIR' ? 'the lair' : state.participants.find(x => x.id === activeId)?.name ?? activeId;
+                return refuse(`It is not ${p.name}'s turn (${active} is acting): ${ability.name} ${grants ? 'grants an action on its own turn' : `costs the ${cost === 'bonus' ? 'bonus action' : 'action'}, spent on its own turn`}.`);
+            }
+            if (grants) {
+                if (!engine.canTakeActions(p.id)) return refuse(`${p.name} is incapacitated`);
+            } else if (cost !== 'none') {
+                const economy = engine.validateActionEconomy(p.id, cost);
+                if (!economy.valid) return refuse(`${p.name}: ${economy.error ?? `${cost} unavailable`}`);
+            }
             if (params.savingThrow && !toLongAbility(params.savingThrow.ability)) return refuse(`Unknown save ability '${params.savingThrow.ability}'`);
 
-            engine.commitAction(p.id, 'action');
-            if (ability.recharge) ability.ready = false;
+            if (grants) {
+                const granted = engine.grantExtraAction(p.id);
+                if (!granted.ok) return refuse(granted.error);
+            } else if (cost !== 'none') {
+                engine.commitAction(p.id, cost);
+            }
+            // A recharge ability rolls to come back; a granted action is a
+            // one-shot resource (two surges a turn would be two extra actions);
+            // a perRest ability (item 18) waits for a rest.
+            const perRest = !!ability.perRest;
+            if (ability.recharge || grants || perRest) ability.ready = false;
+            // A spend the fight cannot bring back reaches the sheet, so the next
+            // fight does not start with it ready; recharge spends stay on the token.
+            const mirroredToCharacter = (grants || perRest) && !ability.recharge ? patchRowAbility(getDb(), p.id, ability.name, false).found : false;
             const area = resolveAreaSave(engine, {
                 targetIds: params.targetIds, damage: params.damage, damageType: params.damageType,
                 savingThrow: params.savingThrow, halfDamageOnSave: params.halfDamageOnSave
             }, ability.name);
             saveEncounterState(new EncounterRepository(getDb()), params.encounterId, state);
-            const summary = `${p.name} uses ${ability.name}${area.targets.length ? ` on ${area.targets.map(t => `${t.targetName} (${t.saved ? 'saved, ' : ''}${t.damageTaken})`).join(', ')}` : ''}${params.reason ? ` — ${params.reason}` : ''}`;
+            const summary = `${p.name} uses ${ability.name}${grants ? ' (one extra action this turn)' : ''}${area.targets.length ? ` on ${area.targets.map(t => `${t.targetName} (${t.saved ? 'saved, ' : ''}${t.damageTaken})`).join(', ')}` : ''}${params.reason ? ` — ${params.reason}` : ''}`;
             logConditionChange(params.encounterId, state, 'use_ability', p.id, summary, params.reason);
-            let message = `✴ ${p.name} uses ${ability.name}`;
+            let message = grants
+                ? `⚡ ${p.name} uses ${ability.name}: one extra action this turn (extra actions: ${p.extraActions ?? 0})`
+                : `✴ ${p.name} uses ${ability.name}${cost === 'none' ? ' (free)' : cost !== 'action' ? ` (${cost})` : ''}`;
             if (typeof params.damage === 'string') message += ` (${params.damage}: ${area.damageRolled})`;
             if (area.lines.length) message += '\n' + area.lines.join('\n');
             if (ability.recharge) message += `\n${ability.name} is spent; it recharges on a d6 of ${ability.recharge}+ at the start of ${p.name}'s turn.`;
+            else if (perRest) message += `\n${perRestSpentNote(ability)}${mirroredToCharacter ? '; the sheet shows it spent too' : ''}.`;
+            else if (grants) message += `\n${ability.name} is spent (character_manage restore_ability or a rest readies it)${mirroredToCharacter ? '; the sheet shows it spent too' : ''}.`;
             return {
                 success: true, actionType: 'use_ability', encounterId: params.encounterId, participantId: p.id,
                 ability: ability.name, ready: ability.ready !== false,
+                actionCost: cost, grantsAction: grants,
+                ...(grants ? { extraActions: p.extraActions ?? 0 } : {}),
+                ...(grants || perRest ? { mirroredToCharacter } : {}),
                 ...(area.damageRolled !== undefined ? { damageRolled: area.damageRolled } : {}),
                 ...(area.damageRolls ? { damageRolls: area.damageRolls } : {}),
                 targets: area.targets,
@@ -1732,7 +1857,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             };
         },
         aliases: ['ability', 'breath_weapon', 'recharge_ability'],
-        description: "Use a limited ability (a breath weapon): spends the action, marks a recharge ability spent, and resolves damage and a save per target on the fight's dice"
+        description: "Use a limited ability (a breath weapon): spends its actionCost (the action by default; action|bonus on its own turn only), marks a recharge, perRest or action-granting ability spent, and resolves damage and a save per target on the fight's dice. grantsAction (Action Surge) costs nothing and banks one extra action this turn; grantsAction and perRest spends are mirrored to the sheet (a rest readies perRest ones)"
     },
     apply_damage: {
         schema: ApplyDamageSchema,
@@ -1757,6 +1882,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 return refuse('A battle cry needs something in it: attackAdvantage, damageBonus, speedBonus or moraleBonus.');
             }
             if (!engine.canTakeActions(p.id)) return refuse(`${p.name} is down or incapacitated and cannot call ${params.name}.`);
+            if (p.surprised) return refuse(`${p.name} is surprised: no action, not even a free cry, until its first turn passes.`);
             let ability: NonNullable<typeof p.abilities>[number] | undefined;
             if (params.ability) {
                 ability = (p.abilities ?? []).find(a => a.name.toLowerCase() === params.ability!.trim().toLowerCase());
@@ -1764,7 +1890,11 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                     const known = (p.abilities ?? []).map(a => a.name);
                     return refuse(`${p.name} has no ability '${params.ability}'${known.length ? `; it has ${known.join(', ')}` : ''}.`);
                 }
-                if (ability.ready === false) return refuse(`${p.name}'s ${ability.name} is spent and not recharged (recharge ${ability.recharge ?? '?'}+ on a d6 at the start of its turn).`);
+                if (ability.ready === false) {
+                    return refuse(ability.perRest && !ability.recharge
+                        ? `${p.name}'s ${perRestSpentNote(ability)}.`
+                        : `${p.name}'s ${ability.name} is spent and not recharged (recharge ${ability.recharge ?? '?'}+ on a d6 at the start of its turn).`);
+                }
             }
             // A cry that costs an action or bonus action is made on the
             // caller's own turn: off it, those flags would be spent and then
@@ -1801,7 +1931,10 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 }
             }
             if (params.actionCost !== 'none') engine.commitAction(p.id, params.actionCost);
-            if (ability?.recharge) ability.ready = false;
+            // A recharge cry rolls to come back; a perRest cry (item 18) waits
+            // for a rest, and the sheet shows it spent so the next fight does too.
+            if (ability?.recharge || ability?.perRest) ability.ready = false;
+            const cryMirrored = ability?.perRest && !ability.recharge ? patchRowAbility(getDb(), p.id, ability.name, false).found : false;
             saveEncounterState(new EncounterRepository(getDb()), params.encounterId, state);
             const effects = [buff.attackAdvantage && 'advantage on attacks', buff.damageBonus !== undefined && `+${buff.damageBonus} damage on a hit`, buff.speedBonus && `+${buff.speedBonus} ft speed`, buff.moraleBonus && `+${buff.moraleBonus} morale`].filter(Boolean).join(', ');
             const summary = `${p.name} calls ${buff.name}: ${recipients.map(r => r.name).join(', ')} (${effects}) until the start of ${p.name}'s turn in round ${buff.untilRound + 1}${params.reason ? ` — ${params.reason}` : ''}`;
@@ -1810,12 +1943,12 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 success: true, actionType: 'battle_cry', encounterId: params.encounterId, participantId: p.id,
                 buff, recipients: recipients.map(r => ({ id: r.id, name: r.name })),
                 ...(offTurn ? { offTurn: true, note: `called off ${p.name}'s turn as a free action (actionCost none)` } : {}),
-                ...(ability ? { ability: { name: ability.name, ready: ability.ready !== false } } : {}),
-                message: `📣 ${summary}${ability?.recharge ? `\n${ability.name} is spent; it recharges on a d6 of ${ability.recharge}+ at the start of ${p.name}'s turn.` : ''}`
+                ...(ability ? { ability: { name: ability.name, ready: ability.ready !== false, ...(ability.perRest ? { mirroredToCharacter: cryMirrored } : {}) } } : {}),
+                message: `📣 ${summary}${ability?.recharge ? `\n${ability.name} is spent; it recharges on a d6 of ${ability.recharge}+ at the start of ${p.name}'s turn.` : ability?.perRest ? `\n${perRestSpentNote(ability)}${cryMirrored ? '; the sheet shows it spent too' : ''}.` : ''}`
             };
         },
         aliases: ['waaagh', 'warcry', 'war_cry', 'rally_cry'],
-        description: "A battle cry (the Waaagh!): buffs the caller and every matching ally in range (advantage, damage, speed, morale) until the start of the caller's next turn; can spend a recharging ability"
+        description: "A battle cry (the Waaagh!): buffs the caller and every matching ally in range (advantage, damage, speed, morale) until the start of the caller's next turn; can spend a recharging or perRest ability"
     },
     budget: {
         schema: BudgetSchema,
@@ -2057,15 +2190,10 @@ async function applyDamage(params: ApplyDamageParams, ctx: SessionContext): Prom
     return encounterId ? applyDamageInEncounter(params, ctx, encounterId, routed, refuse) : applyDamageToSheets(params, refuse);
 }
 
-/** The active encounter holding a token with this exact id, if any. */
-function liveEncounterFor(db: ReturnType<typeof getDb>, id: string): string | undefined {
-    try {
-        const rows = db.prepare("SELECT id, tokens FROM encounters WHERE status = 'active' AND tokens LIKE ?").all(`%"${id}"%`) as Array<{ id: string; tokens: string }>;
-        return rows.find(r => (JSON.parse(r.tokens) as Array<{ id: string }>).some(t => t.id === id))?.id;
-    } catch { return undefined; }
-}
+/** Play report 2, item 6: the kill credits apply_damage hands out, one per victim dropped to 0. */
+type KillCredit = GrowthCredit & { victimId: string };
 
-function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionContext, encounterId: string, routed: boolean, refuse: (m: string) => Record<string, unknown>): Record<string, unknown> {
+async function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionContext, encounterId: string, routed: boolean, refuse: (m: string) => Record<string, unknown>): Promise<Record<string, unknown>> {
     const engine = getOrLoadEngine(ctx, encounterId);
     const state = engine?.getState();
     if (!engine || !state) return refuse(`Encounter ${encounterId} not found (memory or DB).`);
@@ -2077,7 +2205,8 @@ function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionContext, 
     const actorBand = params.actorId
         ? state.participants.find(p => p.id === params.actorId)?.band ?? (new CharacterRepository(getDb()).findById(params.actorId) as { band?: string } | null)?.band
         : undefined;
-    const bandRule = params.actorId ? bandRuleFor(getDb(), resolveWorldId(getDb(), { encounterId, characterIds: [params.actorId] }), [actorBand]) : undefined;
+    const ruleWorld = params.actorId ? resolveWorldId(getDb(), { encounterId, characterIds: [params.actorId] }) : null;
+    const bandRule = params.actorId ? bandRuleFor(getDb(), ruleWorld, [actorBand]) : undefined;
     const area = resolveAreaSave(engine, {
         targetIds: params.targetIds, damage: params.dice, damageType: params.damageType,
         savingThrow: params.save ? { ability: params.save.ability, dc: params.save.dc } : undefined,
@@ -2085,6 +2214,20 @@ function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionContext, 
         damagePurpose: `damage: ${params.source}`,
         ...(bandRule && actorBand ? { bandScaleFor: (t: { band?: string }) => bandDamageMultiplier(bandRule, actorBand, t.band) } : {})
     }, params.source);
+    // Play report 2, item 6: with an actor, every target it dropped to 0 is a
+    // kill on its growth track (perKill, perBandAbove), in order; an auto
+    // rung's condition lands on the actor's token before the state is saved.
+    const growth: KillCredit[] = [];
+    if (params.actorId) {
+        for (const t of area.targets) {
+            if (!((t.hpBefore ?? 0) > 0 && (t.hpAfter ?? 1) <= 0)) continue;
+            const victim = state.participants.find(p => p.id === t.targetId);
+            const credit = await creditKill(getDb(), ruleWorld, params.actorId, { id: t.targetId, name: t.targetName, band: victim?.band }, actorBand);
+            if (!credit) continue;
+            growth.push({ victimId: t.targetId, ...credit });
+            if (state.participants.some(p => p.id === params.actorId)) growthConditionsOnToken(engine, params.actorId, credit);
+        }
+    }
     saveEncounterState(new EncounterRepository(getDb()), encounterId, state);
     const hpChanges: Record<string, { before: number; after: number }> = {};
     for (const t of area.targets) if (t.hpBefore !== undefined && t.hpAfter !== undefined) hpChanges[t.targetId] = { before: t.hpBefore, after: t.hpAfter };
@@ -2097,6 +2240,7 @@ function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionContext, 
     });
     let message = `💥 ${params.source}${typeof params.dice === 'string' ? ` (${params.dice}: ${area.damageRolled})` : ` (${area.damageRolled})`}`;
     if (area.lines.length) message += '\n' + area.lines.join('\n');
+    if (growth.length) message += '\n' + growth.map(g => `⬆ ${growthLine(g)}`).join('\n');
     return {
         success: true, actionType: 'apply_damage', encounterId, ...(routed ? { routedToEncounter: true } : {}),
         source: params.source, damageRolled: area.damageRolled,
@@ -2104,11 +2248,12 @@ function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionContext, 
         ...(params.damageType ? { damageType: params.damageType } : {}),
         targets: area.targets,
         ...(area.breakTests.length ? { breakTests: area.breakTests } : {}),
+        ...(growth.length ? { growth } : {}),
         message
     };
 }
 
-function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string) => Record<string, unknown>): Record<string, unknown> {
+async function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string) => Record<string, unknown>): Promise<Record<string, unknown>> {
     const db = getDb();
     const charRepo = new CharacterRepository(db);
     const rows = params.targetIds.map(id => ({ id, row: charRepo.findById(id) }));
@@ -2123,7 +2268,8 @@ function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string) => R
     const lines: string[] = [];
     // Request 11: with an actor, the band rule's damageScale reads its band.
     const actorBand = params.actorId ? (charRepo.findById(params.actorId) as { band?: string } | null)?.band : undefined;
-    const bandRule = params.actorId ? bandRuleFor(db, resolveWorldId(db, { characterIds: [params.actorId, ...params.targetIds] }), [actorBand]) : undefined;
+    const ruleWorld = params.actorId ? resolveWorldId(db, { characterIds: [params.actorId, ...params.targetIds] }) : null;
+    const bandRule = params.actorId ? bandRuleFor(db, ruleWorld, [actorBand]) : undefined;
     const targets = rows.map(({ id, row }) => {
         const sheet = row!;
         let damageTaken = damageRolled;
@@ -2163,13 +2309,27 @@ function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string) => R
             ...(concentration ? { concentration } : {})
         };
     });
+    // Play report 2, item 6: the same kill credit as the encounter path; an
+    // auto rung's condition already reaches the sheet through applyGrowth.
+    const growth: KillCredit[] = [];
+    if (params.actorId) {
+        for (const t of targets) {
+            if (!(t.hpBefore > 0 && t.defeated)) continue;
+            const victim = rows.find(r => r.id === t.targetId)?.row as { band?: string } | null | undefined;
+            const credit = await creditKill(db, ruleWorld, params.actorId, { id: t.targetId, name: t.targetName, band: victim?.band }, actorBand);
+            if (credit) growth.push({ victimId: t.targetId, ...credit });
+        }
+    }
     let message = `💥 ${params.source}${typeof params.dice === 'string' ? ` (${params.dice}: ${damageRolled})` : ` (${damageRolled})`} — no encounter, written to the sheet${targets.length === 1 ? '' : 's'}`;
     if (lines.length) message += '\n' + lines.join('\n');
+    if (growth.length) message += '\n' + growth.map(g => `⬆ ${growthLine(g)}`).join('\n');
     return {
         success: true, actionType: 'apply_damage', source: params.source, damageRolled,
         ...(damageRolls ? { damageRolls } : {}),
         ...(params.damageType ? { damageType: params.damageType } : {}),
-        targets, message
+        targets,
+        ...(growth.length ? { growth } : {}),
+        message
     };
 }
 
@@ -2201,9 +2361,10 @@ Aliases: start/begin→create, state/status→get, finish/stop→end, restore/re
 5. lair_action - Execute boss lair action (LAIR turn only; once per round; damage takes dice; a creature that rolled 20 acts first)
    legendary_action {participantId, cost?, description} - a non-attack legendary action off its turn (attacks: combat_action attack with legendaryCost)
    legendary_resistance {participantId, reason} - turn a failed save into a success
-   use_ability {participantId, ability, targetIds?, damage?: number | dice, damageType?, savingThrow?: {ability, dc}} - a limited ability (breath weapon): spends the action, marks a recharge ability spent (it rolls a d6 at the start of its turn), saves per target
-   apply_damage {encounterId?, targetIds, dice: number | dice, source, actorId?, damageType?, save?: {ability, dc, half?}} - damage with no actor (a hazard, a trap, an off-turn bite): one logged roll, a save per target, resistances, concentration and break tests; no action spent. Without encounterId it writes to the sheets. With actorId, the band rule's damageScale scales each target by the band gap (bandScale per target)
+   use_ability {participantId, ability, targetIds?, damage?: number | dice, damageType?, savingThrow?: {ability, dc}} - a limited ability (breath weapon): spends its actionCost (action by default; action|bonus on its own turn only, reaction|none off-turn too), marks a recharge ability spent (it rolls a d6 at the start of its turn) or a perRest ability spent until rest_manage short/long (mirrored to the sheet), saves per target. An ability with grantsAction (Action Surge) costs nothing, banks one extra action this turn and is spent until restore_ability or a rest (mirrored to the sheet). get shows ⚡ extra actions N
+   apply_damage {encounterId?, targetIds, dice: number | dice, source, actorId?, damageType?, save?: {ability, dc, half?}} - damage with no actor (a hazard, a trap, an off-turn bite): one logged roll, a save per target, resistances, concentration and break tests; no action spent. Without encounterId it writes to the sheets. With actorId, the band rule's damageScale scales each target by the band gap (bandScale per target), and a target it drops to 0 credits the kill to the actor's growth track: perKill, perBandAbove (growth: [{victimId, track, pool, delta, from, to, growthReady?, growthApplied?}] and a ⬆ GROWTH line)
    battle_cry {participantId, name?: 'Waaagh!', range?: 60, match?: {species?, band?, tag?, nameIncludes?}, rounds?: 1, attackAdvantage?, damageBonus?: number | dice, speedBonus?, moraleBonus?, ability?, actionCost?} - buffs the caller and matching allies in range until the start of the caller's next turn; actionCost action|bonus only on the caller's turn, none (default) is free and may be called out of turn
+   😲 SURPRISE: create {…, surprised: ['gob-1']} or set_surprised {encounterId, participantIds, surprised?: true, reason?} (round 1, before their first turn) - the flagged creatures' round-1 turn passes on advance (noted), and until then they cannot react (no opportunity attacks, readied triggers or reaction attacks), act or take legendary actions. get shows 😲 surprised; STATE_JSON surprised: true. surprised: false clears a flag set by mistake
    budget {partyLevels | partyId, creatures: [{creature | cr | xp, count?}] | encounterId} - read-only 5e XP budget: TRIVIAL/EASY/MEDIUM/HARD/DEADLY
    set_environment {encounterId, environment: {medium: air | water | vacuum, depthFt?, pressure?: {startsAtFt, damagePerRound, unlessTag?}, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?}} - the medium of the fight (create takes environment too). Water: movement budget is swimSpeed else half speed; ranged attacks refused unless rangedAllowed; melee at disadvantage unless the damage type is listed (piercing) or the attacker carries the swim tag ('aquatic'); pressure damage at the start of each turn at depthFt >= startsAtFt unless tagged. A token on a terrain.water cell swims the same way in an air fight. get shows ⟨water · 40 ft⟩
 6. end - Finish combat
@@ -2217,7 +2378,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
         encounterId: z.string().optional().describe('Encounter ID (required for most actions)'),
         seed: z.string().optional().describe('Seed for a replayable new encounter (create only; omit for crypto dice)'),
-        participants: z.array(z.any()).optional().describe("Array of participants (create only). Shape per entry: { id: <character UUID — always the UUID>, name, hp, maxHp, initiativeBonus?: number (default 0, #103), ac?: number (falls back to attacker-side derivation), isEnemy?: boolean, position?: {x,y}, plus optional statline: size, reach, movementSpeed, attackBonus, attackDamage, attackDamageType, attacksPerAction, attacks [{name, attackBonus, damage, damageType?, part?, item?, reachFt?, default?}], abilities [{name, recharge?}], legendaryActions, legendaryResistances, legendaryResistancesRemaining, autoLegendaryResistance, hasLairActions, cr, band, regeneration, parts, unit, intent, species, tags }"),
+        participants: z.array(z.any()).optional().describe("Array of participants (create only). Shape per entry: { id: <character UUID — always the UUID>, name, hp, maxHp, initiativeBonus?: number (default 0, #103), ac?: number (falls back to attacker-side derivation), isEnemy?: boolean, position?: {x,y}, plus optional statline: size, reach, movementSpeed, attackBonus, attackDamage, attackDamageType, attacksPerAction, attacks [{name, attackBonus, damage, damageType?, part?, item?, reachFt?, ranged?, twoHanded?, default?}], abilities [{name, recharge?, perRest?, grantsAction?, ready?}], fightingStyle, legendaryActions, legendaryResistances, legendaryResistancesRemaining, autoLegendaryResistance, hasLairActions, cr, band, regeneration, parts, unit, intent, species, tags }"),
         terrain: z.any().optional().describe('Terrain configuration (create only); water: ["x,y"] cells run the underwater rules for a token standing there'),
         environment: z.any().optional().describe("create / set_environment: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed? (default false in water), meleeDisadvantageUnlessDamageType? (default ['piercing']), swimTag? (default 'aquatic')}"),
         characterId: z.string().optional().describe('Character ID (death_save, add_participant)'),
@@ -2230,13 +2391,16 @@ For CORPSES after combat, use corpse_manage tool.`,
         ac: z.number().optional().describe('Participant AC (add_participant); set_part: AC to hit the part when aimed at'),
         initiativeBonus: z.number().optional().describe('Initiative bonus (add_participant)'),
         participantId: z.string().optional().describe('remove_participant / adjust_hp: participant/token id'),
+        participantIds: z.array(z.string()).optional().describe('set_surprised: the participants caught flat-footed'),
+        surprised: z.union([z.array(z.string()), z.boolean()]).optional().describe("create: participant ids caught flat-footed (their round-1 turn passes; no reactions until it has). set_surprised: true (default) flags participantIds, false clears"),
         value: z.number().optional().describe('adjust_hp: set HP to exactly this'),
         delta: z.number().optional().describe('adjust_hp: shift HP by this amount'),
         reason: z.string().optional().describe('adjust_hp / legendary_resistance (required) / add_condition / remove_condition / legendary_action / use_ability: why — logged'),
-        condition: z.any().optional().describe('add_condition / remove_condition: a name ("prone") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?, level?}; remove also takes the object add_condition returned'),
+        condition: z.any().optional().describe('add_condition / remove_condition: a name ("prone") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?, level?}; remove also takes the object add_condition returned. For a hold, pass fromGrapple instead of hand-writing the source'),
         conditionId: z.string().optional().describe('remove_condition: one condition instance id'),
         replace: z.boolean().optional().describe('add_condition: drop existing conditions of the same type first'),
         mirrorToCharacter: z.boolean().optional().describe('add_condition / remove_condition: also edit the character sheet'),
+        fromGrapple: z.string().optional().describe("add_condition: the holder (participant id or name) — writes source 'grapple: <holder id>' so grapple execute and break recognise the hold"),
         importRowConditions: z.boolean().optional().describe('add_participant: copy the sheet\'s conditions onto the new token'),
         band: z.string().optional().describe('add_participant: table-rules power band (defaults from the character row)'),
         regeneration: z.number().int().min(0).optional().describe('add_participant: HP healed at the start of each of its rounds (defaults from the character row)'),
@@ -2252,8 +2416,9 @@ For CORPSES after combat, use corpse_manage tool.`,
         attackDamage: z.string().optional().describe("add_participant: default attack damage ('1d6+2')"),
         attackDamageType: z.string().optional().describe('add_participant: damage type of the default attack'),
         attacksPerAction: z.number().optional().describe('add_participant: multiattack, attacks per Attack action'),
-        attacks: z.array(z.any()).optional().describe('add_participant: named attack profiles [{name, attackBonus, damage, damageType?, part?, reachFt?, default?}]'),
-        abilities: z.array(z.any()).optional().describe('add_participant: limited abilities [{name, recharge?, ready?}]'),
+        attacks: z.array(z.any()).optional().describe('add_participant: named attack profiles [{name, attackBonus, damage, damageType?, part?, reachFt?, ranged?, twoHanded?, default?}]'),
+        abilities: z.array(z.any()).optional().describe('add_participant: limited abilities [{name, recharge?, perRest?: short | long, grantsAction?, actionCost?, ready?}]; ready unset lets a spent sheet ability stay spent'),
+        fightingStyle: FightingStyleSchema.optional().describe('add_participant: great_weapon | dueling | archery | defense (default from the sheet); attacks [{twoHanded?, ranged?}] decide when it applies'),
         legendaryActions: z.number().optional().describe('add_participant: legendary actions per round'),
         legendaryResistances: z.number().optional().describe('add_participant: legendary resistances per day'),
         legendaryResistancesRemaining: z.number().optional().describe('add_participant: legendary resistances left'),
@@ -2269,7 +2434,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         breakAt: z.number().optional().describe('set_part: one aimed hit dealing at least this much severs the part (integer). set_unit: fraction of models (0-1, exclusive) whose crossing owes a break test (default 0.5)'),
         note: z.string().optional().describe('set_part / trigger_readied: note'),
         targetId: z.string().optional().describe("trigger_readied: who the readied attack strikes (default: its watch, when that names a participant)"),
-        attack: z.any().optional().describe('trigger_readied: {using?, attackBonus?, damage?, damageType?, withPart?}, the attack to roll over the stored one'),
+        attack: z.any().optional().describe('trigger_readied: {using?, attackBonus?, damage?, damageType?, withPart?, twoHanded?}, the attack to roll over the stored one'),
         cost: z.number().optional().describe('legendary_action: legendary actions it costs (default 1)'),
         description: z.string().optional().describe("legendary_action: what the creature does ('wing attack')"),
         suppressed: z.boolean().optional().describe('set_unit'),
@@ -2297,7 +2462,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         worldId: z.string().optional().describe('FINDINGS #105 (mirror): create — stamp the encounter to a world (else derived from first claimed participant); list — STRICT world filter, scopes the ghost sweep'),
         actionDescription: z.string().optional().describe('Lair action description'),
         targetIds: z.array(z.string()).optional().describe('lair_action / use_ability / apply_damage: target IDs'),
-        actorId: z.string().optional().describe("apply_damage: who deals it (token or character id); the band rule's damageScale then applies. Omit for environmental damage"),
+        actorId: z.string().optional().describe("apply_damage: who deals it (token or character id); the band rule's damageScale then applies, and a target it drops to 0 credits the kill to the actor's growth track. Omit for environmental damage"),
         damage: z.union([z.number(), z.string()]).optional().describe("lair_action / use_ability: damage, a number or dice ('8d6') rolled once for every target"),
         ability: z.string().optional().describe("use_ability: the ability's name on the token ('Fire Breath'); battle_cry: an ability it spends ('Waaagh!')"),
         range: z.number().optional().describe('battle_cry: feet from the caller (default 60)'),
@@ -2440,6 +2605,9 @@ export async function handleCombatManage(args: unknown, ctx: SessionContext): Pr
                     break;
                 case 'use_ability':
                     output = RichFormatter.header('Ability', '✴');
+                    break;
+                case 'set_surprised':
+                    output = RichFormatter.header('Surprise', '😲');
                     break;
                 case 'budget':
                     output = RichFormatter.header('Encounter Budget', '⚖️');

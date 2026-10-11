@@ -170,15 +170,18 @@ describe('pinned Open5e engine authority', () => {
         });
     });
 
-    it('applies source species mechanics by default with explicit provenance', async () => {
-        const created = embeddedJson(await handleCharacterManage({
+    // Play report 2 #8: omitted stats are the 10 baseline plus the species
+    // bonuses; placed stats are final unless applySpeciesAbilityBonuses: true.
+    // The reply says which in statsNote, and only when the species has bonuses.
+    it('applies source species mechanics to the 10 baseline when stats are omitted, with explicit provenance', async () => {
+        const res = await handleCharacterManage({
             action: 'create',
             name: 'Dwarven Scholar',
             class: 'Cleric',
             race: 'Hill Dwarf',
-            stats: { str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 10 },
             provisionEquipment: false,
-        }, ctx as any));
+        }, ctx as any);
+        const created = embeddedJson(res);
 
         expect(created.stats.con).toBe(12);
         expect(created.stats.wis).toBe(11);
@@ -192,6 +195,42 @@ describe('pinned Open5e engine authority', () => {
         expect(created._rules.species.unsupportedFeatureNames).toEqual(expect.arrayContaining([
             'Darkvision', 'Dwarven Resilience'
         ]));
+        expect(created.statsNote).toBe('No stats given: 10 baseline + Hill Dwarf bonuses (+2 CON, +1 WIS).');
+        expect(res.content[0].text).toContain('No stats given: 10 baseline + Hill Dwarf bonuses');
+    });
+
+    it('takes placed stats as final and says the bonuses were NOT added', async () => {
+        const created = embeddedJson(await handleCharacterManage({
+            action: 'create',
+            name: 'Placed Dwarf',
+            class: 'Cleric',
+            race: 'Hill Dwarf',
+            stats: { str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 10 },
+            provisionEquipment: false,
+        }, ctx as any));
+
+        expect(created.stats.con).toBe(10);
+        expect(created.stats.wis).toBe(10);
+        expect(created.maxHp).toBe(9);   // d8 + CON +0 + 1 per level (Dwarven Toughness)
+        expect(created._rules.species.abilityBonusesApplied).toBe(false);
+        expect(created._rules.species.deferredMechanics).toContain('ability_score_increases');
+        expect(created.statsNote).toBe('Stats taken as final: Hill Dwarf ability bonuses (+2 CON, +1 WIS) were NOT added. If these are raw rolled/point-buy scores, pass applySpeciesAbilityBonuses: true.');
+    });
+
+    it('adds the bonuses to placed raw scores on applySpeciesAbilityBonuses: true', async () => {
+        const created = embeddedJson(await handleCharacterManage({
+            action: 'create',
+            name: 'Rolled Dwarf',
+            class: 'Cleric',
+            race: 'Hill Dwarf',
+            stats: { str: 13, dex: 10, con: 15, int: 10, wis: 14, cha: 10 },
+            applySpeciesAbilityBonuses: true,
+            provisionEquipment: false,
+        }, ctx as any));
+
+        expect(created.stats).toMatchObject({ str: 13, con: 17, wis: 15 });
+        expect(created._rules.species.abilityBonusesApplied).toBe(true);
+        expect(created.statsNote).toBe('Hill Dwarf bonuses (+2 CON, +1 WIS) added to the stats you passed.');
     });
 
     it('supports the explicit pre-adjusted-stat opt-out without double applying', async () => {
@@ -208,6 +247,19 @@ describe('pinned Open5e engine authority', () => {
         expect(created.stats.con).toBe(12);
         expect(created._rules.species.abilityBonusesApplied).toBe(false);
         expect(created._rules.species.deferredMechanics).toContain('ability_score_increases');
+        expect(created.statsNote).toBe('Dwarf bonuses (+2 CON) not added (applySpeciesAbilityBonuses: false).');
+        // An explicit false refuses them even on the 10 baseline.
+        const baseline = embeddedJson(await handleCharacterManage({ action: 'create', name: 'Plain Dwarf', race: 'Dwarf', applySpeciesAbilityBonuses: false, provisionEquipment: false }, ctx as any));
+        expect(baseline.stats.con).toBe(10);
+        expect(baseline.statsNote).toMatch(/not added \(applySpeciesAbilityBonuses: false\)/);
+    });
+
+    it('a species without bonuses gets no statsNote', async () => {
+        const created = embeddedJson(await handleCharacterManage({
+            action: 'create', name: 'Nobody', race: 'Mutant', stats: { str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 10 }, provisionEquipment: false,
+        }, ctx as any));
+        expect(created._rules.species).toMatchObject({ custom: true, name: 'Mutant' });
+        expect(created.statsNote).toBeUndefined();
     });
 
     it('routes batch character creation through the same source-backed path', async () => {

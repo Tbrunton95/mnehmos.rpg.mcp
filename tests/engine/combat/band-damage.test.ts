@@ -191,6 +191,30 @@ describe('band-scaled damage (request 11)', () => {
         expect(tok('mortal').hp).toBe(20);
     });
 
+    it('execute on sheets (no encounter) is never scaled either', async () => {
+        await setup({});
+        await manage({ action: 'end' });
+        new CharacterRepository(getDb()).update('mortal', { conditions: [{ name: 'Restrained', source: 'grapple: astartes' }] } as never);
+        const { d } = await act({ action: 'grapple', move: 'execute', encounterId: undefined, actorId: 'astartes', targetId: 'mortal', damage: 10 });
+        expect(d.error).toBeFalsy();
+        expect(d.writesTo).toBe('sheet');
+        expect(d.bandScale).toBeUndefined();
+        expect(d.damage).toBe(10);
+        expect(new CharacterRepository(getDb()).findById('mortal')!.hp).toBe(20);
+    });
+
+    it('a posted throw (outcome win, damage N) is band-scaled like a rolled one', async () => {
+        await setup({});
+        const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
+        const { d } = await act({ action: 'grapple', move: 'throw', surface: 'concrete', actorId: 'elite', targetId: 'astartes', outcome: 'win', damage: 8 });
+        expect(d.hit).toBe(true);
+        expect(d.posted).toBe(true);
+        expect(spy).not.toHaveBeenCalled();
+        expect(d.bandScale).toEqual({ steps: -1, multiplier: 0.5, before: 8, after: 4 });
+        expect(d.surfaceDamage).toBe(4);
+        expect(d.damageDetail).toMatch(/posted.*×0\.5 band/);
+    });
+
     it('surface damage from a throw scales by the thrower band', async () => {
         await setup({});
         const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');

@@ -71,6 +71,8 @@ describe('engine: opportunity attackers along a path', () => {
         const stunned = fight({ conditions: [{ id: 's', type: 'stunned', durationType: 'permanent' }] });
         expect(stunned.getOpportunityAttackers('hero', path)).toEqual([]);
         expect(fight({ reactionUsed: true }).getOpportunityAttackers('hero', path)).toEqual([]);
+        // Surprised: no reaction until its first turn has passed.
+        expect(fight({ surprised: true }).getOpportunityAttackers('hero', path)).toEqual([]);
     });
 });
 

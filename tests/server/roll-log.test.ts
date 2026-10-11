@@ -76,6 +76,22 @@ describe('roll log', () => {
         expect(() => seedrandom).not.toThrow();
     });
 
+    // Item 16: a manoeuvre's superiority die and the save it forces are rolls like any other.
+    it('superiority dice and manoeuvre saves reach roll_log under their own purposes', async () => {
+        const now = new Date().toISOString();
+        new CharacterRepository(getDb()).create({ id: 'bm', name: 'Brannoc', stats: { str: 16, dex: 12, con: 14, int: 10, wis: 12, cha: 8 }, hp: 44, maxHp: 44, ac: 18, level: 5,
+            superiorityDie: '1d8', resourcePools: { superiority: { current: 4, max: 4, refresh: 'short' } }, createdAt: now, updatedAt: now } as any);
+        const enc = json(await manage({ action: 'create', seed: 'maneuver-log', participants: [
+            { id: 'bm', name: 'Brannoc', hp: 44, maxHp: 44, initiative: 20 },
+            { id: 'orc', name: 'Orc', hp: 30, maxHp: 30, ac: 1, initiative: 5, isEnemy: true }
+        ] }, {})).encounterId;
+        // +30 against AC 1: only a natural 1 misses; the seed is chosen so it does not.
+        const r = json(await action({ action: 'attack', encounterId: enc, actorId: 'bm', targetId: 'orc', attackBonus: 30, damage: '1d4', maneuver: 'trip' }, {}));
+        expect(r.actionResult.maneuver.spent).toBe(true);
+        const purposes = json(await session({ action: 'rolls', encounterId: enc, limit: 50 }, {})).rolls.map((x: any) => x.purpose);
+        expect(purposes).toEqual(expect.arrayContaining(['superiority die (trip)', 'trip save vs Brannoc']));
+    });
+
     it('a rolled-back call leaves no roll behind', async () => {
         const enc = json(await manage({ action: 'create', participants: [
             { id: 'a', name: 'A', hp: 10, maxHp: 10, initiative: 20 }, { id: 'b', name: 'B', hp: 10, maxHp: 10, initiative: 5 }

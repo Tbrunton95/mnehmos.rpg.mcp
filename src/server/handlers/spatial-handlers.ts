@@ -5,6 +5,9 @@ import { CharacterRepository } from "../../storage/repos/character.repo.js";
 import { RoomNode, Exit, NodeNetwork } from "../../schema/spatial.js";
 import { SessionContext } from "../types.js";
 import { loggedD20 } from "../../math/logged-d20.js";
+import { skillModifier, type SkillSheet } from "../../engine/skill-modifier.js";
+import { worldProgression } from "../../engine/progression.js";
+import { resolveWorldId } from "../../engine/table-rules.js";
 
 type LightEffectRow = {
   id: number;
@@ -280,13 +283,6 @@ function rollPerceptionD20(observerId: string): number {
   return loggedD20(getDb(), { purpose: "perception", forId: observerId }, { tool: "spatial_manage" }).natural;
 }
 
-/**
- * Calculate ability modifier from ability score (D&D 5e formula)
- */
-function getModifier(abilityScore: number): number {
-  return Math.floor((abilityScore - 10) / 2);
-}
-
 export async function handleLookAtSurroundings(
   args: unknown,
   _ctx: SessionContext
@@ -436,8 +432,14 @@ export async function handleLookAtSurroundings(
     };
   }
 
-  // Filter visible exits based on perception
-  const perceptionModifier = getModifier(observer.stats.wis);
+  // Filter visible exits based on perception. Play report 2 #5: the sheet's
+  // ONE perception number — WIS + proficiency on the world's curve, or the
+  // perceptionOverride when the column holds one.
+  const lookDb = getDb();
+  const perceptionModifier = skillModifier(
+    observer as SkillSheet, "perception", "wis",
+    worldProgression(lookDb, resolveWorldId(lookDb, { characterIds: [observer.id] })).profBonus(observer.level)
+  ).value;
   const visibleExits = currentRoom.exits.filter((exit) => {
     if (exit.type === "OPEN") return true;
     if (exit.type === "LOCKED") return false; // Locked exits are not visible

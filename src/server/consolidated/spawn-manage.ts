@@ -86,6 +86,9 @@ function buildCharacter(data: {
     origin?: z.infer<typeof CharacterOriginSchema>;
     position?: { x: number; y: number };
     inventory?: string[];
+    /** Stat-block skill totals (overrides). Pass undefined, never 0, for "not listed". */
+    perceptionBonus?: number;
+    stealthBonus?: number;
     createdAt: string;
     updatedAt: string;
 }): Character {
@@ -102,8 +105,10 @@ function buildCharacter(data: {
         race: data.race,
         characterClass: data.characterClass,
         conditions: [],
-        perceptionBonus: 0,
-        stealthBonus: 0,
+        // Play report 2 #5: a stat block's skill totals are overrides; absent
+        // (undefined) leaves the column NULL so the number is computed.
+        perceptionBonus: data.perceptionBonus,
+        stealthBonus: data.stealthBonus,
         knownSpells: [],
         preparedSpells: [],
         cantripsKnown: [],
@@ -345,6 +350,9 @@ async function handleSpawnCharacter(input: SpawnManageInput, _ctx: SessionContex
         origin: input.origin,
         position: pos,
         inventory: input.equipment || [],
+        // Play report 2 #5: a preset 0 means "not listed", so the column stays NULL (computed)
+        perceptionBonus: preset.perceptionBonus || undefined,
+        stealthBonus: preset.stealthBonus || undefined,
         createdAt: now,
         updatedAt: now
     });
@@ -565,6 +573,8 @@ async function handleSpawnEncounter(input: SpawnManageInput, ctx: SessionContext
                 race: preset.race || 'Unknown',
                 characterClass: preset.characterClass || 'monster',
                 position: pos,
+                perceptionBonus: preset.perceptionBonus || undefined,
+                stealthBonus: preset.stealthBonus || undefined,
                 createdAt: now,
                 updatedAt: now
             });
@@ -1060,6 +1070,8 @@ async function handleSpawnTactical(input: SpawnManageInput, ctx: SessionContext)
             race: preset.race || 'Unknown',
             characterClass: preset.characterClass || 'monster',
             position: pos,
+            perceptionBonus: preset.perceptionBonus || undefined,
+            stealthBonus: preset.stealthBonus || undefined,
             createdAt: now,
             updatedAt: now
         });

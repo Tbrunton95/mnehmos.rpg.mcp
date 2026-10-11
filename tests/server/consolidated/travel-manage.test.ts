@@ -227,6 +227,30 @@ describe('travel_manage consolidated tool', () => {
             expect(data.discovered).toBe(true);
         });
 
+        it('POI discovery rolls the discoverer\'s ONE perception number: proficiency on the sheet, or the perceptionOverride (play report 2 #5)', async () => {
+            const db = getDb(':memory:');
+            const charRepo = new CharacterRepository(db);
+            const lastDiscovery = () => db.prepare("SELECT for_id, result FROM roll_log WHERE purpose = 'poi_discovery' ORDER BY created_at DESC, rowid DESC LIMIT 1").get() as { for_id: string; result: number };
+            const travel = async () => JSON.parse((await handleTravelManage({ action: 'travel', partyId: testPartyId, poiId: testPoiId }, ctx)).content[0].text.match(/<!-- TRAVEL_MANAGE_JSON\n([\s\S]*?)\nTRAVEL_MANAGE_JSON -->/)![1]);
+
+            // The leader (Test Fighter, WIS 12, level 5) is proficient in Perception: +1 WIS + 3 proficiency.
+            charRepo.update(testCharacterId, { skillProficiencies: ['Perception'] } as any);
+            db.prepare("UPDATE pois SET discoveryState = 'unknown', discoveryDc = 40 WHERE id = ?").run(testPoiId); // never discovered: the modifier is what we read
+            let r = await travel();
+            expect(r.discovered).toBe(false);
+            let log = lastDiscovery();
+            expect(log.for_id).toBe(testCharacterId);
+            expect(r.discoveryRoll - log.result).toBe(4);
+
+            // An override replaces it: +25 always clears DC 26, where bare WIS +1 never could.
+            charRepo.update(testCharacterId, { perceptionBonus: 25 } as any);
+            db.prepare("UPDATE pois SET discoveryState = 'unknown', discoveryDc = 26 WHERE id = ?").run(testPoiId);
+            r = await travel();
+            expect(r.discovered).toBe(true);
+            log = lastDiscovery();
+            expect(r.discoveryRoll - log.result).toBe(25);
+        });
+
         it('should return error for missing partyId', async () => {
             const result = await handleTravelManage({
                 action: 'travel',
@@ -348,6 +372,49 @@ describe('travel_manage consolidated tool', () => {
             // Check that HP was restored
             const fighter = data.members.find((m: any) => m.characterName === 'Test Fighter');
             expect(fighter.hpAfter).toBe(50); // maxHp
+        });
+
+        it('a party long rest refills refresh pools, readies perRest abilities and restores slots per member, and says so honestly', async () => {
+            const charRepo = new CharacterRepository(getDb());
+            charRepo.update(testCharacterId, {
+                resourcePools: { superiority: { current: 0, max: 4, refresh: 'short' }, souls: { current: 1, max: 5 } },
+                abilities: [{ name: 'Second Wind', perRest: 'short', ready: false }, { name: 'Fire Breath', recharge: 5, ready: false }]
+            } as any);
+            const result = await handleTravelManage({ action: 'rest', partyId: testPartyId, restType: 'long' }, ctx);
+            const data = parseResult(result);
+            expect(data.success).toBe(true);
+            const fighter = data.members.find((m: any) => m.characterId === testCharacterId);
+            expect(fighter.refilled).toEqual(expect.arrayContaining([
+                { kind: 'pool', name: 'superiority', from: 0, to: 4, max: 4 },
+                { kind: 'ability', name: 'Second Wind' }
+            ]));
+            const row = charRepo.findById(testCharacterId)! as any;
+            expect(row.resourcePools.superiority.current).toBe(4);
+            expect(row.resourcePools.souls.current).toBe(1);
+            expect(row.abilities.find((a: any) => a.name === 'Second Wind').ready).toBe(true);
+            expect(row.abilities.find((a: any) => a.name === 'Fire Breath').ready).toBe(false);
+            // The wizard's slots really are restored; the fighter has none to claim.
+            const wizard = data.members.find((m: any) => m.characterId === testCharacter2Id);
+            expect(wizard.spellSlotsRestored).toMatchObject({ type: 'standard' });
+            expect(fighter.spellSlotsRestored).toBeUndefined();
+            const text = result.content[0].text;
+            expect(text).not.toMatch(/All spell slots restored/);
+            expect(text).toMatch(/Second Wind/);
+        });
+
+        it('a party short rest refills refresh:short pools only', async () => {
+            const charRepo = new CharacterRepository(getDb());
+            charRepo.update(testCharacterId, {
+                resourcePools: { superiority: { current: 0, max: 4, refresh: 'short' }, rage: { current: 0, max: 3, refresh: 'long' } },
+                abilities: [{ name: 'Indomitable', perRest: 'long', ready: false }]
+            } as any);
+            const data = parseResult(await handleTravelManage({ action: 'rest', partyId: testPartyId, restType: 'short', hitDicePerMember: 0 }, ctx));
+            const row = charRepo.findById(testCharacterId)! as any;
+            expect(row.resourcePools.superiority.current).toBe(4);
+            expect(row.resourcePools.rage.current).toBe(0);
+            expect(row.abilities[0].ready).toBe(false);
+            const fighter = data.members.find((m: any) => m.characterId === testCharacterId);
+            expect(fighter.refilled).toEqual([{ kind: 'pool', name: 'superiority', from: 0, to: 4, max: 4 }]);
         });
 
         it('should perform short rest with hit dice', async () => {

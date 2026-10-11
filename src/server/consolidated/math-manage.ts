@@ -18,6 +18,7 @@ import { loadAutoMechanics, autoSkillBonus, autoSaveBonus, autoAdvantage, applyD
 import { parseAbility } from '../../engine/combat/conditions.js';
 import { resolveWorldId, worldSkillAbility } from '../../engine/table-rules.js';
 import { worldProgression } from '../../engine/progression.js';
+import { skillModifier, overrideColumn, signed, type SkillSheet, type ShortAbility } from '../../engine/skill-modifier.js';
 import * as pda from '../../render/pda.js';
 import { ExportEngine } from '../../math/export.js';
 import { CalculationRepository, StoredCalculation } from '../../storage/repos/calculation.repo.js';
@@ -181,38 +182,28 @@ async function handleCharacterRoll(
         const skill = (args.skill || '').toLowerCase().replace(/ /g, '_');
         // Item 8: a world skill (table_rules skill) names its own ability.
         const ability = args.ability || worldSkillAbility(db, worldId, args.skill) || SKILL_ABILITY[skill] || 'wis';
-        const mod = abilityMod(stats[ability] ?? 10);
-        // #67-E: stealth/perception COLUMNS are authoritative when present.
-        // The eavesdrop listener layer already rolls these columns (Findings
-        // #6); until now a contested stealth check composed DEX+prof instead —
-        // two disagreeing stealth numbers per character. One number now: the
-        // column displaces the composition and the block discloses it.
-        const colName = skill === 'stealth' ? 'stealth_bonus' : skill === 'perception' ? 'perception_bonus' : null;
-        let colVal: number | null = null;
-        if (colName) {
-            const r = db.prepare(`SELECT ${colName} AS v FROM characters WHERE id = ?`).get(args.characterId) as { v?: number | null } | undefined;
-            if (typeof r?.v === 'number') colVal = r.v;
-        }
-        if (colVal !== null) {
-            bonus += colVal;
-            breakdown.push(`${skill} column ${colVal >= 0 ? '+' : ''}${colVal} (authoritative — the same number the listener layer rolls)`);
-            contributions.push({ label: `${skill}Bonus column`, value: colVal, lane: 'SHEET', source: colName ?? undefined });
-            const skills0 = (char as { skillProficiencies?: string[] }).skillProficiencies || [];
-            const composed = mod + (normHas(skills0, skill) ? profBonus(char.level) : 0);
-            if (composed !== colVal)
-                breakdown.push(`⚠ ${skill} column (${colVal >= 0 ? '+' : ''}${colVal}) displaces composed ${ability.toUpperCase()}+prof (${composed >= 0 ? '+' : ''}${composed}) — one ${skill} number per character`);
+        // Play report 2 #5: ONE stealth/perception number per character
+        // (src/engine/skill-modifier.ts). The column is tri-state: null
+        // composes ability + proficiency (+ expertise) on the world's curve;
+        // a number, 0 included, is an authoritative override that REPLACES
+        // the composition — the same number stunts and the eavesdrop layer
+        // roll. (#67-E made the column authoritative; the 0 every sheet was
+        // born with then displaced every rogue's DEX+prof. Null fixes that.)
+        const sm = skillModifier(char as SkillSheet, skill, ability as ShortAbility, profBonus(char.level));
+        if (sm.source === 'override') {
+            bonus += sm.value;
+            breakdown.push(`${skill} override ${signed(sm.value)} (replaces computed ${ability.toUpperCase()}+prof ${signed(sm.computed)})`);
+            contributions.push({ label: `${skill} override`, value: sm.value, lane: 'SHEET', source: overrideColumn(skill) ?? undefined });
         } else {
-        bonus += mod; breakdown.push(`${ability.toUpperCase()} ${mod >= 0 ? '+' : ''}${mod}`);
-        contributions.push({ label: `${ability.toUpperCase()} modifier`, value: mod, lane: 'SHEET', source: ability });
-        const skills = (char as { skillProficiencies?: string[] }).skillProficiencies || [];
-        const expertise = (char as { expertise?: string[] }).expertise || [];
-        if (normHas(expertise, skill)) {
-            const p = profBonus(char.level) * 2; bonus += p; breakdown.push(`expertise +${p}`);
-            contributions.push({ label: 'expertise', value: p, lane: 'SHEET' });
-        } else if (normHas(skills, skill)) {
-            const p = profBonus(char.level); bonus += p; breakdown.push(`proficiency +${p}`);
-            contributions.push({ label: 'proficiency', value: p, lane: 'SHEET' });
-        }
+            bonus += sm.abilityMod; breakdown.push(`${ability.toUpperCase()} ${signed(sm.abilityMod)}`);
+            contributions.push({ label: `${ability.toUpperCase()} modifier`, value: sm.abilityMod, lane: 'SHEET', source: ability });
+            if (sm.expertise) {
+                bonus += sm.proficiency; breakdown.push(`expertise +${sm.proficiency}`);
+                contributions.push({ label: 'expertise', value: sm.proficiency, lane: 'SHEET' });
+            } else if (sm.proficiency) {
+                bonus += sm.proficiency; breakdown.push(`proficiency +${sm.proficiency}`);
+                contributions.push({ label: 'proficiency', value: sm.proficiency, lane: 'SHEET' });
+            }
         }
         bonus += autoSkillBonus(mechs, skill, autoApplied);
     } else if (kind === 'ability') {

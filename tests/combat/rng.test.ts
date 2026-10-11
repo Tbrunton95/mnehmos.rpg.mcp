@@ -166,6 +166,42 @@ describe('CombatRNG', () => {
             expect(result).toBeGreaterThanOrEqual(2);  // min: 1+1 (even with reroll)
             expect(result).toBeLessThanOrEqual(12);   // max: 6+6
         });
+
+        // Item 17: rollDamageDetailed rerolls dice at or below a threshold
+        // once, keeps the new value, reports each reroll and logs it under
+        // its own purpose so roll_log shows the great weapon fighting die.
+        it('rollDamageDetailed {rerollAtOrBelow} rerolls low dice once, reports and logs them', () => {
+            // Find a seed whose plain roll shows a 1 or 2, so the reroll has work to do.
+            const seed = Array.from({ length: 60 }, (_, i) => `gwf-${i}`).find(s => new CombatRNG(s).rollDamageDetailed('2d6+3').rolls.some(r => r <= 2))!;
+            expect(seed).toBeTruthy();
+            const plain = new CombatRNG(seed).rollDamageDetailed('2d6+3');
+            const rng = new CombatRNG(seed);
+            rng.tag = { purpose: 'damage', forId: 'a', targetId: 'b' };
+            const r = rng.rollDamageDetailed('2d6+3', { rerollAtOrBelow: 2 });
+            const low = plain.rolls.filter(x => x <= 2);
+            expect(r.rerolls).toHaveLength(low.length);
+            for (const re of r.rerolls!) {
+                expect(re.sides).toBe(6);
+                expect(re.from).toBeLessThanOrEqual(2);
+                expect(re.to).toBeGreaterThanOrEqual(1);
+            }
+            expect(r.rolls.every(x => x >= 1 && x <= 6)).toBe(true);
+            expect(r.total).toBe(r.rolls.reduce((s, x) => s + x, 0) + 3);
+            expect(r.modifier).toBe(3);
+            const records = rng.drainRecords();
+            expect(records.map(x => x.purpose)).toEqual(['damage', 'damage reroll (great weapon fighting)']);
+            expect(records[1].dice.map(d => d.value)).toEqual(r.rerolls!.map(x => x.to));
+            expect(records[0].dice).toHaveLength(2);
+        });
+
+        it('never rerolls a negative dice term, and reports nothing without the option', () => {
+            for (let i = 0; i < 40; i++) {
+                const r = new CombatRNG(`gwf-neg-${i}`).rollDamageDetailed('2d6-1d4', { rerollAtOrBelow: 2 });
+                for (const re of r.rerolls ?? []) expect(re.sides).toBe(6);
+                expect(r.rolls[2]).toBeLessThan(0);
+            }
+            expect(new CombatRNG('gwf-none').rollDamageDetailed('2d6+3').rerolls).toBeUndefined();
+        });
     });
 
     describe('Minimum Roll', () => {

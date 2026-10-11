@@ -71,6 +71,41 @@ describe('world_manage consolidated tool', () => {
             expect(data.worldId).toBeDefined();
         });
 
+        // Play report 2, #12: the outer schema said seed/width/height were
+        // optional; the action schema required all three.
+        it('create with only a name gets a generated 8-hex seed and a 100x100 world', async () => {
+            const res = await handleWorldManage({ action: 'create', name: 'Seedless' }, ctx);
+            const data = parseResult(res);
+            expect(data.success).toBe(true);
+            expect(data.seed).toMatch(/^[0-9a-f]{8}$/);
+            expect(data.seedGenerated).toBe(true);
+            expect(data.dimensions).toEqual({ width: 100, height: 100 });
+            expect(data.message).toMatch(/seed [0-9a-f]{8} \(generated\)/);
+            expect(res.content[0].text.split('<!--')[0]).toMatch(/\*\*Seed:\*\* [0-9a-f]{8} \(generated\)/);
+            const again = parseResult(await handleWorldManage({ action: 'create', name: 'Seedless' }, ctx));
+            expect(again.seed).not.toBe(data.seed);
+            expect(parseResult(await handleWorldManage({ action: 'get', id: data.worldId }, ctx)).world).toMatchObject({ seed: data.seed, width: 100, height: 100 });
+        });
+
+        it('an explicit seed is kept and not marked generated', async () => {
+            const res = await handleWorldManage({ action: 'create', name: 'Seeded', seed: 'my-seed', width: 40, height: 30 }, ctx);
+            const data = parseResult(res);
+            expect(data.seed).toBe('my-seed');
+            expect(data.seedGenerated).toBeUndefined();
+            expect(data.dimensions).toEqual({ width: 40, height: 30 });
+            const banner = res.content[0].text.split('<!--')[0];
+            expect(banner).toMatch(/\*\*Seed:\*\* my-seed\n/);
+            expect(banner).not.toMatch(/generated/);
+        });
+
+        it('the action schema no longer requires seed, width or height for create; generate still does', () => {
+            const shape = (s: { schema: unknown }) => (s.schema as { shape: Record<string, { isOptional(): boolean }> }).shape;
+            expect(shape(WorldManageTool.actionSchemas.create).seed.isOptional()).toBe(true);
+            expect(shape(WorldManageTool.actionSchemas.create).width.isOptional()).toBe(true);
+            expect(shape(WorldManageTool.actionSchemas.create).height.isOptional()).toBe(true);
+            expect(shape(WorldManageTool.actionSchemas.generate).seed.isOptional()).toBe(false);
+        });
+
         it('should accept "new" alias', async () => {
             const result = await handleWorldManage({
                 action: 'new',
@@ -234,6 +269,62 @@ describe('world_manage consolidated tool', () => {
 
             const data = parseResult(result);
             expect(data.actionType).toBe('update');
+        });
+    });
+
+    // Play report 2, #14: the strict schema refused `weather` and had no
+    // `location`; the docs invited both.
+    describe('environment aliases, location and did-you-mean', () => {
+        let worldId: string;
+        beforeEach(async () => {
+            worldId = parseResult(await handleWorldManage({ action: 'create', name: 'Alias World', seed: 'alias', width: 20, height: 20 }, ctx)).worldId;
+        });
+
+        it('weather is written as weatherConditions, location is stored, and the reply says what was renamed', async () => {
+            const data = parseResult(await handleWorldManage({ action: 'update', id: worldId, environment: { weather: 'rain', location: 'Vorago docks' } }, ctx));
+            expect(data.success).toBe(true);
+            expect(data.environment).toMatchObject({ weatherConditions: 'rain', location: 'Vorago docks' });
+            expect(data.environment.weather).toBeUndefined();
+            expect(data.aliased).toEqual({ weather: 'weatherConditions' });
+            const got = parseResult(await handleWorldManage({ action: 'get', id: worldId }, ctx));
+            expect(got.world.environment).toMatchObject({ weatherConditions: 'rain', location: 'Vorago docks' });
+        });
+
+        it('currentLocation and place are aliases of location; a canonical patch reports no aliased', async () => {
+            expect(parseResult(await handleWorldManage({ action: 'update', id: worldId, environment: { currentLocation: 'the mill' } }, ctx))).toMatchObject({ environment: { location: 'the mill' }, aliased: { currentLocation: 'location' } });
+            const plain = parseResult(await handleWorldManage({ action: 'update', id: worldId, environment: { season: 'winter', location: 'the gate' } }, ctx));
+            expect(plain.environment).toMatchObject({ season: 'winter', location: 'the gate' });
+            expect(plain.aliased).toBeUndefined();
+        });
+
+        it('a misspelt key is refused naming the canonical key, with writes none', async () => {
+            const bad = parseResult(await handleWorldManage({ action: 'update', id: worldId, environment: { wether: 'rain' } }, ctx));
+            expect(bad.error).toBe('validation_error');
+            expect(bad.writes).toBe('none');
+            const issue = bad.issues.find((i: { path: string }) => i.path === 'environment.wether');
+            expect(issue.message).toMatch(/Did you mean 'weatherConditions'/);
+            expect(issue.message).toMatch(/Accepted: .*location/);
+            expect(parseResult(await handleWorldManage({ action: 'get', id: worldId }, ctx)).world.environment.weatherConditions).toBeUndefined();
+        });
+
+        it('an alias and its canonical key with different values is a conflict', async () => {
+            const bad = parseResult(await handleWorldManage({ action: 'update', id: worldId, environment: { weather: 'rain', weatherConditions: 'fog' } }, ctx));
+            expect(bad.error).toBe('validation_error');
+            expect(bad.issues.map((i: { message: string }) => i.message).join(' ')).toMatch(/pass one of weather \/ weatherConditions/);
+            // The same value on both is not a conflict: the alias is dropped.
+            const same = parseResult(await handleWorldManage({ action: 'update', id: worldId, environment: { weather: 'rain', weatherConditions: 'rain' } }, ctx));
+            expect(same.environment.weatherConditions).toBe('rain');
+        });
+
+        it('aliased comes from the engine, never from the call', async () => {
+            const data = parseResult(await handleWorldManage({ action: 'update', id: worldId, environment: { season: 'spring' }, environmentAliased: { fake: 'x' }, aliased: { fake: 'x' } }, ctx));
+            expect(data.success).toBe(true);
+            expect(data.aliased).toBeUndefined();
+        });
+
+        it('the tool text lists the aliases', () => {
+            expect(WorldManageTool.description).toMatch(/weatherConditions \(alias weather\)/);
+            expect(WorldManageTool.inputSchema.shape.environment.description).toMatch(/location/);
         });
     });
 

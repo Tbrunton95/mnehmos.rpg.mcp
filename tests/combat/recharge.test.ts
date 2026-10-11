@@ -8,6 +8,7 @@ import { withOperation } from '../../src/server/operation-guard.js';
 import { EncounterRepository } from '../../src/storage/repos/encounter.repo.js';
 import { CombatEngine, type CombatParticipant } from '../../src/engine/combat/engine.js';
 import { queryRolls } from '../../src/storage/roll-log.js';
+import { CharacterRepository } from '../../src/storage/repos/character.repo.js';
 import { closeDb, getDb } from '../../src/storage/index.js';
 
 // The operation guard flushes engine dice for the unscoped session key.
@@ -113,6 +114,148 @@ describe('combat_manage use_ability', () => {
         const again = await manage({ action: 'use_ability', encounterId: enc, participantId: 'dragon', ability: 'Frightful Presence' });
         expect(again.d.error).toBe(true);
         expect(again.d.message).toMatch(/Action already used/);
+    });
+
+    it('grantsAction (Action Surge) spends no action, banks one extra, is spent on use and refused again', async () => {
+        const enc = await dragonFight({ abilities: [{ name: 'Action Surge', grantsAction: true }] });
+        const { d } = await manage({ action: 'use_ability', encounterId: enc, participantId: 'dragon', ability: 'action surge' });
+        expect(d).toMatchObject({ success: true, grantsAction: true, actionCost: 'none', extraActions: 1, ready: false });
+        expect(d.message).toMatch(/⚡ Red Dragon uses Action Surge: one extra action this turn/);
+        const dragon = tok(enc, 'dragon');
+        expect(dragon.actionUsed).toBeFalsy();
+        expect(dragon.extraActions).toBe(1);
+        expect(dragon.abilities[0].ready).toBe(false);
+        const again = await manage({ action: 'use_ability', encounterId: enc, participantId: 'dragon', ability: 'Action Surge' });
+        expect(again.d).toMatchObject({ error: true, writes: 'none' });
+        expect(again.d.message).toMatch(/restore_ability/);
+        expect(again.d.message).not.toMatch(/recharge \?/);
+        expect(tok(enc, 'dragon').extraActions).toBe(1);
+    });
+
+    it('grantsAction is refused off its own turn, writing nothing', async () => {
+        const enc = await dragonFight({ abilities: [{ name: 'Action Surge', grantsAction: true }] });
+        await manage({ action: 'advance', encounterId: enc }); // hero's turn
+        const { d } = await manage({ action: 'use_ability', encounterId: enc, participantId: 'dragon', ability: 'Action Surge' });
+        expect(d).toMatchObject({ error: true, writes: 'none' });
+        expect(d.message).toMatch(/not Red Dragon's turn \(Hero is acting\)/);
+        const dragon = tok(enc, 'dragon');
+        expect(dragon.abilities[0].ready).toBe(true);
+        expect(dragon.extraActions ?? 0).toBe(0);
+    });
+
+    it("actionCost 'bonus' spends the bonus action and 'none' spends nothing", async () => {
+        const enc = await dragonFight({ abilities: [{ name: 'Quick Bite', actionCost: 'bonus' }, { name: 'Glare', actionCost: 'none' }] });
+        const bite = await manage({ action: 'use_ability', encounterId: enc, participantId: 'dragon', ability: 'Quick Bite' });
+        expect(bite.d).toMatchObject({ success: true, actionCost: 'bonus' });
+        expect(tok(enc, 'dragon').bonusActionUsed).toBe(true);
+        expect(tok(enc, 'dragon').actionUsed).toBeFalsy();
+        const biteAgain = await manage({ action: 'use_ability', encounterId: enc, participantId: 'dragon', ability: 'Quick Bite' });
+        expect(biteAgain.d.error).toBe(true);
+        expect(biteAgain.d.message).toMatch(/Bonus Action already used/);
+        const glare = await manage({ action: 'use_ability', encounterId: enc, participantId: 'dragon', ability: 'Glare' });
+        expect(glare.d).toMatchObject({ success: true, actionCost: 'none' });
+        expect(glare.d.message).toMatch(/\(free\)/);
+        expect(tok(enc, 'dragon').actionUsed).toBeFalsy();
+        // A free ability is not spent either (no recharge, no granted action).
+        expect(tok(enc, 'dragon').abilities[1].ready).toBe(true);
+    });
+
+    it("actionCost 'action' or 'bonus' is refused off its own turn; 'reaction' and 'none' may happen off-turn", async () => {
+        const enc = await dragonFight({ abilities: [
+            { name: 'Quick Bite', actionCost: 'bonus' }, { name: 'Tail Lash', actionCost: 'reaction' }, { name: 'Glare', actionCost: 'none' }, { name: 'Frightful Presence' }
+        ] });
+        await manage({ action: 'advance', encounterId: enc }); // hero's turn
+        const bite = await manage({ action: 'use_ability', encounterId: enc, participantId: 'dragon', ability: 'Quick Bite' });
+        expect(bite.d).toMatchObject({ error: true, writes: 'none' });
+        expect(bite.d.message).toMatch(/not Red Dragon's turn \(Hero is acting\)/);
+        expect(tok(enc, 'dragon').bonusActionUsed).toBeFalsy();
+        const fright = await manage({ action: 'use_ability', encounterId: enc, participantId: 'dragon', ability: 'Frightful Presence' });
+        expect(fright.d).toMatchObject({ error: true, writes: 'none' });
+        expect(tok(enc, 'dragon').actionUsed).toBeFalsy();
+        const lash = await manage({ action: 'use_ability', encounterId: enc, participantId: 'dragon', ability: 'Tail Lash' });
+        expect(lash.d).toMatchObject({ success: true, actionCost: 'reaction' });
+        expect(tok(enc, 'dragon').reactionUsed).toBe(true);
+        expect((await manage({ action: 'use_ability', encounterId: enc, participantId: 'dragon', ability: 'Glare' })).d).toMatchObject({ success: true, actionCost: 'none' });
+    });
+});
+
+// Item 18: a per-rest ability (Second Wind) is spent on use and stays spent
+// on the sheet until rest_manage readies it; the next fight hydrates it spent.
+describe('per-rest abilities', () => {
+    const sheet = (id: string) => new CharacterRepository(getDb()).findById(id)! as any;
+    function knight(abilities: Array<Record<string, unknown>>) {
+        const now = new Date().toISOString();
+        new CharacterRepository(getDb()).create({ id: 'knight', name: 'Knight', characterType: 'pc', stats: { str: 16, dex: 12, con: 14, int: 10, wis: 10, cha: 10 },
+            hp: 40, maxHp: 40, ac: 18, level: 5, abilities, createdAt: now, updatedAt: now } as any);
+    }
+    const fight = async (extra: Record<string, unknown> = {}) => (await manage({ action: 'create', seed: 'per-rest', participants: [
+        { id: 'knight', name: 'Knight', hp: 40, maxHp: 40, initiative: 20, ...extra },
+        { id: 'gob', name: 'Goblin', hp: 10, maxHp: 10, initiative: 5, isEnemy: true }
+    ] })).d.encounterId as string;
+
+    it('use_ability spends a perRest ability on the token and the sheet; a recharge-only spend stays on the token', async () => {
+        knight([{ name: 'Second Wind', perRest: 'short' }, { name: 'Fire Breath', recharge: 5, actionCost: 'none' }]);
+        const enc = await fight();
+        const { d } = await manage({ action: 'use_ability', encounterId: enc, participantId: 'knight', ability: 'second wind' });
+        expect(d).toMatchObject({ success: true, ready: false, mirroredToCharacter: true });
+        expect(d.message).toMatch(/Second Wind is spent until a short rest/);
+        expect(tok(enc, 'knight').abilities[0].ready).toBe(false);
+        expect(sheet('knight').abilities[0].ready).toBe(false);
+        // The action is spent too: a second use is refused as spent, writing nothing.
+        const again = await manage({ action: 'use_ability', encounterId: enc, participantId: 'knight', ability: 'Second Wind' });
+        expect(again.d).toMatchObject({ error: true, writes: 'none' });
+        expect(again.d.message).toMatch(/spent until a short rest/);
+        // Recharge spends never reach the sheet.
+        const breath = await manage({ action: 'use_ability', encounterId: enc, participantId: 'knight', ability: 'Fire Breath' });
+        expect(breath.d.success).toBe(true);
+        expect(tok(enc, 'knight').abilities[1].ready).toBe(false);
+        expect(sheet('knight').abilities[1].ready).toBe(true);
+    });
+
+    it('the next fight hydrates a spent perRest ability spent, with or without caller abilities', async () => {
+        knight([{ name: 'Second Wind', perRest: 'short' }]);
+        const first = await fight();
+        await manage({ action: 'use_ability', encounterId: first, participantId: 'knight', ability: 'Second Wind' });
+        await manage({ action: 'end', encounterId: first });
+        const omitted = await fight();
+        expect(tok(omitted, 'knight').abilities[0]).toMatchObject({ name: 'Second Wind', perRest: 'short', ready: false });
+        await manage({ action: 'end', encounterId: omitted });
+        // The live client resends the statline without a ready flag: the sheet's spent state wins.
+        const resent = await fight({ abilities: [{ name: 'Second Wind', perRest: 'short' }] });
+        expect(tok(resent, 'knight').abilities[0].ready).toBe(false);
+        await manage({ action: 'end', encounterId: resent });
+        // An explicit ready: true from the caller is honoured.
+        const explicit = await fight({ abilities: [{ name: 'Second Wind', perRest: 'short', ready: true }] });
+        expect(tok(explicit, 'knight').abilities[0].ready).toBe(true);
+    });
+
+    it('add_participant with a resent statline keeps the sheet\'s spent perRest ability too (any case)', async () => {
+        knight([{ name: 'Second Wind', perRest: 'short', ready: false }]);
+        const enc = (await manage({ action: 'create', seed: 'per-rest-add', participants: [
+            { id: 'gob', name: 'Goblin', hp: 10, maxHp: 10, initiative: 5, isEnemy: true }
+        ] })).d.encounterId as string;
+        const added = await manage({ action: 'add_participant', encounterId: enc, characterId: 'knight', abilities: [{ name: 'second wind', perRest: 'short' }] });
+        expect(added.d.success).toBe(true);
+        expect(tok(enc, 'knight').abilities[0]).toMatchObject({ name: 'second wind', perRest: 'short', ready: false });
+        // An explicit ready: true from the caller is honoured here as on create.
+        const enc2 = (await manage({ action: 'create', seed: 'per-rest-add-2', participants: [
+            { id: 'gob', name: 'Goblin', hp: 10, maxHp: 10, initiative: 5, isEnemy: true }
+        ] })).d.encounterId as string;
+        await manage({ action: 'add_participant', encounterId: enc2, characterId: 'knight', abilities: [{ name: 'Second Wind', perRest: 'short', ready: true }] });
+        expect(tok(enc2, 'knight').abilities[0].ready).toBe(true);
+    });
+
+    it('battle_cry spends a perRest ability on the token and the sheet', async () => {
+        knight([{ name: 'Waaagh!', perRest: 'long' }]);
+        const enc = await fight();
+        const { d } = await manage({ action: 'battle_cry', encounterId: enc, participantId: 'knight', name: 'Waaagh!', ability: 'Waaagh!', attackAdvantage: true });
+        expect(d).toMatchObject({ success: true, ability: { name: 'Waaagh!', ready: false } });
+        expect(d.message).toMatch(/spent until a long rest/);
+        expect(tok(enc, 'knight').abilities[0].ready).toBe(false);
+        expect(sheet('knight').abilities[0].ready).toBe(false);
+        const again = await manage({ action: 'battle_cry', encounterId: enc, participantId: 'knight', name: 'Waaagh!', ability: 'Waaagh!', attackAdvantage: true });
+        expect(again.d).toMatchObject({ error: true, writes: 'none' });
+        expect(again.d.message).toMatch(/spent until a long rest/);
     });
 });
 

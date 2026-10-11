@@ -4,7 +4,7 @@ import { Character, CharacterSchema, NPC, NPCSchema } from '../../schema/charact
 import { CharacterType } from '../../schema/party.js';
 
 /** The sheet fields stored together in the combat_profile JSON column. */
-const COMBAT_PROFILE_KEYS = ['size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'attacksPerAction', 'attacks', 'abilities', 'cr', 'autoLegendaryResistance', 'form', 'vessel'] as const;
+const COMBAT_PROFILE_KEYS = ['size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'attacksPerAction', 'attacks', 'abilities', 'fightingStyle', 'superiorityDie', 'maneuverAbility', 'cr', 'autoLegendaryResistance', 'form', 'vessel'] as const;
 
 /** Pack the combat profile for the column; null when the sheet sets none of it. */
 function packCombatProfile(c: Character | NPC): string | null {
@@ -95,9 +95,10 @@ export class CharacterRepository {
             immunities: JSON.stringify(validChar.immunities || []),
             // PHASE-1: Spatial awareness
             currentRoomId: validChar.currentRoomId || null,
-            // PHASE-2: Social hearing mechanics skill bonuses
-            perceptionBonus: validChar.perceptionBonus || 0,
-            stealthBonus: validChar.stealthBonus || 0,
+            // Play report 2 #5: tri-state override columns. An explicit NULL bind
+            // bypasses the column's DEFAULT 0; only a number (0 included) is an override.
+            perceptionBonus: validChar.perceptionBonus ?? null,
+            stealthBonus: validChar.stealthBonus ?? null,
             // §10.3: Generalized resource pools (attentional_capacity et al.)
             resourcePools: JSON.stringify(validChar.resourcePools || {}),
             // Table rules: power band and per-round regeneration
@@ -197,6 +198,16 @@ export class CharacterRepository {
             if (updates.level !== undefined && updates.level !== existing.level) {
                 auditStmt.run(canonicalId, 'level', String(existing.level), String(updates.level), src, now);
             }
+            // Play report 2 #5: the override columns join the audited set. The
+            // journal is how the skill-override migration tells a deliberate
+            // override (0 included) from a column born 0 by the old default.
+            // Only a key the caller sent counts; 'null' is written as text.
+            for (const field of ['stealthBonus', 'perceptionBonus'] as const) {
+                if (!(field in updates)) continue;
+                const before = (existing as Record<string, unknown>)[field] ?? null;
+                const after = (updates as Record<string, unknown>)[field] ?? null;
+                if (before !== after) auditStmt.run(canonicalId, field, String(before), String(after), src, now);
+            }
             const newPools = (updates as { resourcePools?: Record<string, { current: number; max: number }> }).resourcePools;
             const oldPools = (existing as { resourcePools?: Record<string, { current: number; max: number }> }).resourcePools || {};
             if (newPools) {
@@ -270,9 +281,9 @@ export class CharacterRepository {
             JSON.stringify(validChar.immunities || []),
             // PHASE-1: Spatial awareness
             validChar.currentRoomId || null,
-            // PHASE-2: Social hearing mechanics skill bonuses
-            validChar.perceptionBonus || 0,
-            validChar.stealthBonus || 0,
+            // Play report 2 #5: tri-state override columns (NULL = computed)
+            validChar.perceptionBonus ?? null,
+            validChar.stealthBonus ?? null,
             // §10.3: Generalized resource pools
             JSON.stringify(validChar.resourcePools || {}),
             validChar.band ?? null,
@@ -347,9 +358,9 @@ export class CharacterRepository {
             immunities: row.immunities ? JSON.parse(row.immunities) : [],
             // PHASE-1: Spatial awareness
             currentRoomId: row.current_room_id || undefined,
-            // PHASE-2: Social hearing mechanics skill bonuses
-            perceptionBonus: row.perception_bonus ?? 0,
-            stealthBonus: row.stealth_bonus ?? 0,
+            // Play report 2 #5: a NULL column reads as "not set" (computed), never 0
+            perceptionBonus: row.perception_bonus ?? undefined,
+            stealthBonus: row.stealth_bonus ?? undefined,
             // §10.3: Generalized resource pools (attentional_capacity et al.)
             resourcePools: row.resource_pools ? JSON.parse(row.resource_pools) : {},
             band: row.band ?? undefined,
