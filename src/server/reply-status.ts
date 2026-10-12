@@ -47,6 +47,16 @@ export function replyData(text: string | undefined): { body: string; embedded: b
     return bare.startsWith('{') ? { body: bare, embedded: false } : null;
 }
 
+/**
+ * Where the reply's first embed sits: the text before it, the embed itself
+ * and what follows. Null when the reply has no embed (bare JSON, prose).
+ */
+export function splitEmbed(text: string): { before: string; embed: string; after: string } | null {
+    const m = text.match(EMBED);
+    if (!m || m.index === undefined) return null;
+    return { before: text.slice(0, m.index), embed: m[0], after: text.slice(m.index + m[0].length) };
+}
+
 /** replyData's body alone. */
 export function replyBody(text: string | undefined): string | null {
     return replyData(text)?.body ?? null;

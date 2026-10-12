@@ -23,6 +23,7 @@ import {
     MatchResult
 } from './fuzzy-enum.js';
 import type { SessionContext } from '../server/types.js';
+import { keepsUnknownKeys, shapeOf } from './zod-shape.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // TYPES
@@ -51,12 +52,13 @@ export interface ActionDefinition {
     /** Description for documentation */
     description?: string;
     /**
-     * Play report 2 #10: what happens to keys the action schema does not
-     * declare. 'strip' (default) drops them silently, as Zod does. 'warn'
-     * still runs the handler but the success reply carries
-     * `ignoredParams: [...]` and a message line naming each key with its
-     * nearest valid key (or the hint from unknownKeyHints). Per-action opt-in:
-     * every other action's reply shape is unchanged.
+     * Play report 2 #10 / play report 4 #2: what happens to keys the action
+     * schema does not declare. 'warn' (the router's default) still runs the
+     * handler but the success reply carries `ignoredParams: [...]` and a
+     * message line naming each key with its nearest valid key (or the hint
+     * from unknownKeyHints). 'strip' drops them silently, as Zod does — a
+     * per-action opt-out for the rare action whose callers legitimately send
+     * keys it never reads. Unset here, the router's own setting applies.
      */
     unknownKeys?: 'strip' | 'warn';
     /** Per-key hints for 'warn' (e.g. update-only keys sent to create). */
@@ -66,25 +68,55 @@ export interface ActionDefinition {
 /** Transport envelope keys the outer schema carries for every action; never reported as ignored. */
 const ENVELOPE_KEYS = new Set(['action', 'sessionId', 'output_mode', 'outputMode', 'fields', 'opId']);
 
-/** The keys a caller sent that the action's schema does not declare (undefined values do not count). */
+/**
+ * The keys a caller sent that the action's schema does not declare (undefined
+ * values do not count). The schema is read through its preprocess / refine /
+ * default wrappers; a passthrough or catchall object keeps every key, so
+ * nothing is ignored there and nothing is reported.
+ */
 export function ignoredParamsOf(schema: z.ZodType<any>, args: Record<string, unknown>): string[] {
-    const shape = (schema as { shape?: Record<string, unknown> }).shape;
-    if (!shape) return [];
+    const shape = shapeOf(schema);
+    if (!shape || keepsUnknownKeys(schema)) return [];
     return Object.keys(args).filter(k => !ENVELOPE_KEYS.has(k) && args[k] !== undefined && !(k in shape));
+}
+
+/** The action's own parameter names, through the schema's wrappers, `action` excluded. */
+function validKeysOf(schema: z.ZodType<any>): string[] {
+    return Object.keys(shapeOf(schema) ?? {}).filter(k => k !== 'action');
+}
+
+/** The closest of `candidates` to `key` when it is close enough to be a misspelling (similarity ≥ 0.5). */
+function nearestKey(key: string, candidates: readonly string[]): string | undefined {
+    let best: { key: string; score: number } | undefined;
+    for (const v of candidates) {
+        const score = similarity(key, v);
+        if (!best || score > best.score) best = { key: v, score };
+    }
+    return best && best.score >= 0.5 ? best.key : undefined;
+}
+
+/**
+ * Keys the call envelope reads before any action does. The operation guard
+ * takes args.worldId to stamp roll_log.world_id on every die the call rolls,
+ * whether or not the action declares it — so an action that ignores it must
+ * say what the envelope still did with it, not call it a near-miss.
+ */
+const ENVELOPE_KEY_NOTES: Record<string, (action: string) => string> = {
+    worldId: action => `not among ${action}'s parameters; it only stamps this call's dice log (roll_log.world_id)`
+};
+
+/** `key — <hint>` / `key — <envelope note>` / `key — nearest valid key 'x'` / `key — no close match among <action>'s parameters`. */
+function describeKey(action: string, key: string, valid: readonly string[], hints: Record<string, string>): string {
+    if (hints[key]) return `${key} — ${hints[key]}`;
+    if (ENVELOPE_KEY_NOTES[key]) return `${key} — ${ENVELOPE_KEY_NOTES[key](action)}`;
+    const near = nearestKey(key, valid);
+    return near ? `${key} — nearest valid key '${near}'` : `${key} — no close match among ${action}'s parameters`;
 }
 
 /** One line naming each ignored key and the nearest valid key, or the action's own hint for it. */
 export function describeIgnoredParams(action: string, ignored: string[], schema: z.ZodType<any>, hints: Record<string, string> = {}): string {
-    const valid = Object.keys((schema as { shape?: Record<string, unknown> }).shape ?? {}).filter(k => k !== 'action');
-    const parts = ignored.map(key => {
-        if (hints[key]) return `${key} — ${hints[key]}`;
-        let best: { key: string; score: number } | undefined;
-        for (const v of valid) {
-            const score = similarity(key, v);
-            if (!best || score > best.score) best = { key: v, score };
-        }
-        return best && best.score >= 0.5 ? `${key} — nearest valid key '${best.key}'` : `${key} — no close match among ${action}'s parameters`;
-    });
+    const valid = validKeysOf(schema);
+    const parts = ignored.map(key => describeKey(action, key, valid, hints));
     return `Ignored params (not ${action} parameters; nothing was written for them): ${parts.join('; ')}.`;
 }
 
@@ -113,6 +145,13 @@ export interface ActionRouterConfig<TActions extends string> {
     aliases?: Record<string, TActions>;
     /** Minimum similarity for fuzzy matching (default: 0.6) */
     threshold?: number;
+    /**
+     * Play report 4 #2: the default for every action that sets no
+     * `unknownKeys` of its own. 'warn' unless the tool says otherwise — a key
+     * an action does not declare is reported on the reply, never dropped in
+     * silence.
+     */
+    unknownKeys?: 'strip' | 'warn';
 }
 
 /**
@@ -166,7 +205,7 @@ export interface EnhancedResult<T> {
 export function createActionRouter<TActions extends string>(
     config: ActionRouterConfig<TActions>
 ): ActionRouter {
-    const { actions, definitions, threshold = 0.6 } = config;
+    const { actions, definitions, threshold = 0.6, unknownKeys: defaultUnknownKeys = 'warn' } = config;
 
     // Build alias map from definitions if not provided
     const aliasMap: Record<string, TActions> = config.aliases ?? {};
@@ -219,7 +258,7 @@ export function createActionRouter<TActions extends string>(
         const parseResult = definition.schema.safeParse(argsWithResolvedAction);
 
         if (!parseResult.success) {
-            return formatValidationError(action, parseResult.error);
+            return formatValidationError(action, parseResult.error, { schema: definition.schema, args, hints: definition.unknownKeyHints });
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -231,9 +270,10 @@ export function createActionRouter<TActions extends string>(
             // ─────────────────────────────────────────────────────────────────
             // STEP 5: Format response with optional fuzzy match metadata
             // ─────────────────────────────────────────────────────────────────
-            // Play report 2 #10: an action that opted in says which keys it
-            // dropped — loudly, on the success reply, with the nearest valid key.
-            const ignored = definition.unknownKeys === 'warn' ? ignoredParamsOf(definition.schema, args) : [];
+            // Play report 2 #10 / play report 4 #2: every action says which keys
+            // it dropped — loudly, on the success reply, with the nearest valid
+            // key — unless it, or its router, opted out with 'strip'.
+            const ignored = (definition.unknownKeys ?? defaultUnknownKeys) === 'warn' ? ignoredParamsOf(definition.schema, args) : [];
             if (ignored.length && typeof result === 'object' && result !== null && !('content' in result) && !(result as { error?: unknown }).error) {
                 const note = describeIgnoredParams(action, ignored, definition.schema, definition.unknownKeyHints);
                 const prior = (result as { message?: unknown }).message;
@@ -405,17 +445,36 @@ export function formatMcpError(
 }
 
 /**
- * Format a Zod validation error as MCP response with helpful details
+ * Format a Zod validation error as MCP response with helpful details.
+ *
+ * Play report 4 #2: given the action's schema and the raw args, the reply
+ * also names the keys the schema does not declare (`unknownParams`, each
+ * with its nearest valid key or the action's hint), and a missing required
+ * key whose misspelt twin was sent says so on its own issue — the two
+ * halves of "nmae instead of name" meet in one message.
  */
 export function formatValidationError(
     action: string,
-    error: z.ZodError
+    error: z.ZodError,
+    context?: { schema: z.ZodType<any>; args: Record<string, unknown>; hints?: Record<string, string> }
 ): McpResponse {
     const issues = error.issues.map(issue => ({
         path: issue.path.join('.') || '(root)',
         message: issue.message,
         code: issue.code
     }));
+
+    let hint = 'Check the parameter types and required fields';
+    const unknown = context ? ignoredParamsOf(context.schema, context.args) : [];
+    if (unknown.length) {
+        for (const issue of issues) {
+            if (issue.code !== 'invalid_type' || issue.message !== 'Required' || issue.path === '(root)' || issue.path.includes('.')) continue;
+            const twin = nearestKey(issue.path, unknown);
+            if (twin) issue.message = `Required — you sent '${twin}'; did you mean '${issue.path}'?`;
+        }
+        const valid = validKeysOf(context!.schema);
+        hint += `. Unknown keys (not ${action} parameters): ${unknown.map(k => describeKey(action, k, valid, context!.hints ?? {})).join('; ')}.`;
+    }
 
     return {
         content: [{
@@ -425,7 +484,8 @@ export function formatValidationError(
                 action,
                 message: `Validation failed for action "${action}"`,
                 issues,
-                hint: 'Check the parameter types and required fields',
+                ...(unknown.length ? { unknownParams: unknown } : {}),
+                hint,
                 // FINDINGS #64: validation precedes the handler by construction —
                 // the throw site can prove write-freedom, so it asserts it.
                 writes: 'none'

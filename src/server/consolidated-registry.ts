@@ -7,6 +7,7 @@
 
 import { ToolMetadata, ToolCategory, ToolRegistry } from './tool-metadata.js';
 import { ConsolidatedTools } from './consolidated/index.js';
+import { shapeOf } from '../utils/zod-shape.js';
 
 let cachedRegistry: ToolRegistry | null = null;
 
@@ -32,16 +33,10 @@ export function buildConsolidatedRegistry(): ToolRegistry {
  * Until outer schemas are auto-generated, audit them at every boot and
  * shout about drift where it cannot be missed.
  */
-/**
- * The object behind a z.preprocess / refine wrapper (world_manage update and
- * advance are preprocess-wrapped): their keys are inner params like any other,
- * and a client strips them just the same when the outer schema lacks them.
- */
-function shapeOf(schema: unknown): Record<string, unknown> | undefined {
-    let current = schema as { shape?: Record<string, unknown>; _def?: { typeName?: string; schema?: unknown } } | undefined;
-    while (current?._def?.typeName === 'ZodEffects') current = current._def.schema as typeof current;
-    return current?.shape;
-}
+// The object behind a z.preprocess / refine wrapper (world_manage update and
+// advance are preprocess-wrapped): their keys are inner params like any other,
+// and a client strips them just the same when the outer schema lacks them.
+// shapeOf lives in utils/zod-shape.ts so the action router reads the same way.
 
 export function mirrorAuditMissing(registry: ToolRegistry): Record<string, string[]> {
     const drift: Record<string, string[]> = {};

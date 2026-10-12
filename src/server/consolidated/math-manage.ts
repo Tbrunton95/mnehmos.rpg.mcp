@@ -3,7 +3,6 @@
  * Replaces 5 separate tools: dice_roll, probability_calculate, algebra_solve, algebra_simplify, physics_projectile
  */
 
-import { matchUniqueLabel } from '../../utils/match-label.js';
 import { z } from 'zod';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { SessionContext } from '../types.js';
@@ -16,6 +15,7 @@ import { PhysicsEngine } from '../../math/physics.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { loadAutoMechanics, autoSkillBonus, autoSaveBonus, autoAdvantage, applyDeclaredEffects } from '../../engine/effects-resolver.js';
 import { parseAbility } from '../../engine/combat/conditions.js';
+import { resolveNamedSources, loadEffectNames, jsonIfString, sourcesField } from '../../engine/advantage-sources.js';
 import { resolveWorldId, worldSkillAbility } from '../../engine/table-rules.js';
 import { worldProgression } from '../../engine/progression.js';
 import { skillModifier, overrideColumn, signed, type SkillSheet, type ShortAbility } from '../../engine/skill-modifier.js';
@@ -69,8 +69,6 @@ const SKILL_ABILITY: Record<string, string> = {
     deception: 'cha', intimidation: 'cha', performance: 'cha', persuasion: 'cha'
 };
 
-const jsonIfString = (v: unknown) => { if (typeof v === 'string') { try { return JSON.parse(v); } catch { return v; } } return v; };
-
 const DeclaredEffectRefSchema = z.object({ name: z.string(), lane: z.string().optional() });
 
 // Wishlist item 10: 'Wisdom', 'WIS' and 'wisdom' all mean wis. Long names map
@@ -83,8 +81,6 @@ const abilityKey = (v: unknown) => {
     return long ? SHORT_ABILITY[long] : v;
 };
 const abilityField = () => z.preprocess(abilityKey, z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']));
-const sourcesField = (what: string) => z.preprocess(jsonIfString, z.array(z.string())).optional()
-    .describe(`Wishlist item 10: names that grant ${what} — each must match exactly one of the character's conditions (name or source) or active effects (name), case-insensitive substring. A miss or an ambiguous match is refused and grants nothing. Logged in the roll's purpose.`);
 
 const CheckBaseFields = {
     characterId: z.string().describe('Character making the roll'),
@@ -291,29 +287,18 @@ async function handleCharacterRoll(
         disFrom.push(...auto.dis.map(label => ({ label, lane: 'ENGINE' })));
     }
     if (args.advantageSources?.length || args.disadvantageSources?.length) {
-        const conds = ((char as { conditions?: Array<{ name: string; source?: string }> }).conditions ?? []);
-        const effectNames = (db.prepare('SELECT name FROM custom_effects WHERE target_id = ? AND is_active = 1').all(charId) as Array<{ name: string }>).map(r => r.name);
-        // A prose condition is named by its text up to the first colon
-        // ('VAUREK: the ward-sigil…' → 'VAUREK'), as feature_from_condition does.
-        const shortName = (text: string) => text.split(':')[0].trim().slice(0, 60) || text.slice(0, 60);
-        const resolveSource = (text: string, which: string): string | undefined => {
-            const t = text.trim().toLowerCase();
-            if (!t) { resolverProblems.push(`${which} source "" is empty — nothing granted`); return undefined; }
-            // One hit per distinct name: a condition and the feature made from it
-            // count once. Exact beats prefix beats substring (matchUniqueLabel).
-            const candidates = [
-                ...conds.map(c => ({ label: shortName(c.name), texts: [shortName(c.name), c.name, c.source ?? ''], value: shortName(c.name) })),
-                ...effectNames.map(n => ({ label: n, texts: [n], value: n }))
-            ];
-            const m = matchUniqueLabel(candidates, t);
-            if ('match' in m) return m.match;
-            resolverProblems.push('ambiguous' in m
-                ? `${which} source "${text}" matches ${m.ambiguous.length} conditions or effects by ${m.tier} [${m.ambiguous.join(' | ')}] — use more of the text; nothing granted`
-                : `${which} source "${text}" matches nothing in ${char.name}'s conditions or active effects — nothing granted`);
-            return undefined;
+        // Shared with grapple (src/engine/advantage-sources.ts): a miss or an
+        // ambiguous name is a problem line here and the roll still happens.
+        const owner = {
+            ownerName: char.name,
+            conditions: ((char as { conditions?: Array<{ name: string; source?: string }> }).conditions ?? []),
+            effectNames: loadEffectNames(db, charId)
         };
-        for (const text of args.advantageSources ?? []) { const label = resolveSource(text, 'advantage'); if (label) advFrom.push({ label, lane: 'SITUATIONAL' }); }
-        for (const text of args.disadvantageSources ?? []) { const label = resolveSource(text, 'disadvantage'); if (label) disFrom.push({ label, lane: 'SITUATIONAL' }); }
+        const adv = resolveNamedSources(args.advantageSources ?? [], 'advantage', owner);
+        const dis = resolveNamedSources(args.disadvantageSources ?? [], 'disadvantage', owner);
+        resolverProblems.push(...adv.problems, ...dis.problems);
+        advFrom.push(...adv.labels.map(label => ({ label, lane: 'SITUATIONAL' })));
+        disFrom.push(...dis.labels.map(label => ({ label, lane: 'SITUATIONAL' })));
     }
     for (const a of advFrom) { contributions.push({ label: `ADV ← ${a.label}`, value: 0, lane: a.lane }); breakdown.push(`advantage ← ${a.label}`); }
     for (const d of disFrom) { contributions.push({ label: `DIS ← ${d.label}`, value: 0, lane: d.lane }); breakdown.push(`disadvantage ← ${d.label}`); }

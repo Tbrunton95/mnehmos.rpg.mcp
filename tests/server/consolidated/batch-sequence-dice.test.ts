@@ -22,4 +22,26 @@ describe('execute_sequence dice', () => {
         const seeds = [...text.matchAll(/▌ seed (\S+)/g)].map(m => m[1]);
         expect(new Set(seeds).size).toBe(3);
     });
+
+    // Play report 4 #2: a roll step prints its disclosure block instead of the
+    // reply's message, so the ignored-key note the router put in that message
+    // never reached the batch banner — only the embed knew. The step line
+    // carries it now; a clean roll step prints nothing extra.
+    it('a roll step with a key roll does not take shows the ignored-key note under its disclosure block', async () => {
+        const res = await handleBatchManage({
+            action: 'execute_sequence',
+            steps: [
+                { id: 'typo', tool: 'math_manage', args: { action: 'roll', expression: '1d20', expresion: '2d6' } },
+                { id: 'clean', tool: 'math_manage', args: { action: 'roll', expression: '1d20' } }
+            ]
+        }, { sessionId: 'batch-ignored' } as any);
+        const text = res.content[0].text;
+        const banner = text.slice(0, text.indexOf('<!-- BATCH_MANAGE_JSON'));
+        expect(banner).toMatch(/⚠ Ignored params \(not roll parameters; nothing was written for them\): expresion — nearest valid key 'expression'\./);
+        expect(banner.split('Ignored params').length - 1).toBe(1);
+        const embed = JSON.parse(text.match(/<!-- BATCH_MANAGE_JSON\n([\s\S]*?)\nBATCH_MANAGE_JSON -->/)![1]);
+        expect(embed.stepResults.typo.ignoredParams).toEqual(['expresion']);
+        expect(embed.stepResults.clean.ignoredParams).toBeUndefined();
+        expect(embed.successCount).toBe(2);
+    });
 });

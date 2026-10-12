@@ -72,6 +72,12 @@ The Deep One campaign ran four days of fights outside the engine because its dic
 - **A hand-set AC survives equipping.** `character_manage update {ac}` marks the sheet manual; equip and unequip keep it and say what the gear would give. `recomputeAc: true` on an equip, or `update {acSource: 'derived'}`, hands AC back to the gear. When a manual AC equals what the gear derives, the reply says so.
 - **Stores are mouth-days in one pool.** Before linking an old pool counted in camp-days, convert it: `character_manage adjust_pool {characterId, pool: 'stores', value: 200, max: 600, label: 'Stores (mouth-days)'}`. Never link a pool in old units: the first advance would starve the herd. Then `party_manage set_upkeep {partyId, linkPool: {characterId, pool: 'stores'}, mouthsFromPool: [{characterId, pool: 'captives'}]}`; it starts from today and charges nothing before. Guide: `docs/table-rules/upkeep.md`.
 
+## After play report 4 (the Horn-Lock throw)
+
+- **Grapple takes advantage.** `combat_action grapple {…, advantage: true}` or `advantageSources: ['Horn-Lock']` (a condition or active effect on the grappler, by name or source). The band or size rule still adds its own disadvantage; the two cancel to one die. A source that matches nothing or two things is refused before anything is rolled.
+- **A key an action doesn't use is reported, not dropped.** Every consolidated tool now returns `ignoredParams` with the nearest valid key when a call carries one, including keys the tool never declared. Read it when a call "worked" but did nothing you asked.
+- **Custom items equip by slot.** `item_manage create {…, equipSlots: ['mainhand']}` (or `update {itemId, equipSlots}`); an equip refused for a missing slot prints the exact update call to run. Slots: mainhand, offhand, armor, head, feet, accessory, accessory2, accessory3.
+
 ## Never do these
 
 - **Never fake a result with a huge `attackBonus`.** Post it with `outcome`.
@@ -215,3 +221,16 @@ The Deep One campaign ran four days of fights outside the engine because its dic
 | Time passed outside advance | `party_manage upkeep {partyId, days}` charges by hand; the clock catches up to it before charging again |
 | Fixing a wrong clock or jumping an era | `world_manage update {worldId, correction: true, environment: {day, time}}` / `era_jump` charge nothing and move the upkeep anchor (reply `upkeepAnchored[]`); a plain `update` that moves the clock is caught up by the next advance |
 | Stop tracking stores | `party_manage set_upkeep {partyId, clear: true}` (the pool keeps its value) |
+| A grapple with advantage the table ruled | `combat_action grapple {encounterId, actorId, targetId, move, advantage: true}` — two d20 keep high for the grappler, situational 'Marine: advantage (GM)', logged as `grapple (adv: GM)`; `disadvantage: true` keeps the low die |
+| A grapple with advantage from something on the grappler | `combat_action grapple {…, advantageSources: ['Bulwark']}` (or `disadvantageSources`) — a condition on its token or sheet (name or source) or an active effect; exact beats prefix beats any part; a name that matches nothing or two things is refused before anything is rolled or spent |
+| The GM's advantage against the band/size rule | `grapple {…, advantage: true}` on a lower-band or smaller grappler rolls one die (`rollMode.actor: 'cancelled'`, the line says both); the defender keeps only its own automatic disadvantage |
+| Which die was kept and why | reply `rollMode {actor, defender}`, `advantageSources`, `disadvantageSources`, `situational[]`; `session_manage rolls {forId}` shows `grapple (adv: GM, Bulwark; dis: lower band)` and `2d20kh1` / `2d20kl1` on the sheet path |
+| A straight attack roll with the flag spelled out | `combat_action attack {…, advantage: false}` (or volley) rolls one d20 — it used to roll at disadvantage |
+| Make a misc item wearable | `item_manage create {name, type: 'misc', equipSlots: ['accessory']}`, or later `item_manage update {itemId, equipSlots: ['accessory']}` (the other properties are kept; no mergeProperties needed). `equipSlots: []` hands the slots back to the type defaults. Slots: mainhand, offhand, armor, head, feet, accessory, accessory2, accessory3 |
+| Equip is refused for the slot | the reply's `fix.args` is the exact `item_manage update {itemId: '<real id>', equipSlots: [...]}` to run, then equip again; nothing was written. A weapon tried in `armor` gets `['mainhand', 'offhand', 'armor']`; the `properties: {equipSlots: [...]}, mergeProperties: true` form is printed as the alternative |
+| Edit one property on a template | `item_manage update {itemId, properties: {key: value}, mergeProperties: true}` keeps the rest (a key set to null is deleted; `propertyMerge.preservedKeys` lists what survived). Without `mergeProperties` the stored set is replaced wholesale. `preview: true` shows the diff and writes nothing |
+| A slot is misspelt | `properties.equipSlots: ['mainhnd']` is refused with the nearest slot and nothing written; a top-level `equipSlots` typo fails validation with the full slot list |
+| A reply shows ⚠️ Ignored params | re-send with the key the line names (`nearest valid key 'weight'`); the write already happened without it |
+| A validation error names a key you did not send | read `unknownParams` and the issue's "you sent 'nmae'; did you mean 'name'?" — nothing was written |
+| Chair wants only two fields but must still see dropped keys | `any_tool {..., fields: ['worldId']}` — `ignoredParams` rides along with success/error/actionType/message |
+| An action should accept stray keys quietly (rare) | set `unknownKeys: 'strip'` on that action's definition (or on its createActionRouter config) |

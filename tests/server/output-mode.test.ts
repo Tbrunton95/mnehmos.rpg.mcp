@@ -1,4 +1,4 @@
-import { shapeReply, pickFields, summarizeResult } from '../../src/server/output-mode.js';
+import { shapeReply, pickFields, summarizeResult, noteIgnoredParams } from '../../src/server/output-mode.js';
 import { handleWorldManage } from '../../src/server/consolidated/world-manage.js';
 import { handleNarrativeManage } from '../../src/server/consolidated/narrative-manage.js';
 import { handleItemManage } from '../../src/server/consolidated/item-manage.js';
@@ -171,5 +171,60 @@ describe('the guard line rides summary and json as _op', () => {
         const res = { content: [{ type: 'text', text: `▌ HP 320/320 · RESOLVE 100/100\n▌ COND x\n<!-- X_JSON\n${body}\nX_JSON -->` }] };
         expect(JSON.parse(text(shapeReply(res, { mode: 'summary' })))._op).toBeUndefined();
         expect(text(shapeReply(res, { mode: 'json' }))).toBe(body);
+    });
+});
+
+/**
+ * Play report 4 #2: a key an action ignores must not vanish. The router puts
+ * ignoredParams on the reply; these two keep it visible whatever the chair
+ * asked for — fields: [...] keeps the list, and a banner that never prints
+ * `message` gets one warning line before its embed.
+ */
+describe('ignoredParams stays visible', () => {
+    const embed = (data: unknown) => `\n<!-- X_JSON\n${JSON.stringify(data)}\nX_JSON -->\n`;
+    const note = "Ignored params (not update parameters; nothing was written for them): bogus — no close match among update's parameters.";
+    const data = { success: true, actionType: 'update', hp: 5, ignoredParams: ['bogus'], message: `Updated. ${note}` };
+
+    it('fields: [...] always keeps ignoredParams', () => {
+        expect(pickFields(data, ['hp'])).toEqual({ success: true, actionType: 'update', message: data.message, ignoredParams: ['bogus'], hp: 5 });
+        expect(pickFields({ success: true, hp: 5 }, ['hp'])).toEqual({ success: true, hp: 5 });
+    });
+
+    it('a banner without the note gets one warning line before the embed, once', () => {
+        const res = { content: [{ type: 'text', text: `HEADER\nHP: 5\n${embed(data)}` }] };
+        const once = noteIgnoredParams(res);
+        const [banner, rest] = once.content[0].text.split('<!-- X_JSON');
+        expect(banner).toBe(`HEADER\nHP: 5\n\n> ⚠️ **WARNING**: ${note}\n\n`);
+        expect(`<!-- X_JSON${rest}`).toBe(embed(data).trimStart());
+        expect(noteIgnoredParams(once)).toBe(once);
+    });
+
+    it('a banner that already prints the note is left alone', () => {
+        const res = { content: [{ type: 'text', text: `HEADER\n> ⚠️ **WARNING**: ${note}\n${embed(data)}` }] };
+        expect(noteIgnoredParams(res)).toBe(res);
+    });
+
+    it('a reply whose message lacks the sentence still names the keys', () => {
+        const res = { content: [{ type: 'text', text: `HEADER\n${embed({ success: true, ignoredParams: ['bogus', 'typo'] })}` }] };
+        expect(noteIgnoredParams(res).content[0].text).toContain('> ⚠️ **WARNING**: Ignored params (nothing was written for them): bogus, typo\n');
+    });
+
+    it('bare JSON, prose, errors and replies without ignoredParams pass through untouched', () => {
+        const bare = { content: [{ type: 'text', text: JSON.stringify(data) }] };
+        expect(noteIgnoredParams(bare)).toBe(bare);
+        const prose = { content: [{ type: 'text', text: 'words' }] };
+        expect(noteIgnoredParams(prose)).toBe(prose);
+        const clean = { content: [{ type: 'text', text: `HEADER\n${embed({ success: true })}` }] };
+        expect(noteIgnoredParams(clean)).toBe(clean);
+        const empty = { content: [{ type: 'text', text: `HEADER\n${embed({ success: true, ignoredParams: [] })}` }] };
+        expect(noteIgnoredParams(empty)).toBe(empty);
+    });
+
+    it('the guard line on top stays on top', () => {
+        const res = { content: [{ type: 'text', text: `▌ op 7 applied\nHEADER\n${embed(data)}` }] };
+        const out = noteIgnoredParams(res).content[0].text;
+        expect(out.startsWith('▌ op 7 applied\nHEADER\n')).toBe(true);
+        expect(out).toContain(`> ⚠️ **WARNING**: ${note}`);
+        expect(JSON.parse(text(shapeReply(noteIgnoredParams(res), { fields: ['hp'] })))).toEqual({ _op: 'op 7 applied', success: true, actionType: 'update', message: data.message, ignoredParams: ['bogus'], hp: 5 });
     });
 });

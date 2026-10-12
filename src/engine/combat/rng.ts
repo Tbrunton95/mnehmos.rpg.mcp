@@ -347,7 +347,9 @@ export class CombatRNG {
         const r1 = this.rollDie(20);
         let roll = r1;
         const allRolls = [r1];
-        if (advantage !== disadvantage) {   // one flag set, not both
+        // Play report 4: coerce both flags — `false !== undefined` used to read
+        // as "one flag set" and {advantage: false} rolled at disadvantage.
+        if (!!advantage !== !!disadvantage) {   // one flag set, not both
             const r2 = this.rollDie(20);
             allRolls.push(r2);
             roll = advantage ? Math.max(r1, r2) : Math.min(r1, r2);

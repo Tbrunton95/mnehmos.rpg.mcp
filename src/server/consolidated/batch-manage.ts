@@ -898,10 +898,19 @@ async function handleExecuteSequence(input: BatchManageInput, ctx: SessionContex
                 // further: steps that produce a roll print the FULL disclosure
                 // block under the step line — no collapsing to a tick.
                 const at = (result as Record<string, unknown> | null)?.actionType;
-                if (at === 'roll_skill_check' || at === 'roll_ability_check' || at === 'roll_saving_throw' || at === 'stunt') {
-                    output += pda.renderCheck(result as Parameters<typeof pda.renderCheck>[0]);
-                } else if (at === 'roll') {
-                    output += pda.renderRawRoll(result as Parameters<typeof pda.renderRawRoll>[0]);
+                if (at === 'roll_skill_check' || at === 'roll_ability_check' || at === 'roll_saving_throw' || at === 'stunt' || at === 'roll') {
+                    output += at === 'roll'
+                        ? pda.renderRawRoll(result as Parameters<typeof pda.renderRawRoll>[0])
+                        : pda.renderCheck(result as Parameters<typeof pda.renderCheck>[0]);
+                    // Play report 4 #2: the disclosure block replaces the reply's
+                    // message, and that message is where the router names the keys
+                    // the action ignored — so the step line says so itself.
+                    const ignored = (result as Record<string, unknown>)?.ignoredParams;
+                    if (Array.isArray(ignored) && ignored.length) {
+                        const msg = (result as Record<string, unknown>).message;
+                        const noteAt = typeof msg === 'string' ? msg.indexOf('Ignored params') : -1;
+                        output += `  ⚠ ${noteAt >= 0 ? (msg as string).slice(noteAt) : `Ignored params (nothing was written for them): ${ignored.map(String).join(', ')}`}\n`;
+                    }
                 } else {
                     const msg = (result as Record<string, unknown> | null)?.message;
                     output += `  ✅ ${typeof msg === 'string' && msg ? msg : 'Success'}\n`;

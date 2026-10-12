@@ -2,9 +2,10 @@ import { CombatEngine } from '../../src/engine/combat/engine.js';
 import { handleCombatManage } from '../../src/server/consolidated/combat-manage.js';
 import { handleCombatAction, CombatActionTool } from '../../src/server/consolidated/combat-action.js';
 import { handleTableRules } from '../../src/server/consolidated/table-rules.js';
-import { clearCombatState } from '../../src/server/handlers/combat-handlers.js';
+import { clearCombatState, getOrLoadEngine } from '../../src/server/handlers/combat-handlers.js';
 import { withOperation } from '../../src/server/operation-guard.js';
 import { CharacterRepository } from '../../src/storage/repos/character.repo.js';
+import { CustomEffectsRepository } from '../../src/storage/repos/custom-effects.repo.js';
 import { EncounterRepository } from '../../src/storage/repos/encounter.repo.js';
 import { WorldRepository } from '../../src/storage/repos/world.repo.js';
 import { closeDb, getDb } from '../../src/storage/index.js';
@@ -374,6 +375,30 @@ describe('helpless targets and posted grapple results', () => {
         expect(tok('cultist').conditions.map((c: any) => c.type)).toEqual(['unconscious']);
     });
 
+    it('a helpless actor with actionSurge: true is refused BEFORE the surge is spent (token and sheet untouched)', async () => {
+        // Play report 4, side bug: the surge was granted and the ability marked
+        // spent (sheet mirrored) before the helpless-actor refusal that claimed
+        // writes: 'none'. The refusal comes first now.
+        mkSheet('marine', 'Marine', { abilities: [{ name: 'Action Surge', grantsAction: true, ready: true }] });
+        await fight([{ ...marine, abilities: [{ name: 'Action Surge', grantsAction: true }] }, { id: 'cultist', name: 'Cultist', hp: 10, maxHp: 10, initiative: 5, isEnemy: true }]);
+        dice(18, 4);
+        expect((await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist' })).hit).toBe(true);
+        // The action is spent; now the marine is knocked out by a custom condition the engine does not know.
+        await manage({ action: 'add_condition', encounterId, participantId: 'marine', name: 'Asleep' });
+        const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
+        const res = await act({ action: 'grapple', move: 'takedown', encounterId, actorId: 'marine', targetId: 'cultist', actionSurge: true });
+        expect(res.error).toBeTruthy();
+        expect(res.writes).toBe('none');
+        expect(String(res.message)).toMatch(/Marine cannot grapple now: Marine is Asleep/);
+        expect(res.actionSurge).toBeUndefined();
+        expect(spy).not.toHaveBeenCalled();
+        const live = getOrLoadEngine(ctx as any, encounterId)!.getState()!.participants.find(p => p.id === 'marine') as any;
+        expect(live.abilities[0].ready).toBe(true);
+        expect(live.extraActions ?? 0).toBe(0);
+        expect(new CharacterRepository(getDb()).findById('marine')!.abilities![0].ready).toBe(true);
+        expect(tok('cultist').conditions.map((c: any) => c.type)).toEqual(['Clinched']);
+    });
+
     it('a target at 0 HP is helpless too', async () => {
         await fight([marine, { id: 'cultist', name: 'Cultist', hp: 0, maxHp: 10, initiative: 5, isEnemy: true }]);
         const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
@@ -587,5 +612,296 @@ describe('grapple without an encounter (item 4)', () => {
         expect(String(down.message)).toMatch(/Luciel is at 0 HP/);
         expect(grappleRolls()).toBe(0);
         expect(repo.findById('foe')!.conditions.map((c: any) => c.name)).toEqual(['Stunned']);
+    });
+});
+
+/**
+ * Play report 4, item 1: `grapple {advantage: true}` rolled one d20 and said
+ * nothing. The actor's roll mode now comes from the GM's flag, the automatic
+ * band/size rule and named sources (advantageSources / disadvantageSources,
+ * matched against the actor's token conditions, sheet conditions and active
+ * effects, math_manage's vocabulary); both present cancel to one die. The
+ * defender keeps only its automatic disadvantage. A bad source is refused
+ * before any roll or spend — a grapple writes.
+ */
+describe('grapple honours advantage (play report 4)', () => {
+    let encounterId: string;
+    const tokens = () => new EncounterRepository(getDb()).loadState(encounterId)!.participants as any[];
+    const tok = (id: string) => tokens().find(t => t.id === id);
+    const fight = async (participants: Array<Record<string, unknown>>) => {
+        const created = await manage({ action: 'create', seed: 'grapple-advantage', participants });
+        encounterId = created.encounterId;
+    };
+    const marine = { id: 'marine', name: 'Marine', hp: 60, maxHp: 60, initiative: 20, attacksPerAction: 4 };
+    const cultist = { id: 'cultist', name: 'Cultist', hp: 10, maxHp: 10, initiative: 5, isEnemy: true };
+    const mkSheet = (id: string, name: string, extra: Record<string, unknown> = {}) => {
+        const now = new Date().toISOString();
+        new CharacterRepository(getDb()).create({ id, name, stats: { str: 16, dex: 12, con: 14, int: 10, wis: 10, cha: 10 }, hp: 50, maxHp: 50, ac: 14, level: 5, createdAt: now, updatedAt: now, ...extra } as any);
+    };
+    const effect = (targetId: string, name: string) => new CustomEffectsRepository(getDb()).apply({
+        target_id: targetId, target_type: 'character', name, description: name,
+        category: 'neutral', power_level: 1, source: { type: 'unknown' },
+        mechanics: [{ type: 'custom_trigger', value: name }] as never, duration: { type: 'until_removed' as never },
+        triggers: [], removal_conditions: [{ type: 'duration_expires' as const }], stackable: false, max_stacks: 1
+    } as never);
+    const rollLog = () => { try { return getDb().prepare('SELECT for_id, purpose, expression FROM roll_log WHERE purpose LIKE ? ORDER BY rowid').all('grapple%') as Array<{ for_id: string; purpose: string; expression: string }>; } catch { return []; } };
+
+    beforeEach(() => { closeDb(); getDb(':memory:'); clearCombatState(); });
+    afterEach(() => { vi.restoreAllMocks(); closeDb(); });
+
+    it('advantage: true rolls two d20 for the actor, keeps the high die, names the GM and logs the reason in the purpose', async () => {
+        await fight([marine, cultist]);
+        const spy = dice(5, 18, 9);
+        const res = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantage: true });
+        expect(res.error).toBeFalsy();
+        expect(res.rolls).toEqual({ actor: [5, 18], defender: [9] });
+        expect(res.margin).toBe(9);
+        expect(res.hit).toBe(true);
+        expect(res.breakdown).toMatch(/Marine d20\(5,18 adv → 18\)/);
+        expect(res.situational).toEqual(['Marine: advantage (GM)']);
+        expect(res.rollMode).toEqual({ actor: 'advantage', defender: 'normal' });
+        expect(spy).toHaveBeenCalledTimes(3);
+        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (adv: GM)', forId: 'marine', targetId: 'cultist' }));
+        expect(spy).toHaveBeenNthCalledWith(2, expect.objectContaining({ purpose: 'grapple (adv: GM)', forId: 'marine' }));
+        expect(spy).toHaveBeenNthCalledWith(3, expect.objectContaining({ purpose: 'grapple', forId: 'cultist', targetId: 'marine' }));
+    });
+
+    it('disadvantage: true rolls two and keeps the low die', async () => {
+        await fight([marine, cultist]);
+        const spy = dice(15, 3, 10);
+        const res = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', disadvantage: true });
+        expect(res.rolls).toEqual({ actor: [15, 3], defender: [10] });
+        expect(res.hit).toBe(false);
+        expect(res.breakdown).toMatch(/Marine d20\(15,3 dis → 3\)/);
+        expect(res.situational).toEqual(['Marine: disadvantage (GM)']);
+        expect(res.rollMode).toEqual({ actor: 'disadvantage', defender: 'normal' });
+        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (dis: GM)', forId: 'marine' }));
+    });
+
+    it("the GM's advantage and the automatic band disadvantage cancel to one die; the defender is unchanged", async () => {
+        await fight([{ ...marine, band: 'Mortal' }, { ...cultist, band: 'Astartes' }]);
+        const spy = dice(7, 12);
+        const res = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantage: true });
+        expect(res.rolls).toEqual({ actor: [7], defender: [12] });
+        expect(res.rollMode).toEqual({ actor: 'cancelled', defender: 'normal' });
+        expect(res.situational).toHaveLength(1);
+        expect(res.situational[0]).toMatch(/^Marine: advantage and disadvantage cancel.*adv: GM.*dis: lower band \(Mortal vs Astartes\)/);
+        expect(res.breakdown).toMatch(/Marine d20\(7\)/);
+        expect(spy).toHaveBeenCalledTimes(2);
+        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (adv: GM; dis: lower band)', forId: 'marine' }));
+        expect(spy).toHaveBeenNthCalledWith(2, expect.objectContaining({ purpose: 'grapple', forId: 'cultist' }));
+    });
+
+    it('the automatic rule still reads in the purpose and the line when it stands alone', async () => {
+        await fight([{ ...marine, band: 'Astartes' }, { ...cultist, band: 'Mortal', size: 'small' }]);
+        const spy = dice(5, 20, 3);
+        const res = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist' });
+        expect(res.rolls).toEqual({ actor: [5], defender: [20, 3] });
+        expect(res.rollMode).toEqual({ actor: 'normal', defender: 'disadvantage' });
+        expect(res.situational).toEqual(['Cultist: disadvantage (lower band (Mortal vs Astartes); smaller (small vs medium))']);
+        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple', forId: 'marine' }));
+        expect(spy).toHaveBeenNthCalledWith(2, expect.objectContaining({ purpose: 'grapple (dis: lower band, smaller)', forId: 'cultist' }));
+    });
+
+    it('advantage: false alone is one straight die; advantage with disadvantage cancels', async () => {
+        await fight([marine, cultist]);
+        dice(11, 4);
+        const plain = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantage: false });
+        expect(plain.rolls).toEqual({ actor: [11], defender: [4] });
+        expect(plain.rollMode).toEqual({ actor: 'normal', defender: 'normal' });
+        expect(plain.situational).toBeUndefined();
+        dice(11, 4);
+        const both = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantage: true, disadvantage: true });
+        expect(both.rolls).toEqual({ actor: [11], defender: [4] });
+        expect(both.rollMode.actor).toBe('cancelled');
+        expect(both.situational[0]).toMatch(/Marine: advantage and disadvantage cancel.*adv: GM; dis: GM/);
+    });
+
+    it("sources resolve against the actor's token conditions, sheet conditions and active custom effects", async () => {
+        mkSheet('marine', 'Marine', { conditions: [{ name: 'Blessed', source: 'chaplain' }] });
+        effect('marine', 'Iron Grip');
+        await fight([{ ...marine, conditions: [{ name: 'Bulwark Stance', source: 'ritual' }] }, cultist]);
+        // A token condition, by a substring of its name.
+        let spy = dice(5, 18, 9);
+        const token = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantageSources: ['bulwark'] });
+        expect(token.error).toBeFalsy();
+        expect(token.rolls.actor).toEqual([5, 18]);
+        expect(token.advantageSources).toEqual(['Bulwark Stance']);
+        expect(token.situational).toEqual(['Marine: advantage (Bulwark Stance)']);
+        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (adv: Bulwark Stance)' }));
+        // A sheet condition, by its source text; with the GM's flag the GM reads first.
+        spy = dice(5, 18, 9);
+        const sheet = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantage: true, advantageSources: ['chaplain'] });
+        expect(sheet.advantageSources).toEqual(['Blessed']);
+        expect(sheet.situational).toEqual(['Marine: advantage (GM; Blessed)']);
+        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (adv: GM, Blessed)' }));
+        // A custom effect for advantage and a condition for disadvantage cancel.
+        spy = dice(7, 12);
+        const both = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantageSources: ['iron grip'], disadvantageSources: ['ritual'] });
+        expect(both.rolls).toEqual({ actor: [7], defender: [12] });
+        expect(both.rollMode.actor).toBe('cancelled');
+        expect(both.advantageSources).toEqual(['Iron Grip']);
+        expect(both.disadvantageSources).toEqual(['Bulwark Stance']);
+        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (adv: Iron Grip; dis: Bulwark Stance)' }));
+        // A disadvantage source alone keeps the low die.
+        dice(15, 3, 10);
+        const dis = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', disadvantageSources: ['Iron Grip'] });
+        expect(dis.rolls.actor).toEqual([15, 3]);
+        expect(dis.rollMode.actor).toBe('disadvantage');
+        expect(dis.situational).toEqual(['Marine: disadvantage (Iron Grip)']);
+    });
+
+    it('a source that matches nothing, or two things, is refused before any roll or spend', async () => {
+        await fight([{ ...marine, conditions: [{ name: 'Shaken by the Warp' }, { name: 'Shaken nerves' }] }, cultist]);
+        const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
+        const miss = await act({ action: 'grapple', move: 'takedown', encounterId, actorId: 'marine', targetId: 'cultist', advantageSources: ['Khorne'] });
+        expect(miss.error).toBeTruthy();
+        expect(miss.writes).toBe('none');
+        expect(String(miss.message)).toMatch(/advantage source "Khorne" matches nothing in Marine's conditions or active effects/);
+        const amb = await act({ action: 'grapple', move: 'takedown', encounterId, actorId: 'marine', targetId: 'cultist', advantage: true, disadvantageSources: ['shaken'] });
+        expect(amb.error).toBeTruthy();
+        expect(amb.writes).toBe('none');
+        expect(String(amb.message)).toMatch(/disadvantage source "shaken" matches 2 conditions or effects by prefix \[Shaken by the Warp \| Shaken nerves\]/);
+        // Several problems print together.
+        const two = await act({ action: 'grapple', move: 'takedown', encounterId, actorId: 'marine', targetId: 'cultist', advantageSources: ['Khorne', ''], disadvantageSources: ['shaken'] });
+        expect(String(two.message)).toMatch(/Khorne.*is empty.*shaken/);
+        expect(spy).not.toHaveBeenCalled();
+        expect(tok('marine').attacksMade ?? 0).toBe(0);
+        expect(tok('marine').actionUsed).toBeFalsy();
+        expect(tok('cultist').conditions).toEqual([]);
+    });
+
+    it('a bad source with actionSurge: true spends nothing either', async () => {
+        await fight([{ ...marine, attacksPerAction: 1, abilities: [{ name: 'Action Surge', grantsAction: true }] }, cultist]);
+        dice(18, 4);
+        expect((await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist' })).hit).toBe(true);
+        const res = await act({ action: 'grapple', move: 'takedown', encounterId, actorId: 'marine', targetId: 'cultist', actionSurge: true, advantageSources: ['Khorne'] });
+        expect(res.error).toBeTruthy();
+        expect(res.writes).toBe('none');
+        expect(getOrLoadEngine(ctx as any, encounterId)!.getState()!.participants.find(p => p.id === 'marine')!.abilities![0].ready).toBe(true);
+    });
+
+    it("on the sheets, advantage logs 2d20kh1 under the reasoned purpose; the defender's die stays 1d20 'grapple'", async () => {
+        mkSheet('luciel', 'Luciel');
+        mkSheet('foe', 'Foe');
+        const adv = await act({ action: 'grapple', move: 'clinch', actorId: 'luciel', targetId: 'foe', advantage: true });
+        expect(adv.error).toBeFalsy();
+        expect(adv.rolls.actor).toHaveLength(2);
+        expect(adv.rolls.defender).toHaveLength(1);
+        expect(adv.breakdown).toMatch(new RegExp(`Luciel d20\\(${adv.rolls.actor.join(',')} adv → ${Math.max(...adv.rolls.actor)}\\)\\+3stat\\+0prof = ${Math.max(...adv.rolls.actor) + 3}`));
+        expect(adv.rollMode).toEqual({ actor: 'advantage', defender: 'normal' });
+        let log = rollLog();
+        expect(log.find(r => r.for_id === 'luciel')).toEqual({ for_id: 'luciel', purpose: 'grapple (adv: GM)', expression: '2d20kh1' });
+        expect(log.find(r => r.for_id === 'foe')).toEqual({ for_id: 'foe', purpose: 'grapple', expression: '1d20' });
+        const dis = await act({ action: 'grapple', move: 'clinch', actorId: 'luciel', targetId: 'foe', disadvantage: true });
+        expect(dis.rolls.actor).toHaveLength(2);
+        log = rollLog().filter(r => r.for_id === 'luciel');
+        expect(log[1]).toEqual({ for_id: 'luciel', purpose: 'grapple (dis: GM)', expression: '2d20kl1' });
+        // A sheet condition names a source without an encounter too.
+        new CharacterRepository(getDb()).update('luciel', { conditions: [{ name: 'Bulwark', source: 'ritual' }] } as never);
+        const src = await act({ action: 'grapple', move: 'clinch', actorId: 'luciel', targetId: 'foe', advantageSources: ['bulwark'] });
+        expect(src.advantageSources).toEqual(['Bulwark']);
+        expect(rollLog().filter(r => r.for_id === 'luciel')[2].purpose).toBe('grapple (adv: Bulwark)');
+    });
+
+    it('a posted outcome or a helpless target rolls no contest: the flag and the sources are noted as ignored, not checked', async () => {
+        await fight([marine, { ...cultist, conditions: ['unconscious'] }]);
+        const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
+        const posted = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', outcome: 'win', advantage: true });
+        expect(posted.error).toBeFalsy();
+        expect(posted.hit).toBe(true);
+        expect(posted.rollMode).toBeUndefined();
+        expect(posted.situational).toEqual(['advantage ignored: no contest rolled']);
+        const auto = await act({ action: 'grapple', move: 'takedown', encounterId, actorId: 'marine', targetId: 'cultist', advantageSources: ['Khorne'], disadvantage: true });
+        expect(auto.error).toBeFalsy();
+        expect(auto.autoWin.reason).toMatch(/unconscious/);
+        expect(auto.advantageSources).toBeUndefined();
+        expect(auto.situational).toEqual(['advantage ignored: no contest rolled', 'disadvantage ignored: no contest rolled']);
+        expect(spy).not.toHaveBeenCalled();
+    });
+
+    it('the outer schema and the grapple action schema carry the source params; the description owns them', () => {
+        const parsed = CombatActionTool.inputSchema.parse({ action: 'grapple', actorId: 'a', targetId: 'b', move: 'clinch', advantage: true, advantageSources: ['x'], disadvantageSources: '["y"]' });
+        expect(parsed.advantageSources).toEqual(['x']);
+        expect(parsed.disadvantageSources).toEqual(['y']);
+        const grapple = CombatActionTool.actionSchemas.grapple;
+        expect(grapple).toBeDefined();
+        expect(grapple.aliases).toEqual(expect.arrayContaining(['clinch', 'takedown', 'slam', 'break_grapple']));
+        const keys = Object.keys((grapple.schema as any).shape);
+        expect(keys).toEqual(expect.arrayContaining(['action', 'encounterId', 'actorId', 'targetId', 'move', 'surface', 'control', 'outcome', 'damage', 'damageType', 'modifier', 'actionSurge', 'advantage', 'disadvantage', 'advantageSources', 'disadvantageSources']));
+        // Every grapple key is mirrored on the outer schema.
+        const outer = Object.keys((CombatActionTool.inputSchema as any).shape);
+        for (const k of keys) expect(outer).toContain(k);
+        expect(CombatActionTool.description).toMatch(/advantageSources/);
+        expect(CombatActionTool.description).toMatch(/grapple.*advantage/i);
+    });
+
+    it('a key grapple does not use comes back in ignoredParams with the nearest valid key; a refusal carries none', async () => {
+        await fight([marine, cultist]);
+        dice(18, 4);
+        const res = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', modifer: 2 });
+        expect(res.error).toBeFalsy();
+        expect(res.hit).toBe(true);
+        expect(res.ignoredParams).toEqual(['modifer']);
+        expect(String(res.message)).toMatch(/Ignored params \(not grapple parameters; nothing was written for them\): modifer — nearest valid key 'modifier'/);
+        const refused = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantageSources: ['Khorne'], modifer: 2 });
+        expect(refused.error).toBeTruthy();
+        expect(refused.ignoredParams).toBeUndefined();
+    });
+
+    it('grapple without a move is refused with the move list and writes nothing; the schema promises no default it does not give', async () => {
+        await fight([marine, cultist]);
+        const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
+        const none = await act({ action: 'grapple', encounterId, actorId: 'marine', targetId: 'cultist', advantage: true });
+        expect(none.error).toBe(true);
+        expect(none.writes).toBe('none');
+        expect(String(none.message)).toMatch(/grapple needs move: clinch \| takedown \| throw \| slam \| control \| break \| execute/);
+        expect(spy).not.toHaveBeenCalled();
+        expect(tok('marine').attacksMade ?? 0).toBe(0);
+        // The action aliases name the move themselves, and the GM's flag rides along.
+        dice(5, 18, 9);
+        const alias = await act({ action: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantage: true });
+        expect(alias.move).toBe('clinch');
+        expect(alias.rolls.actor).toEqual([5, 18]);
+        const moveField = (CombatActionTool.actionSchemas.grapple.schema as any).shape.move;
+        expect(String(moveField.description)).not.toMatch(/default/i);
+    });
+
+    it("a flag that is not a boolean is refused before anything is rolled or spent — never read as 'no advantage'", async () => {
+        // Over MCP the outer schema refuses a string here; batch_manage and
+        // direct callers hand the raw value to the handler, where
+        // `'true' === true` is false and the call used to roll one plain die.
+        await fight([marine, cultist]);
+        const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
+        const str = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantage: 'true' });
+        expect(str.error).toBe(true);
+        expect(str.writes).toBe('none');
+        expect(String(str.message)).toMatch(/advantage must be true or false, not "true"/);
+        const num = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', disadvantage: 1 });
+        expect(num.error).toBe(true);
+        expect(num.writes).toBe('none');
+        expect(String(num.message)).toMatch(/disadvantage must be true or false, not 1/);
+        expect(spy).not.toHaveBeenCalled();
+        expect(tok('marine').attacksMade ?? 0).toBe(0);
+        expect(tok('cultist').conditions).toEqual([]);
+        // null is an unset flag, as it is everywhere else in the handler.
+        dice(11, 4);
+        const nul = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantage: null, disadvantage: null });
+        expect(nul.error).toBeFalsy();
+        expect(nul.rollMode).toEqual({ actor: 'normal', defender: 'normal' });
+    });
+
+    it('a direct caller (batch_manage) may hand the sources over as a JSON string or one bare name; the outer schema has not run for it', async () => {
+        await fight([{ ...marine, conditions: [{ name: 'Bulwark Stance', source: 'ritual' }] }, cultist]);
+        dice(5, 18, 9);
+        const json = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantageSources: '["bulwark"]' });
+        expect(json.error).toBeFalsy();
+        expect(json.advantageSources).toEqual(['Bulwark Stance']);
+        expect(json.rolls.actor).toEqual([5, 18]);
+        dice(15, 3, 10);
+        const bare = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', disadvantageSources: 'ritual' });
+        expect(bare.error).toBeFalsy();
+        expect(bare.disadvantageSources).toEqual(['Bulwark Stance']);
+        expect(bare.rolls.actor).toEqual([15, 3]);
     });
 });

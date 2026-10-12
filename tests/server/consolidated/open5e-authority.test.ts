@@ -331,7 +331,11 @@ describe('pinned Open5e engine authority', () => {
             action: 'equip', characterId, itemId: longswordFirst.item.id, slot: 'armor',
         }, ctx as any));
         expect(invalid.error).toBe(true);
-        expect(invalid.message).toContain('Allowed slots: mainhand, offhand');
+        // Play report 4 #3: the refusal is structured and carries the fix.
+        expect(invalid.writes).toBe('none');
+        expect(invalid.allowedSlots).toEqual(['mainhand', 'offhand']);
+        expect(invalid.message).toContain('it goes in mainhand or offhand');
+        expect(invalid.fix.args).toEqual({ action: 'update', itemId: longswordFirst.item.id, equipSlots: ['mainhand', 'offhand', 'armor'] });
 
         const armorEquip = embeddedJson(await handleInventoryManage({
             action: 'equip', characterId, itemId: chainMail.item.id, slot: 'armor',
