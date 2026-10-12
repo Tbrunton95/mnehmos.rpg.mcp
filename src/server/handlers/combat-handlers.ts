@@ -2,9 +2,12 @@ import { z } from 'zod';
 import { loadAutoMechanics, autoAttackBonus, autoAcBonus, autoDamageBonus, applyDeclaredEffects } from '../../engine/effects-resolver.js';
 import * as pda from '../../render/pda.js';
 import { randomUUID } from 'crypto';
+import type Database from 'better-sqlite3';
 import { CombatEngine, CombatParticipant, CombatState, CombatActionResult } from '../../engine/combat/engine.js';
-import { normalizeConditions, normalizeCondition } from '../../engine/combat/conditions.js';
-import { ConditionInputSchema, footprintCells, EnvironmentSchema } from '../../schema/encounter.js';
+import { normalizeConditions, normalizeCondition, ConditionType, DurationType } from '../../engine/combat/conditions.js';
+import { ConditionInputSchema, footprintCells, EnvironmentSchema, sizeRank } from '../../schema/encounter.js';
+import { applyScheduledOps } from '../../engine/scheduled-ops.js';
+import { MANEUVERS, maneuverProblem, maneuverSaveDC, maneuverAbilityMod, dieMax, findSuperiorityPool, menacingUntil, type ManeuverName, type ManeuverDef } from '../../engine/combat/maneuvers.js';
 import { SpatialEngine } from '../../engine/spatial/engine.js';
 
 import { PubSub } from '../../engine/pubsub.js';
@@ -17,14 +20,15 @@ import { SessionContext } from '../types.js';
 // CRIT-006: Import spellcasting validation and resolution
 import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
-import { PartSchema, UnitSchema, ParticipantExtrasShape, type Part, type ReadiedAttack } from '../../schema/token-extras.js';
+import { PartSchema, UnitSchema, ParticipantExtrasShape, type Part, type ReadiedAttack, type Ability } from '../../schema/token-extras.js';
+import { findActionGrantAcross, patchRowAbility, setAbilityReady } from '../../engine/combat/abilities.js';
 import { worldProgression } from '../../engine/progression.js';
 import { resolveWorldId, bandOrderFor, bandRuleFor, bandDamageMultiplier, loadRule, loadRules, castingClassFor, findWorldRule, type TableRule, type BandDamageScale } from '../../engine/table-rules.js';
 import { castWorldSpell, sheetSpecies } from './world-spell.js';
-import { creditGrowth } from '../growth.js';
+import { creditKill, growthLine, growthConditionsOnToken } from '../growth.js';
 import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
 import { volleyTier, describeUnit, breakTestDue, moraleModifiers, type BreakTest } from '../../engine/combat/units.js';
-import { upsertPart, findPart, resolveAttackSource } from '../../engine/combat/parts.js';
+import { upsertPart, findPart, resolveAttackSource, holdingPart } from '../../engine/combat/parts.js';
 import { compareBands } from '../../engine/table-rules.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
@@ -144,6 +148,63 @@ function charRepoFor(id: string): boolean {
     return !!new CharacterRepository(getDb()).findById(id);
 }
 
+/** Item 17: an equipped inventory row in the armor slot (a shield is not armour). */
+function wearsArmour(db: Database.Database, characterId: string): boolean {
+    try {
+        return !!db.prepare("SELECT 1 FROM inventory_items ii JOIN items i ON i.id = ii.item_id WHERE ii.character_id = ? AND ii.equipped = 1 AND ii.slot = 'armor' AND ii.quantity > 0 LIMIT 1").get(characterId);
+    } catch { return false; }
+}
+
+/** Item 17: an equipped weapon in the offhand slot (a shield is armour, not a weapon). */
+function wieldsOffhandWeapon(db: Database.Database, characterId: string): boolean {
+    try {
+        return !!db.prepare("SELECT 1 FROM inventory_items ii JOIN items i ON i.id = ii.item_id WHERE ii.character_id = ? AND ii.equipped = 1 AND ii.slot = 'offhand' AND ii.quantity > 0 AND LOWER(i.type) = 'weapon' LIMIT 1").get(characterId);
+    } catch { return false; }
+}
+
+/**
+ * Item 16: what a failed manoeuvre save does to the target token. Prone and
+ * frightened land on the token only (the spell-debuff precedent); the fright
+ * carries metadata the engine sweeps at the end of the attacker's next turn.
+ * Disarming empties the held item from the part's holds, drops it as a prop
+ * at the target's feet and mirrors the parts to the sheet when there is one.
+ */
+function applyManeuverEffect(engine: CombatEngine, def: ManeuverDef, actor: CombatParticipant, target: CombatParticipant, item?: string): Record<string, unknown> {
+    const state = engine.getState()!;
+    switch (def.effect) {
+        case 'prone':
+            if (!target.conditions.some(c => c.type === ConditionType.PRONE)) {
+                engine.applyCondition(target.id, { type: ConditionType.PRONE, durationType: DurationType.PERMANENT, sourceId: actor.id });
+            }
+            return { condition: 'prone' };
+        case 'frightened': {
+            // The same attacker's fright is replaced, never stacked.
+            target.conditions = target.conditions.filter(c => !(c.type === ConditionType.FRIGHTENED && c.sourceId === actor.id));
+            const afterRound = menacingUntil(state, actor.id);
+            engine.applyCondition(target.id, { type: ConditionType.FRIGHTENED, durationType: DurationType.PERMANENT, sourceId: actor.id, metadata: { endsAtEndOfTurnOf: actor.id, afterRound } });
+            return { condition: 'frightened', untilEndOfTurnOf: actor.id, afterRound };
+        }
+        case 'disarm': {
+            const part = item ? holdingPart(target, item) : (target.parts ?? []).find(p => p.holds?.length);
+            if (!part?.holds?.length) {
+                const held = (target.parts ?? []).flatMap(p => p.holds ?? []);
+                return { dropped: null, note: item && held.length ? `${target.name} holds no '${item}' (holds: ${held.join(', ')}); the GM names what falls` : `nothing recorded in ${target.name}'s holds; the GM names what falls` };
+            }
+            const key = (item ?? part.holds[0]).trim().toLowerCase();
+            const dropped = part.holds.find(h => h.trim().toLowerCase() === key) ?? part.holds[0];
+            target.parts = upsertPart(target.parts ?? [], { name: part.name, holds: part.holds.filter(h => h !== dropped) });
+            const position = target.position ? `${target.position.x},${target.position.y}` : '0,0';
+            state.props = [...(state.props ?? []), { id: `prop-${randomUUID().slice(0, 8)}`, position, label: dropped, propType: 'interactive', description: `dropped by ${target.name} (disarmed by ${actor.name})` }];
+            if (charRepoFor(target.id)) new CharacterRepository(getDb()).update(target.id, { parts: target.parts } as never);
+            const droppedKey = dropped.trim().toLowerCase();
+            const profilesAffected = (target.attacks ?? []).filter(a => [a.item, a.name].some(x => x && x.trim().toLowerCase() === droppedKey)).map(a => a.name);
+            return { dropped, part: part.name, profilesAffected, prop: position };
+        }
+        default:
+            return {};
+    }
+}
+
 /**
  * Mirror a token condition onto the character row (add replaces any same-named
  * entry). False when the token has no character row.
@@ -162,19 +223,14 @@ export function mirrorConditionToRow(characterId: string, op: 'add' | 'remove', 
 }
 
 /**
- * Item 2: a sheet change that reshapes a creature (a form taken or put down)
- * reaches its tokens in every active encounter: the stored rows and any
- * engine held in memory. A field given as undefined is removed from the
- * token. Returns the encounter ids patched.
+ * Patch a character's token in every active encounter: the stored rows and
+ * any engine held in memory. The patcher returns whether it changed the
+ * token; an encounter whose copies it left alone is reported in unpatched
+ * (one patched copy is enough to count the encounter as patched).
  */
-export function pushSheetToLiveTokens(characterId: string, tokenFields: Record<string, unknown>): string[] {
-    const patch = (tok: Record<string, unknown>) => {
-        for (const [k, v] of Object.entries(tokenFields)) {
-            if (v === undefined) delete tok[k];
-            else tok[k] = JSON.parse(JSON.stringify(v));
-        }
-    };
+export function patchLiveTokens(characterId: string, patcher: (tok: Record<string, unknown>) => boolean): { patched: string[]; unpatched: string[] } {
     const patched = new Set<string>();
+    const seen = new Set<string>();
     const db = getDb();
     try {
         const rows = db.prepare("SELECT id, tokens FROM encounters WHERE status = 'active' AND tokens LIKE ?").all(`%"${characterId}"%`) as Array<{ id: string; tokens: string }>;
@@ -183,7 +239,8 @@ export function pushSheetToLiveTokens(characterId: string, tokenFields: Record<s
             const tokens = JSON.parse(r.tokens) as Array<Record<string, unknown>>;
             const tok = tokens.find(t => t.id === characterId);
             if (!tok) continue;
-            patch(tok);
+            seen.add(r.id);
+            if (!patcher(tok)) continue;
             upd.run(JSON.stringify(tokens), new Date().toISOString(), r.id);
             patched.add(r.id);
         }
@@ -192,10 +249,41 @@ export function pushSheetToLiveTokens(characterId: string, tokenFields: Record<s
     for (const key of manager.list()) {
         const tok = manager.get(key)?.getState()?.participants.find(p => p.id === characterId) as unknown as Record<string, unknown> | undefined;
         if (!tok) continue;
-        patch(tok);
-        patched.add(key.slice(key.indexOf(':') + 1));
+        const id = key.slice(key.indexOf(':') + 1);
+        seen.add(id);
+        if (patcher(tok)) patched.add(id);
     }
-    return [...patched];
+    return { patched: [...patched], unpatched: [...seen].filter(id => !patched.has(id)) };
+}
+
+/**
+ * Item 2: a sheet change that reshapes a creature (a form taken or put down)
+ * reaches its tokens in every active encounter. A field given as undefined
+ * is removed from the token. Returns the encounter ids patched.
+ */
+export function pushSheetToLiveTokens(characterId: string, tokenFields: Record<string, unknown>): string[] {
+    return patchLiveTokens(characterId, tok => {
+        for (const [k, v] of Object.entries(tokenFields)) {
+            if (v === undefined) delete tok[k];
+            else tok[k] = JSON.parse(JSON.stringify(v));
+        }
+        return true;
+    }).patched;
+}
+
+/**
+ * Play report 2 (item 15): one ability's ready flag, by name, onto the
+ * character's live tokens. Token-only abilities are never touched; an
+ * encounter whose token lacks every named ability is listed separately.
+ */
+export function pushAbilityStateToLiveTokens(characterId: string, states: Array<{ name: string; ready: boolean }>): { liveTokens: string[]; tokensWithoutAbility: string[] } {
+    const result = patchLiveTokens(characterId, tok => {
+        const abilities = Array.isArray(tok.abilities) ? tok.abilities as Ability[] : undefined;
+        let changed = false;
+        for (const s of states) if (setAbilityReady(abilities, s.name, s.ready)) changed = true;
+        return changed;
+    });
+    return { liveTokens: result.patched, tokensWithoutAbility: result.unpatched };
 }
 
 /**
@@ -213,6 +301,18 @@ export function getOrLoadEngine(ctx: SessionContext, encounterId: string): Comba
     engine.loadState(persisted);
     getCombatManager().create(key, engine);
     return engine;
+}
+
+/**
+ * The active encounter holding a token with this exact id, if any. The
+ * routing rule apply_damage and grapple share: a character with a live
+ * token is acted on through its fight.
+ */
+export function liveEncounterFor(db: ReturnType<typeof getDb>, id: string): string | undefined {
+    try {
+        const rows = db.prepare("SELECT id, tokens FROM encounters WHERE status = 'active' AND tokens LIKE ?").all(`%"${id}"%`) as Array<{ id: string; tokens: string }>;
+        return rows.find(r => (JSON.parse(r.tokens) as Array<{ id: string }>).some(t => t.id === id))?.id;
+    } catch { return undefined; }
 }
 
 // ============================================================
@@ -263,6 +363,10 @@ function buildStateJson(state: CombatState, encounterId: string, sessionId?: str
             ...(p.attacks?.length ? { attacks: p.attacks } : {}),
             ...(p.abilities?.length ? { abilities: p.abilities } : {}),
             ...((p.attacksPerAction ?? 1) > 1 ? { attacksPerAction: p.attacksPerAction, attacksMade: p.attacksMade ?? 0 } : {}),
+            // Action economy the GM reads mid-turn: banked extra actions (Action Surge) and dashes taken.
+            ...((p.extraActions ?? 0) > 0 ? { extraActions: p.extraActions } : {}),
+            ...((p.dashes ?? 0) > 0 ? { dashes: p.dashes } : {}),
+            ...(p.surprised ? { surprised: true } : {}),
             ...(p.legendaryActions ? { legendaryActions: p.legendaryActions, legendaryActionsRemaining: p.legendaryActionsRemaining ?? 0 } : {}),
             ...(p.legendaryResistances ? { legendaryResistances: p.legendaryResistances, legendaryResistancesRemaining: p.legendaryResistancesRemaining ?? 0 } : {}),
             // Table state the GM reads each round
@@ -328,7 +432,7 @@ function formatCombatStateText(state: CombatState): string {
         const hpPct = p.maxHp > 0 ? (p.hp / p.maxHp) * 100 : 0;
         const hpBar = createHpBar(hpPct);
         const marker = isCurrent ? '▶' : ' ';
-        const status = p.hp <= 0 ? '💀 DEFEATED' : '';
+        const status = p.hp <= 0 ? '💀 DEFEATED' : p.surprised ? '😲 surprised' : '';
         
         // Include ID for LLM targeting
         output += `${marker} ${icon} ${p.name.padEnd(18)} ${hpBar} ${p.hp}/${p.maxHp} HP  [Init: ${p.initiative}] ID: ${p.id} ${status}\n`;
@@ -336,10 +440,12 @@ function formatCombatStateText(state: CombatState): string {
         const counters = [
             p.legendaryActions ? `LA ${p.legendaryActionsRemaining ?? 0}/${p.legendaryActions}` : '',
             p.legendaryResistances ? `LR ${p.legendaryResistancesRemaining ?? 0}/${p.legendaryResistances}` : '',
-            (p.attacksPerAction ?? 1) > 1 ? `attacks ${p.attacksMade ?? 0}/${p.attacksPerAction}` : ''
+            (p.attacksPerAction ?? 1) > 1 ? `attacks ${p.attacksMade ?? 0}/${p.attacksPerAction}` : '',
+            (p.extraActions ?? 0) > 0 ? `⚡ extra actions ${p.extraActions}` : '',
+            (p.dashes ?? 0) > 1 ? `dashes ${p.dashes}` : ''
         ].filter(Boolean);
         if (counters.length) output += `      👑 ${counters.join(' · ')}\n`;
-        if (p.abilities?.length) output += `      ✴ abilities: ${p.abilities.map(a => `${a.name}${a.recharge ? ` (recharge ${a.recharge}${a.recharge < 6 ? '-6' : ''})` : ''}${a.ready === false ? ' SPENT' : ''}`).join(', ')}\n`;
+        if (p.abilities?.length) output += `      ✴ abilities: ${p.abilities.map(a => `${a.grantsAction ? '⚡ ' : ''}${a.name}${a.recharge ? ` (recharge ${a.recharge}${a.recharge < 6 ? '-6' : ''})` : ''}${a.actionCost === 'bonus' ? ' [bonus]' : a.actionCost === 'none' || (a.grantsAction && !a.actionCost) ? ' [free]' : a.actionCost === 'reaction' ? ' [reaction]' : ''}${a.perRest ? ` [${a.perRest} rest]` : ''}${a.ready === false ? ' SPENT' : ''}`).join(', ')}\n`;
         if (p.attacks?.length) output += `      🗡 attacks: ${p.attacks.map(a => `${a.name} ${a.attackBonus >= 0 ? '+' : ''}${a.attackBonus}`).join(', ')}\n`;
         // Hurt parts, and armoured ones (own ac, hp or breakAt) even when intact.
         const hurt = (p.parts ?? []).filter(pt => pt.state !== 'intact' || pt.ac !== undefined || pt.hp !== undefined || pt.breakAt !== undefined);
@@ -578,7 +684,7 @@ export function resolveReadiedAttack(engine: CombatEngine, reactor: CombatPartic
     const ac = target.ac ?? new CharacterRepository(getDb()).findById(target.id)?.ac ?? 10;
     const withPart = spec.withPart && findPart(reactor, spec.withPart) ? spec.withPart : source.part?.name;
     const result = engine.executeAttack(reactor.id, target.id, attackBonus, ac, damage, damageType,
-        false, false, undefined, undefined, undefined, undefined, { withPart, ranged: profile?.ranged });
+        false, false, undefined, undefined, undefined, undefined, { withPart, ranged: profile?.ranged, twoHanded: spec.twoHanded ?? profile?.twoHanded, reachFt: profile?.reachFt });
     engine.commitAction(reactor.id, 'reaction');
     return result;
 }
@@ -870,7 +976,8 @@ Example (use real UUID from context for player character!):
                 difficultTerrain: z.array(z.string()).optional().describe('Array of "x,y" strings for difficult terrain'),
                 water: z.array(z.string()).optional().describe('Array of "x,y" strings for water terrain (streams, rivers)')
             }).optional().describe('CRIT-003: Terrain configuration for collision'),
-            environment: EnvironmentSchema.optional().describe("The medium of the fight: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound, unlessTag?}, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?}")
+            environment: EnvironmentSchema.optional().describe("The medium of the fight: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound, unlessTag?}, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?}"),
+            surprised: z.array(z.string()).optional().describe('Participant ids caught flat-footed: their round-1 turn passes and they cannot react, act or take legendary actions until it has')
         })
     },
     GET_ENCOUNTER_STATE: {
@@ -944,10 +1051,14 @@ Examples:
             hand: z.enum(['mainhand', 'offhand']).optional().describe('Which hand swings: finds the part whose holds names the slot'),
             atPart: z.string().optional().describe('The target part aimed at: breached = advantage; a called strike cripples this part'),
             ranged: z.boolean().optional().describe('A ranged attack (not within 5 ft): a prone target is disadvantage and paralysed/unconscious no auto-crit. Unset = from token positions, else melee'),
+            twoHanded: z.boolean().optional().describe('Item 17: the swing is made with both hands (great weapon fighting applies, dueling does not); default from the profile'),
+            maneuver: z.enum(['trip', 'precision', 'riposte', 'menacing', 'disarming']).optional().describe("Item 16: a Battle Master manoeuvre paid from the sheet's superiority pool"),
+            maneuverItem: z.string().optional().describe('disarming: the held item the target drops'),
             ignoreConditions: z.boolean().optional().describe('Skip the automatic advantage/disadvantage/auto-crit from standard conditions (raw roll)'),
             cleave: z.boolean().optional().describe('Cleave through a packed unit of a lower band: damage flows through models instead of stopping at one'),
             legendaryCost: z.number().int().min(1).optional().describe("A legendary action: spends this many of the creature's legendary actions instead of its action (off its own turn only)"),
             reaction: z.boolean().optional().describe('An attack as a reaction (opportunity attack, readied swing): spends the reaction instead of the action'),
+            actionSurge: z.union([z.boolean(), z.string()]).optional().describe("When the action is already spent: spend a ready action-granting ability (true = the first grantsAction ability; a string names it; token first, then the sheet) for an extra action and swing. A no-op while the action is free"),
             volley: z.object({ dice: z.string(), reason: z.string() }).optional().describe('Internal: set by combat_action volley'),
             bandScale: z.boolean().optional().describe("Request 11: false skips the band rule's damageScale for this swing (execute sets it). Default: applied when the world's band rule has damageScale and both bands are set"),
             declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit trail: printed in output, never re-applied'),
@@ -1405,6 +1516,16 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
         return participant;
     });
 
+    // Surprise: the named participants lose their round-1 turn and cannot
+    // react until it has passed. An id that names nobody is refused before
+    // anything is written.
+    if (parsed.surprised?.length) {
+        const ids = new Set(participants.map(p => p.id));
+        const unknown = parsed.surprised.filter(id => !ids.has(id));
+        if (unknown.length) throw new Error(`surprised names no participant: ${unknown.join(', ')} (participants: ${[...ids].join(', ')})`);
+        for (const p of participants) if (parsed.surprised.includes(p.id)) p.surprised = true;
+    }
+
     // Start encounter
     const state = engine.startEncounter(participants);
 
@@ -1487,6 +1608,8 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
     let output = `⚔️ COMBAT STARTED\n`;
     output += `Encounter ID: ${encounterId}\n`;
     output += `Dice: ${engine.describeDice()}\n`;
+    // A surprised first actor's slot already passed (and ticked) at start.
+    for (const note of engine.turnStartNotes) output += `${note}\n`;
     output += formattedText;
     
     // Append JSON for frontend parsing (marked clearly)
@@ -1652,7 +1775,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // using/weapon picks a profile, which fills whatever the call omits;
         // with nothing named and no bonus, the default (or sole) profile
         // stands in for the STR/DEX guess below.
-        const profiles = actor?.attacks?.length ? actor.attacks : (new CharacterRepository(getDb()).findById(parsed.actorId)?.attacks ?? []);
+        // The actor's sheet, read once: profiles, fighting style and (item 16) the superiority pool.
+        const actorRow = new CharacterRepository(getDb()).findById(parsed.actorId);
+        const profiles = actor?.attacks?.length ? actor.attacks : (actorRow?.attacks ?? []);
         const named = parsed.using ?? parsed.weapon;
         const sourceOpts = { using: parsed.using, weapon: parsed.weapon, withPart: parsed.withPart, hand: parsed.hand };
         let source = actor ? resolveAttackSource({ parts: actor.parts, attacks: profiles }, sourceOpts) : { notes: [] as string[] };
@@ -1771,6 +1896,17 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         }
         const targetMechs = parsed.targetId ? loadAutoMechanics(resolverDb, parsed.targetId) : [];
         dc = partAc !== undefined ? partAc : (dc ?? 0) + autoAcBonus(targetMechs, autoApplied);
+        // Item 17: the target's defense style adds +1 to a derived AC (token or
+        // sheet, never an aimed part or a dc the GM passed) while it wears
+        // armour. A sheet whose ac already counts it should not set defense.
+        let targetDefense: { style: 'defense'; acBonus: number; note: string } | undefined;
+        if (!outcome && partAc === undefined && (parsed.dc === undefined || parsed.dc === 0) && parsed.targetId) {
+            const targetStyle = target?.fightingStyle ?? new CharacterRepository(resolverDb).findById(parsed.targetId)?.fightingStyle;
+            if (targetStyle === 'defense' && wearsArmour(resolverDb, parsed.targetId)) {
+                dc += 1;
+                targetDefense = { style: 'defense', acBonus: 1, note: 'derived AC + 1 (armour worn); pass dc if the sheet already counts it' };
+            }
+        }
 
         // 3. Damage - auto-calculate from multiple sources
         if (!outcome && (damage === undefined || damage === 0)) {
@@ -1837,6 +1973,17 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         if (parsed.legendaryCost !== undefined && parsed.reaction) {
             throw new Error('An attack is a legendary action or a reaction, not both');
         }
+        if (parsed.legendaryCost !== undefined && parsed.actionSurge) {
+            throw new Error('An attack is a legendary action or an Action Surge, not both');
+        }
+        if (parsed.reaction && parsed.actionSurge) {
+            throw new Error('An attack is a reaction or an Action Surge, not both');
+        }
+        // actionSurge: a spent action is reopened by a ready action-granting
+        // ability (the token's, else the sheet's). Found here, spent right
+        // before the roll so a table-rules refusal spends nothing.
+        let surge: { ability: Ability; onToken: boolean } | undefined;
+        let surgeNoop = false;
         if (parsed.legendaryCost !== undefined) {
             const problem = engine.legendaryActionProblem(parsed.actorId, parsed.legendaryCost)
                 ?? (engine.canTakeActions(parsed.actorId) ? undefined : 'Participant is incapacitated');
@@ -1847,7 +1994,16 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 ? engine.validateActionEconomy(parsed.actorId, 'reaction')
                 : engine.validateAttackEconomy(parsed.actorId);
             if (!validation.valid) {
-                throw new Error(validation.error);
+                if (parsed.actionSurge && !parsed.reaction) {
+                    const want: true | string = parsed.actionSurge === true ? true : String(parsed.actionSurge);
+                    const found = findActionGrantAcross(actor?.abilities, new CharacterRepository(getDb()).findById(parsed.actorId)?.abilities, want);
+                    if ('problem' in found) throw new Error(`${validation.error}; ${found.problem}`);
+                    surge = found;
+                } else {
+                    throw new Error(validation.error);
+                }
+            } else if (parsed.actionSurge && !parsed.reaction) {
+                surgeNoop = true;
             }
             if (parsed.reaction) turnWarning = undefined;
         }
@@ -1884,6 +2040,45 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             if (!preparedRule) throw new Error(`No enabled prepared_asset rule named '${parsed.preparedAsset}' in this encounter's world`);
         }
 
+        // Item 16: a Battle Master manoeuvre. Refused before any roll or write
+        // when the sheet cannot pay for it (writes: none); the engine rolls
+        // the die into the attack (precision) or the damage (the rest).
+        let plan: { name: ManeuverName; def: ManeuverDef; die: string; poolKey: string; poolBefore: number; dc?: number } | undefined;
+        if (parsed.maneuver) {
+            const found = findSuperiorityPool(actorRow?.resourcePools as Record<string, { current: number }> | undefined);
+            const problem = maneuverProblem(parsed.maneuver, {
+                outcome, volley: !!parsed.volley, cleave: !!parsed.cleave,
+                sheet: actorRow ? { superiorityDie: actorRow.superiorityDie } : null,
+                pool: found?.pool, reaction: !!parsed.reaction, ranged: ranged === true,
+                lastMeleeMisses: actor?.lastMeleeMisses, round: currentState?.round,
+                actorName: actor?.name ?? parsed.actorId, targetId: parsed.targetId, targetName: target?.name ?? parsed.targetId
+            });
+            if (problem) {
+                const refusal = new Error(problem) as Error & { writes?: string };
+                refusal.writes = 'none';
+                throw refusal;
+            }
+            const def = MANEUVERS[parsed.maneuver];
+            plan = {
+                name: parsed.maneuver, def, die: actorRow!.superiorityDie!, poolKey: found!.key, poolBefore: found!.pool.current,
+                ...(def.save ? { dc: maneuverSaveDC(worldProgression(rulesDb, ruleWorld).profBonus(actorRow!.level), maneuverAbilityMod(actorRow!.stats, actorRow!.maneuverAbility)) } : {})
+            };
+        }
+
+        // Every refusal is behind us: spend the surge. The ability is marked
+        // spent where it was found; a token grant with no recharge is mirrored
+        // to the sheet so the next fight starts with it spent.
+        let surgeInfo: { spent: true; ability: string; source: 'token' | 'sheet'; mirroredToCharacter: boolean } | undefined;
+        if (surge) {
+            const granted = engine.grantExtraAction(parsed.actorId);
+            if (!granted.ok) throw new Error(granted.error);
+            if (surge.onToken) surge.ability.ready = false;
+            const mirroredToCharacter = (!surge.onToken || !surge.ability.recharge) ? patchRowAbility(getDb(), parsed.actorId, surge.ability.name, false).found : false;
+            const again = engine.validateAttackEconomy(parsed.actorId);
+            if (!again.valid) throw new Error(again.error);
+            surgeInfo = { spent: true, ability: surge.ability.name, source: surge.onToken ? 'token' : 'sheet', mirroredToCharacter };
+        }
+
         // Use the new detailed attack method with optional damageType for HIGH-002
         result = engine.executeAttack(
             parsed.actorId,
@@ -1898,7 +2093,19 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             damageLaneLabel,
             outcome,
             parsed.unaffectedLimb,
-            { withPart, atPart: parsed.atPart, uncapped: !!(parsed.cleave || parsed.volley), ranged, ignoreConditions: parsed.ignoreConditions, ...(bandScale ? { bandScale } : {}) }
+            {
+                withPart, atPart: parsed.atPart, uncapped: !!(parsed.cleave || parsed.volley), ranged, ignoreConditions: parsed.ignoreConditions, ...(bandScale ? { bandScale } : {}),
+                // Item 17: the style on the token, else the sheet; how this swing is made.
+                fightingStyle: actor?.fightingStyle ?? actorRow?.fightingStyle,
+                twoHanded: parsed.twoHanded ?? profile?.twoHanded,
+                offhand: parsed.hand === 'offhand',
+                // Dueling wants no other weapon: an equipped off-hand weapon (not a shield) turns it off.
+                dualWielding: (actor?.fightingStyle ?? actorRow?.fightingStyle) === 'dueling' ? wieldsOffhandWeapon(getDb(), parsed.actorId) : undefined,
+                reachFt: profile?.reachFt,
+                // Item 16: the superiority die, into the damage or (precision) the attack.
+                ...(plan && plan.def.dieTo === 'damage' ? { extraDamageDice: [{ dice: plan.die, label: `superiority die (${plan.name})` }] } : {}),
+                ...(plan && plan.name === 'precision' ? { attackBonusDie: { dice: plan.die, label: 'superiority die (precision)', onlyIfMiss: true, maxMissBy: dieMax(plan.die) } } : {})
+            }
         );
 
         // Sync HP to character database after attack
@@ -2041,6 +2248,60 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             ruleLines.push(`RULE ${prepared.rule}: ${prepared.tier.toUpperCase()}${prepared.margin !== undefined ? ` (margin ${prepared.margin >= 0 ? '+' : ''}${prepared.margin})` : ''}, ${prepared.note}`);
         }
 
+        if (targetDefense && targetNow) {
+            resultRec.fightingStyle = { ...((result.fightingStyle ?? {}) as Record<string, unknown>), targetDefense };
+            ruleLines.push(`⚖️ ${targetNow.name} defense +1 AC (armour worn)`);
+        }
+        // Item 16: the manoeuvre's spend and effect. The die is spent only
+        // when it was rolled; the pool debit carries the reason on its history.
+        if (plan && actorNow && targetNow) {
+            const used = plan.name === 'precision' ? !!result.attackBonusDie : result.success;
+            const maneuver: Record<string, unknown> = {
+                name: plan.name, die: plan.die, spent: used, addedTo: plan.def.dieTo,
+                pool: { before: plan.poolBefore, after: used ? plan.poolBefore - 1 : plan.poolBefore }
+            };
+            if (plan.name === 'precision') {
+                if (result.attackBonusDie) Object.assign(maneuver, { roll: result.attackBonusDie.roll, before: result.attackBonusDie.before, after: result.attackBonusDie.after, turnedHit: result.attackBonusDie.turnedHit });
+                else if (result.attackBonusDieSkipped) maneuver.note = result.attackBonusDieSkipped;
+            } else if (result.extraDamage?.[0]) {
+                maneuver.roll = result.extraDamage[0].total;
+                maneuver.rolls = result.extraDamage[0].rolls;
+            }
+            if (used) {
+                const repo = new CharacterRepository(getDb());
+                const fresh = repo.findById(parsed.actorId);
+                if (fresh) {
+                    const { updates } = applyScheduledOps(fresh, [{ op: 'adjust_pool', pool: plan.poolKey, delta: -1 }], { reason: `superiority die (${plan.name}) vs ${targetNow.name}` });
+                    repo.update(parsed.actorId, updates as never);
+                }
+            }
+            if (used && plan.def.save && plan.dc !== undefined) {
+                if (targetNow.hp <= 0) {
+                    // The blow dropped the target: a creature at 0 HP makes no
+                    // save and is neither tripped, frightened nor disarmed by
+                    // the engine (the GM narrates the body); the die still landed.
+                    maneuver.applied = { note: `${targetNow.name} is down: no save, the blow dropped it (the die still landed)` };
+                } else if (plan.def.maxTargetSize && sizeRank(targetNow.size) > sizeRank(plan.def.maxTargetSize)) {
+                    maneuver.applied = { note: `${targetNow.name} is ${targetNow.size ?? 'medium'}: too large to trip (${plan.def.maxTargetSize} at most); the die still lands` };
+                } else {
+                    const save = rollParticipantSave(engine, getDb(), targetNow, plan.def.save, plan.dc, { purpose: `${plan.name} save vs ${actorNow.name}` });
+                    maneuver.dc = plan.dc;
+                    maneuver.save = { ability: save.ability, dc: plan.dc, natural: save.natural, total: save.total, saved: save.saved, ...(save.legendaryResisted ? { legendaryResisted: true } : {}) };
+                    if (!save.saved) maneuver.applied = applyManeuverEffect(engine, plan.def, actorNow, targetNow, parsed.maneuverItem);
+                }
+            }
+            resultRec.maneuver = maneuver;
+            const save = maneuver.save as { ability: string; total: number; saved: boolean } | undefined;
+            const applied = maneuver.applied as { condition?: string; dropped?: string | null; part?: string; note?: string } | undefined;
+            const appliedLine = !applied ? ''
+                : applied.condition === 'prone' ? `; ${targetNow.name} is prone`
+                : applied.condition === 'frightened' ? `; ${targetNow.name} is frightened of ${actorNow.name} until the end of ${actorNow.name}'s next turn`
+                : applied.dropped ? `; ${targetNow.name} drops ${applied.dropped} (${applied.part})`
+                : `; ${applied.note}`;
+            ruleLines.push(`RULE maneuver ${plan.name}: ${used
+                ? `superiority die ${plan.die} = ${maneuver.roll} on the ${plan.def.dieTo} (${plan.poolBefore} → ${plan.poolBefore - 1} left)`
+                : `not spent (${maneuver.note ?? 'the attack missed'}; ${plan.poolBefore} left)`}${save ? `; ${save.ability.slice(0, 3).toUpperCase()} save ${save.total} vs DC ${plan.dc} ${save.saved ? 'saved' : 'FAILED'}` : ''}${appliedLine}`);
+        }
         for (const note of source.notes) ruleLines.push(`⚖️ ${note}`);
         for (const note of (result.situational ?? []).slice().reverse()) ruleLines.unshift(`⚖️ ${note}`);
         if (profile) {
@@ -2069,21 +2330,15 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
 
         // Growth tracks: a kill feeds the killer's growth pool (more for a
         // victim of its band or above). The next form is offered, never taken.
+        // The same hook apply_damage and sheet execute use (creditKill).
         if (result.target && result.target.hpBefore > 0 && targetNow && targetNow.hp <= 0 && actorNow) {
-            try {
-                const credit = await creditGrowth(rulesDb, ruleWorld, parsed.actorId, 'kill', { victim: targetNow.name, victimBand: targetNow.band, attackerBand: actorNow.band });
-                if (credit) {
-                    resultRec.growth = credit;
-                    const fired = (credit.growthApplied ?? []).map(a => `${a.at}: ${a.condition ?? (a.form as { form?: string } | undefined)?.form ?? (a.table as { table?: string } | undefined)?.table}`).join(', ');
-                    ruleLines.push(`GROWTH ${credit.track}: ${credit.pool} ${credit.from} → ${credit.to} (${credit.reason})${fired ? `; fired ${fired}` : ''}${credit.growthReady ? `; ready for ${credit.growthReady.form ?? credit.growthReady.condition?.name ?? credit.growthReady.table}: ${credit.growthReady.call}` : ''}`);
-                    // A condition an auto step put on the sheet reaches the live token too.
-                    for (const a of credit.growthApplied ?? []) {
-                        if (!a.condition) continue;
-                        const norm = normalizeCondition({ name: a.condition, sourceId: parsed.actorId, source: a.track } as never, parsed.actorId);
-                        if (norm) { const { id: _drop, ...rest } = norm; engine.applyCondition(parsed.actorId, rest); }
-                    }
-                }
-            } catch { /* no character row or rules table: no credit */ }
+            const credit = await creditKill(rulesDb, ruleWorld, parsed.actorId, { id: targetNow.id, name: targetNow.name, band: targetNow.band }, actorNow.band);
+            if (credit) {
+                resultRec.growth = credit;
+                ruleLines.push(growthLine(credit));
+                // A condition an auto step put on the sheet reaches the live token too.
+                growthConditionsOnToken(engine, parsed.actorId, credit);
+            }
         }
 
         // Commit Action Economy: legendary actions, the reaction, or one
@@ -2098,6 +2353,14 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             ruleLines.push('↩ reaction spent');
         } else {
             const swing = engine.commitAttack(parsed.actorId);
+            if (surgeInfo) {
+                // Reported after the swing is counted: the extra it bought is spent.
+                resultRec.actionSurge = { ...surgeInfo, extraActions: actorNow?.extraActions ?? 0 };
+                ruleLines.push(`⚡ Action Surge spent${surgeInfo.ability.toLowerCase() !== 'action surge' ? ` (${surgeInfo.ability})` : ''}: a fresh Attack action${surgeInfo.mirroredToCharacter ? '; the sheet shows it spent' : ''}`);
+            } else if (surgeNoop) {
+                resultRec.actionSurge = { spent: false };
+                ruleLines.push('⚡ action still free: Action Surge not spent');
+            }
             if (swing && swing.of > 1) {
                 resultRec.multiattack = swing;
                 ruleLines.push(`⚔ attack ${swing.made}/${swing.of}${swing.made < swing.of ? '' : ' (Attack action spent)'}`);
@@ -2254,8 +2517,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             );
             // Calculate movement cost (5ft per step); path includes the start node.
             const moveCost = path ? (path.length - 1) * 5 : 0;
-            // A condition added mid-turn (grappled, exhaustion 2) caps what is left.
-            const speedCap = engine.effectiveSpeed(actor) * (actor.hasDashed ? 2 : 1);
+            // A condition added mid-turn (grappled, exhaustion 2) caps what is
+            // left; each Dash taken widens the budget by one speed allotment.
+            const speedCap = engine.moveBudget(actor);
             const currentMovement = Math.min((actor as any).movementRemaining ?? 30, speedCap); // Default 30 if undefined
 
             if (destBlocked) {
@@ -2935,6 +3199,12 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             multiattack: (r as { multiattack?: unknown }).multiattack,
             legendary: (r as { legendary?: unknown }).legendary,
             reaction: (r as { reaction?: unknown }).reaction,
+            // Play report 2: the Action Surge an attack spent (or did not need).
+            actionSurge: (r as { actionSurge?: unknown }).actionSurge,
+            // Item 17: the fighting style on this swing (and the target's defense).
+            fightingStyle: (r as { fightingStyle?: unknown }).fightingStyle,
+            // Item 16: the manoeuvre on this swing: die, spend, save and effect.
+            maneuver: (r as { maneuver?: unknown }).maneuver,
             saves: (r as { saves?: unknown }).saves,
             conditionsApplied: (r as { conditionsApplied?: unknown }).conditionsApplied,
             worldSpell: (r as { worldSpell?: unknown }).worldSpell,

@@ -1,5 +1,7 @@
-import { withOperation } from '../../src/server/operation-guard.js';
+import { withOperation, lookupOperation } from '../../src/server/operation-guard.js';
 import { handleCombatManage } from '../../src/server/consolidated/combat-manage.js';
+import { handleWorldManage } from '../../src/server/consolidated/world-manage.js';
+import { WorldRepository } from '../../src/storage/repos/world.repo.js';
 import { handleBatchManage } from '../../src/server/consolidated/batch-manage.js';
 import { handleSessionManage } from '../../src/server/consolidated/session-manage.js';
 import { clearCombatState } from '../../src/server/handlers/combat-handlers.js';
@@ -13,6 +15,7 @@ const guarded = (tool: string, h: (a: any, c: any) => Promise<any>) => withOpera
 const manage = guarded('combat_manage', handleCombatManage);
 const batch = guarded('batch_manage', handleBatchManage);
 const session = guarded('session_manage', handleSessionManage);
+const world = guarded('world_manage', handleWorldManage);
 let enc: string;
 const hp = () => new EncounterRepository(getDb()).loadState(enc)!.participants.find(p => p.id === 'orla')!.hp;
 
@@ -88,5 +91,99 @@ describe('operation guard', () => {
         });
         await Promise.all([slow('a')({}, {}), slow('b')({}, {})]);
         expect(order).toEqual(['a:start', 'a:end', 'b:start', 'b:end']);
+    });
+
+    // Play report 2, #11: a validation failure or an unknown action was stored
+    // as applied, so the corrected retry with the same opId was refused.
+    describe('error and no-write replies leave the opId free', () => {
+        const W = 'w-guard';
+        beforeEach(() => {
+            const now = new Date().toISOString();
+            new WorldRepository(getDb()).create({ id: W, name: 'Guarded', seed: 's', width: 10, height: 10, createdAt: now, updatedAt: now } as any);
+        });
+
+        it('a validation error does not burn the opId, and the corrected resend applies', async () => {
+            const bad = await world({ action: 'update', id: W, environment: { bogus: 1 }, opId: 'v1' }, {});
+            expect(bad.content[0].text).toMatch(/op v1 NOT applied/);
+            expect(bad.content[0].text).toMatch(/validation_error/);
+            expect((await session({ action: 'op_status', forOpId: 'v1' }, {})).content[0].text).toMatch(/did not apply/);
+            const good = await world({ action: 'update', id: W, environment: { weatherConditions: 'rain' }, opId: 'v1' }, {});
+            expect(good.content[0].text).toMatch(/op v1 applied/);
+            expect(new WorldRepository(getDb()).findById(W)!.environment).toMatchObject({ weatherConditions: 'rain' });
+            expect((await session({ action: 'op_status', forOpId: 'v1' }, {})).content[0].text).toMatch(/op v1 applied: world_manage/);
+        });
+
+        it('the #14 did-you-mean refusal is a validation error, so the opId stays free too', async () => {
+            const bad = await world({ action: 'update', id: W, environment: { wether: 'rain' }, opId: 'v1b' }, {});
+            expect(bad.content[0].text).toMatch(/op v1b NOT applied/);
+            expect(bad.content[0].text).toMatch(/Did you mean 'weatherConditions'/);
+            const good = await world({ action: 'update', id: W, environment: { weather: 'rain' }, opId: 'v1b' }, {});
+            expect(good.content[0].text).toMatch(/op v1b applied/);
+            expect(new WorldRepository(getDb()).findById(W)!.environment).toMatchObject({ weatherConditions: 'rain' });
+        });
+
+        it('an unknown action leaves the opId free', async () => {
+            const bad = await world({ action: 'frobnicate', opId: 'v2' }, {});
+            expect(bad.content[0].text).toMatch(/op v2 NOT applied/);
+            const good = await world({ action: 'update', id: W, environment: { season: 'winter' }, opId: 'v2' }, {});
+            expect(good.content[0].text).toMatch(/op v2 applied/);
+        });
+
+        it('success:false without an error wrote, so it claims the opId and replays', async () => {
+            getDb().exec('CREATE TABLE IF NOT EXISTS probe (v TEXT)');
+            const partial = withOperation('probe_tool', async () => {
+                getDb().prepare("INSERT INTO probe (v) VALUES ('partial')").run();
+                return { content: [{ type: 'text', text: '<!-- PROBE_JSON\n{"success":false,"message":"step 2 of 3 failed"}\nPROBE_JSON -->' }] };
+            });
+            expect((await partial({ opId: 'v3' }, {})).content[0].text).toMatch(/op v3 applied/);
+            expect((await partial({ opId: 'v3' }, {})).content[0].text).toMatch(/REPLAYED op v3/);
+            expect((getDb().prepare('SELECT COUNT(*) AS n FROM probe').get() as { n: number }).n).toBe(1);
+        });
+
+        it('a reply with writes:none does not consume the opId', async () => {
+            const preview = withOperation('probe_tool', async () => ({ content: [{ type: 'text', text: '<!-- PROBE_JSON\n{"success":true,"preview":true,"writes":"none"}\nPROBE_JSON -->' }] }));
+            expect((await preview({ opId: 'v4' }, {})).content[0].text).toMatch(/op v4: nothing written — opId not consumed/);
+            expect((await session({ action: 'op_status', forOpId: 'v4' }, {})).content[0].text).toMatch(/did not apply/);
+            const real = await world({ action: 'update', id: W, environment: { season: 'spring' }, opId: 'v4' }, {});
+            expect(real.content[0].text).toMatch(/op v4 applied/);
+        });
+
+        it('an opId burned by an error reply before this fix is healed: the retry runs', async () => {
+            lookupOperation(getDb(), 'make-table');
+            getDb().prepare('INSERT INTO op_log (op_id, tool, args_hash, response, created_at) VALUES (?, ?, ?, ?, ?)')
+                .run('burned', 'world_manage', 'stale', '<!-- WORLD_MANAGE_JSON\n{"error":"validation_error","writes":"none"}\nWORLD_MANAGE_JSON -->', '2026-01-01T00:00:00.000Z');
+            expect(lookupOperation(getDb(), 'burned')).toBeNull();
+            expect((await session({ action: 'op_status', forOpId: 'burned' }, {})).content[0].text).toMatch(/did not apply/);
+            const good = await world({ action: 'update', id: W, environment: { season: 'autumn' }, opId: 'burned' }, {});
+            expect(good.content[0].text).toMatch(/op burned applied/);
+            expect(good.content[0].text).not.toMatch(/REPLAYED|REFUSED/);
+            expect(lookupOperation(getDb(), 'burned')?.tool).toBe('world_manage');
+        });
+
+        it('an opId a preview consumed before this fix is healed too: the real call runs', async () => {
+            // Before #11 a writes:'none' reply (a preview, a budget read) was
+            // stored as applied; the real call with that opId was then refused
+            // and op_status claimed a write that never happened.
+            lookupOperation(getDb(), 'make-table');
+            getDb().prepare('INSERT INTO op_log (op_id, tool, args_hash, response, created_at) VALUES (?, ?, ?, ?, ?)')
+                .run('previewed', 'character_manage', 'stale', '<!-- CHARACTER_MANAGE_JSON\n{"success":true,"preview":true,"writes":"none"}\nCHARACTER_MANAGE_JSON -->', '2026-01-01T00:00:00.000Z');
+            expect(lookupOperation(getDb(), 'previewed')).toBeNull();
+            expect((await session({ action: 'op_status', forOpId: 'previewed' }, {})).content[0].text).toMatch(/did not apply/);
+            const good = await world({ action: 'update', id: W, environment: { season: 'summer' }, opId: 'previewed' }, {});
+            expect(good.content[0].text).toMatch(/op previewed applied/);
+            expect(good.content[0].text).not.toMatch(/REPLAYED|REFUSED/);
+            expect(lookupOperation(getDb(), 'previewed')?.tool).toBe('world_manage');
+        });
+
+        it('the MCP isError flag rolls the call back like an error embed', async () => {
+            getDb().exec('CREATE TABLE IF NOT EXISTS probe (v TEXT)');
+            const flagged = withOperation('probe_tool', async () => {
+                getDb().prepare("INSERT INTO probe (v) VALUES ('half')").run();
+                return { isError: true, content: [{ type: 'text', text: 'the handler gave up' }] };
+            });
+            await flagged({ opId: 'v6' }, {});
+            expect((getDb().prepare('SELECT COUNT(*) AS n FROM probe').get() as { n: number }).n).toBe(0);
+            expect(lookupOperation(getDb(), 'v6')).toBeNull();
+        });
     });
 });

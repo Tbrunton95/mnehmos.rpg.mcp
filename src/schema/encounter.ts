@@ -1,4 +1,4 @@
-import { PartSchema, UnitSchema, ReadiedSchema, SizeCategorySchema, AttackProfileSchema, AbilitySchema, BuffSchema } from './token-extras.js';
+import { PartSchema, UnitSchema, ReadiedSchema, SizeCategorySchema, AttackProfileSchema, AbilitySchema, BuffSchema, FightingStyleSchema } from './token-extras.js';
 import type { SizeCategory } from './token-extras.js';
 import { z } from 'zod';
 import { DurationType, parseAbility, parseDurationType } from '../engine/combat/conditions.js';
@@ -254,6 +254,7 @@ export const TokenSchema = z.object({
     attacksPerAction: z.number().optional(),
     attacks: z.array(AttackProfileSchema).optional(),
     abilities: z.array(AbilitySchema).optional(),
+    fightingStyle: FightingStyleSchema.optional(),
     legendaryActions: z.number().optional(),
     legendaryResistances: z.number().optional(),
     legendaryResistancesRemaining: z.number().optional(),

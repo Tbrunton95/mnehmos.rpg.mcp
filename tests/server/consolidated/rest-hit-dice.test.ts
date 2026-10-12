@@ -65,19 +65,27 @@ describe('short rest hit dice', () => {
         expect(repo.findById('fighter')!.resourcePools?.hit_dice).toMatchObject({ current: 2, max: 5 });
     });
 
-    it('only this session\'s encounters block a rest', async () => {
+    it('the in-combat guard reads active encounter rows, not in-memory engines', async () => {
+        // An engine another session holds in memory decides nothing: the
+        // operation guard evicts engines per call in production.
         const engine = new CombatEngine('enc-other');
         engine.startEncounter([{ id: 'fighter', name: 'Veteran', initiativeBonus: 0, hp: 1, maxHp: 200, conditions: [] }] as any);
         getCombatManager().create('rest-b:enc-other', engine);
         const r = await rest({ action: 'short', hitDiceToSpend: 1 });
         expect(r.restType).toBe('short');
 
-        const own = new CombatEngine('enc-own');
-        own.startEncounter([{ id: 'fighter', name: 'Veteran', initiativeBonus: 0, hp: 1, maxHp: 200, conditions: [] }] as any);
-        getCombatManager().create('rest-a:enc-own', own);
-        const refused = (await handleRestManage({ action: 'short', characterId: 'fighter' }, ctx as any)).content[0].text;
-        expect(refused).toMatch(/Cannot rest while in combat/);
-        expect(refused).not.toMatch(/enc-other/);
+        // An active encounter row holding the character does, whatever the session.
+        const now = new Date().toISOString();
+        const tokens = JSON.stringify([{ id: 'fighter', name: 'Veteran', hp: 1, maxHp: 200, position: { x: 0, y: 0 }, initiative: 10 }]);
+        getDb().prepare("INSERT INTO encounters (id, tokens, round, status, created_at, updated_at) VALUES ('enc-own', ?, 1, 'active', ?, ?)").run(tokens, now, now);
+        getCombatManager().clear();
+        const refused = await rest({ action: 'short', hitDiceToSpend: 1 });
+        expect(refused).toMatchObject({ error: true, writes: 'none' });
+        expect(refused.message).toMatch(/Cannot rest while in combat/);
+        expect(refused.message).toMatch(/enc-own/);
+        expect(refused.message).not.toMatch(/enc-other/);
+        getDb().prepare("UPDATE encounters SET status = 'completed' WHERE id = 'enc-own'").run();
+        expect((await rest({ action: 'short', hitDiceToSpend: 1 })).restType).toBe('short');
     });
 });
 

@@ -97,13 +97,14 @@ describe('the skaven-horned-rat preset', () => {
         expect(boot.tableRules.data).toMatchObject({ growth_track: 2, roll_table: 4, spell: 9, pool_family: 1, species: 1, char_class: 1 });
         expect(boot.tableRules.bestiary).toBe(SKAVEN_HORNED_RAT_PRESET.filter(e => e.kind === 'creature').length);
         expect(boot.tableRules.principles.some((p: string) => /Flee/.test(p))).toBe(true);
-        // Importing twice updates, never duplicates.
-        expect(await rules({ action: 'import', preset: 'skaven-horned-rat' })).toMatchObject({ created: 0, updated: SKAVEN_HORNED_RAT_PRESET.length });
+        // Importing twice updates, never duplicates; principles the world already has are kept (play report 2, item 11).
+        const principles = SKAVEN_HORNED_RAT_PRESET.filter(e => e.kind === 'principle').length;
+        expect(await rules({ action: 'import', preset: 'skaven-horned-rat' })).toMatchObject({ created: 0, updated: SKAVEN_HORNED_RAT_PRESET.length - principles, kept: principles });
     });
 
     it('a Grey Seer is created from the world species, class and background', async () => {
         await rules({ action: 'import', preset: 'skaven-horned-rat' });
-        const c = await char({ action: 'create', worldId: W, name: 'Thanquol', race: 'skaven', class: 'grey_seer', background: 'Council whelp', level: 5, provisionEquipment: false, stats: { str: 8, dex: 12, con: 10, int: 17, wis: 14, cha: 12 } });
+        const c = await char({ action: 'create', worldId: W, name: 'Thanquol', race: 'skaven', class: 'grey_seer', background: 'Council whelp', level: 5, provisionEquipment: false, stats: { str: 8, dex: 12, con: 10, int: 17, wis: 14, cha: 12 }, applySpeciesAbilityBonuses: true });
         const id = c.id ?? c.character?.id ?? c.characterId;
         expect(id).toBeTruthy();
         const s = sheet(id);
@@ -201,6 +202,30 @@ describe('the Warpstone Hunger ladder (auto growth steps)', () => {
     it('a step needs form, condition or table', () => {
         expect(() => parseRuleSpec('growth_track', { pool: 'x', steps: [{ at: 1 }] })).toThrow(/form, condition or table/);
         expect(() => parseRuleSpec('growth_track', { pool: 'x', steps: [{ at: 1, condition: { name: 'Shaky' } }], direction: 'sideways' })).toThrow();
+    });
+});
+
+/**
+ * Play report 2, item 6: an apply_damage kill feeds the Ascension track, and
+ * an auto rung it crosses lands on the actor's live token as well as the sheet.
+ */
+describe('Ascension through apply_damage', () => {
+    beforeEach(async () => { await rules({ action: 'import', preset: 'skaven-horned-rat' }); });
+
+    it('the kill credits the favour and the auto rung reaches the actor token', async () => {
+        mkSeer('seer', { horned_rat_favour: { current: 19, max: 100 } });
+        const enc = (await combat({ action: 'create', worldId: W, participants: [
+            { id: 'seer', name: 'seer', hp: 60, maxHp: 60, initiative: 20, band: 'Grey Seer' },
+            { id: 'rat', name: 'Clanrat', hp: 5, maxHp: 5, initiative: 1, isEnemy: true, band: 'Clanrat' }
+        ] })).encounterId;
+        const r = await combat({ action: 'apply_damage', encounterId: enc, targetIds: ['rat'], dice: 10, source: 'warp lightning', actorId: 'seer' });
+        expect(r.targets[0].defeated).toBe(true);
+        expect(r.growth[0]).toMatchObject({ victimId: 'rat', track: 'Ascension', pool: 'horned_rat_favour', delta: 1, from: 19, to: 20 });
+        expect(r.growth[0].growthApplied[0]).toMatchObject({ at: 20, condition: 'Grey Seer (ascendant)' });
+        expect(r.message).toMatch(/GROWTH Ascension.*fired 20: Grey Seer \(ascendant\)/);
+        expect(sheet('seer').conditions.map((c: any) => c.name)).toEqual(['Grey Seer (ascendant)']);
+        const tokens = JSON.parse((getDb().prepare('SELECT tokens FROM encounters WHERE id = ?').get(enc) as { tokens: string }).tokens);
+        expect(tokens.find((t: any) => t.id === 'seer').conditions.map((c: any) => c.type)).toEqual(['Grey Seer (ascendant)']);
     });
 });
 

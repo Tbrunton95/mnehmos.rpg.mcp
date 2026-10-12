@@ -447,6 +447,8 @@ export function renderStatusBlock(d: StatusInput): string {
     let out = renderStrip({ callsign: callsign(d.characterName ?? '???'), day: d.day, time: d.time, era: d.era, rads: d.rads, badge: d.badge });
     const rows: Cell[][] = [];
     rows.push([L('HP '), V(`${d.hp ?? '?'}/${d.maxHp ?? '?'}`)]);
+    // #14: where they are — the room, else the world's location — as on the compact block.
+    if (d.location) rows.push([L('AT  '), V(d.location)]);
     if (typeof d.rads === 'number')
         rows.push([L(g.rad + ' '), L('RADS '), V(d.rads), L('   '), V(bar(d.rads, 8, 1000)), L(' '), V(radBand(d.rads))]);
     if (typeof d.composure === 'number')

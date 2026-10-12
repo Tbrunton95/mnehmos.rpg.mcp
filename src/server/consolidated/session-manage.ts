@@ -20,7 +20,7 @@ import { getMeta, setMeta } from '../../storage/data-migrations.js';
 import { lookupOperation } from '../operation-guard.js';
 import { queryRolls, rollStats } from '../../storage/roll-log.js';
 import { buildBootPacket, renderBootPacket } from '../boot-packet.js';
-import { readWorldClock, clockWarning, scheduleInWorldSql, scheduleLiveSql } from '../../engine/world-clock.js';
+import { readWorldClock, readWorldConditions, clockWarning, scheduleInWorldSql, scheduleLiveSql } from '../../engine/world-clock.js';
 
 /** Engine changes this database has not been shown yet. */
 function unseenChangelog(): ChangelogEntry[] {
@@ -494,19 +494,24 @@ async function handleGetContext(input: SessionManageInput, _ctx: SessionContext)
             if (worldClock) {
                 context.world.day = worldClock.day;
                 if (worldClock.time) context.world.time = worldClock.time;
-                if (worldClock.era) context.world.era = worldClock.era;
                 // Items 14/15: records dated after the clock, advisory.
                 try {
                     const warning = clockWarning(db, world.id);
                     if (warning) context.world.clockWarning = warning;
                 } catch { /* advisory only */ }
             }
+            // Play report 2, #14: weather, era and location without needing a day.
+            const conditions = readWorldConditions(db, world.id);
+            if (conditions?.era) context.world.era = conditions.era;
+            if (conditions?.weather) context.world.weather = conditions.weather;
+            if (conditions?.location) context.world.location = conditions.location;
 
-            // Get current location if party has position
+            // Get current location if party has position: the party's wins.
             if (input.partyId) {
                 const party = partyRepo.findById(input.partyId);
                 if (party && (party as any).currentLocation) {
                     context.world.currentLocation = (party as any).currentLocation;
+                    context.world.location = (party as any).currentLocation;
                 }
             }
 

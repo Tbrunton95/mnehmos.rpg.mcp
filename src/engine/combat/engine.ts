@@ -1,4 +1,5 @@
-import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile, Buff, VesselProfile, Shields } from '../../schema/token-extras.js';
+import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile, Buff, VesselProfile, Shields, FightingStyle } from '../../schema/token-extras.js';
+import { fightingStyleEffects } from './fighting-style.js';
 import { absorbWithShields, roleState, sectionRole } from './vessel.js';
 import { damageWithModifiers } from './damage-modifiers.js';
 import { findPart as findNamedPart, matchProfile } from './parts.js';
@@ -41,6 +42,9 @@ export interface CombatParticipant {
     movementRemaining?: number;   // Remaining movement this turn (in feet)
     size?: SizeCategory;          // Creature size for footprint calculation
     hasDashed?: boolean;          // Whether dash action was used this turn
+    dashes?: number;              // Dash actions taken this turn (each adds a speed allotment to the move budget)
+    extraActions?: number;        // Extra actions banked this turn (Action Surge); cleared when the turn ends
+    surprised?: boolean;          // Caught flat-footed: its round-1 turn passes and it cannot react until it has
     isDodging?: boolean;          // Dodge: attacks against it roll at disadvantage until its next turn
     helpedBy?: string;            // Help: advantage on its next attack, granted by this participant
     band?: string;                // Table rules: power band (see table_rules band)
@@ -104,6 +108,8 @@ export interface CombatParticipant {
     species?: string;                // 'Orruk': nearby counts and battle cries match it
     tags?: string[];                 // Free tags nearby matches read
     buffs?: Buff[];                  // Battle-cry buffs (combat_manage battle_cry)
+    fightingStyle?: FightingStyle;   // Item 17: applied by executeAttack on its attacks (defense: by the handler on attacks against it)
+    lastMeleeMisses?: Array<{ attackerId: string; round: number }>; // Item 16: who missed this token in melee this round (riposte)
     // REQUEST 5: the void-combat lane (a token made from a create_vessel row)
     vessel?: VesselProfile;          // Section roles, shield regen; marks the token a vessel
     shields?: Shields;               // Drained before the hull; regen at the start of its turn
@@ -170,6 +176,17 @@ export interface CombatActionResult {
     // Request 5: the target's shields took this much before the hull.
     shieldsAbsorbed?: number;
     shields?: Shields;
+    // Item 17: the attacker's fighting style on this swing (never on a posted
+    // outcome); applied: false carries why it did not fit. The handler adds
+    // targetDefense when the target's defense style raised the AC.
+    fightingStyle?: { style: FightingStyle; applied: boolean; attackBonus?: number; damageBonus?: number; rerolls?: Array<{ sides: number; from: number; to: number }>; note?: string };
+    // Item 16: a die rolled after the d20 and folded into the attack (precision):
+    // present only when it was rolled; turnedHit says the miss became a hit.
+    attackBonusDie?: { label: string; dice: string; roll: number; before: number; after: number; turnedHit: boolean };
+    attackBonusDieSkipped?: string;
+    // Item 16: extra dice rolled on a hit (a superiority die), doubled on a crit,
+    // added before resistance; never touched by great weapon fighting.
+    extraDamage?: Array<{ label: string; dice: string; rolls: number[]; total: number }>;
     
     // Heal specifics (if type === 'heal')
     healAmount?: number;
@@ -285,6 +302,8 @@ export class CombatEngine {
             spellsCast: {},
             reactionUsed: false,
             hasDashed: false,
+            dashes: 0,
+            extraActions: 0,
             hasDisengaged: false
         }));
 
@@ -348,6 +367,8 @@ export class CombatEngine {
                 spellsCast: {},
                 reactionUsed: false,
                 hasDashed: false,
+                dashes: 0,
+                extraActions: 0,
                 hasDisengaged: false
             };
         });
@@ -390,6 +411,20 @@ export class CombatEngine {
             hasLairActions,
             lairOwnerId: lairOwner?.id
         };
+
+        // A surprised creature first in the order loses that turn at once:
+        // its slot passes (with the note) and the next actor is up. A LAIR
+        // slot first is not a participant; the next advance handles it.
+        this.turnStartNotes = [];
+        const first = this.getCurrentParticipant();
+        if (first?.surprised) {
+            if (first.hp > 0) {
+                this.passSurprisedTurn(first);
+                this.advanceToNextActor();
+            } else {
+                first.surprised = false;
+            }
+        }
 
         this.emitter?.publish('combat', {
             type: 'encounter_started',
@@ -600,6 +635,7 @@ export class CombatEngine {
         if (!this.state) return 'No active combat';
         const participant = this.state.participants.find(p => p.id === participantId);
         if (!participant) return `Participant ${participantId} not in this encounter`;
+        if (participant.surprised) return `${participant.name} is surprised: no legendary action until its first turn passes`;
         if (!participant.legendaryActions || participant.legendaryActions <= 0) return `${participant.name} has no legendary actions`;
         const currentId = this.state.turnOrder[this.state.currentTurnIndex];
         if (currentId === participantId) return `${participant.name} cannot take a legendary action on its own turn`;
@@ -738,18 +774,22 @@ export class CombatEngine {
      * and counts the modifier once; a plain number has no dice and lands as
      * given, crit or not.
      */
-    private rollAttackDamage(damage: number | string, crit: boolean): { total: number; rolls?: number[]; breakdown: string } {
+    private rollAttackDamage(damage: number | string, crit: boolean, rerollAtOrBelow?: number): { total: number; rolls?: number[]; breakdown: string; rerolls?: Array<{ sides: number; from: number; to: number }> } {
         if (typeof damage !== 'string') return { total: damage, breakdown: '' };
-        const first = this.rng.rollDamageDetailed(damage);
+        // Item 17: great weapon fighting rerolls the weapon dice, crit dice included.
+        const opts = rerollAtOrBelow !== undefined ? { rerollAtOrBelow } : {};
+        const first = this.rng.rollDamageDetailed(damage, opts);
         let diceTotal = first.diceTotal;
         let rolls = first.rolls;
+        let rerolls = first.rerolls;
         if (crit) {
-            const extra = this.rng.rollDamageDetailed(damage);
+            const extra = this.rng.rollDamageDetailed(damage, opts);
             diceTotal += extra.diceTotal;
             rolls = [...rolls, ...extra.rolls];
+            if (extra.rerolls) rerolls = [...(rerolls ?? []), ...extra.rerolls];
         }
         const mod = first.modifier;
-        return { total: diceTotal + mod, rolls, breakdown: ` (${rolls.join('+')}${mod >= 0 ? '+' + mod : mod})` };
+        return { total: diceTotal + mod, rolls, breakdown: ` (${rolls.join('+')}${mod >= 0 ? '+' + mod : mod})`, ...(rerolls ? { rerolls } : {}) };
     }
 
     /**
@@ -785,7 +825,20 @@ export class CombatEngine {
         // opportunity tags the rolls and the event as an opportunity attack.
         // bandScale (request 11) is the band rule's multiplier for this pair,
         // applied after resistance and before the part or unit caps.
-        partOpts?: { withPart?: string; atPart?: string; uncapped?: boolean; ranged?: boolean; ignoreConditions?: boolean; opportunity?: boolean; bandScale?: { steps: number; multiplier: number } }
+        // Item 17: fightingStyle overrides the actor's own; twoHanded / offhand
+        // say how this swing is made; reachFt is the profile's reach, read
+        // when `ranged` is unset to tell a shot from a swing by the grid.
+        // Item 16: extraDamageDice are rolled on a hit (twice on a crit) and
+        // added before resistance; attackBonusDie is rolled after the d20 and
+        // folded into the total (onlyIfMiss: only when the swing missed and
+        // not on a natural 1; maxMissBy: only when the die could make it up).
+        partOpts?: {
+            withPart?: string; atPart?: string; uncapped?: boolean; ranged?: boolean; ignoreConditions?: boolean; opportunity?: boolean;
+            bandScale?: { steps: number; multiplier: number };
+            fightingStyle?: FightingStyle; twoHanded?: boolean; offhand?: boolean; dualWielding?: boolean; reachFt?: number;
+            extraDamageDice?: Array<{ dice: string; label: string }>;
+            attackBonusDie?: { dice: string; label: string; onlyIfMiss?: boolean; maxMissBy?: number };
+        }
     ): CombatActionResult {
         if (!this.state) throw new Error('No active combat');
 
@@ -876,6 +929,17 @@ export class CombatEngine {
             situational.push(`mob rule +${mob.bonus} to hit (${mob.models} models)`);
         }
 
+        // Item 17: the attacker's fighting style. `ranged` unset is read from
+        // the grid (a shot from beyond the attacker's reach), else melee.
+        const styleRanged = partOpts?.ranged ?? (actor.position && target.position
+            ? edgeDistanceSquares(actor, target) * 5 > effectiveReachFt(actor, partOpts?.reachFt !== undefined ? { reachFt: partOpts.reachFt } : undefined)
+            : false);
+        const fs = fightingStyleEffects(partOpts?.fightingStyle ?? actor.fightingStyle, { ranged: styleRanged, twoHanded: partOpts?.twoHanded, offhand: partOpts?.offhand, dualWielding: partOpts?.dualWielding, resolved: !!resolved });
+        if (fs?.attackBonus) {
+            attackBonus += fs.attackBonus;
+            situational.push(fs.note);
+        }
+
         // Conditions can carry mechanics in metadata (a called strike's
         // crippled arm). The GM passes unaffectedLimb for the good arm.
         const hampering = actor.conditions.filter(c => c.metadata?.attackDisadvantage);
@@ -933,6 +997,40 @@ export class CombatEngine {
             }
         }
 
+        // Item 16: a die added to the attack after the d20 (Precision Attack).
+        // Never on a posted result, never on a natural 1 (nothing turns it),
+        // and with maxMissBy only when the die could close the gap.
+        let attackBonusDie: CombatActionResult['attackBonusDie'];
+        let attackBonusDieSkipped: string | undefined;
+        if (partOpts?.attackBonusDie && !resolved) {
+            const abd = partOpts.attackBonusDie;
+            const missBy = dc - attackRoll.total;
+            if (attackRoll.isNat1) attackBonusDieSkipped = `${abd.label} not rolled: a natural 1 cannot be turned`;
+            else if (abd.onlyIfMiss && attackRoll.isHit) attackBonusDieSkipped = `${abd.label} not rolled: the swing already hits`;
+            else if (abd.maxMissBy !== undefined && missBy > abd.maxMissBy) attackBonusDieSkipped = `${abd.label} not rolled: missed by ${missBy}, more than ${abd.dice} can make up`;
+            else {
+                const roll = this.tagged({ purpose: abd.label, forId: actorId, targetId }, () => this.rng.roll(abd.dice));
+                const before = attackRoll.total;
+                const wasHit = attackRoll.isHit;
+                attackRoll.modifier += roll;
+                attackRoll.total += roll;
+                attackRoll.margin = attackRoll.total - dc;
+                attackRoll.isHit = attackRoll.isNat20 || attackRoll.total >= dc;
+                if (attackRoll.isHit && !attackRoll.isCrit) attackRoll.degree = 'success';
+                else if (!attackRoll.isHit) attackRoll.degree = 'failure';
+                attackBonusDie = { label: abd.label, dice: abd.dice, roll, before, after: attackRoll.total, turnedHit: !wasHit && attackRoll.isHit };
+                situational.push(`${abd.label} +${roll}: ${before} → ${attackRoll.total} vs AC ${dc}${attackBonusDie.turnedHit ? ' (turned the miss)' : attackRoll.isHit ? '' : ' (still a miss)'}`);
+            }
+            if (attackBonusDieSkipped) situational.push(attackBonusDieSkipped);
+        }
+
+        // Item 16: a melee miss is remembered on the target for the round, so a
+        // riposte can answer it. Posted misses count too.
+        if (!attackRoll.isHit && !styleRanged) {
+            const round = this.state.round;
+            target.lastMeleeMisses = [...(target.lastMeleeMisses ?? []).filter(m => m.round === round && m.attackerId !== actor.id), { attackerId: actor.id, round }];
+        }
+
         let damageDealt = 0;
         let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
         let bandScale: CombatActionResult['bandScale'];
@@ -942,10 +1040,16 @@ export class CombatEngine {
         let baseDamageVal = 0;
         let damageBreakdownStr = '';
 
-        const rolled = this.tagged({ purpose: partOpts?.opportunity ? 'opportunity damage' : 'damage', forId: actorId, targetId }, () => this.rollAttackDamage(damage, attackRoll.isHit && attackRoll.isCrit));
+        // Item 17: great weapon fighting rerolls only on a hit (a miss rolls and
+        // logs nothing extra); the hit is known before the dice are rolled.
+        const gwfThreshold = attackRoll.isHit && !resolved ? fs?.rerollAtOrBelow : undefined;
+        const rolled = this.tagged({ purpose: partOpts?.opportunity ? 'opportunity damage' : 'damage', forId: actorId, targetId }, () => this.rollAttackDamage(damage, attackRoll.isHit && attackRoll.isCrit, gwfThreshold));
         baseDamageVal = rolled.total;
         const capturedDamageRolls = rolled.rolls;
         damageBreakdownStr = rolled.breakdown;
+        if (rolled.rerolls?.length) situational.push(`great weapon fighting rerolled ${rolled.rerolls.length}: ${rolled.rerolls.map(r => `${r.from}→${r.to}`).join(', ')}`);
+        const styleDamage = attackRoll.isHit && !resolved ? (fs?.damageBonus ?? 0) : 0;
+        if (styleDamage) situational.push(fs!.note);
 
         // Battle-cry damage: a flat bonus or dice on the encounter's stream,
         // added on a hit (never doubled by a crit). A GM-posted result lands
@@ -962,10 +1066,30 @@ export class CombatEngine {
             }
         }
 
+        // Item 16: extra dice on a hit (a superiority die), rolled again on a
+        // crit, under their own purpose. Great weapon fighting never touches them.
+        let extraDamage: CombatActionResult['extraDamage'];
+        let extraDamageTotal = 0;
+        if (attackRoll.isHit && !resolved && partOpts?.extraDamageDice?.length) {
+            extraDamage = [];
+            for (const extra of partOpts.extraDamageDice) {
+                const rolledExtra = this.tagged({ purpose: extra.label, forId: actorId, targetId }, () => {
+                    const first = this.rng.rollDamageDetailed(extra.dice);
+                    if (!attackRoll.isCrit) return first;
+                    const second = this.rng.rollDamageDetailed(extra.dice);
+                    return { ...first, rolls: [...first.rolls, ...second.rolls], total: first.total + second.total };
+                });
+                extraDamage.push({ label: extra.label, dice: extra.dice, rolls: rolledExtra.rolls, total: rolledExtra.total });
+                extraDamageTotal += rolledExtra.total;
+                situational.push(`${extra.label} +${rolledExtra.total} (${extra.dice}${attackRoll.isCrit ? ' ×2 crit' : ''}: ${rolledExtra.rolls.join('+')})`);
+            }
+        }
+
         if (attackRoll.isHit) {
             // FINDINGS #70: the damage lane lands here — outside the crit
-            // doubling, inside the resistance math.
-            const finalBaseDamage = baseDamageVal + (flatDamageBonus ?? 0) + buffDamage;
+            // doubling, inside the resistance math. Item 17: dueling's +2 too;
+            // item 16: the superiority die.
+            const finalBaseDamage = baseDamageVal + (flatDamageBonus ?? 0) + buffDamage + styleDamage + extraDamageTotal;
             
             // HIGH-002: Apply resistance/vulnerability/immunity
             const modResult = this.calculateDamageWithModifiers(finalBaseDamage, damageType, target);
@@ -1094,6 +1218,16 @@ export class CombatEngine {
             ...(bandScale ? { bandScale } : {}),
             ...(shieldsAbsorbed ? { shieldsAbsorbed } : {}),
             ...(target.shields ? { shields: { ...target.shields } } : {}),
+            ...(fs ? { fightingStyle: {
+                style: fs.style, applied: fs.applied,
+                ...(fs.attackBonus ? { attackBonus: fs.attackBonus } : {}),
+                ...(styleDamage ? { damageBonus: styleDamage } : {}),
+                ...(rolled.rerolls?.length ? { rerolls: rolled.rerolls } : {}),
+                note: fs.note
+            } } : {}),
+            ...(attackBonusDie ? { attackBonusDie } : {}),
+            ...(attackBonusDieSkipped ? { attackBonusDieSkipped } : {}),
+            ...(extraDamage ? { extraDamage } : {}),
             success: attackRoll.isHit,
             defeated,
             message,
@@ -1505,6 +1639,8 @@ export class CombatEngine {
         participant.reactionUsed = false;
         participant.hasDisengaged = false;
         participant.hasDashed = false;
+        participant.dashes = 0;
+        participant.extraActions = 0;
         participant.actionUsed = false;
         participant.attacksMade = 0;
         participant.bonusActionUsed = false;
@@ -1534,6 +1670,40 @@ export class CombatEngine {
             p.buffs = keep.length ? keep : undefined;
         }
         for (const [name, who] of faded) this.turnStartNotes.push(`${name} fades from ${who.join(', ')}`);
+    }
+
+    /**
+     * Item 16: conditions carrying metadata.endsAtEndOfTurnOf = this
+     * participant's id end now when the round has reached metadata.afterRound
+     * (Menacing Attack: until the end of the attacker's next turn).
+     */
+    private expireSourceTurnConditions(source: CombatParticipant): void {
+        if (!this.state) return;
+        const round = this.state.round;
+        for (const p of this.state.participants) {
+            const keep = p.conditions.filter(c => {
+                const meta = c.metadata as { endsAtEndOfTurnOf?: string; afterRound?: number } | undefined;
+                if (meta?.endsAtEndOfTurnOf !== source.id) return true;
+                if (typeof meta.afterRound === 'number' && round < meta.afterRound) return true;
+                this.turnStartNotes.push(`${p.name} is no longer ${c.type} of ${source.name}`);
+                return false;
+            });
+            if (keep.length !== p.conditions.length) p.conditions = keep;
+        }
+    }
+
+    /** Item 16: a source-turn condition whose source is dead or gone ends at its bearer's turn start. */
+    private expireOrphanedSourceTurnConditions(bearer: CombatParticipant): void {
+        if (!this.state) return;
+        const keep = bearer.conditions.filter(c => {
+            const meta = c.metadata as { endsAtEndOfTurnOf?: string } | undefined;
+            if (!meta?.endsAtEndOfTurnOf) return true;
+            const source = this.state!.participants.find(o => o.id === meta.endsAtEndOfTurnOf);
+            if (source && source.hp > 0) return true;
+            this.turnStartNotes.push(`${bearer.name} is no longer ${c.type}${source ? ` of ${source.name} (down)` : ''}`);
+            return false;
+        });
+        if (keep.length !== bearer.conditions.length) bearer.conditions = keep;
     }
 
     // ── Environment: the medium the fight happens in ──────────────────
@@ -1603,7 +1773,7 @@ export class CombatEngine {
         const econ = this.validateActionEconomy(participantId, 'action');
         if (!econ.valid) return { ok: false, error: econ.error || 'Action already used this turn' };
         participant.isDodging = true;
-        participant.actionUsed = true;
+        this.takeAction(participant, 'other');
         return { ok: true };
     }
 
@@ -1621,21 +1791,21 @@ export class CombatEngine {
         const econ = this.validateActionEconomy(helperId, 'action');
         if (!econ.valid) return { ok: false, error: econ.error || 'Action already used this turn' };
         ally.helpedBy = helperId;
-        helper.actionUsed = true;
+        this.takeAction(helper, 'other');
         return { ok: true };
     }
 
     /**
      * Apply the Dash action for a participant. Adds a fresh movement
-     * allotment on top of whatever they already have left, and flags
-     * hasDashed so the budget-check in move actions sees the doubled
-     * window. Consumes the main action.
+     * allotment on top of whatever they already have left and counts the
+     * dash, so the budget-check in move actions (moveBudget) sees the wider
+     * window. Consumes the main action: a second Dash in a turn needs an
+     * extra action (Action Surge).
      */
     applyDash(participantId: string): { ok: true; movementRemaining: number } | { ok: false; error: string } {
         if (!this.state) return { ok: false, error: 'No active combat' };
         const participant = this.state.participants.find((p) => p.id === participantId);
         if (!participant) return { ok: false, error: `Participant ${participantId} not found` };
-        if (participant.hasDashed) return { ok: false, error: 'Already dashed this turn' };
 
         // Dash IS the action. Reject if the participant already burned their
         // main action this turn (5e action economy). Without this guard, a
@@ -1647,11 +1817,78 @@ export class CombatEngine {
 
         const baseSpeed = this.effectiveSpeed(participant);
         const currentRemaining = participant.movementRemaining ?? baseSpeed;
+        this.takeAction(participant, 'other');
         participant.movementRemaining = currentRemaining + baseSpeed;
+        participant.dashes = (participant.dashes ?? 0) + 1;
         participant.hasDashed = true;
-        participant.actionUsed = true;
 
         return { ok: true, movementRemaining: participant.movementRemaining };
+    }
+
+    /**
+     * The most movement a participant may spend this turn: its speed, plus
+     * one allotment per Dash taken (hasDashed alone counts as one for tokens
+     * saved before dashes were counted).
+     */
+    moveBudget(participant: CombatParticipant): number {
+        return this.effectiveSpeed(participant) * (1 + (participant.dashes ?? (participant.hasDashed ? 1 : 0)));
+    }
+
+    /**
+     * Bank an extra action (Action Surge) for this turn. Only on the
+     * participant's own turn and while it can act; the bank clears when the
+     * turn ends, so a surge never leaks into off-turn swings.
+     */
+    grantExtraAction(participantId: string, n: number = 1): { ok: true; extraActions: number } | { ok: false; error: string } {
+        if (!this.state) return { ok: false, error: 'No active combat' };
+        const participant = this.state.participants.find(p => p.id === participantId);
+        if (!participant) return { ok: false, error: `Participant ${participantId} not found` };
+        if (this.state.turnOrder[this.state.currentTurnIndex] !== participantId) {
+            return { ok: false, error: `${participant.name} can only gain an extra action on its own turn` };
+        }
+        if (!this.canTakeActions(participantId)) return { ok: false, error: `${participant.name} is incapacitated` };
+        participant.extraActions = (participant.extraActions ?? 0) + n;
+        return { ok: true, extraActions: participant.extraActions };
+    }
+
+    /**
+     * The one place an action is consumed. An attack spends the action,
+     * continues an open multiattack, or spends a banked extra action (a
+     * fresh Attack action). Any other use spends the action or an extra;
+     * an extra spent this way closes an open Attack action. Callers
+     * validate first; false means nothing was left to spend.
+     */
+    private takeAction(participant: CombatParticipant, kind: 'attack' | 'other'): boolean {
+        const of = participant.attacksPerAction ?? 1;
+        const made = participant.attacksMade ?? 0;
+        if (kind === 'attack') {
+            if (!participant.actionUsed) {
+                participant.actionUsed = true;
+                participant.attacksMade = 1;
+                return true;
+            }
+            if (made > 0 && made < of) {
+                participant.attacksMade = made + 1;
+                return true;
+            }
+            if ((participant.extraActions ?? 0) > 0) {
+                participant.extraActions = (participant.extraActions ?? 0) - 1;
+                participant.attacksMade = 1;
+                return true;
+            }
+            participant.attacksMade = made + 1;
+            return false;
+        }
+        if (!participant.actionUsed) {
+            participant.actionUsed = true;
+            return true;
+        }
+        if ((participant.extraActions ?? 0) > 0) {
+            participant.extraActions = (participant.extraActions ?? 0) - 1;
+            participant.attacksMade = of;
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -1660,6 +1897,9 @@ export class CombatEngine {
     private processStartOfTurnConditions(participant: CombatParticipant): void {
         // Battle cries end first, so this turn's speed no longer carries them.
         this.expireBuffs(participant);
+        // Item 16: a fright whose source is gone or down ends at the bearer's
+        // own turn start (the source's end-of-turn sweep would never come).
+        this.expireOrphanedSourceTurnConditions(participant);
 
         // HIGH-003: Reset reaction at start of turn
         this.resetTurnResources(participant);
@@ -1795,16 +2035,42 @@ export class CombatEngine {
         if (currentParticipant && currentParticipant.hp > 0) {
             this.processEndOfTurnConditions(currentParticipant);
         }
-        // A telegraphed intent lasts one turn; a readied action stays.
-        if (currentParticipant) currentParticipant.intent = undefined;
+        // Item 16: conditions that end at the end of THIS creature's turn on
+        // other creatures (Menacing's fright), whether or not it is still up.
+        if (currentParticipant) this.expireSourceTurnConditions(currentParticipant);
+        // A telegraphed intent lasts one turn; a readied action stays. A
+        // banked extra action (Action Surge) dies with the turn too.
+        if (currentParticipant) {
+            currentParticipant.intent = undefined;
+            currentParticipant.extraActions = 0;
+        }
 
-        // Advance turn, automatically skipping dead participants
+        const newParticipant = this.advanceToNextActor();
+
+        this.emitter?.publish('combat', {
+            type: 'turn_changed',
+            round: this.state.round,
+            activeParticipantId: newParticipant?.id,
+            isLairAction: this.isLairActionPending()
+        });
+
+        return newParticipant;
+    }
+
+    /**
+     * Move to the next slot that acts: dead participants, a LAIR whose owner
+     * is down, and the round-1 slot of a surprised participant are passed
+     * over. The new actor's start-of-turn processing runs here.
+     */
+    private advanceToNextActor(): CombatParticipant | null {
+        if (!this.state) return null;
         let iterations = 0;
-        const maxIterations = this.state.turnOrder.length + 1; // Safety limit
+        // Safety limit: every slot may be surprised once, then acts.
+        const maxIterations = this.state.turnOrder.length * 2 + 1;
         let newParticipant: CombatParticipant | null = null;
+        let passed = false;
 
         do {
-            // Advance turn index
             this.state.currentTurnIndex++;
 
             if (this.state.currentTurnIndex >= this.state.turnOrder.length) {
@@ -1815,9 +2081,20 @@ export class CombatEngine {
             newParticipant = this.getCurrentParticipant();
             iterations++;
 
-            // Exit if we found a living participant or exhausted all options
+            // Surprise lasts until the creature's first slot has come round,
+            // alive or not: a downed one clears the flag without a pass note,
+            // so a heal in round 2 does not lose it another turn.
+            passed = false;
+            if (newParticipant?.surprised) {
+                if (newParticipant.hp > 0) {
+                    this.passSurprisedTurn(newParticipant);
+                    passed = true;
+                } else {
+                    newParticipant.surprised = false;
+                }
+            }
         } while (
-            ((newParticipant && newParticipant.hp <= 0) || this.lairOwnerDown()) &&
+            (passed || (newParticipant && newParticipant.hp <= 0) || this.lairOwnerDown()) &&
             iterations < maxIterations
         );
 
@@ -1825,15 +2102,20 @@ export class CombatEngine {
         if (newParticipant && newParticipant.hp > 0) {
             this.processStartOfTurnConditions(newParticipant);
         }
-
-        this.emitter?.publish('combat', {
-            type: 'turn_changed',
-            round: this.state.round,
-            activeParticipantId: newParticipant?.id,
-            isLairAction: this.isLairActionPending()
-        });
-
         return newParticipant;
+    }
+
+    /**
+     * A surprised participant's first turn passes: it is noted, its start-
+     * and end-of-turn effects still tick (regeneration, recharge, ongoing
+     * damage, durations), and the flag clears so it reacts and acts from
+     * here on.
+     */
+    private passSurprisedTurn(participant: CombatParticipant): void {
+        this.turnStartNotes.push(`😲 ${participant.name} is surprised: its first turn passes`);
+        this.processStartOfTurnConditions(participant);
+        this.processEndOfTurnConditions(participant);
+        participant.surprised = false;
     }
 
     /** The LAIR slot is up but the creature that owns the lair is dead: skip it. */
@@ -1869,6 +2151,8 @@ export class CombatEngine {
 
         const participant = this.state.participants.find(p => p.id === participantId);
         if (!participant || participant.hp <= 0) return false;
+        // Caught flat-footed: no reaction until its first turn has passed.
+        if (participant.surprised) return false;
 
         return !participant.conditions.some(c => {
             const effects = CONDITION_EFFECTS[c.type];
@@ -1894,10 +2178,13 @@ export class CombatEngine {
         if (!this.canTakeActions(participantId)) {
             return { valid: false, error: 'Participant is incapacitated' };
         }
+        if (participant.surprised) {
+            return { valid: false, error: `${participant.name} is surprised: no action until its first turn passes` };
+        }
 
-        // 2. Check Action availability
+        // 2. Check Action availability (a banked extra action reopens it)
         if (actionType === 'action') {
-            if (participant.actionUsed) {
+            if (participant.actionUsed && !((participant.extraActions ?? 0) > 0)) {
                 return { valid: false, error: 'Action already used this turn' };
             }
             
@@ -1959,13 +2246,15 @@ export class CombatEngine {
         return economy;
     }
 
-    /** Count one attack of the Attack action (the action is spent from the first). */
+    /**
+     * Count one attack of the Attack action (the action is spent from the
+     * first; a banked extra action opens a fresh one once the count is full).
+     */
     commitAttack(participantId: string): { made: number; of: number } | undefined {
         const participant = this.state?.participants.find(p => p.id === participantId);
         if (!participant) return undefined;
-        participant.attacksMade = (participant.attacksMade ?? 0) + 1;
-        participant.actionUsed = true;
-        return { made: participant.attacksMade, of: participant.attacksPerAction ?? 1 };
+        this.takeAction(participant, 'attack');
+        return { made: participant.attacksMade ?? 0, of: participant.attacksPerAction ?? 1 };
     }
 
     /**
@@ -1983,7 +2272,7 @@ export class CombatEngine {
         if (!participant.spellsCast) participant.spellsCast = {};
 
         if (actionType === 'action') {
-            participant.actionUsed = true;
+            this.takeAction(participant, 'other');
             if (spellLevel !== undefined) participant.spellsCast.action = spellLevel;
         } else if (actionType === 'bonus') {
             participant.bonusActionUsed = true;
@@ -2146,7 +2435,7 @@ export class CombatEngine {
                 : 10 + (target.initiativeBonus > 0 ? Math.floor(target.initiativeBonus / 2) : 0));
 
         const result = this.executeAttack(attackerId, targetId, attackBonus, targetAC, damage, damageType,
-            false, false, undefined, undefined, undefined, undefined, { opportunity: true });
+            false, false, undefined, undefined, undefined, undefined, { opportunity: true, twoHanded: profile?.twoHanded, reachFt: profile?.reachFt });
 
         // Mark reaction as used
         attacker.reactionUsed = true;

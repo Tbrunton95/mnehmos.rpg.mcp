@@ -57,10 +57,39 @@ describe('world characters', () => {
     });
     afterEach(() => { closeDb(); clearCombatState(); });
 
+    it('placed stats are final for a world species too; the note names its bonuses', async () => {
+        const c = await char({ action: 'create', worldId: W, name: 'Gorbad', class: 'brute', race: 'orruk', stats: { str: 16, dex: 10, con: 14, int: 8, wis: 10, cha: 8 }, provisionEquipment: false });
+        expect(c.stats).toMatchObject({ str: 16, con: 14 });
+        expect(c._rules.species.abilityBonusesApplied).toBe(false);
+        expect(c.statsNote).toBe('Stats taken as final: Orruk ability bonuses (+2 STR, +1 CON) were NOT added. If these are raw rolled/point-buy scores, pass applySpeciesAbilityBonuses: true.');
+        const base = await char({ action: 'create', worldId: W, name: 'Grot', class: 'brute', race: 'orruk', provisionEquipment: false });
+        expect(base.stats).toMatchObject({ str: 12, con: 11 });
+        expect(base.statsNote).toBe('No stats given: 10 baseline + Orruk bonuses (+2 STR, +1 CON).');
+    });
+
+    // Play report 2 #9: no 'Stalker' default — a world that defines a
+    // background of that name no longer hands its skills and gold to every
+    // character created without one.
+    it('a character created without a background gets none, even when the world defines "Stalker"', async () => {
+        await rules({ action: 'define', kind: 'background', name: 'Stalker', spec: { skills: ['Scrounging'], gold: 50 } });
+        const c = await char({ action: 'create', worldId: W, name: 'Nobody', class: 'Adventurer', race: 'Human', provisionEquipment: false });
+        expect(c.background).toBeUndefined();
+        expect(c._rules.background).toBeNull();
+        expect(c.skillProficiencies).not.toContain('Scrounging');
+        const row = new CharacterRepository(getDb()).findById(c.id)!;
+        expect(row.background).toBeUndefined();
+        expect((row as any).currency.gold).toBe(0);
+        // Asked for by name it still applies.
+        const s = await char({ action: 'create', worldId: W, name: 'Marked', class: 'Adventurer', race: 'Human', background: 'stalker', provisionEquipment: false });
+        expect(s.background).toBe('Stalker');
+        expect(s.skillProficiencies).toContain('Scrounging');
+        expect((new CharacterRepository(getDb()).findById(s.id) as any).currency.gold).toBe(50);
+    });
+
     it('create reads the world class, species and background', async () => {
         const c = await char({
             action: 'create', worldId: W, name: 'Gorbad', class: 'brute', race: 'orruk', background: 'scrap scavenger',
-            stats: { str: 16, dex: 10, con: 14, int: 8, wis: 10, cha: 8 }, provisionEquipment: false
+            stats: { str: 16, dex: 10, con: 14, int: 8, wis: 10, cha: 8 }, applySpeciesAbilityBonuses: true, provisionEquipment: false
         });
         expect(c.characterClass).toBe('Brute');
         expect(c.race).toBe('Orruk');
@@ -99,7 +128,7 @@ describe('world characters', () => {
     });
 
     it('skill rolls and stunts read a world skill; an unknown stunt skill needs an ability', async () => {
-        const c = await char({ action: 'create', worldId: W, name: 'Gorbad', class: 'Brute', race: 'Orruk', provisionEquipment: false, stats: { str: 16, dex: 10, con: 14, int: 8, wis: 10, cha: 8 } });
+        const c = await char({ action: 'create', worldId: W, name: 'Gorbad', class: 'Brute', race: 'Orruk', provisionEquipment: false, stats: { str: 16, dex: 10, con: 14, int: 8, wis: 10, cha: 8 }, applySpeciesAbilityBonuses: true });
         expect(worldSkillAbility(getDb(), W, 'waaagh_lore')).toBe('str');
         expect(worldSkillAbility(getDb(), OTHER, 'Waaagh Lore')).toBeUndefined();
         const r = await math({ action: 'roll_skill_check', characterId: c.id, skill: 'Waaagh Lore' });
@@ -143,7 +172,11 @@ describe('world characters', () => {
         expect(row.characterClass).toBe('Weirdnob');
         expect((row as any).spellSlots.level3.current).toBe(1);
         clearCombatState();
-        await handleRestManage({ action: 'long_rest', characterId: c.id }, ctx as any);
+        // Item 18: the rest guard reads encounter rows, so the fight is ended first (combat_manage end would do the same).
+        getDb().prepare("UPDATE encounters SET status = 'completed' WHERE id = ?").run(encounterId);
+        const rested = JSON.parse((await handleRestManage({ action: 'long_rest', characterId: c.id }, ctx as any)).content[0].text);
+        expect(rested.restType).toBe('long');
+        expect(rested.spellSlotsRestored).toMatchObject({ type: 'standard' });
         expect((new CharacterRepository(getDb()).findById(c.id) as any).spellSlots.level3.current).toBe(2);
         expect(new CharacterRepository(getDb()).findById(c.id)!.characterClass).toBe('Weirdnob');
     });

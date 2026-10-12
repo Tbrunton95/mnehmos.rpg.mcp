@@ -21,6 +21,47 @@ export interface WorldClock {
     weather?: string;
     /** The era label era_jump wrote, for the readers that print it beside the clock. */
     era?: string;
+    /** The stored world location (environment.location), free text. */
+    location?: string;
+}
+
+/** Weather, location and era: what a world says about itself besides its clock. */
+export interface WorldConditions {
+    weather?: string;
+    location?: string;
+    era?: string;
+}
+
+/** The normalised environment of a world, or null when the world or its JSON is missing or broken. */
+function readEnvironment(db: Database.Database, worldId: string | null | undefined): ReturnType<typeof normalizeWorldEnvironment> | null {
+    if (!worldId) return null;
+    try {
+        const row = db.prepare('SELECT environment FROM worlds WHERE id = ?').get(worldId) as { environment?: string | null } | undefined;
+        if (!row) return null;
+        let raw: unknown = {};
+        try { raw = JSON.parse(row.environment || '{}'); } catch { return null; }
+        try { return normalizeWorldEnvironment(raw); } catch { return null; }
+    } catch {
+        return null;
+    }
+}
+
+function conditionsOf(env: ReturnType<typeof normalizeWorldEnvironment>): WorldConditions {
+    return {
+        ...(env.weatherConditions ? { weather: env.weatherConditions } : {}),
+        ...(env.location ? { location: env.location } : {}),
+        ...(env.era ? { era: env.era } : {})
+    };
+}
+
+/**
+ * Play report 2, #14: weather, location and era without needing a day. The
+ * status block, boot and get_context read these here so a world that keeps
+ * no clock still shows its weather.
+ */
+export function readWorldConditions(db: Database.Database, worldId: string | null | undefined): WorldConditions | null {
+    const env = readEnvironment(db, worldId);
+    return env ? conditionsOf(env) : null;
 }
 
 /** Day + 'HH:MM' as a fractional day, or null without a numeric day. */
@@ -36,26 +77,16 @@ export function clockAt(env: { day?: unknown; time?: unknown } | undefined | nul
 
 /** The stored clock of a world, or null when the world or its day is missing. */
 export function readWorldClock(db: Database.Database, worldId: string | null | undefined): WorldClock | null {
-    if (!worldId) return null;
-    try {
-        const row = db.prepare('SELECT environment FROM worlds WHERE id = ?').get(worldId) as { environment?: string | null } | undefined;
-        if (!row) return null;
-        let raw: unknown = {};
-        try { raw = JSON.parse(row.environment || '{}'); } catch { return null; }
-        let env: ReturnType<typeof normalizeWorldEnvironment>;
-        try { env = normalizeWorldEnvironment(raw); } catch { return null; }
-        const at = clockAt(env);
-        if (at === null || env.day === undefined) return null;
-        return {
-            day: env.day,
-            ...(typeof env.time === 'string' ? { time: env.time } : {}),
-            at,
-            ...(env.weatherConditions ? { weather: env.weatherConditions } : {}),
-            ...(env.era ? { era: env.era } : {})
-        };
-    } catch {
-        return null;
-    }
+    const env = readEnvironment(db, worldId);
+    if (!env) return null;
+    const at = clockAt(env);
+    if (at === null || env.day === undefined) return null;
+    return {
+        day: env.day,
+        ...(typeof env.time === 'string' ? { time: env.time } : {}),
+        at,
+        ...conditionsOf(env)
+    };
 }
 
 /** The clock `hours` after a fractional day, midnight rollover included. */

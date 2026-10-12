@@ -2,16 +2,19 @@
  * Every tool call as one operation (field report, tier 1):
  *
  * - All or nothing. The call runs inside a SAVEPOINT on its campaign
- *   database. If it throws or answers with an error, every write it made is
- *   rolled back and the session's in-memory combat engines are dropped so the
- *   next call reloads them from the (rolled back) database. Half-applied
- *   turns were where the drift came from.
+ *   database. If it throws or answers with an error (error: true, a string
+ *   error code such as validation_error, or the MCP isError flag), every
+ *   write it made is rolled back and the session's in-memory combat engines
+ *   are dropped so the next call reloads them from the (rolled back)
+ *   database. Half-applied turns were where the drift came from.
  * - One at a time. Calls on the same database queue behind each other, so
  *   two requests can never interleave inside one savepoint.
  * - Operation IDs. A call may carry opId. The first call runs and stores its
  *   reply; a retry with the same opId and arguments gets that reply back and
  *   applies nothing, so a timeout is safe to retry. The same opId with other
- *   arguments is refused.
+ *   arguments is refused. An error reply, or one that says writes: 'none',
+ *   consumes nothing: the opId stays free for the corrected resend (play
+ *   report 2, #11).
  */
 import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
@@ -20,6 +23,7 @@ import { getCombatManager } from './state/combat-manager.js';
 import { getTenant } from '../storage/tenant-context.js';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { recordRolls } from '../storage/roll-log.js';
+import { replyOutcome } from './reply-status.js';
 
 export interface OperationContext {
     opId?: string;
@@ -63,7 +67,7 @@ function flushCombatRolls(db: Database.Database, sessionId: string, op: Operatio
     }
 }
 
-type ToolReply = { content?: Array<{ type: string; text: string }> };
+type ToolReply = { content?: Array<{ type: string; text: string }>; isError?: boolean };
 type Handler = (args: Record<string, unknown>, extra: unknown) => Promise<ToolReply>;
 
 /** Tools that wait on outside services (LLM calls) run without holding the database. */
@@ -89,17 +93,19 @@ function hashArgs(tool: string, args: Record<string, unknown>): string {
     return createHash('sha256').update(tool + JSON.stringify(stable(args))).digest('hex');
 }
 
-/** An error reply: the embedded JSON says error: true, or the call failed outright. */
-function isErrorReply(res: ToolReply | undefined): boolean {
-    const text = res?.content?.[0]?.text;
-    if (!text) return false;
-    const m = text.match(/<!--\s*([A-Z_]*JSON)\s*\n?([\s\S]*?)\n?\1\s*-->/);
-    const body = m ? m[2] : text.trim().startsWith('{') ? text : null;
-    if (!body) return false;
-    try {
-        const parsed = JSON.parse(body);
-        return !!parsed && typeof parsed === 'object' && parsed.error === true;
-    } catch { return false; }
+/** The guard's line on top of a reply's first text block. */
+function prefixed(res: ToolReply, line: string): ToolReply {
+    if (!res?.content?.[0]) return res;
+    return { ...res, content: [{ ...res.content[0], text: `${line}\n${res.content[0].text}` }, ...res.content.slice(1)] };
+}
+
+/**
+ * A stored op_log row whose reply was an error or said writes: 'none':
+ * written before the guard read string errors and no-write replies, it
+ * records nothing that happened, so the opId it holds is still free.
+ */
+function storedUnconsumed(response: string): boolean {
+    return replyOutcome({ content: [{ type: 'text', text: response }] }) !== 'applied';
 }
 
 function sessionKey(): string {
@@ -116,7 +122,10 @@ export function evictSessionEngines(sessionId: string): void {
 export function lookupOperation(db: Database.Database, opId: string): { tool: string; createdAt: string; response: string } | null {
     ensureOpLog(db);
     const row = db.prepare('SELECT tool, created_at, response FROM op_log WHERE op_id = ?').get(opId) as { tool: string; created_at: string; response: string } | undefined;
-    return row ? { tool: row.tool, createdAt: row.created_at, response: row.response } : null;
+    // A row holding an error or a no-write reply was burned before this guard
+    // read them; op_status and the replay check agree that it did not apply.
+    if (!row || storedUnconsumed(row.response)) return null;
+    return { tool: row.tool, createdAt: row.created_at, response: row.response };
 }
 
 export function withOperation(toolName: string, handler: Handler): Handler {
@@ -153,7 +162,11 @@ export function withOperation(toolName: string, handler: Handler): Handler {
                 ensureOpLog(db);
                 argsHash = hashArgs(toolName, args ?? {});
                 const done = db.prepare('SELECT tool, args_hash, response, created_at FROM op_log WHERE op_id = ?').get(opId) as { tool: string; args_hash: string; response: string; created_at: string } | undefined;
-                if (done) {
+                if (done && storedUnconsumed(done.response)) {
+                    // Healing: an opId burned by a validation, unknown-action or
+                    // preview reply before this fix. Drop the row and let the call run.
+                    db.prepare('DELETE FROM op_log WHERE op_id = ?').run(opId);
+                } else if (done) {
                     if (done.args_hash !== argsHash || done.tool !== toolName) {
                         const message = `opId ${opId} was already used for a different call (${done.tool} at ${done.created_at}). Nothing was applied; use a new opId.`;
                         rollback();
@@ -174,17 +187,25 @@ export function withOperation(toolName: string, handler: Handler): Handler {
                 evictSessionEngines(sessionKey());
                 throw e;
             }
-            if (isErrorReply(res)) {
-                // The call failed partway or refused: nothing it wrote stays.
+            const outcome = replyOutcome(res);
+            if (outcome === 'error') {
+                // The call failed partway or refused: nothing it wrote stays,
+                // and the opId is not consumed.
                 rollback();
                 evictSessionEngines(sessionKey());
-                return res;
+                return opId ? prefixed(res, `▌ op ${opId} NOT applied (error) — opId still free; fix the call and resend with the same opId`) : res;
             }
             flushCombatRolls(db, sessionKey(), op);
             if (opId) {
-                db.prepare('INSERT INTO op_log (op_id, tool, args_hash, response, created_at) VALUES (?, ?, ?, ?, ?)')
-                    .run(opId, toolName, argsHash, res?.content?.[0]?.text ?? '', new Date().toISOString());
-                if (res?.content?.[0]) res = { ...res, content: [{ ...res.content[0], text: `▌ op ${opId} applied\n${res.content[0].text}` }, ...res.content.slice(1)] };
+                if (outcome === 'no_write') {
+                    // A refusal or a preview: the audit row commits, but there
+                    // is nothing to replay, so the opId stays free.
+                    res = prefixed(res, `▌ op ${opId}: nothing written — opId not consumed`);
+                } else {
+                    db.prepare('INSERT INTO op_log (op_id, tool, args_hash, response, created_at) VALUES (?, ?, ?, ?, ?)')
+                        .run(opId, toolName, argsHash, res?.content?.[0]?.text ?? '', new Date().toISOString());
+                    res = prefixed(res, `▌ op ${opId} applied`);
+                }
             }
             db.exec(outer ? 'COMMIT' : `RELEASE ${sp}`);
             return res;

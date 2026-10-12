@@ -1,5 +1,5 @@
 import { randomBytes, randomInt } from 'node:crypto';
-import { parseDiceTerms } from '../engine/combat/rng.js';
+import { parseDiceTerms } from '../engine/combat/dice-terms.js';
 
 /**
  * Cryptographic dice: the default for every roll the caller did not seed.

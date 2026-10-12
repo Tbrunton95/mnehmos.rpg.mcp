@@ -101,6 +101,31 @@ describe('encounter conditions at create', () => {
         }, ctx)).rejects.toThrow(/incapacitated/i);
     });
 
+    it('surprised at create is validated against the participants and persisted on the token', async () => {
+        await expect(handleCreateEncounter({
+            seed: 'surprise-unknown',
+            participants: [{ id: 'hero', name: 'Hero', initiative: 20, hp: 30, maxHp: 30, ac: 10, isEnemy: false }, foe],
+            surprised: ['nobody']
+        }, ctx)).rejects.toThrow(/surprised names no participant: nobody/);
+        const viaTool = manageJson(await handleCombatManage({
+            action: 'create', seed: 'surprise-unknown-tool',
+            participants: [{ id: 'hero', name: 'Hero', initiative: 20, hp: 30, maxHp: 30, ac: 10 }, foe],
+            surprised: ['nobody']
+        }, ctx as any));
+        expect(viaTool).toMatchObject({ error: true, writes: 'none' });
+
+        const created = await handleCreateEncounter({
+            seed: 'surprise-known',
+            participants: [{ id: 'hero', name: 'Hero', initiative: 20, hp: 30, maxHp: 30, ac: 10, isEnemy: false }, foe],
+            surprised: ['foe']
+        }, ctx);
+        const encounterId = encounterIdOf(created);
+        expect(persistedToken(encounterId, 'foe').surprised).toBe(true);
+        expect(persistedToken(encounterId, 'hero').surprised).toBeUndefined();
+        await handleAdvanceTurn({ encounterId }, ctx);
+        expect(persistedToken(encounterId, 'foe').surprised).toBe(false);
+    });
+
     it('keeps unknown condition names without crashing the engine', async () => {
         const created = await handleCreateEncounter({
             seed: 'cond-unknown',

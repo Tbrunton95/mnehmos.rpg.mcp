@@ -2,6 +2,7 @@ import { handleImprovisationManage } from '../../../src/server/consolidated/impr
 import { handleCharacterManage } from '../../../src/server/consolidated/character-manage.js';
 import { handleNarrativeManage } from '../../../src/server/consolidated/narrative-manage.js';
 import { handleSessionManage } from '../../../src/server/consolidated/session-manage.js';
+import { handleWorldManage } from '../../../src/server/consolidated/world-manage.js';
 import { handlePrecedentManage } from '../../../src/server/consolidated/precedent-manage.js';
 import { handleCombatManage } from '../../../src/server/consolidated/combat-manage.js';
 import { handleTableRules } from '../../../src/server/consolidated/table-rules.js';
@@ -79,6 +80,26 @@ describe('boot packet', () => {
         expect(p.telegraphs[0]).toMatchObject({ name: "An'ggrath", intent: 'closes the thirty metres and takes the wing' });
         expect(p.precedents[0].statement).toMatch(/Flight is the Warp's/);
         expect(text).toMatch(/◇ Warp-sight \[on_spell_cast \(when he looks\)\] cost: 1 RESOLVE per scene/);
+    });
+});
+
+describe('boot now-line', () => {
+    it('opens with the clock, weather and location when the world keeps them', async () => {
+        const first = await handleSessionManage({ action: 'boot', worldId: W }, ctx as any);
+        expect(first.content[0].text).toMatch(/Now: Day 367, 06:00\n/);
+        expect(json(first).weather).toBeUndefined();
+        await handleWorldManage({ action: 'update', worldId: W, environment: { weather: 'sleet', location: 'Vorago docks' } }, ctx as any);
+        const res = await handleSessionManage({ action: 'boot', worldId: W }, ctx as any);
+        expect(res.content[0].text).toMatch(/Now: Day 367, 06:00 · sleet · at Vorago docks\n/);
+        expect(json(res)).toMatchObject({ day: 367, time: '06:00', weather: 'sleet', location: 'Vorago docks' });
+    });
+
+    it('a world with nothing set still says so', async () => {
+        getDb().prepare('UPDATE worlds SET environment = ? WHERE id = ?').run('{}', W);
+        getDb().prepare('DELETE FROM characters').run();
+        const res = await handleSessionManage({ action: 'boot', worldId: W }, ctx as any);
+        expect(res.content[0].text).not.toMatch(/Now:/);
+        expect(res.content[0].text).toMatch(/nothing recorded for this world yet/);
     });
 });
 

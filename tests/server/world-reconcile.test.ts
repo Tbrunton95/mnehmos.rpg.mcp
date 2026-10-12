@@ -156,7 +156,7 @@ describe('world_manage reconcile', () => {
         chars.update('wake', { abilities: [{ name: 'Tidal Surge', recharge: 5, ready: false }, { name: 'Brine Breath', ready: true }] } as any);
         let r = await reconcile();
         expect(kinds(r)).toEqual(['ability_spent_outside_combat']);
-        expect(r.findings[0]).toMatchObject({ characterId: 'wake', detail: 'Tidal Surge ready:false with no live encounter', fix: expect.stringMatching(/character_manage update \{characterId: "wake", abilities: \[\.\.\.\]\} with ready: true/) });
+        expect(r.findings[0]).toMatchObject({ characterId: 'wake', detail: 'Tidal Surge ready:false with no live encounter', fix: 'character_manage restore_ability {characterId: "wake", name: "Tidal Surge"}' });
 
         liveEncounter('enc-1', ['wake', 'someone']);
         expect((await reconcile()).count).toBe(0);
@@ -165,6 +165,12 @@ describe('world_manage reconcile', () => {
         expect(kinds(await reconcile())).toEqual(['ability_spent_outside_combat']);
         chars.update('wake', { abilities: [{ name: 'Tidal Surge', recharge: 5, ready: true }, { name: 'Brine Breath', ready: true }] } as any);
         expect((await reconcile()).count).toBe(0);
+        // Item 18: a per-rest ability waits for rest_manage; spent outside a fight is not drift.
+        chars.update('wake', { abilities: [{ name: 'Second Wind', perRest: 'short', ready: false }, { name: 'Tidal Surge', recharge: 5, ready: false }] } as any);
+        r = await reconcile();
+        expect(kinds(r)).toEqual(['ability_spent_outside_combat']);
+        expect(r.findings[0].detail).toBe('Tidal Surge ready:false with no live encounter');
+        expect(r.findings[0].fix).toBe('character_manage restore_ability {characterId: "wake", name: "Tidal Surge"}');
     });
 
     it('legendary_depleted_outside_combat: remaining below the maximum with no live encounter', async () => {
@@ -174,7 +180,7 @@ describe('world_manage reconcile', () => {
         chars.update('tesk', { legendaryActions: 2, legendaryActionsRemaining: 2 } as any);
         let r = await reconcile();
         expect(kinds(r)).toEqual(['legendary_depleted_outside_combat']);
-        expect(r.findings[0]).toMatchObject({ characterId: 'wake', detail: 'legendary actions 1/3, legendary resistances 0/2 with no live encounter', fix: 'character_manage update {characterId: "wake", legendaryActionsRemaining: 3, legendaryResistancesRemaining: 2}' });
+        expect(r.findings[0]).toMatchObject({ characterId: 'wake', detail: 'legendary actions 1/3, legendary resistances 0/2 with no live encounter', fix: 'character_manage update {characterId: "wake", legendaryActionsRemaining: 3, legendaryResistancesRemaining: 2} (rest_manage long also restores legendary resistances)' });
 
         liveEncounter('enc-2', ['wake']);
         expect((await reconcile()).count).toBe(0);

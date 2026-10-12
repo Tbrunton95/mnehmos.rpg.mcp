@@ -54,6 +54,18 @@ describe('pools as counters', () => {
         expect(pools().anggrath_calls.label).toBe("An'ggrath's calls");
     });
 
+    it('refresh (short | long | none) persists through get and survives a later delta; the reply echoes it', async () => {
+        const r = await char({ action: 'adjust_pool', characterId: 'luciel', pool: 'superiority', value: 4, max: 4, refresh: 'short' });
+        expect(r).toMatchObject({ current: 4, max: 4, refresh: 'short' });
+        const got = await char({ action: 'get', characterId: 'luciel' });
+        expect(got.resourcePools.superiority).toMatchObject({ current: 4, max: 4, refresh: 'short' });
+        const d = await char({ action: 'adjust_pool', characterId: 'luciel', pool: 'superiority', delta: -1 });
+        expect(d).toMatchObject({ current: 3, refresh: 'short' });
+        expect(pools().superiority.refresh).toBe('short');
+        await char({ action: 'adjust_pool', characterId: 'luciel', pool: 'superiority', refresh: 'long' });
+        expect(pools().superiority).toMatchObject({ current: 3, refresh: 'long' });
+    });
+
     it('a linked item mirrors the pool; adjust_charges on it points to adjust_pool', async () => {
         const r = await char({ action: 'adjust_pool', characterId: 'luciel', pool: 'anggrath_calls', value: 3, max: 3, linkItem: tokenId });
         expect(r.item).toMatchObject({ name: "An'ggrath's Skull Token", charges: 3, max: 3 });

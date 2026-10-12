@@ -67,6 +67,18 @@ describe('house-format status block', () => {
         expect(data.footer).toEqual(['The True Name (0 of 1)', 'Day 367']);
     });
 
+    it('the compact block falls back to the world location when the character has no room', async () => {
+        await handleTableRules({ action: 'define', worldId: W, kind: 'status_block', name: 'tiny-status', spec: { corePool: 'resolve' } }, ctx as any);
+        expect(tagJson(await block()).location).toBeUndefined();
+        new WorldRepository(getDb()).updateEnvironment(W, { location: 'Vorago docks' });
+        const text = await block();
+        expect(tagJson(text).location).toBe('Vorago docks');
+        expect(banner(text)).toMatch(/▌ AT  Vorago docks\n/);
+        // showLocation: false still drops the AT row.
+        await handleTableRules({ action: 'define', worldId: W, kind: 'status_block', name: 'tiny-status', spec: { corePool: 'resolve', showLocation: false } }, ctx as any);
+        expect(tagJson(await block()).location).toBeUndefined();
+    });
+
     it('the defaults still render the rows layout with +N more', async () => {
         const text = banner(await block());
         expect(text).toMatch(/▌ Oath of the Ninth\n▌ Warp-sight\n▌ \+1 more\n/);

@@ -8,6 +8,7 @@
  * Every lane is defensive — a missing table or column is an empty lane.
  */
 import type Database from 'better-sqlite3';
+import { signed } from '../engine/skill-modifier.js';
 
 export const RECONCILE_KINDS = [
     'equipped_missing',
@@ -16,7 +17,8 @@ export const RECONCILE_KINDS = [
     'condition_stale_precedent',
     'ability_spent_outside_combat',
     'legendary_depleted_outside_combat',
-    'xp_unposted'
+    'xp_unposted',
+    'skill_override_migrated'
 ] as const;
 export type ReconcileKind = typeof RECONCILE_KINDS[number];
 
@@ -45,7 +47,7 @@ type CharRow = {
     legendary_resistances: number | null; legendary_resistances_remaining: number | null;
 };
 type Attack = { name?: string; item?: string };
-type Ability = { name?: string; ready?: boolean };
+type Ability = { name?: string; ready?: boolean; perRest?: 'short' | 'long' };
 type Condition = { name?: string; source?: string; note?: string };
 
 /** Precedent ids as the ledger mints them: prec-<8 hex>. */
@@ -78,18 +80,34 @@ function loadCharacters(db: Database.Database, worldId: string, characterId?: st
     }
 }
 
+/** Every active encounter row with the token ids it holds (the database is tenant-scoped already). */
+function activeEncounterTokens(db: Database.Database): Array<{ id: string; tokenIds: string[] }> {
+    const rows = tryRows(() => db.prepare("SELECT id, tokens FROM encounters WHERE status = 'active'").all() as Array<{ id: string; tokens: string }>);
+    return rows.map(r => ({
+        id: r.id,
+        tokenIds: parseJson<Array<{ id?: string }>>(r.tokens, []).map(t => t?.id).filter((id): id is string => typeof id === 'string')
+    }));
+}
+
 /** Ids of characters standing in an active encounter (token id = character id). */
 function charactersInLiveCombat(db: Database.Database, ids: string[]): Set<string> {
     const live = new Set<string>();
     if (!ids.length) return live;
     const want = new Set(ids);
-    const rows = tryRows(() => db.prepare("SELECT tokens FROM encounters WHERE status = 'active'").all() as Array<{ tokens: string }>);
-    for (const r of rows) {
-        for (const t of parseJson<Array<{ id?: string }>>(r.tokens, [])) {
-            if (t && typeof t.id === 'string' && want.has(t.id)) live.add(t.id);
-        }
+    for (const enc of activeEncounterTokens(db)) {
+        for (const id of enc.tokenIds) if (want.has(id)) live.add(id);
     }
     return live;
+}
+
+/**
+ * Item 18: the active encounters this character is a token in, by id. The
+ * rest guard reads this instead of the in-memory combat manager, which the
+ * operation guard evicts before every call. A paused or completed encounter
+ * does not count.
+ */
+export function liveEncountersFor(db: Database.Database, characterId: string): string[] {
+    return activeEncounterTokens(db).filter(enc => enc.tokenIds.includes(characterId)).map(enc => enc.id);
 }
 
 /** Every name an attack profile's `item` may legitimately use: template names and ids, instance names and ids. */
@@ -170,13 +188,15 @@ export function reconcileWorld(db: Database.Database, worldId: string, character
             }
         }
 
-        // 5/6. Spent ability state with no fight to spend it in.
+        // 5/6. Spent ability state with no fight to spend it in. A perRest
+        // ability (item 18) waits for rest_manage: spent between fights is
+        // the rule working, not drift.
         if (!live.has(c.id)) {
-            const spent = (Array.isArray(profile.abilities) ? profile.abilities : []).filter(a => a && a.ready === false);
+            const spent = (Array.isArray(profile.abilities) ? profile.abilities : []).filter(a => a && a.ready === false && !a.perRest);
             if (spent.length) {
                 const names = spent.map(a => a.name ?? '?');
                 push('ability_spent_outside_combat', `${names.join(', ')} ready:false with no live encounter`,
-                    `character_manage update {characterId: "${c.id}", abilities: [...]} with ready: true (rest_manage long resets them too)`);
+                    `character_manage restore_ability {characterId: "${c.id}", ${names.length === 1 ? `name: "${names[0]}"` : 'all: true'}}${names.length === 1 ? '' : ` (or name: "${names[0]}" for one)`}`);
             }
             const la = c.legendary_actions, lar = c.legendary_actions_remaining;
             const lr = c.legendary_resistances, lrr = c.legendary_resistances_remaining;
@@ -185,8 +205,10 @@ export function reconcileWorld(db: Database.Database, worldId: string, character
             if (la !== null && la !== undefined && lar !== null && lar !== undefined && lar < la) { parts.push(`legendary actions ${lar}/${la}`); fixes.push(`legendaryActionsRemaining: ${la}`); }
             if (lr !== null && lr !== undefined && lrr !== null && lrr !== undefined && lrr < lr) { parts.push(`legendary resistances ${lrr}/${lr}`); fixes.push(`legendaryResistancesRemaining: ${lr}`); }
             if (parts.length) {
+                // Item 18: a long rest restores resistances (actions reset per round, so update is the only fix for those).
+                const restHint = lr !== null && lr !== undefined && lrr !== null && lrr !== undefined && lrr < lr ? ' (rest_manage long also restores legendary resistances)' : '';
                 push('legendary_depleted_outside_combat', `${parts.join(', ')} with no live encounter`,
-                    `character_manage update {characterId: "${c.id}", ${fixes.join(', ')}}`);
+                    `character_manage update {characterId: "${c.id}", ${fixes.join(', ')}}${restHint}`);
             }
         }
 
@@ -198,6 +220,29 @@ export function reconcileWorld(db: Database.Database, worldId: string, character
                     `character_manage post_awards {characterId: "${c.id}"}`);
             }
         }
+
+        // 8. Play report 2 #5: a stealth/perception column the 2026-10-11
+        // migration moved (a born-0 default nulled, a legacy additive bonus
+        // folded into an override), until the GM acknowledges or restores it.
+        const ledger = tryRows(() => db.prepare('SELECT skill, before, after, computed, kind FROM skill_override_migrations WHERE character_id = ? AND acknowledged = 0 ORDER BY id').all(c.id) as Array<{ skill: string; before: number | null; after: number | null; computed: number | null; kind: string }>);
+        // A column back at its old number (restored by any writer) is a move
+        // undone: no longer a finding. A column moved elsewhere — the #67-F
+        // offset sync tracks stat changes on a non-null column without anyone
+        // deciding — stays listed, with the live number. An explicit
+        // stealthOverride/perceptionOverride update acknowledges its row itself
+        // (character_manage). Reconcile writes nothing here.
+        const columnsNow = ledger.length
+            ? tryRows(() => [db.prepare('SELECT stealth_bonus AS stealth, perception_bonus AS perception FROM characters WHERE id = ?').get(c.id) as { stealth: number | null; perception: number | null } | undefined]).find(Boolean)
+            : undefined;
+        for (const m of ledger) {
+            const current = columnsNow ? ((columnsNow as Record<string, number | null>)[m.skill] ?? null) : (m.after ?? null);
+            if (current === (m.before ?? null)) continue;
+            const fmt = (v: number | null) => v === null ? 'null' : signed(v);
+            const now = current !== (m.after ?? null) ? `; now ${fmt(current)}` : '';
+            const why = m.kind === 'default_to_null' ? 'a 0 nobody wrote; the sheet computes it now' : 'legacy additive bonus folded into an override';
+            push('skill_override_migrated', `${m.skill} ${signed(m.before ?? 0)} -> ${fmt(m.after)} (computed ${signed(m.computed ?? 0)}; ${why}${now})`,
+                `character_manage update {characterId: "${c.id}", ${m.skill}Override: ${m.before ?? 0}} restores the old number, or world_manage reconcile {worldId: "${worldId}", acknowledge: ["skill_override_migrated"]} accepts the move`);
+        }
     }
 
     const byKind: Partial<Record<ReconcileKind, number>> = {};
@@ -208,4 +253,26 @@ export function reconcileWorld(db: Database.Database, worldId: string, character
 /** One line per finding, for boot and the tool's text output. */
 export function reconcileLine(f: ReconcileFinding): string {
     return `${f.characterName}: [${f.kind}] ${f.detail}`;
+}
+
+/** The kinds a GM can acknowledge (the one write reconcile makes). */
+export const ACKNOWLEDGEABLE_KINDS: readonly ReconcileKind[] = ['skill_override_migrated'];
+
+/**
+ * Mark findings as seen so they stop appearing: for skill_override_migrated,
+ * the migration ledger rows of this world's characters (or one character).
+ * Returns how many rows each kind marked. Other kinds have nothing to mark;
+ * their findings clear when the sheet is fixed.
+ */
+export function acknowledgeFindings(db: Database.Database, worldId: string, kinds: readonly ReconcileKind[], characterId?: string): Partial<Record<ReconcileKind, number>> {
+    const out: Partial<Record<ReconcileKind, number>> = {};
+    if (!kinds.includes('skill_override_migrated')) return out;
+    const ids = loadCharacters(db, worldId, characterId).rows.map(c => c.id);
+    let n = 0;
+    try {
+        const stmt = db.prepare('UPDATE skill_override_migrations SET acknowledged = 1 WHERE acknowledged = 0 AND character_id = ?');
+        for (const id of ids) n += stmt.run(id).changes;
+    } catch { /* no ledger table on this db: nothing to acknowledge */ }
+    out.skill_override_migrated = n;
+    return out;
 }

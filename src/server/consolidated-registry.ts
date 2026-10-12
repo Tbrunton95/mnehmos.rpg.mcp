@@ -32,16 +32,27 @@ export function buildConsolidatedRegistry(): ToolRegistry {
  * Until outer schemas are auto-generated, audit them at every boot and
  * shout about drift where it cannot be missed.
  */
+/**
+ * The object behind a z.preprocess / refine wrapper (world_manage update and
+ * advance are preprocess-wrapped): their keys are inner params like any other,
+ * and a client strips them just the same when the outer schema lacks them.
+ */
+function shapeOf(schema: unknown): Record<string, unknown> | undefined {
+    let current = schema as { shape?: Record<string, unknown>; _def?: { typeName?: string; schema?: unknown } } | undefined;
+    while (current?._def?.typeName === 'ZodEffects') current = current._def.schema as typeof current;
+    return current?.shape;
+}
+
 export function mirrorAuditMissing(registry: ToolRegistry): Record<string, string[]> {
     const drift: Record<string, string[]> = {};
     for (const [name, entry] of Object.entries(registry)) {
-        const outerShape = (entry.schema as { shape?: Record<string, unknown> }).shape;
-        const actionSchemas = entry.actionSchemas as Record<string, { schema?: { shape?: Record<string, unknown> } }> | undefined;
+        const outerShape = shapeOf(entry.schema);
+        const actionSchemas = entry.actionSchemas as Record<string, { schema?: unknown }> | undefined;
         if (!outerShape || !actionSchemas) continue;
         const outerKeys = new Set(Object.keys(outerShape));
         const missing = new Set<string>();
         for (const def of Object.values(actionSchemas)) {
-            const innerShape = def?.schema?.shape;
+            const innerShape = shapeOf(def?.schema);
             if (!innerShape) continue;
             for (const k of Object.keys(innerShape)) {
                 if (k !== 'action' && !outerKeys.has(k)) missing.add(k);

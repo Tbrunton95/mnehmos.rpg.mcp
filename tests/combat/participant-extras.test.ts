@@ -108,4 +108,25 @@ describe('hydrateExtras', () => {
             attackDamage: '2d6+4', attackBonus: 7, attackDamageType: 'slashing' });
         expect(Object.keys(hydrateExtras({}))).toHaveLength(0);
     });
+
+    it('fightingStyle rides from the sheet unless the caller sets one', () => {
+        expect(hydrateExtras({}, { fightingStyle: 'archery' } as any).fightingStyle).toBe('archery');
+        expect(hydrateExtras({ fightingStyle: 'dueling' } as any, { fightingStyle: 'archery' } as any).fightingStyle).toBe('dueling');
+        expect(hydrateExtras({}, {} as any).fightingStyle).toBeUndefined();
+    });
+
+    // Item 18: a spent per-rest ability on the sheet stays spent on the token
+    // even when the caller resends the statline, unless it says ready itself.
+    it('a same-named sheet ability with ready:false wins over caller abilities that leave ready unset', () => {
+        const row = { abilities: [{ name: 'Second Wind', perRest: 'short', ready: false }, { name: 'Fire Breath', recharge: 5, ready: false }] } as any;
+        const out = hydrateExtras({ abilities: [{ name: 'second wind', perRest: 'short' }, { name: 'Fire Breath', recharge: 5 }, { name: 'Shove' }] } as any, row);
+        expect(out.abilities).toEqual([
+            { name: 'second wind', perRest: 'short', ready: false },
+            { name: 'Fire Breath', recharge: 5, ready: false },
+            { name: 'Shove', ready: true }
+        ]);
+        const explicit = hydrateExtras({ abilities: [{ name: 'Second Wind', perRest: 'short', ready: true }] } as any, row);
+        expect(explicit.abilities).toEqual([{ name: 'Second Wind', perRest: 'short', ready: true }]);
+        expect(hydrateExtras({}, row).abilities).toEqual(row.abilities);
+    });
 });

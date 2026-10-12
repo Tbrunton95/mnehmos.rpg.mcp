@@ -56,6 +56,16 @@ The Deep One campaign ran four days of fights outside the engine because its dic
 6. **Oaths, owed meetings and borders** are ledger rows with `kind: 'oath' | 'meeting' | 'border' | 'favour'` and a `consequence`; they lapse on the clock like a debt and need no amount.
 7. **Damage by band** is opt-in: give the band rule `damageScale: {}` for the defaults and a Mortal's blow on a Monster/Lord halves per step while the reverse grows. Grapples and executes already scaled; attacks now can.
 
+## After play report 2 (Varek)
+
+- **Action Surge is an ability flag.** `abilities: [{name: 'Action Surge', grantsAction: true, perRest: 'short'}]` on the sheet. In a fight, `attack {actionSurge: true}` spends it when the action is already used; `use_ability` banks it by hand. It stays spent across fights until `rest_manage short` or `character_manage restore_ability`.
+- **Surprise is on create.** `combat_manage create {…, surprised: [ids]}`; the flagged creatures lose their round-1 turn and reactions.
+- **Grapple works everywhere.** No encounter: the sheets roll. A helpless target is held without a contest. `execute` reads any pin you wrote to the holder's name, and `add_condition {fromGrapple}` writes the canonical one. An execute with no damage is a coup de grâce.
+- **Create is honest.** Stats you pass are final (species bonuses only on omitted stats or `applySpeciesAbilityBonuses: true`); no default background; `conditions` and `xp` on create; anything create ignores comes back in `ignoredParams`.
+- **Stealth and Perception compute from the sheet.** The override columns are empty unless you set `stealthOverride`/`perceptionOverride`; boot's `skill_override_migrated` finding lists any old row the migration moved.
+- **Battle Master.** `superiorityDie`, a `superiority` pool with `refresh: 'short'`, and `attack {maneuver}`; fighting styles on `fightingStyle`. Guide: `docs/table-rules/fighter.md`.
+- **Friction gone.** A failed call leaves its `opId` free; `world_manage create {name}` is enough; summary replies keep ids; `environment.weather` and `environment.location` are accepted.
+
 ## Never do these
 
 - **Never fake a result with a huge `attackBonus`.** Post it with `outcome`.
@@ -151,3 +161,35 @@ The Deep One campaign ran four days of fights outside the engine because its dic
 | A ship in the fight | `table_rules define {kind: 'vessel', ...}` then `character_manage create_vessel {worldId, vessel, name}`; strike a section with `atPart`; `combat_manage board {encounterId, attackerId, targetId}` for the boarding (`vessels.md`) |
 | Is the d20 fair? | `session_manage rolls {worldId, stats: true}` |
 | Damage with no attacker, or from a named one | `combat_manage apply_damage {targetIds, dice, source, actorId?}` |
+| Spend Action Surge mid-swing (the action is already used) | `combat_action attack {..., actionSurge: true \| 'Action Surge'}` (grapple too); a no-op while the action is free |
+| Bank the surge by hand, then act | `combat_manage use_ability {encounterId, participantId, ability: 'Action Surge'}` on its own turn (ability needs `grantsAction: true`); any ability spends its `actionCost` (action \| bonus \| reaction \| none) |
+| Ambush: foes caught flat-footed | `combat_manage create {..., surprised: ['gob-1']}` or `set_surprised {encounterId, participantIds, reason?}` before their round-1 turn; `surprised: false` clears |
+| Mark a sheet ability spent / ready | `character_manage spend_ability {characterId, name, reason?}` / `restore_ability {characterId, name \| all: true}` (bookkeeping; reaches live tokens by name) |
+| Mark a hold so execute and break see it | `combat_manage add_condition {encounterId, participantId, condition: 'restrained', fromGrapple: <holder id or name>}` writes source 'grapple: <holder id>' (reply heldBy); or write the source yourself as the holder's id or name, 'grapple: <id>', 'pinned by <name>' |
+| Grapple a helpless target, or post a grapple the table resolved | `combat_action grapple {encounterId?, actorId, targetId, move}` needs no roll against an unconscious/asleep/incapacitated/paralysed/stunned/petrified/0-HP target (autoWin.reason); `outcome: 'win' | 'lose'` posts the result (no d20, attack spent; with a win, `damage` is the throw/slam surface damage) |
+| Grapple outside a fight | `combat_action grapple {actorId, targetId, move}` with no encounterId: sheets, logged dice, world prof curve + expertise; two live tokens in one fight are routed there (routedToEncounter) |
+| Finish a pinned lower-band foe on the sheets | `combat_action grapple {actorId, targetId, move: 'execute', damage?, damageType?}`: no damage = coup de grâce (its HP, defences bypassed); a number or dice (crit, doubled) respects resistances; at 0 HP the kill makes a corpse (writesTo 'sheet', killed, corpseId, growth) |
+| Credit a kill made through the damage lane | `combat_manage apply_damage {encounterId?, targetIds, dice, source, actorId}`: each target dropped to 0 credits the actor's growth track (growth[], ⬆ GROWTH line) |
+| A character's Stealth or Perception looks wrong | math_manage roll_skill_check {characterId, skill} — the breakdown says computed (DEX/WIS + proficiency) or override; character_manage update {characterId, stealthOverride: null} clears an override, {stealthOverride: 0} is an authoritative zero |
+| Boot says RECONCILE with skill_override_migrated | world_manage reconcile {worldId} lists each moved column (old -> new, computed value); character_manage update {characterId, stealthOverride: <old>} restores it, or world_manage reconcile {worldId, acknowledge: ["skill_override_migrated"]} accepts the moves (characterId scopes it to one sheet) |
+| Create with rolled or point-buy scores | character_manage create {stats, applySpeciesAbilityBonuses: true} adds the species bonuses; stats alone are taken as final; omit stats for 10s + bonuses — statsNote says which |
+| Clear a character's background | character_manage update {characterId, background: null} |
+| Create with a wound clock or starting XP | character_manage create {conditions | addConditions, xp}; a key create does not take comes back in ignoredParams with the nearest valid key or the update-only hint |
+| Re-import a preset without losing a rewritten principle | table_rules import {worldId, preset} keeps your principles (kept: n); {overwrite: true} replaces them |
+| A call failed validation or named a wrong action and you sent an opId | resend the corrected call with the same opId — the reply said 'op <id> NOT applied (error) — opId still free' |
+| You want to know whether an opId ever applied | session_manage op_status {forOpId} — a preview (writes: 'none') or an error reply reads 'did not apply' |
+| A new world, no seed in mind | world_manage create {name} — seed generated (8 hex, echoed as seed, seedGenerated: true), 100x100; pass seed/width/height to choose |
+| Set the weather or where the party is | world_manage update {worldId, environment: {weatherConditions: 'sleet', location: 'Vorago docks'}} — weather, currentLocation and place are accepted aliases; the reply's aliased lists renames |
+| You misspelt an environment key | the refusal names the nearest accepted key and the full list; nothing was written |
+| You need ids out of a summary reply | output_mode: 'summary' keeps id-like keys and short names of oversized objects and lists (25 rows a list, 50 a reply, then {_more}); _op carries the guard's op line |
+| Where and when, before play | session_manage boot — first line 'Now: Day 47, 06:00 · era … · sleet · at …'; the full status block shows an AT row, get_context world has weather and location |
+| Mark a pool to refill on a rest | `character_manage adjust_pool {characterId, pool: 'superiority', value: 4, max: 4, refresh: 'short' \| 'long' \| 'none'}` |
+| An ability that comes back on a rest | `character_manage update {abilities: [{name: 'Second Wind', perRest: 'short' \| 'long', actionCost?}]}`; `use_ability` / `battle_cry` / `attack {actionSurge}` spend it on the token and the sheet |
+| Rest one character | `rest_manage short \| long {characterId}`: pools by `refresh`, `perRest` abilities, legendary resistances (long), slots; refused while a token in an active encounter (`combat_manage end` first) |
+| Rest the party | `travel_manage rest {partyId, restType: 'long' \| 'short'}`: the same per member (`members[].refilled`) |
+| Give a fighter a style | `character_manage update {fightingStyle: 'great_weapon' \| 'dueling' \| 'archery' \| 'defense'}`; profiles carry `twoHanded` and `ranged`; one swing: `attack {twoHanded: true}` |
+| Set up a Battle Master | `character_manage update {superiorityDie: '1d8', maneuverAbility?: 'str' \| 'dex'}` + `adjust_pool {pool: 'superiority', value: 4, max: 4, refresh: 'short'}` |
+| Trip, menace or disarm on a hit | `combat_action attack {actorId, targetId, maneuver: 'trip' \| 'menacing' \| 'disarming', maneuverItem?}` |
+| Turn a near miss | `combat_action attack {..., maneuver: 'precision'}` (rolled only on a miss within the die; a natural 1 is never turned) |
+| Answer a melee miss | `combat_action attack {..., maneuver: 'riposte', reaction: true}` |
+| Audit the superiority dice | `session_manage rolls {encounterId, purpose: 'superiority'}`; the pool's history on `character_manage get` |

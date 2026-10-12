@@ -131,6 +131,84 @@ describe('kill credit in combat', () => {
     });
 });
 
+/**
+ * Play report 2, item 6: apply_damage took actorId for band scaling only, so
+ * a kill through it (the GM's damage lane for anything the attack path does
+ * not model) never fed the actor's growth track. With actorId, every target
+ * it drops to 0 credits the kill: perKill plus perBandAbove, in order.
+ */
+describe('kill credit from apply_damage', () => {
+    const manage = async (a: Record<string, unknown>) => json(await handleCombatManage(a, ctx as any));
+    async function fightWith(victims: Array<Record<string, unknown>>): Promise<string> {
+        return (await manage({ action: 'create', worldId: W, participants: [
+            { id: 'grimgor', name: 'Grimgor', hp: 20, maxHp: 20, initiative: 20, position: { x: 0, y: 0 } },
+            ...victims.map((v, i) => ({ hp: 5, maxHp: 5, ac: 1, isEnemy: true, initiative: 1, position: { x: i + 1, y: 0 }, ...v }))
+        ] })).encounterId;
+    }
+
+    it('with actorId, a target dropped to 0 credits the kill: perKill, the GROWTH line and the pool', async () => {
+        const enc = await fightWith([{ id: 'gob', name: 'Gob', band: 'Grot' }]);
+        const r = await manage({ action: 'apply_damage', encounterId: enc, targetIds: ['gob'], dice: 10, source: "Grimgor's choppa", actorId: 'grimgor' });
+        expect(r.success).toBe(true);
+        expect(r.growth).toHaveLength(1);
+        expect(r.growth[0]).toMatchObject({ victimId: 'gob', track: 'Getting Bigga', pool: 'growth', delta: 1, from: 8, to: 9, reason: 'kill: Gob' });
+        expect(r.message).toMatch(/GROWTH Getting Bigga: growth 8 → 9 \(kill: Gob\)/);
+        expect(growth('grimgor')).toBe(9);
+        expect(sheet('grimgor').resourcePools.growth.history.at(-1).reason).toBe('kill: Gob');
+    });
+
+    it('a victim of the same band is worth perBandAbove more, and the offer rides the reply', async () => {
+        const enc = await fightWith([{ id: 'rival', name: 'Rival Boy', band: 'Boy' }]);
+        const r = await manage({ action: 'apply_damage', encounterId: enc, targetIds: ['rival'], dice: 10, source: 'choppa', actorId: 'grimgor' });
+        expect(r.growth[0]).toMatchObject({ delta: 2, from: 8, to: 10 });
+        expect(r.growth[0].growthReady).toMatchObject({ form: 'Orruk Brute' });
+        expect(r.message).toMatch(/ready for Orruk Brute/);
+        expect(sheet('grimgor').form).toBeUndefined();
+    });
+
+    it('no actorId, a non-lethal hit, or the actor among its own targets: no credit for those', async () => {
+        const enc = await fightWith([{ id: 'gob', name: 'Gob', band: 'Grot' }, { id: 'gob2', name: 'Gob 2', band: 'Grot' }]);
+        const hazard = await manage({ action: 'apply_damage', encounterId: enc, targetIds: ['gob'], dice: 10, source: 'rubble' });
+        expect(hazard.growth).toBeUndefined();
+        const graze = await manage({ action: 'apply_damage', encounterId: enc, targetIds: ['gob2'], dice: 2, source: 'choppa', actorId: 'grimgor' });
+        expect(graze.growth).toBeUndefined();
+        expect(growth('grimgor')).toBe(8);
+        const blast = await manage({ action: 'apply_damage', encounterId: enc, targetIds: ['grimgor', 'gob2'], dice: 30, source: 'blast', actorId: 'grimgor' });
+        expect(blast.growth.map((g: any) => g.victimId)).toEqual(['gob2']);
+        expect(growth('grimgor')).toBe(9);
+    });
+
+    it('two kills in one call are credited in order, each with its line', async () => {
+        const enc = await fightWith([{ id: 'gob', name: 'Gob', band: 'Grot' }, { id: 'rival', name: 'Rival Boy', band: 'Boy' }]);
+        const r = await manage({ action: 'apply_damage', encounterId: enc, targetIds: ['gob', 'rival'], dice: 10, source: 'Waaagh!', actorId: 'grimgor' });
+        expect(r.growth.map((g: any) => [g.victimId, g.from, g.to])).toEqual([['gob', 8, 9], ['rival', 9, 11]]);
+        expect(growth('grimgor')).toBe(11);
+        expect(r.message.match(/GROWTH/g)).toHaveLength(2);
+    });
+
+    it('a routed call (no encounterId, live tokens) credits once', async () => {
+        await fightWith([{ id: 'gob', name: 'Gob', band: 'Grot' }]);
+        const r = await manage({ action: 'apply_damage', targetIds: ['gob'], dice: 10, source: 'choppa', actorId: 'grimgor' });
+        expect(r.routedToEncounter).toBe(true);
+        expect(r.growth).toHaveLength(1);
+        expect(growth('grimgor')).toBe(9);
+    });
+
+    it('on sheets outside a fight the pool moves and the line prints', async () => {
+        new CharacterRepository(getDb()).update('wolf', { hp: 5, maxHp: 5 } as any);
+        const r = await manage({ action: 'apply_damage', targetIds: ['wolf'], dice: 10, source: 'ambush', actorId: 'grimgor' });
+        expect(r.encounterId).toBeUndefined();
+        expect(r.targets[0].defeated).toBe(true);
+        expect(r.growth[0]).toMatchObject({ victimId: 'wolf', delta: 3, from: 8, to: 11 });
+        expect(r.message).toMatch(/⬆ GROWTH Getting Bigga: growth 8 → 11 \(kill: Big Wolf\)/);
+        expect(growth('grimgor')).toBe(11);
+        // Already dead: a second blow is not a second kill.
+        const again = await manage({ action: 'apply_damage', targetIds: ['wolf'], dice: 10, source: 'ambush', actorId: 'grimgor' });
+        expect(again.growth).toBeUndefined();
+        expect(growth('grimgor')).toBe(11);
+    });
+});
+
 describe('after_battle perVictory', () => {
     it('adds perVictory to every surviving member with the pool', async () => {
         const pid = (await party({ action: 'create', name: 'Da Boyz', initialMembers: [{ characterId: 'grimgor', role: 'leader' }] })).party.id;

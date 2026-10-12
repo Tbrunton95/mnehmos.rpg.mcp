@@ -203,6 +203,67 @@ export function normalizeConditions(inputs: ConditionInput[] | undefined, partic
         .filter((c): c is Condition => c !== null);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Grapple holds (play report 2, items 2-3). One matcher reads every way a
+// GM writes who holds whom; execute and break both lean on it.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** The names a hold puts on: what a break clears and a pin is read from. */
+export const HOLD_CONDITIONS = ['clinched', 'grappled', 'restrained', 'pinned'] as const;
+/** A pin by itself; Grappled + Prone is the other way to be pinned. */
+export const PIN_CONDITIONS = ['restrained', 'pinned'] as const;
+/**
+ * A target that cannot contest a grapple (house ruling; 5e RAW lets an
+ * incapacitated creature still roll). Matched case-insensitively against
+ * token types and sheet names, so a custom 'Asleep' counts.
+ */
+export const HELPLESS_CONDITIONS = ['unconscious', 'asleep', 'sleeping', 'incapacitated', 'paralyzed', 'paralysed', 'stunned', 'petrified'] as const;
+
+/** The canonical source a grapple writes: 'grapple: <holder id>'. */
+export function grappleSource(holderId: string): string {
+    return `grapple: ${holderId}`;
+}
+
+/** 'grapple: x', 'grappled by x', 'pinned by x', 'held by x', 'grabbed by x', 'held: x', 'grapple - x'. */
+const HOLDER_PREFIX = /^(?:grapple[ds]?|pinned|held|grabbed)(?:\s+by)?\s*[:\-–]?\s*/i;
+
+/**
+ * How a condition's source names a holder: 'prefixed' when a grapple prefix
+ * stands before the holder's id or name ('grapple: marine', 'pinned by
+ * Marine'), 'bare' when the source is the id or name alone ('Marine'), null
+ * when it names someone or something else ('spell: Web', 'Brute'). The
+ * WHOLE remainder must be the id or name: 'Marines' never names Marine.
+ * Both the raw source and the prefix-stripped remainder are compared, so a
+ * holder called 'Held Thorsson' still matches its own bare name.
+ */
+export function holderMatch(source: string | undefined | null, holder: { id: string; name: string }): 'prefixed' | 'bare' | null {
+    const raw = String(source ?? '').trim().toLowerCase();
+    if (!raw) return null;
+    const names = [holder.id, holder.name].map(x => String(x ?? '').trim().toLowerCase()).filter(Boolean);
+    if (names.includes(raw)) return 'bare';
+    const stripped = raw.replace(HOLDER_PREFIX, '').trim();
+    return stripped && stripped !== raw && names.includes(stripped) ? 'prefixed' : null;
+}
+
+/** Whether a condition's source names this holder in any accepted form. */
+export function sourceNamesHolder(source: string | undefined | null, holder: { id: string; name: string }): boolean {
+    return holderMatch(source, holder) !== null;
+}
+
+/**
+ * Why a creature cannot contest a grapple, or undefined when it can: a
+ * helpless condition (named with the label it carries) or 0 HP. Reads token
+ * conditions ({type}) and sheet conditions ({name}) alike.
+ */
+export function helplessReason(who: { name: string; hp?: number | null; conditions?: Array<{ type?: string; name?: string }> | null }): string | undefined {
+    for (const c of who.conditions ?? []) {
+        const label = String(c.type ?? c.name ?? '').trim();
+        if (label && (HELPLESS_CONDITIONS as readonly string[]).includes(label.toLowerCase())) return `${who.name} is ${label}`;
+    }
+    if (typeof who.hp === 'number' && who.hp <= 0) return `${who.name} is at 0 HP`;
+    return undefined;
+}
+
 /**
  * Condition effect modifiers
  * Defines mechanical effects of each condition type

@@ -1,5 +1,6 @@
 import seedrandom from 'seedrandom';
 import { assertNotCryptoKey, cryptoInt, cryptoNonce, cryptoReplayKey } from '../../math/crypto-dice.js';
+import { parseDiceTerms } from './dice-terms.js';
 
 /**
  * Comprehensive Combat RNG system supporting multiple RPG dice mechanics.
@@ -421,17 +422,25 @@ export class CombatRNG {
     /**
      * Roll damage dice with detailed breakdown.
      * Supports compound expressions like "1d6+4+2d6" (sneak attack) and "1d8+3+2d8" (smite).
+     *
+     * Item 17: rerollAtOrBelow rerolls every positive die at or below it once
+     * (great weapon fighting) and keeps the new value. The rerolls are drawn
+     * after the main pass under `<purpose> reroll (great weapon fighting)`,
+     * so roll_log shows one damage record and one reroll record. Negative
+     * terms are never rerolled.
      */
-    rollDamageDetailed(notation: string): DamageResult {
+    rollDamageDetailed(notation: string, opts: { rerollAtOrBelow?: number } = {}): DamageResult {
         const terms = parseDiceTerms(notation);
         const rolls: number[] = [];
         let diceTotal = 0;
         let modifier = 0;
+        const pending: Array<{ index: number; sides: number }> = [];
 
         for (const term of terms) {
             if (term.kind === 'dice') {
                 for (let i = 0; i < term.count; i++) {
                     const r = this.rollDie(term.sides);
+                    if (term.sign === 1 && opts.rerollAtOrBelow !== undefined && r <= opts.rerollAtOrBelow) pending.push({ index: rolls.length, sides: term.sides });
                     rolls.push(term.sign * r);
                     diceTotal += term.sign * r;
                 }
@@ -440,12 +449,30 @@ export class CombatRNG {
             }
         }
 
+        let rerolls: DamageResult['rerolls'];
+        if (pending.length) {
+            const saved = this.tag;
+            this.tag = { ...saved, purpose: `${saved.purpose} reroll (great weapon fighting)` };
+            try {
+                rerolls = pending.map(({ index, sides }) => {
+                    const from = rolls[index];
+                    const to = this.rollDie(sides);
+                    rolls[index] = to;
+                    diceTotal += to - from;
+                    return { sides, from, to };
+                });
+            } finally {
+                this.tag = saved;
+            }
+        }
+
         return {
             notation,
             rolls,
             diceTotal,
             modifier,
-            total: diceTotal + modifier
+            total: diceTotal + modifier,
+            ...(rerolls ? { rerolls } : {})
         };
     }
 }
@@ -471,57 +498,12 @@ export interface CheckResult {
  */
 export interface DamageResult {
     notation: string;       // Original notation (e.g., "2d6+3")
-    rolls: number[];        // Individual die results
+    rolls: number[];        // Individual die results (after any reroll)
     diceTotal: number;      // Sum of dice only
     modifier: number;       // Flat modifier
     total: number;          // Final damage total
+    rerolls?: Array<{ sides: number; from: number; to: number }>;  // Item 17: dice rerolled once (great weapon fighting)
 }
 
-export type DiceTerm =
-    | { kind: 'dice'; count: number; sides: number; sign: 1 | -1 }
-    | { kind: 'scalar'; value: number; sign: 1 | -1 };
-
-/**
- * Parse compound dice notation into a list of terms.
- * Accepts a `+`/`-`-joined chain of dice (`NdS`, `dS`) and integers.
- * Examples: `1d6+4+2d6`, `1d8+3+2d8`, `2d6+1d4-2`, `d20+5`.
- *
- * Strict grammar — rejects malformed operator chains like `1d6++2`,
- * `1d6--2`, `1d6+`, or trailing operators. Pattern:
- *   <term> ( [+-] <term> )*
- *   <term> := <int> | <int>?d<int>
- * with at most one leading sign.
- */
-export function parseDiceTerms(notation: string): DiceTerm[] {
-    const stripped = notation.replace(/\s+/g, '');
-    if (!stripped) {
-        throw new Error(`Invalid dice notation: ${notation}`);
-    }
-    const TERM = String.raw`(?:\d*d\d+|\d+)`;
-    const STRICT = new RegExp(`^[+-]?${TERM}(?:[+-]${TERM})*$`, 'i');
-    if (!STRICT.test(stripped)) {
-        throw new Error(`Invalid dice notation: ${notation}`);
-    }
-
-    // Tokenize once the grammar check has passed.
-    const tokens = stripped.match(/[+-]?[^+-]+/g)!;
-
-    const terms: DiceTerm[] = [];
-    for (const raw of tokens) {
-        const sign: 1 | -1 = raw.startsWith('-') ? -1 : 1;
-        const body = raw.replace(/^[+-]/, '');
-        const diceMatch = body.match(/^(\d*)d(\d+)$/i);
-        if (diceMatch) {
-            const count = diceMatch[1] === '' ? 1 : parseInt(diceMatch[1], 10);
-            const sides = parseInt(diceMatch[2], 10);
-            if (count <= 0 || sides <= 0) {
-                throw new Error(`Invalid dice notation: ${notation}`);
-            }
-            terms.push({ kind: 'dice', count, sides, sign });
-            continue;
-        }
-        // Grammar already guaranteed scalar shape.
-        terms.push({ kind: 'scalar', value: parseInt(body, 10), sign });
-    }
-    return terms;
-}
+// parseDiceTerms and DiceTerm live in dice-terms.ts (shared with crypto-dice); re-exported for every importer.
+export { parseDiceTerms, type DiceTerm } from './dice-terms.js';

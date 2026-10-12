@@ -123,4 +123,12 @@ describe('WorldRepository', () => {
         const updated = repo.updateEnvironment('world-env', { weather: 'fog' });
         expect(updated?.environment).toEqual({ timeOfDay: 'dusk', weatherConditions: 'fog' });
     });
+
+    it('location is part of the contract, and legacy currentLocation / place normalise to it', () => {
+        repo.create({ id: 'world-loc', name: 'Located', seed: 'seed-loc', width: 20, height: 20, createdAt: FIXED_TIMESTAMP, updatedAt: FIXED_TIMESTAMP });
+        db.prepare('UPDATE worlds SET environment = ? WHERE id = ?').run(JSON.stringify({ currentLocation: 'Vorago docks' }), 'world-loc');
+        expect(repo.findById('world-loc')?.environment).toEqual({ location: 'Vorago docks' });
+        expect(repo.updateEnvironment('world-loc', { place: 'the mill' })?.environment).toEqual({ location: 'the mill' });
+        expect(repo.updateEnvironment('world-loc', { location: 'the gate' })?.environment).toEqual({ location: 'the gate' });
+    });
 });

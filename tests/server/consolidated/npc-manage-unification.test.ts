@@ -8,7 +8,7 @@
  * are configured and explicit imports break test collection on Windows + vitest 1.6.1.
  */
 
-import { handleNpcManage } from '../../../src/server/consolidated/npc-manage.js';
+import { handleNpcManage, NpcManageTool } from '../../../src/server/consolidated/npc-manage.js';
 import { getDb, closeDb } from '../../../src/storage/index.js';
 import { CharacterRepository } from '../../../src/storage/repos/character.repo.js';
 import { NpcMemoryRepository } from '../../../src/storage/repos/npc-memory.repo.js';
@@ -61,6 +61,8 @@ describe('npc_manage unification — create + get_full_context', () => {
             expect(data.character.name).toBe('Bartender Bob');
             expect(data.character.characterType).toBe('npc');
             expect(data.character.characterClass).toBe('Commoner');
+            // Play report 2 #9: no 'Stalker' placeholder background.
+            expect(data.character.background).toBeUndefined();
 
             // Verify character row exists in DB
             const db = getDb(':memory:');
@@ -68,6 +70,28 @@ describe('npc_manage unification — create + get_full_context', () => {
             const stored = charRepo.findById(data.characterId);
             expect(stored).not.toBeNull();
             expect(stored!.name).toBe('Bartender Bob');
+        });
+
+        // Play report 2 #8: npc_manage forwards omitted stats as omitted, so the
+        // NPC gets the 10 baseline + species bonuses and an honest statsNote;
+        // placed stats are final.
+        it('omitted stats take the species bonuses on the baseline; placed stats are final', async () => {
+            const baseline = parseResult(await handleNpcManage({ action: 'create', name: 'Dwarf Smith', race: 'Hill Dwarf' }, ctx));
+            expect(baseline.success).toBe(true);
+            expect(baseline.character.stats).toMatchObject({ con: 12, wis: 11, str: 10 });
+            expect(baseline.statsNote).toBe('No stats given: 10 baseline + Hill Dwarf bonuses (+2 CON, +1 WIS).');
+
+            const placed = parseResult(await handleNpcManage({ action: 'create', name: 'Dwarf Guard', race: 'Hill Dwarf', stats: { str: 14, dex: 10, con: 14, int: 10, wis: 10, cha: 10 } }, ctx));
+            expect(placed.character.stats).toMatchObject({ str: 14, con: 14, wis: 10 });
+            expect(placed.statsNote).toMatch(/^Stats taken as final: Hill Dwarf ability bonuses \(\+2 CON, \+1 WIS\) were NOT added/);
+
+            const plain = parseResult(await handleNpcManage({ action: 'create', name: 'Mutant Thing', race: 'Mutant' }, ctx));
+            expect(plain.statsNote).toBeUndefined();
+
+            // The note's hint must be a key npc_manage accepts: raw rolled scores take the bonuses on request.
+            const rolled = parseResult(await handleNpcManage(NpcManageTool.inputSchema.parse({ action: 'create', name: 'Dwarf Scout', race: 'Hill Dwarf', stats: { str: 14, dex: 10, con: 14, int: 10, wis: 10, cha: 10 }, applySpeciesAbilityBonuses: true }), ctx));
+            expect(rolled.character.stats).toMatchObject({ str: 14, con: 16, wis: 11 });
+            expect(rolled.statsNote).toBe('Hill Dwarf bonuses (+2 CON, +1 WIS) added to the stats you passed.');
         });
 
         it('propagates full sheet fields through to the character row', async () => {

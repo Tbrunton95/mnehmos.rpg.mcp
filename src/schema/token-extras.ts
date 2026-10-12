@@ -63,6 +63,21 @@ export const SizeCategorySchema = z.enum([
 ]);
 export type SizeCategory = z.infer<typeof SizeCategorySchema>;
 
+/**
+ * Item 17: the fighting styles the engine applies by itself. archery: +2 to
+ * hit on a ranged attack. great_weapon: weapon dice of 1 or 2 are rerolled
+ * once on a two-handed melee hit (crit dice too; never added dice such as a
+ * superiority die). dueling: +2 damage on a one-handed melee hit (not with
+ * twoHanded, not hand: 'offhand'). defense: +1 AC when the target's AC is
+ * derived from its sheet or token and it wears armour: if the sheet's ac
+ * already counts it, do not set defense (or pass dc) or it counts twice.
+ * two_weapon is not listed: the engine never subtracted the off-hand
+ * modifier, so there is nothing for it to lift.
+ */
+export const FIGHTING_STYLES = ['great_weapon', 'dueling', 'archery', 'defense'] as const;
+export const FightingStyleSchema = z.enum(FIGHTING_STYLES);
+export type FightingStyle = z.infer<typeof FightingStyleSchema>;
+
 /** A named attack: its bonus, damage and the part that makes it ('whip' in the left arm). */
 export const AttackProfileSchema = z.object({
     name: z.string().min(1).describe("Profile name ('axe', 'whip'); attack {using} picks it"),
@@ -72,20 +87,35 @@ export const AttackProfileSchema = z.object({
     part: z.string().optional().describe('The part that makes this attack (its state applies)'),
     item: z.string().optional().describe("The inventory item this profile swings ('Chainsword', an item id or instance id). world_manage reconcile flags a profile whose item the character no longer holds"),
     reachFt: z.number().int().min(0).optional().describe('Reach in feet when longer than the creature\'s own'),
-    ranged: z.boolean().optional(),
+    ranged: z.boolean().optional().describe('A ranged weapon: archery applies, great weapon fighting and dueling do not. Unset: read from the grid when both tokens are placed, else melee'),
+    twoHanded: z.boolean().optional().describe('Wielded in both hands: great weapon fighting applies, dueling does not'),
     default: z.boolean().optional().describe('Used when an attack names no profile'),
     note: z.string().optional()
 });
 export type AttackProfile = z.infer<typeof AttackProfileSchema>;
 
-/** A limited ability ('Hellfire Breath', recharge 5-6). */
+/** A limited ability ('Hellfire Breath', recharge 5-6; 'Second Wind', perRest short). */
 export const AbilitySchema = z.object({
     name: z.string().min(1),
     recharge: z.number().int().min(2).max(6).optional().describe('Recharges on a d6 roll of this or higher at the start of its turn'),
     ready: z.boolean().default(true),
+    grantsAction: z.boolean().optional().describe('Using it gives one extra action this turn (Action Surge): it costs nothing, is spent on use, and is used on its own turn'),
+    actionCost: z.enum(['action', 'bonus', 'reaction', 'none']).optional().describe("What using it costs (default action; none when grantsAction). action|bonus only on its own turn"),
+    perRest: z.enum(['short', 'long']).optional().describe('Spent on use (mirrored to the sheet) and readied by a rest: short = any rest, long = a long rest only'),
     note: z.string().optional()
 });
 export type Ability = z.infer<typeof AbilitySchema>;
+
+/**
+ * The same ability as a participant input (combat_manage create,
+ * add_participant): `ready` stays unset when the caller did not say, so the
+ * sheet's spent state can win (hydrateExtras). The token is normalised to a
+ * boolean before it is stored.
+ */
+export const AbilityInputSchema = AbilitySchema.extend({
+    ready: z.boolean().optional().describe('Unset: the sheet decides (a spent perRest ability stays spent); true/false is kept as sent')
+});
+export type AbilityInput = z.infer<typeof AbilityInputSchema>;
 
 /**
  * Who counts as 'nearby' for a Waaagh! (a spell's nearby bonus, a battle
@@ -133,7 +163,7 @@ export const ParticipantExtrasShape = {
     attackDamageType: z.string().optional().describe('Damage type of the default attack'),
     attacksPerAction: z.number().int().min(1).optional().describe('Multiattack: attacks one Attack action allows (default 1)'),
     attacks: z.array(AttackProfileSchema).optional().describe('Named attack profiles {name, attackBonus, damage, damageType?, part?, reachFt?, default?}'),
-    abilities: z.array(AbilitySchema).optional().describe('Limited abilities {name, recharge?, ready?}'),
+    abilities: z.array(AbilityInputSchema).optional().describe('Limited abilities {name, recharge?, perRest?: short | long, grantsAction?, actionCost?, ready?}; ready unset lets a spent sheet ability stay spent'),
     legendaryActions: z.number().int().min(0).optional().describe('Legendary actions per round'),
     legendaryResistances: z.number().int().min(0).optional().describe('Legendary resistances per day'),
     legendaryResistancesRemaining: z.number().int().min(0).optional().describe('Legendary resistances left (defaults to the full count)'),
@@ -141,7 +171,8 @@ export const ParticipantExtrasShape = {
     hasLairActions: z.boolean().optional().describe('Adds a LAIR slot at initiative 20 to the turn order'),
     cr: z.number().min(0).optional().describe('Challenge rating'),
     species: z.string().optional().describe("Species ('Orruk'): nearby counts and battle cries match it"),
-    tags: z.array(z.string()).optional().describe("Free tags ('mob', 'ladz') that nearby matches read")
+    tags: z.array(z.string()).optional().describe("Free tags ('mob', 'ladz') that nearby matches read"),
+    fightingStyle: FightingStyleSchema.optional().describe('great_weapon | dueling | archery | defense: applied by the engine on its attacks (defense on attacks against it); default from the sheet')
 };
 
 export const UnitTierSchema = z.object({
@@ -189,7 +220,8 @@ export const ReadiedAttackSchema = z.object({
     attackBonus: z.number().int().optional(),
     damage: z.union([z.number(), z.string()]).optional(),
     damageType: z.string().optional(),
-    withPart: z.string().optional().describe('The part that makes the attack')
+    withPart: z.string().optional().describe('The part that makes the attack'),
+    twoHanded: z.boolean().optional().describe('Swung in both hands (great weapon fighting; no dueling); default from the profile')
 });
 export type ReadiedAttack = z.infer<typeof ReadiedAttackSchema>;
 

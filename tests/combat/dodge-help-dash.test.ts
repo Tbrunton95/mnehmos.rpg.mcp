@@ -86,6 +86,15 @@ describe('dodge, help and dash survive a reload', () => {
     it('dash', async () => {
         await handleCombatAction({ action: 'dash', encounterId, actorId: 'marine' }, ctx as any);
         expect(saved('marine').hasDashed).toBe(true);
+        expect(saved('marine').dashes).toBe(1);
+        expect(saved('marine').movementRemaining).toBe(60);
+    });
+
+    it('a second dash without an extra action is refused by the economy', async () => {
+        await handleCombatAction({ action: 'dash', encounterId, actorId: 'marine' }, ctx as any);
+        const text = (await handleCombatAction({ action: 'dash', encounterId, actorId: 'marine' }, ctx as any)).content[0].text;
+        expect(text).toMatch(/Action already used this turn/);
+        expect(saved('marine').dashes).toBe(1);
         expect(saved('marine').movementRemaining).toBe(60);
     });
 

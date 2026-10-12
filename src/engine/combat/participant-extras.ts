@@ -5,15 +5,23 @@
  * `undefined` over anything.
  */
 import type { CombatParticipant } from './engine.js';
-import type { Part, SizeCategory, Shields } from '../../schema/token-extras.js';
+import type { Part, SizeCategory, Shields, Ability, AbilityInput } from '../../schema/token-extras.js';
 import { CREATURE_PRESETS, type CreaturePreset } from '../../data/creature-presets.js';
+import { sameName } from './abilities.js';
 
-/** Fields a caller may pass for a new participant (create, add_participant). */
-export type ExtrasInput = Partial<Pick<CombatParticipant,
-    'size' | 'reach' | 'movementSpeed' | 'attackBonus' | 'attackDamage' | 'attackDamageType' |
+type ExtrasKey = 'size' | 'reach' | 'movementSpeed' | 'attackBonus' | 'attackDamage' | 'attackDamageType' |
     'attacksPerAction' | 'attacks' | 'abilities' | 'legendaryActions' | 'legendaryResistances' |
     'legendaryResistancesRemaining' | 'autoLegendaryResistance' | 'hasLairActions' | 'cr' |
-    'band' | 'regeneration' | 'parts' | 'ac' | 'species' | 'tags' | 'swimSpeed' | 'flySpeed' | 'vessel' | 'shields'>>;
+    'band' | 'regeneration' | 'parts' | 'ac' | 'species' | 'tags' | 'swimSpeed' | 'flySpeed' | 'vessel' | 'shields' | 'fightingStyle';
+
+/** What hydrateExtras hands the token: every ability carries a boolean ready. */
+export type ExtrasOutput = Partial<Pick<CombatParticipant, ExtrasKey>>;
+
+/**
+ * Fields a caller may pass for a new participant (create, add_participant).
+ * Abilities arrive as inputs: `ready` unset means "the sheet decides".
+ */
+export type ExtrasInput = Omit<ExtrasOutput, 'abilities'> & { abilities?: AbilityInput[] };
 
 /** The character-row fields that default a token (the sheet side of hydrateExtras). */
 export type ExtrasRow = ExtrasInput & { parts?: Part[]; speed?: number; resourcePools?: Record<string, { current: number; max: number }> };
@@ -23,7 +31,7 @@ const ROW_KEYS = [
     'size', 'reach', 'movementSpeed', 'swimSpeed', 'flySpeed', 'attackBonus', 'attackDamage', 'attackDamageType',
     'attacksPerAction', 'attacks', 'abilities', 'legendaryActions', 'legendaryResistances',
     'legendaryResistancesRemaining', 'autoLegendaryResistance', 'hasLairActions', 'cr',
-    'species', 'tags', 'vessel'
+    'species', 'tags', 'vessel', 'fightingStyle'
 ] as const;
 
 /** The preset side: CreaturePreset names its fields differently. */
@@ -42,11 +50,25 @@ function presetExtras(preset?: CreaturePreset): ExtrasInput {
 }
 
 /**
+ * Item 18: the caller's abilities, with the sheet's spent state carried over.
+ * An entry whose `ready` the caller left unset takes `ready: false` from a
+ * same-named sheet ability that is spent (a per-rest ability the last fight
+ * used), else ready. An explicit ready from the caller is kept as sent.
+ */
+function mergeAbilities(callers: AbilityInput[], row?: Ability[] | null): Ability[] {
+    return callers.map(a => {
+        if (a.ready !== undefined) return a as Ability;
+        const onSheet = (row ?? []).find(r => sameName(r.name, a.name));
+        return { ...a, ready: onSheet?.ready === false ? false : true };
+    });
+}
+
+/**
  * Default a new participant's extras: caller ?? row ?? preset, per field.
  * Returns only the keys that resolved to a value. Empty parts from the row do
  * not count as set (a sheet with parts: [] gives the token none).
  */
-export function hydrateExtras(p: ExtrasInput, row?: ExtrasRow | null, preset?: CreaturePreset): ExtrasInput {
+export function hydrateExtras(p: ExtrasInput, row?: ExtrasRow | null, preset?: CreaturePreset): ExtrasOutput {
     const fromPreset = presetExtras(preset);
     const out: Record<string, unknown> = {};
     for (const key of ROW_KEYS) {
@@ -55,6 +77,10 @@ export function hydrateExtras(p: ExtrasInput, row?: ExtrasRow | null, preset?: C
         const value = p[key] ?? rowValue ?? (fromPreset as Record<string, unknown>)[key];
         if (value === undefined || value === null) continue;
         if (key === 'parts' && Array.isArray(value) && value.length === 0) continue;
+        if (key === 'abilities' && p.abilities) {
+            out.abilities = mergeAbilities(p.abilities, row?.abilities as Ability[] | undefined);
+            continue;
+        }
         out[key] = value;
     }
     // Request 5: a vessel's shields ride its `shields` resource pool, and its
@@ -67,7 +93,7 @@ export function hydrateExtras(p: ExtrasInput, row?: ExtrasRow | null, preset?: C
         }
         if (out.movementSpeed === undefined && typeof vessel.speed === 'number') out.movementSpeed = vessel.speed;
     }
-    return out as ExtrasInput;
+    return out as ExtrasOutput;
 }
 
 /**

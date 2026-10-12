@@ -1,35 +1,103 @@
 /**
  * output_mode: 'summary' — a small reply for chairs whose context is precious.
  * Keeps the result's scalar fields and short lists, and replaces anything
- * large (a 40 KB condition list, a full sheet's arrays) with its size.
+ * large (a 40 KB condition list, a full sheet's arrays) with its size —
+ * except the handles. An oversized object keeps its id-like keys and a short
+ * name beside `_keys`; an oversized list of id-bearing rows keeps those
+ * handles per row, 25 rows a list and 50 a reply, the remainder counted as
+ * `{_more}` (play report 2, #13). Lists and objects without a handle still
+ * collapse to '[N items]' / '{N keys}'.
  */
+import { replyData, splitOpLine } from './reply-status.js';
+
 const MAX_STRING = 300;
 const MAX_INLINE = 200;
+/** Rows of handles kept from one id-bearing list. */
+const MAX_ID_ROWS = 25;
+/** Rows of handles kept across one reply, nested lists included. */
+const MAX_ID_ROWS_PER_REPLY = 50;
+/** A top-level `…Ids` list of scalars keeps this many. */
+const MAX_ID_SCALARS = 50;
+/** A `name` longer than this is text, not a handle. */
+const MAX_NAME = 80;
 
-function shrink(value: unknown): unknown {
+const ID_KEY = /^(id|[a-z][A-Za-z0-9]*Id|[a-z][a-z0-9_]*_id)$/;
+const IDS_KEY = /Ids$/;
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+const isScalar = (v: unknown): boolean => v === null || typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
+const hasIdKey = (o: Record<string, unknown>): boolean => Object.entries(o).some(([k, v]) => ID_KEY.test(k) && isScalar(v));
+
+/** The handles of an object: its id-like scalars, and its name when short. */
+function idView(o: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(o)) if (ID_KEY.test(k) && isScalar(v)) out[k] = v;
+    if (typeof o.name === 'string' && o.name.length <= MAX_NAME) out.name = o.name;
+    return out;
+}
+
+/** What is left of the reply's row budget while one summary is built. */
+type Budget = { rows: number };
+
+/**
+ * An oversized list: the handles of each row when any row carries an id key,
+ * capped by the list and the reply budgets with the remainder counted;
+ * undefined when the list has no id-bearing row.
+ */
+function idRows(arr: unknown[], budget: Budget): unknown[] | string | undefined {
+    const objs = arr.filter(isPlainObject);
+    if (!objs.some(hasIdKey)) return undefined;
+    if (budget.rows <= 0) return `[${arr.length} items]`;
+    const take = Math.min(MAX_ID_ROWS, budget.rows, objs.length);
+    budget.rows -= take;
+    const rows: unknown[] = objs.slice(0, take).map(idView);
+    if (arr.length > take) rows.push({ _more: arr.length - take });
+    return rows;
+}
+
+function shrink(value: unknown, budget: Budget): unknown {
     if (value === null || typeof value === 'number' || typeof value === 'boolean') return value;
     if (typeof value === 'string') return value.length > MAX_STRING ? `${value.slice(0, MAX_STRING)}… (${value.length} chars)` : value;
     if (Array.isArray(value)) {
         const inline = JSON.stringify(value);
-        return inline.length <= MAX_INLINE ? value : `[${value.length} items]`;
+        if (inline.length <= MAX_INLINE) return value;
+        return idRows(value, budget) ?? `[${value.length} items]`;
     }
     if (typeof value === 'object') {
-        const inline = JSON.stringify(value);
-        return inline.length <= MAX_INLINE ? value : `{${Object.keys(value as object).length} keys}`;
+        const obj = value as Record<string, unknown>;
+        const inline = JSON.stringify(obj);
+        if (inline.length <= MAX_INLINE) return obj;
+        const n = Object.keys(obj).length;
+        const handles = idView(obj);
+        if (Object.keys(handles).length) return { ...handles, _keys: n };
+        // One level down: an object of id-bearing lists (session find's results).
+        const inner: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(obj)) {
+            if (!Array.isArray(v)) continue;
+            const rows = idRows(v, budget);
+            if (rows !== undefined) inner[k] = rows;
+        }
+        if (Object.keys(inner).length) return { ...inner, _keys: n };
+        return `{${n} keys}`;
     }
     return undefined;
 }
 
+/** A top-level `…Ids` (or id-named) list of scalars: kept whole up to 50, then counted. */
+function idScalars(k: string, v: unknown): unknown[] | undefined {
+    if (!Array.isArray(v) || !(IDS_KEY.test(k) || ID_KEY.test(k)) || !v.every(isScalar)) return undefined;
+    return v.length <= MAX_ID_SCALARS ? v : [...v.slice(0, MAX_ID_SCALARS), { _more: v.length - MAX_ID_SCALARS }];
+}
+
 export function summarizeResult(result: Record<string, unknown>): Record<string, unknown> {
     const out: Record<string, unknown> = {};
+    const budget: Budget = { rows: MAX_ID_ROWS_PER_REPLY };
     for (const [k, v] of Object.entries(result)) {
-        const s = shrink(v);
+        const s = idScalars(k, v) ?? shrink(v, budget);
         if (s !== undefined) out[k] = s;
     }
     return out;
 }
-
-const isPlainObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 
 /**
  * Walk `parts` into `v`, keeping only what the path touches. A list maps the
@@ -105,6 +173,9 @@ type Reply = { content?: Array<{ type: string; text: string }> };
  * reply's `<!-- X_JSON -->` embed; a tool that replies with bare JSON (no
  * embed, text starting with '{') is read as-is, so fields and summary work
  * there too. Anything else — prose, a parse failure — comes back untouched.
+ * The operation guard's line on top of the reply ('op v1 applied',
+ * 'REPLAYED …', 'NOT applied …') rides along as `_op`, so the opId's fate
+ * survives output_mode; without one, json mode is the embed byte for byte.
  */
 export function shapeReply<R extends Reply>(res: R, opts: { mode?: unknown; fields?: string[] }): R {
     const { mode, fields } = opts;
@@ -112,16 +183,17 @@ export function shapeReply<R extends Reply>(res: R, opts: { mode?: unknown; fiel
     const wantSummary = mode === 'summary' || !!fields;
     const text = res?.content?.[0]?.text;
     if (!(wantJson || wantSummary) || !text) return res;
-    const m = text.match(/<!--\s*([A-Z_]*JSON)\s*\n?([\s\S]*?)\n?\1\s*-->/);
-    const body = m ? m[2].trim() : text.trimStart().startsWith('{') ? text.trim() : null;
-    if (body === null) return res;
-    if (wantJson) return m ? { ...res, content: [{ type: 'text', text: body }] } : res;
-    // summary: the result's small fields only; big lists become counts.
+    const { op } = splitOpLine(text);
+    const data = replyData(text);
+    if (data === null) return res;
+    const { body, embedded } = data;
+    if (wantJson && !op) return embedded ? { ...res, content: [{ type: 'text', text: body }] } : res;
     try {
         const parsed = JSON.parse(body);
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            const shaped = fields ? pickFields(parsed, fields) : summarizeResult(parsed);
-            return { ...res, content: [{ type: 'text', text: JSON.stringify(shaped) }] };
+            const shaped = wantJson ? parsed : fields ? pickFields(parsed, fields) : summarizeResult(parsed);
+            const withOp = op ? { _op: op, ...shaped } : shaped;
+            return { ...res, content: [{ type: 'text', text: JSON.stringify(withOp) }] };
         }
     } catch { /* not JSON: fall through to the full reply */ }
     return res;

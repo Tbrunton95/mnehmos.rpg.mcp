@@ -14,7 +14,7 @@ import { loadRule, findPool, conditionsForDisplay, shownCounters } from '../engi
 import { recentPrecedents } from './consolidated/precedent-manage.js';
 import { reconcileWorld, reconcileLine } from './reconcile.js';
 import { NOTE_SOFT_CAP, splitSections } from './consolidated/narrative-manage.js';
-import { readWorldClock, clockWarning, scheduleInWorldSql, scheduleLiveSql } from '../engine/world-clock.js';
+import { readWorldClock, readWorldConditions, clockWarning, scheduleInWorldSql, scheduleLiveSql } from '../engine/world-clock.js';
 import type { Character } from '../schema/character.js';
 import { pendingTotal } from '../storage/xp-awards.js';
 
@@ -25,6 +25,10 @@ export interface BootPacket {
     time?: string;
     /** Request 2: the era label era_jump wrote. */
     era?: string;
+    /** #14: stored weather (environment.weatherConditions), shown on the Now line. */
+    weather?: string;
+    /** #14: stored world location (environment.location), shown on the Now line. */
+    location?: string;
     characters: Array<Record<string, unknown>>;
     clocks: Array<Record<string, unknown>>;
     /** A grown thread reads as its first line, then its newest section; `long` past the soft cap. */
@@ -104,6 +108,7 @@ export function buildBootPacket(worldId: string, characterIds?: string[], journa
     // Item 14: the shared clock reader (legacy currentDay rows included).
     // Scheduled rows compare against the fractional clock, debts the day.
     const clock = readWorldClock(db, worldId);
+    const conditions = readWorldConditions(db, worldId);
     const day: number | null = clock?.day ?? null;
     const at: number | null = clock?.at ?? null;
 
@@ -165,10 +170,23 @@ export function buildBootPacket(worldId: string, characterIds?: string[], journa
         if (r.count > 0) reconcile = { count: r.count, first: r.findings.slice(0, 5).map(reconcileLine) };
     } catch { reconcile = undefined; }
 
-    return { worldId, day, ...(clock?.time ? { time: clock.time } : {}), ...(clock?.era ? { era: clock.era } : {}), ...(warning ? { clockWarning: warning } : {}), ...(xpOwed ? { xpOwed } : {}), ...(reconcile ? { reconcile } : {}), characters, clocks, threads, telegraphs, journal, precedents };
+    return { worldId, day, ...(clock?.time ? { time: clock.time } : {}), ...(conditions?.era ? { era: conditions.era } : {}), ...(conditions?.weather ? { weather: conditions.weather } : {}), ...(conditions?.location ? { location: conditions.location } : {}), ...(warning ? { clockWarning: warning } : {}), ...(xpOwed ? { xpOwed } : {}), ...(reconcile ? { reconcile } : {}), characters, clocks, threads, telegraphs, journal, precedents };
+}
+
+/** 'Now: Day 47, 06:00 · era M42 · sleet · at Vorago docks', each segment only when known; '' when none is. */
+export function nowLine(p: Pick<BootPacket, 'day' | 'time' | 'era' | 'weather' | 'location'>): string {
+    const segs: string[] = [];
+    if (p.day !== null && p.day !== undefined) segs.push(`Day ${p.day}${p.time ? `, ${p.time}` : ''}`);
+    if (p.era) segs.push(`era ${p.era}`);
+    if (p.weather) segs.push(p.weather);
+    if (p.location) segs.push(`at ${p.location}`);
+    return segs.length ? `Now: ${segs.join(' · ')}` : '';
 }
 
 export function renderBootPacket(p: BootPacket): string {
+    // #14: the first line is where and when, before any warning.
+    const now = nowLine(p);
+    const head = now ? `\n${now}\n` : '';
     let out = '';
     const section = (title: string) => `\n## ${title}\n`;
     if (p.clockWarning) out += `\n⚠ CLOCK: ${p.clockWarning}\n`;
@@ -203,5 +221,6 @@ export function renderBootPacket(p: BootPacket): string {
     if (p.threads.length) { out += section('Open threads'); for (const t of p.threads) out += `• ${t.text}\n`; }
     if (p.journal.length) { out += section('Last journal entries'); for (const j of p.journal) out += `• [${j.type}] ${j.text}\n`; }
     if (p.precedents.length) { out += section('Recent precedents'); for (const r of p.precedents) out += `• [${r.kind}${r.scope ? ` · ${r.scope}` : ''}] ${r.statement}\n`; }
-    return out || '\n(nothing recorded for this world yet)\n';
+    // The fallback keys on the sections, so a clock-only world keeps it under its Now line.
+    return head + (out || '\n(nothing recorded for this world yet)\n');
 }

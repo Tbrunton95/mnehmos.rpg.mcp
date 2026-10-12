@@ -6,12 +6,12 @@
  */
 
 import { z } from 'zod';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomBytes } from 'crypto';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 import type { WorldRepository } from '../../storage/repos/world.repo.js';
-import { World, WorldEnvironmentSchema } from '../../schema/world.js';
+import { World, WorldEnvironmentSchema, EnvironmentPatchSchema, applyEnvAliases } from '../../schema/world.js';
 import { generateWorld as generateWorldProc } from '../../engine/worldgen/index.js';
 import { getWorldManager } from '../state/world-manager.js';
 import { getDomainServices } from '../domain-services.js';
@@ -21,7 +21,7 @@ import { readWorldClock, clockAt, clockAfter, dayClock, clockLabel, clockWarning
 import { parseExposure, tickExposure, type ExposureTickLine } from '../../engine/exposure.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { fireDueScheduledRows } from './character-manage.js';
-import { reconcileWorld, reconcileLine, RECONCILE_KINDS, type ReconcileFinding } from '../reconcile.js';
+import { reconcileWorld, reconcileLine, acknowledgeFindings, RECONCILE_KINDS, type ReconcileFinding } from '../reconcile.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -42,12 +42,17 @@ function getWorldRepo(): WorldRepository {
 // ACTION SCHEMAS
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Play report 2, #12: the outer schema advertised seed/width/height as
+// optional while this one required them, so {name} alone failed validation
+// (and, before #11, burned its opId). A seed is a crypto nonce when omitted
+// — identically named worlds must not share later worldgen output — and the
+// reply echoes it so the caller can record it.
 const CreateSchema = z.object({
     action: z.literal('create'),
     name: z.string().min(1).describe('World name'),
-    seed: z.string().describe('Seed for generation'),
-    width: z.number().int().min(10).max(1000).describe('World width'),
-    height: z.number().int().min(10).max(1000).describe('World height'),
+    seed: z.string().min(1).optional().describe('Seed for generation. Omit to get a random 8-hex seed, echoed as seed with seedGenerated: true'),
+    width: z.number().int().min(10).max(1000).default(100).describe('World width (default 100)'),
+    height: z.number().int().min(10).max(1000).default(100).describe('World height (default 100)'),
     landRatio: z.number().min(0.1).max(0.9).optional().describe('Land to water ratio')
 });
 
@@ -77,15 +82,18 @@ const UpdateSchema = z.preprocess(
         id: z.string().describe('World ID (worldId accepted as alias)'),
         worldId: z.string().optional().describe('Alias of id — pass either'),
         correction: z.boolean().optional().describe('Item 15: the clock was WRONG, not time passing — skips regeneration and the elapsed/time_passed note; returns correction {from, to, deltaHours}'),
-        environment: WorldEnvironmentSchema.partial().describe(
-            'Canonical environment properties to update: day, time, date, timeOfDay, season, moonPhase, weatherConditions, temperature, lighting'
+        // Play report 2, #14: aliases are renamed (weather → weatherConditions,
+        // currentLocation/place → location) and an unknown key is refused with
+        // the nearest accepted one, instead of zod's bare "Unrecognized key(s)".
+        environment: EnvironmentPatchSchema.describe(
+            'Environment properties to update: day, time, date, timeOfDay, season, moonPhase, weatherConditions (alias weather), temperature, lighting, era, location (alias currentLocation / place). A misspelt key is refused naming the nearest accepted key; the reply lists renamed keys as aliased'
         )
     })
 );
 
 const GenerateSchema = z.object({
     action: z.literal('generate'),
-    seed: z.string().describe('Seed for random number generation'),
+    seed: z.string().describe('Seed for random number generation — required here (the world id and name derive from it); create generates one when omitted'),
     width: z.number().int().min(10).max(1000).describe('Width of the world grid'),
     height: z.number().int().min(10).max(1000).describe('Height of the world grid'),
     landRatio: z.number().min(0.1).max(0.9).optional().describe('Land to water ratio'),
@@ -248,11 +256,13 @@ const GetStateSchema = z.object({
 async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<object> {
     const worldRepo = getWorldRepo();
     const now = new Date().toISOString();
+    const seedGenerated = !args.seed;
+    const seed = args.seed ?? randomBytes(4).toString('hex');
 
     const world: World = {
         id: randomUUID(),
         name: args.name,
-        seed: args.seed,
+        seed,
         width: args.width,
         height: args.height,
         createdAt: now,
@@ -267,8 +277,9 @@ async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<object>
         worldId: world.id,
         name: world.name,
         seed: world.seed,
+        ...(seedGenerated ? { seedGenerated: true } : {}),
         dimensions: { width: world.width, height: world.height },
-        message: `Created world "${world.name}" (${world.width}x${world.height})`
+        message: `Created world "${world.name}" (${world.width}x${world.height}), seed ${world.seed}${seedGenerated ? ' (generated)' : ''}`
     };
 }
 
@@ -667,22 +678,28 @@ async function handleEraJump(args: z.infer<typeof EraJumpSchema>): Promise<objec
 const ReconcileSchema = z.object({
     action: z.literal('reconcile'),
     worldId: z.string().describe('World whose characters are checked'),
-    characterId: z.string().optional().describe('Check one character instead of every character in the world')
+    characterId: z.string().optional().describe('Check one character instead of every character in the world'),
+    acknowledge: z.array(z.enum(RECONCILE_KINDS)).optional().describe("Play report 2 #5: mark these kinds as seen before reporting — the one write reconcile makes. Today only skill_override_migrated has anything to mark (the 2026-10-11 migration ledger); scoped to characterId when given")
 });
 
 async function handleReconcile(args: z.infer<typeof ReconcileSchema>): Promise<object> {
     const db = getDb();
-    if (!db.prepare('SELECT id FROM worlds WHERE id = ?').get(args.worldId)) return { error: true, actionType: 'reconcile', message: `World not found: ${args.worldId}` };
+    if (!db.prepare('SELECT id FROM worlds WHERE id = ?').get(args.worldId)) return { error: true, actionType: 'reconcile', message: `World not found: ${args.worldId}`, writes: 'none' };
+    const acknowledged = args.acknowledge?.length ? acknowledgeFindings(db, args.worldId, args.acknowledge, args.characterId) : undefined;
     const report = reconcileWorld(db, args.worldId, args.characterId);
     const kinds = Object.entries(report.byKind).map(([k, n]) => `${k} ×${n}`).join(', ');
+    const ackLine = !acknowledged ? ''
+        : Object.keys(acknowledged).length ? `Acknowledged ${Object.entries(acknowledged).map(([k, n]) => `${k} ×${n}`).join(', ')}. `
+        : `Nothing to acknowledge for ${args.acknowledge!.join(', ')}: those findings clear when the sheet is fixed. `;
     return {
         success: true,
         actionType: 'reconcile',
         ...report,
         kinds: RECONCILE_KINDS,
-        message: report.count === 0
+        ...(acknowledged ? { acknowledged } : {}),
+        message: ackLine + (report.count === 0
             ? `Reconcile clean — ${args.characterId ? 'the sheet agrees' : 'every sheet agrees'} with inventory, encounters and the precedent ledger.${report.scope === 'all-characters' ? ' (characters carry no world_id on this db — every character was read)' : ''}`
-            : `${report.count} finding(s): ${kinds}. Each carries the fix call; fixing is a decision, not an auto-repair.${report.scope === 'all-characters' ? ' (characters carry no world_id on this db — every character was read)' : ''}`
+            : `${report.count} finding(s): ${kinds}. Each carries the fix call; fixing is a decision, not an auto-repair.${report.scope === 'all-characters' ? ' (characters carry no world_id on this db — every character was read)' : ''}`)
     };
 }
 
@@ -920,7 +937,7 @@ const definitions: Record<WorldManageAction, ActionDefinition> = {
         schema: UpdateSchema,
         handler: handleUpdate,
         aliases: ['set', 'modify', 'environment'],
-        description: 'Update world environment (time, weather, season) — returns elapsedHours since the prior clock (#88)'
+        description: 'Update world environment (day/time, weatherConditions (alias weather), season, location) — returns elapsedHours since the prior clock (#88); aliased lists renamed keys'
     },
     advance: {
         schema: AdvanceSchema,
@@ -1007,10 +1024,10 @@ Aliases: new→create, fetch→get, all→list, remove→delete, set→update, g
 🌍 WORLD WORKFLOW:
 1. generate - Create procedural world with terrain/biomes
 2. get_state - Check world status
-3. update - Set time/weather/season; correction:true when fixing a wrong clock (no regeneration, no time_passed)
+3. update {worldId, environment: {day, time, weatherConditions (alias weather), season, location (alias currentLocation / place), era, …}} - a misspelt key is refused naming the nearest accepted key; correction:true when fixing a wrong clock (no regeneration, no time_passed)
    advance {worldId, minutes?|hours?|days?, fireScheduled?} - move the clock forward; ticks every exposure timer in the world (character_manage set_exposure; reply exposure: [{characterId, name, pool, from, to, conditionsAdded}]); returns dueNow {scheduled, debts, congregations?}; fireScheduled: true also fires the due scheduled rows (reply fired[]) instead of only counting them
    era_jump {worldId, day, time?, label, threads?: dormant|archived|keep, scheduled?: cancel|keep, resetAbilities?: true, dryRun?} - years pass between campaigns: clock corrected (no regeneration), environment.era = label, active threads parked with a '[era: label]' section, unfired scheduled rows cancelled (stamped; list_scheduled {includeCancelled} shows them), abilities ready and legendary pools full, wall-clock effects expired. Reply: {from, to, threads, scheduledCancelled, abilitiesReset, effectsCleared}; dryRun writes nothing
-   reconcile {worldId, characterId?} - after fights run in chat: {findings: [{kind, characterId, characterName, detail, fix}], count}. Kinds: equipped_missing (equipped row with quantity ≤ 0 or no item), attack_duplicate (two profiles share a name), attack_item_missing (profile.item not in inventory), condition_stale_precedent (source/note cites a prec-id that is superseded or missing), ability_spent_outside_combat, legendary_depleted_outside_combat, xp_unposted. Read-only; boot shows 'RECONCILE: n findings' when n > 0
+   reconcile {worldId, characterId?, acknowledge?: [kind]} - after fights run in chat: {findings: [{kind, characterId, characterName, detail, fix}], count}. Kinds: equipped_missing (equipped row with quantity ≤ 0 or no item), attack_duplicate (two profiles share a name), attack_item_missing (profile.item not in inventory), condition_stale_precedent (source/note cites a prec-id that is superseded or missing), ability_spent_outside_combat, legendary_depleted_outside_combat, xp_unposted, skill_override_migrated (the 2026-10-11 migration moved a stealth/perception column: a born-0 default nulled, a legacy additive bonus folded into an override; the fix names the restore call). Read-only except acknowledge: ['skill_override_migrated'], which marks those ledger rows seen (reply acknowledged: {kind: n}); a character_manage update that sets stealthOverride/perceptionOverride acknowledges that skill's row itself, and a column back at its old number is no longer listed (one moved elsewhere, e.g. by the stat-change sync, stays listed with its live value); boot shows 'RECONCILE: n findings' when n > 0
 4. For map operations, use world_map tool instead`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
@@ -1020,14 +1037,15 @@ Aliases: new→create, fetch→get, all→list, remove→delete, set→update, g
         id: z.string().optional().describe('World ID'),
         worldId: z.string().optional().describe('World ID (for get_state, audit, era_jump, reconcile)'),
         characterId: z.string().optional().describe('reconcile: check one character instead of the whole world'),
+        acknowledge: z.array(z.enum(RECONCILE_KINDS)).optional().describe("reconcile (mirror): mark these kinds seen before reporting — skill_override_migrated is the one with ledger rows to mark"),
         name: z.string().optional().describe('World name (for create)'),
-        seed: z.string().optional().describe('Seed for generation'),
-        width: z.number().optional().describe('World width'),
-        height: z.number().optional().describe('World height'),
+        seed: z.string().optional().describe('create: optional, generated (8 hex) and echoed as seed with seedGenerated: true when omitted; generate: required'),
+        width: z.number().optional().describe('World width (create: default 100)'),
+        height: z.number().optional().describe('World height (create: default 100)'),
         landRatio: z.number().optional(),
         temperatureOffset: z.number().optional(),
         moistureOffset: z.number().optional(),
-        environment: z.any().optional().describe('Environment properties (for update)'),
+        environment: z.any().optional().describe('update: environment patch — day, time, date, timeOfDay, season, moonPhase, weatherConditions (alias weather), temperature, lighting, era, location (alias currentLocation / place)'),
         correction: z.boolean().optional().describe('update: the clock was wrong, not time passing — no regeneration, no elapsed note; returns correction {from, to, deltaHours}'),
         minutes: z.number().optional().describe('advance: minutes to move the clock forward'),
         hours: z.number().optional().describe('advance: hours to move the clock forward'),
@@ -1045,6 +1063,15 @@ Aliases: new→create, fetch→get, all→list, remove→delete, set→update, g
 export async function handleWorldManage(args: unknown, _ctx: SessionContext): Promise<McpResponse> {
     const result = await router(args as Record<string, unknown>);
     const parsed = JSON.parse(result.content[0].text);
+
+    // #14: which environment keys the engine renamed, computed here from the
+    // alias map and the raw patch — never read from the call, so a client
+    // cannot claim a rename that did not happen.
+    if (parsed.actionType === 'update' && !parsed.error) {
+        const raw = (args as { environment?: unknown } | null)?.environment;
+        const { aliased } = applyEnvAliases(raw);
+        if (Object.keys(aliased).length) parsed.aliased = aliased; else delete parsed.aliased;
+    }
 
     let output = '';
 
@@ -1064,6 +1091,7 @@ export async function handleWorldManage(args: unknown, _ctx: SessionContext): Pr
                 output += RichFormatter.keyValue({
                     'ID': `\`${parsed.worldId}\``,
                     'Name': parsed.name,
+                    'Seed': parsed.seedGenerated ? `${parsed.seed} (generated)` : parsed.seed,
                     'Dimensions': `${parsed.dimensions?.width}x${parsed.dimensions?.height}`
                 });
                 break;
@@ -1095,6 +1123,7 @@ export async function handleWorldManage(args: unknown, _ctx: SessionContext): Pr
             case 'update':
                 output = RichFormatter.header('Environment Updated', '🌤️');
                 output += RichFormatter.keyValue({ 'World ID': `\`${parsed.worldId}\``, ...(parsed.elapsedHours !== undefined && parsed.elapsedHours !== null ? { 'Elapsed': `${parsed.elapsedHours}h` } : {}) });
+                if (parsed.aliased) output += RichFormatter.alert(`Aliased: ${Object.entries(parsed.aliased as Record<string, string>).map(([a, c]) => `${a} → ${c}`).join(', ')}`, 'info');
                 if (parsed.correction) output += RichFormatter.alert(`Correction: ${parsed.correction.from ?? '?'} → ${parsed.correction.to ?? '?'} (${parsed.correction.deltaHours ?? '?'}h) — no time passed`, 'info');
                 if (parsed.elapsedNote) output += RichFormatter.alert(parsed.elapsedNote, 'info');
                 if (parsed.hint) output += RichFormatter.alert(parsed.hint, 'warning');
@@ -1129,7 +1158,7 @@ export async function handleWorldManage(args: unknown, _ctx: SessionContext): Pr
                 break;
             case 'reconcile':
                 output = RichFormatter.header('Sheet Reconcile', '🧮');
-                output += RichFormatter.keyValue({ 'World ID': `\`${parsed.worldId}\``, ...(parsed.characterId ? { 'Character': `\`${parsed.characterId}\`` } : {}), 'Findings': parsed.count });
+                output += RichFormatter.keyValue({ 'World ID': `\`${parsed.worldId}\``, ...(parsed.characterId ? { 'Character': `\`${parsed.characterId}\`` } : {}), 'Findings': parsed.count, ...(parsed.acknowledged ? { 'Acknowledged': Object.entries(parsed.acknowledged as Record<string, number>).map(([k, n]) => `${k} ×${n}`).join(', ') || 'nothing' } : {}) });
                 for (const f of (parsed.findings ?? []).slice(0, 12) as ReconcileFinding[]) {
                     output += `• ${reconcileLine(f)}\n  fix: ${f.fix}\n`;
                 }

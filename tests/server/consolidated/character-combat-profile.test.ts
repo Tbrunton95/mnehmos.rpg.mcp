@@ -61,6 +61,32 @@ describe('character_manage combat profile', () => {
         expect(row.attacks).toHaveLength(2);
     });
 
+    // Item 17: a fighting style and two-handed profiles live in the combat profile.
+    it('fightingStyle and attacks[].twoHanded survive create, update and get; an unknown style is refused', async () => {
+        const created = json(await call({ action: 'create', name: 'Brannoc', hp: 44, maxHp: 44, fightingStyle: 'great_weapon',
+            attacks: [{ name: 'greatsword', attackBonus: 7, damage: '2d6+4', twoHanded: true, default: true }] }));
+        let row = repo.findById(created.id)!;
+        expect(row.fightingStyle).toBe('great_weapon');
+        expect(row.attacks![0]).toMatchObject({ name: 'greatsword', twoHanded: true });
+        expect(json(await call({ action: 'get', characterId: created.id }))).toMatchObject({ fightingStyle: 'great_weapon' });
+        await call({ action: 'update', characterId: created.id, fightingStyle: 'dueling' });
+        row = repo.findById(created.id)!;
+        expect(row.fightingStyle).toBe('dueling');
+        expect(row.attacks![0].twoHanded).toBe(true);
+        expect(() => CharacterManageTool.inputSchema.parse({ action: 'update', characterId: created.id, fightingStyle: 'bananas' })).toThrow();
+    });
+
+    // Item 16: the superiority die and the manoeuvre ability live in the combat profile.
+    it('superiorityDie and maneuverAbility survive create, update and get; a bad die is refused', async () => {
+        const created = json(await call({ action: 'create', name: 'Brannoc', hp: 44, maxHp: 44, superiorityDie: '1d8', maneuverAbility: 'str' }));
+        expect(repo.findById(created.id)).toMatchObject({ superiorityDie: '1d8', maneuverAbility: 'str' });
+        expect(json(await call({ action: 'get', characterId: created.id }))).toMatchObject({ superiorityDie: '1d8', maneuverAbility: 'str' });
+        await call({ action: 'update', characterId: created.id, superiorityDie: '1d10' });
+        expect(repo.findById(created.id)).toMatchObject({ superiorityDie: '1d10', maneuverAbility: 'str' });
+        expect(() => CharacterManageTool.inputSchema.parse({ action: 'update', characterId: created.id, superiorityDie: '2d6' })).toThrow();
+        expect(() => CharacterManageTool.inputSchema.parse({ action: 'update', characterId: created.id, maneuverAbility: 'cha' })).toThrow();
+    });
+
     it('a sheet without a profile reads back with none', async () => {
         const created = json(await call({ action: 'create', name: 'Plain Hero' }));
         const row = repo.findById(created.id)!;
