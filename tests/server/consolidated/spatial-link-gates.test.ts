@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import { handleSpatialManage, SpatialManageTool } from '../../../src/server/consolidated/spatial-manage.js';
+import { handlePartyManage, PartyManageTool } from '../../../src/server/consolidated/party-manage.js';
 import { advanceWorldClock } from '../../../src/server/consolidated/world-manage.js';
 import { readWorldClock } from '../../../src/engine/world-clock.js';
 import { CharacterRepository } from '../../../src/storage/repos/character.repo.js';
@@ -19,6 +20,7 @@ const W = 'realm-world';
 const ctx = { sessionId: 'gates' };
 const json = (res: any) => { const t = res.content[0].text; const m = t.match(/<!-- ([A-Z_]+JSON)\n([\s\S]*?)\n\1 -->/); return m ? JSON.parse(m[2]) : JSON.parse(t); };
 const sp = async (a: Record<string, unknown>) => json(await handleSpatialManage(SpatialManageTool.inputSchema.parse(a), ctx as any));
+const pm = async (a: Record<string, unknown>) => json(await handlePartyManage(PartyManageTool.inputSchema.parse(a), ctx as any));
 const gold = (id: string) => new InventoryRepository(getDb()).getCurrency(id).gold;
 const roomOf = (id: string) => (getDb().prepare('SELECT current_room_id AS r FROM characters WHERE id = ?').get(id) as any).r;
 
@@ -99,6 +101,26 @@ describe('spatial_manage gates', () => {
         expect(back.to.roomId).toBe(yard);
         expect(back.clock).toBeUndefined();
         expect(gold(kor)).toBe(4);
+    });
+
+    it('traverse {advanceClock} charges party upkeep for the midnight it crosses and the reply says so', async () => {
+        new CharacterRepository(getDb()).update(kor, { resourcePools: { stores: { current: 50, max: 50, label: 'Stores (mouth-days)' } } } as any);
+        const pid = (await pm({ action: 'create', name: 'Kor Band', worldId: W, initialMembers: [{ characterId: kor, role: 'leader' }] })).party.id;
+        const set = await pm({ action: 'set_upkeep', partyId: pid, linkPool: { characterId: kor, pool: 'stores' } });
+        expect(set).toMatchObject({ success: true, startDay: 5, mouths: { total: 1 } });
+        const g = await gate();
+        await sp({ action: 'move', characterId: kor, roomId: yard });
+        // 30 hours from Day 5, 06:00 is Day 6, 12:00: one midnight crossed, one day eaten.
+        const t = await sp({ action: 'traverse', gateId: g.gateId, characterId: kor, advanceClock: true });
+        expect(t.clock).toMatchObject({ clock: 'Day 6, 12:00', upkeep: [expect.objectContaining({ partyId: pid, name: 'Kor Band', days: 1, storesFrom: 50, storesTo: 49, mouths: 1 })] });
+        expect(t.message).toMatch(/upkeep: Kor Band 50→49 \(1d × 1\)/);
+        expect((new CharacterRepository(getDb()).findById(kor) as any).resourcePools.stores.current).toBe(49);
+        // The toll came off the purse, not the stores.
+        expect(gold(kor)).toBe(7);
+        // Back without the clock: nothing more is eaten.
+        const back = await sp({ action: 'traverse', gateId: g.gateId, characterId: kor });
+        expect(back.clock).toBeUndefined();
+        expect((new CharacterRepository(getDb()).findById(kor) as any).resourcePools.stores.current).toBe(49);
     });
 
     it('refuses a short purse, a closed gate, a one-way return and a traveller not at the gate; nothing is written', async () => {

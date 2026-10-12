@@ -570,6 +570,28 @@ describe('character_manage consolidated tool', () => {
             expect(parsed.ac).toBe(15);
             expect(parsed._fuzzyMatch).toBeDefined();
         });
+
+        // Play report 3 #2: update {ac} marks the AC hand-set, so equip/unequip
+        // keep it; acSource alone flips the sheet back to following its gear.
+        it('update {ac} marks the AC hand-set; acSource switches it back to derived', async () => {
+            const set = extractJson((await handleCharacterManage({ action: 'update', characterId, ac: 17 }, ctx)).content[0].text) as any;
+            expect(set).toMatchObject({ ac: 17, acSource: 'manual' });
+            expect(set.changed).toEqual(expect.arrayContaining(['ac', 'acSource']));
+            expect(new CharacterRepository(db).findById(characterId)).toMatchObject({ ac: 17, acSource: 'manual' });
+
+            const preview = extractJson((await handleCharacterManage({ action: 'update', characterId, ac: 12, preview: true }, ctx)).content[0].text) as any;
+            expect(preview.preview).toBe(true);
+            expect(preview.wouldChange.acSource).toEqual({ from: 'manual', to: 'manual' });
+            expect(new CharacterRepository(db).findById(characterId)?.ac).toBe(17);
+
+            const flipped = extractJson((await handleCharacterManage({ action: 'update', characterId, acSource: 'derived' }, ctx)).content[0].text) as any;
+            expect(flipped).toMatchObject({ ac: 17, acSource: 'derived' });
+            expect(flipped.message).toContain('follows its gear from the next equip or unequip');
+
+            // An explicit acSource beside ac wins over the manual default.
+            const both = extractJson((await handleCharacterManage({ action: 'update', characterId, ac: 13, acSource: 'derived' }, ctx)).content[0].text) as any;
+            expect(both).toMatchObject({ ac: 13, acSource: 'derived' });
+        });
     });
 
     describe('action: list', () => {

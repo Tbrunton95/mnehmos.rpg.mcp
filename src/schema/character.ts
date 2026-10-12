@@ -52,6 +52,20 @@ export type CharacterOrigin = z.infer<typeof CharacterOriginSchema>;
  * that embeds a pool gets its own instance (an outer tool schema that reuses
  * one zod instance twice publishes a $ref).
  */
+/**
+ * Play report 3 #2: where the sheet's AC comes from. 'manual' = hand-set
+ * (character_manage update {ac}, set_form): inventory_manage equip/unequip
+ * keep it. 'derived' = gear drives it: every equip/unequip recomputes it.
+ * Absent on a legacy row: it follows its gear only while the stored AC
+ * equals what the gear derives.
+ */
+export const AC_SOURCES = ['manual', 'derived'] as const;
+export type AcSource = typeof AC_SOURCES[number];
+/** A fresh enum each call, so no outer schema holds one zod instance twice. */
+export function acSourceSchema() {
+    return z.enum(AC_SOURCES);
+}
+
 export function resourcePoolSchema() {
     return z.object({
         current: z.number(),
@@ -93,6 +107,8 @@ export const CharacterSchema = z.object({
     hp: z.number().int().min(0),
     maxHp: z.number().int().min(0),
     ac: z.number().int().min(0),
+    /** Play report 3 #2: manual (hand-set; gear changes keep it) | derived (gear drives it). Stored in combat_profile. */
+    acSource: acSourceSchema().optional(),
     level: z.number().int().min(1),
     xp: z.number().int().min(0).default(0).describe('Current experience points'),
     characterType: CharacterTypeSchema.optional().default('pc'),

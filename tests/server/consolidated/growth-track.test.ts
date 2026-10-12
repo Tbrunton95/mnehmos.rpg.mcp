@@ -228,4 +228,19 @@ describe('after_battle perVictory', () => {
         expect(d.growth ?? []).toEqual([]);
         expect(growth('grimgor')).toBe(10);
     });
+
+    it('goes only to the members who fought when participants are named', async () => {
+        const pid = (await party({ action: 'create', name: 'Da Boyz', initialMembers: [{ characterId: 'grimgor', role: 'leader' }] })).party.id;
+        await party({ action: 'add_member', partyId: pid, characterId: 'azhag' });
+        await party({ action: 'add_member', partyId: pid, characterId: 'gitz' });
+        const r = await party({ action: 'after_battle', partyId: pid, victory: true, participants: ['GRIMGOR', 'gitz'] });
+        expect(r.success).toBe(true);
+        expect(r.participantSource).toBe('participants');
+        expect(growth('grimgor')).toBe(10);
+        expect(growth('gitz')).toBe(10);
+        expect(growth('azhag')).toBe(9);
+        expect(r.growth.map((g: any) => g.characterId).sort()).toEqual(['gitz', 'grimgor']);
+        expect(r.absent).toEqual([{ characterId: 'azhag', name: 'Azhag', loyalty: 5 }]);
+        expect(r.loyalty.map((l: any) => l.characterId).sort()).toEqual(['gitz', 'grimgor']);
+    });
 });

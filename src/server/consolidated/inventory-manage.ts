@@ -10,6 +10,7 @@ import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { CustomEffectsRepository } from '../../storage/repos/custom-effects.repo.js';
 import { journalSnapshot } from '../utils/write-journal.js';
 import { INVENTORY_LIMITS } from '../../schema/inventory.js';
+import type { AcSource } from '../../schema/character.js';
 import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
 import { characterLexicon } from '../../engine/table-rules.js';
@@ -136,18 +137,24 @@ const ExtinguishSchema = z.object({
     itemId: z.string().describe('The light-source item to extinguish')
 });
 
+// Play report 3 #2: a fresh instance per schema, so the outer never holds
+// one zod instance twice.
+const recomputeAcSchema = () => z.boolean().optional().describe("Take the gear-derived AC even though the sheet's AC is hand-set, and let gear drive it from here (sets acSource: 'derived'). Without it a hand-set AC is kept and the reply says what the gear would give");
+
 const EquipSchema = z.object({
     action: z.literal('equip'),
     characterId: z.string().describe('Character equipping the item'),
     itemId: z.string().describe('Item to equip'),
-    slot: z.enum(['mainhand', 'offhand', 'armor', 'head', 'feet', 'accessory', 'accessory2', 'accessory3']).describe('Equipment slot — #96: three accessory slots (medallion + rings; detector + patch + dosimeter)')
+    slot: z.enum(['mainhand', 'offhand', 'armor', 'head', 'feet', 'accessory', 'accessory2', 'accessory3']).describe('Equipment slot — #96: three accessory slots (medallion + rings; detector + patch + dosimeter)'),
+    recomputeAc: recomputeAcSchema()
 });
 
 const UnequipSchema = z.object({
     action: z.literal('unequip'),
     characterId: z.string().describe('Character unequipping the item'),
     itemId: z.string().optional().describe('Item to unequip (or pass slot alone — FINDINGS #34 T3)'),
-    slot: z.enum(['mainhand', 'offhand', 'armor', 'head', 'feet', 'accessory', 'accessory2', 'accessory3']).optional().describe('Unequip whatever occupies this slot')
+    slot: z.enum(['mainhand', 'offhand', 'armor', 'head', 'feet', 'accessory', 'accessory2', 'accessory3']).optional().describe('Unequip whatever occupies this slot'),
+    recomputeAc: recomputeAcSchema()
 });
 
 const GetSchema = z.object({
@@ -350,6 +357,61 @@ function deriveArmorClass(
         }
     }
     return { ac: base + bonus, parts: [baseDesc, ...bonusParts] };
+}
+
+// AcSource comes from the schema (one source of truth with COMBAT_PROFILE_KEYS).
+type AcReport = { before: number; after: number; source: AcSource; derived: number; parts: string[] };
+
+// Play report 3 #2: a hand-set AC survives gear changes. Before this, equip
+// and unequip wrote the derived value whenever it differed, so a GM's AC 17
+// became 10 + DEX the moment a weapon or an apron went on. The sheet follows
+// its gear when acSource is 'derived', or — a legacy row with no source —
+// when the stored AC equalled what the gear derived BEFORE the change.
+// Otherwise the number is kept, the row is stamped 'manual' so the rule is
+// explicit from here, and the reply says what the gear would give.
+// recomputeAc: true takes the derived value and sets 'derived', so gear
+// drives the sheet from then on. Live tokens keep their own AC either way.
+function settleArmorClass(
+    db: ReturnType<typeof getDb>,
+    charRepo: CharacterRepository,
+    characterId: string,
+    before: { ac: number; acSource?: AcSource },
+    derivedBefore: number,
+    recomputeAc: boolean | undefined
+): { ac: AcReport; acChange: string; acMatchesDerived?: true } {
+    const derived = deriveArmorClass(db, characterId);
+    const gear = derived.parts.join(' + ');
+    const follows = recomputeAc === true
+        || before.acSource === 'derived'
+        || (before.acSource === undefined && before.ac === derivedBefore);
+    if (follows) {
+        if (derived.ac !== before.ac || before.acSource !== 'derived') {
+            charRepo.update(characterId, { ac: derived.ac, acSource: 'derived' });
+        }
+        // Review: the first 'derived' stamp is a durable write on the sheet, so
+        // the reply names it — by the flag, or by the legacy compare rule (a
+        // row with no source whose AC equalled its gear).
+        const taken = before.acSource === 'derived' ? ''
+            : recomputeAc === true ? '; gear drives it from here'
+                : '; the AC matched its gear, so gear drives it from here';
+        const acChange = derived.ac !== before.ac
+            ? `AC ${before.ac} → ${derived.ac} (now ${derived.ac}: ${gear}${taken})`
+            : `AC unchanged (now ${derived.ac}: ${gear}${taken})`;
+        return { ac: { before: before.ac, after: derived.ac, source: 'derived', derived: derived.ac, parts: derived.parts }, acChange };
+    }
+    // Review: same for the 'manual' stamp on a legacy row — said once, here.
+    const stamped = before.acSource !== 'manual';
+    if (stamped) charRepo.update(characterId, { acSource: 'manual' });
+    const marked = stamped ? ', marked hand-set from here' : '';
+    const matches = derived.ac === before.ac;
+    const acChange = matches
+        ? `AC ${before.ac} is hand-set${marked} and the gear now derives ${derived.ac} too; pass recomputeAc: true to let gear drive it from here (${gear}). Live tokens keep their own AC.`
+        : `AC kept at ${before.ac} (hand-set${marked}; gear gives ${derived.ac}: ${gear}). Pass recomputeAc: true to take it. Live tokens keep their own AC.`;
+    return {
+        ac: { before: before.ac, after: before.ac, source: 'manual', derived: derived.ac, parts: derived.parts },
+        acChange,
+        ...(matches ? { acMatchesDerived: true as const } : {})
+    };
 }
 
 const definitions: Record<InventoryAction, ActionDefinition> = {
@@ -793,23 +855,19 @@ const definitions: Record<InventoryAction, ActionDefinition> = {
                 throw new Error(`Cannot equip "${item.name}" in ${params.slot}. ${guidance}`);
             }
 
-            inventoryRepo.equipItem(params.characterId, params.itemId, params.slot);
-
             // FINDINGS #69: AC is DERIVED from the full equipped set (armor
             // base + capped DEX + every other equipped acBonus, head included),
             // not patched incrementally — the old arithmetic dropped the
             // Sphere-08's +1 on every armor re-equip.
-            const character = charRepo.findById(params.characterId);
-            let acChange: string | null = null;
-            if (character) {
-                const derived = deriveArmorClass(db, params.characterId);
-                if (derived.ac !== character.ac) {
-                    charRepo.update(params.characterId, { ac: derived.ac });
-                    acChange = `AC ${character.ac} → ${derived.ac} (now ${derived.ac}: ${derived.parts.join(' + ')})`;
-                } else {
-                    acChange = `AC unchanged (now ${derived.ac}: ${derived.parts.join(' + ')})`;
-                }
-            }
+            // Play report 3 #2: derive BEFORE the change too, so a legacy row
+            // with no acSource is read right (stored == derived → follows gear),
+            // and a hand-set AC is kept (settleArmorClass).
+            const before = charRepo.findById(params.characterId);
+            const derivedBefore = before ? deriveArmorClass(db, params.characterId).ac : 0;
+
+            inventoryRepo.equipItem(params.characterId, params.itemId, params.slot);
+
+            const settled = before ? settleArmorClass(db, charRepo, params.characterId, before, derivedBefore, params.recomputeAc) : null;
 
             return {
                 success: true,
@@ -817,8 +875,10 @@ const definitions: Record<InventoryAction, ActionDefinition> = {
                 itemName: item.name,
                 slot: params.slot,
                 characterId: params.characterId,
-                acChange,
-                message: `Equipped ${item.name} in ${params.slot} slot`
+                acChange: settled?.acChange ?? null,
+                ...(settled ? { ac: settled.ac } : {}),
+                ...(settled?.acMatchesDerived ? { acMatchesDerived: true } : {}),
+                message: `Equipped ${item.name} in ${params.slot} slot${settled ? `. ${settled.acChange}` : ''}`
             };
         },
         aliases: ['wear', 'wield', 'don']
@@ -846,32 +906,29 @@ const definitions: Record<InventoryAction, ActionDefinition> = {
             // (equippedItem/slot lookup retired — #69 derives AC from the
             // whole equipped set after the write; noUnusedLocals-safe.)
 
-            inventoryRepo.unequipItem(params.characterId, itemId);
-
             // FINDINGS #69: same derivation as equip — the live defect was a
             // 19 → 14 write reported as acChange: null. The write and the
             // report now come from the same computation; a write can never
             // again be silent, and remaining equipped bonuses (head slot)
             // survive the removal of the body armor.
-            const character = charRepo.findById(params.characterId);
-            let acChange: string | null = null;
-            if (character) {
-                const derived = deriveArmorClass(db, params.characterId);
-                if (derived.ac !== character.ac) {
-                    charRepo.update(params.characterId, { ac: derived.ac });
-                    acChange = `AC ${character.ac} → ${derived.ac} (now ${derived.ac}: ${derived.parts.join(' + ')})`;
-                } else {
-                    acChange = `AC unchanged (now ${derived.ac}: ${derived.parts.join(' + ')})`;
-                }
-            }
+            // Play report 3 #2: same before/after rule as equip — a hand-set
+            // AC is kept, a gear-following one is recomputed.
+            const before = charRepo.findById(params.characterId);
+            const derivedBefore = before ? deriveArmorClass(db, params.characterId).ac : 0;
+
+            inventoryRepo.unequipItem(params.characterId, itemId);
+
+            const settled = before ? settleArmorClass(db, charRepo, params.characterId, before, derivedBefore, params.recomputeAc) : null;
 
             return {
                 success: true,
                 actionType: 'unequip',
                 itemName: item?.name || itemId,
                 characterId: params.characterId,
-                acChange,
-                message: `Unequipped ${item?.name || itemId}`
+                acChange: settled?.acChange ?? null,
+                ...(settled ? { ac: settled.ac } : {}),
+                ...(settled?.acMatchesDerived ? { acMatchesDerived: true } : {}),
+                message: `Unequipped ${item?.name || itemId}${settled ? `. ${settled.acChange}` : ''}`
             };
         },
         aliases: ['remove_equipped', 'doff', 'unwield']
@@ -1270,7 +1327,7 @@ export const InventoryManageTool = {
 📦 ITEM WORKFLOW:
 1. Create items with item_manage first (or use existing items)
 2. give - Add items to character inventory
-3. equip - Slot weapons/armor (updates AC automatically)
+3. equip - Slot weapons/armor. AC: a sheet that follows its gear (acSource 'derived', or a legacy row whose AC already equals what the gear derives) is recomputed on every equip/unequip and the reply carries ac {before, after, source, derived, parts}. A hand-set AC (character_manage update {ac}, set_form) is KEPT and acChange says what the gear would give; pass recomputeAc: true to take the derived value and let gear drive it from then on. acMatchesDerived: true flags a hand-set AC the gear now derives anyway
 
 🔄 COMMON ACTIONS:
 - transfer: Move items between characters atomically (use this for a player-to-NPC handoff)
@@ -1294,7 +1351,10 @@ Aliases: add→give, take→remove, trade→transfer, consume→use, wield→equ
         fromCharacterId: z.string().optional().describe('Source character (for transfer)'),
         toCharacterId: z.string().optional().describe('Target character (for transfer)'),
         targetId: z.string().optional().describe('Effect target (for use)'),
-        slot: z.enum(['mainhand', 'offhand', 'armor', 'head', 'feet', 'accessory']).optional().describe('Equipment slot (for equip)'),
+        // Play report 3 #2 (mirror law): the outer enum lacked accessory2/3 since
+        // #96 added them — a direct equip into a second ring slot could not validate.
+        slot: z.enum(['mainhand', 'offhand', 'armor', 'head', 'feet', 'accessory', 'accessory2', 'accessory3']).optional().describe('Equipment slot (equip; unequip by slot)'),
+        recomputeAc: recomputeAcSchema(),
         // FINDINGS #33 (mirror law, 5th strike): amount/reason were never in the
         // outer — direct add_currency was broken since wave 10; only batch worked.
         amount: z.number().optional().describe('Currency delta for add_currency (the world lexicon names it): positive credits, negative debits'),

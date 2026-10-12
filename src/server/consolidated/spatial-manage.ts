@@ -28,6 +28,7 @@ import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { readWorldClock, SET_CLOCK_HINT } from '../../engine/world-clock.js';
 import { advanceWorldClock } from './world-manage.js';
+import { upkeepLineText, type UpkeepTickLine } from './party-manage.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -674,14 +675,15 @@ async function handleTraverse(args: z.infer<typeof TraverseSchema>): Promise<obj
     let clock: Record<string, unknown> | undefined;
     if (args.advanceClock && g.travel_hours > 0 && g.world_id) {
         const r = advanceWorldClock(g.world_id, g.travel_hours);
-        clock = { clock: r.clock, elapsedHours: r.elapsedHours, dueNow: r.dueNow, ...(r.regenerated ? { regenerated: r.regenerated } : {}), ...(r.error ? { error: r.error, message: r.message } : {}) };
+        // Play report 3: the travel time ate stores; say so, as advance does.
+        clock = { clock: r.clock, elapsedHours: r.elapsedHours, dueNow: r.dueNow, ...(r.regenerated ? { regenerated: r.regenerated } : {}), ...(r.upkeep ? { upkeep: r.upkeep } : {}), ...(r.error ? { error: r.error, message: r.message } : {}) };
     }
     return {
         success: true, actionType: 'traverse', gateId: g.id, gateName: g.name, characterId: character.id, characterName: character.name,
         from: { roomId: at, name: nameOf(at!) }, to: { roomId: toRoomId, name: nameOf(toRoomId) },
         travelHours: g.travel_hours, ...(toll ? { tollPaid: toll } : {}), ...(g.holder ? { holder: g.holder } : {}),
         ...(clock ? { clock } : {}),
-        message: `${character.name} passes ${g.name}: ${nameOf(at!)} → ${nameOf(toRoomId)}${toll ? `, paying ${tollText(toll)}` : ''}${g.travel_hours ? ` (${g.travel_hours}h${clock ? `; clock now ${String(clock.clock)}` : ' — the clock was not moved; pass advanceClock: true'})` : ''}`
+        message: `${character.name} passes ${g.name}: ${nameOf(at!)} → ${nameOf(toRoomId)}${toll ? `, paying ${tollText(toll)}` : ''}${g.travel_hours ? ` (${g.travel_hours}h${clock ? `; clock now ${String(clock.clock)}${clock.upkeep ? `; upkeep: ${(clock.upkeep as UpkeepTickLine[]).map(upkeepLineText).join('; ')}` : ''}` : ' — the clock was not moved; pass advanceClock: true'})` : ''}`
     };
 }
 
