@@ -8,7 +8,8 @@
  * `{_more}` (play report 2, #13). Lists and objects without a handle still
  * collapse to '[N items]' / '{N keys}'.
  */
-import { replyData, splitOpLine } from './reply-status.js';
+import { replyData, replyJson, splitEmbed, splitOpLine } from './reply-status.js';
+import { RichFormatter } from './utils/formatter.js';
 
 const MAX_STRING = 300;
 const MAX_INLINE = 200;
@@ -131,7 +132,9 @@ function mergeProjection(a: unknown, b: unknown): unknown {
 }
 
 /**
- * fields: [...] — only the named fields, plus success/error/actionType/message.
+ * fields: [...] — only the named fields, plus success/error/actionType/message
+ * and ignoredParams (play report 4 #2: a dropped key must not vanish because
+ * the chair asked for two fields).
  * A dotted name walks the full path ('world.environment.weather'); through a
  * list it keeps that path of each element ('conditions.name'). Several names
  * on one head merge. An undotted name takes the whole value.
@@ -140,7 +143,7 @@ function mergeProjection(a: unknown, b: unknown): unknown {
  * bare success.
  */
 export function pickFields(result: Record<string, unknown>, fields: string[]): Record<string, unknown> {
-    const always = ['success', 'error', 'actionType', 'message'];
+    const always = ['success', 'error', 'actionType', 'message', 'ignoredParams'];
     const out: Record<string, unknown> = {};
     for (const k of always) if (k in result) out[k] = result[k];
 
@@ -167,6 +170,31 @@ export function pickFields(result: Record<string, unknown>, fields: string[]): R
 }
 
 type Reply = { content?: Array<{ type: string; text: string }> };
+
+const IGNORED_NOTE = /Ignored params/;
+
+/**
+ * Play report 4 #2: the action router puts `ignoredParams` (and the note in
+ * `message`) on the reply's data, but most banners never print `message`, so
+ * a chair reading the banner still saw a clean success. One warning line goes
+ * in before the embed when the banner lacks it — the note from `message` when
+ * it carries one, else the bare key list. Bare-JSON replies already show the
+ * field; prose and error replies are left alone.
+ */
+export function noteIgnoredParams<R extends Reply>(res: R): R {
+    const text = res?.content?.[0]?.text;
+    if (!text) return res;
+    const data = replyJson(text);
+    const ignored = data?.ignoredParams;
+    if (!Array.isArray(ignored) || ignored.length === 0) return res;
+    const parts = splitEmbed(text);
+    if (!parts || IGNORED_NOTE.test(parts.before)) return res;
+    const message = typeof data?.message === 'string' ? data.message : '';
+    const at = message.indexOf('Ignored params');
+    const note = at >= 0 ? message.slice(at) : `Ignored params (nothing was written for them): ${ignored.map(String).join(', ')}`;
+    const banner = `${parts.before.replace(/\n*$/, '\n')}${RichFormatter.alert(note, 'warning')}\n`;
+    return { ...res, content: [{ ...res.content![0], text: `${banner}${parts.embed}${parts.after}` }, ...res.content!.slice(1)] };
+}
 
 /**
  * Apply output_mode / fields to a tool reply. The data comes from the

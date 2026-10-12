@@ -9,7 +9,7 @@ import { ItemRepository } from '../../storage/repos/item.repo.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { CustomEffectsRepository } from '../../storage/repos/custom-effects.repo.js';
 import { journalSnapshot } from '../utils/write-journal.js';
-import { INVENTORY_LIMITS } from '../../schema/inventory.js';
+import { INVENTORY_LIMITS, EQUIP_SLOTS, equipSlotSchema } from '../../schema/inventory.js';
 import type { AcSource } from '../../schema/character.js';
 import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
@@ -145,7 +145,7 @@ const EquipSchema = z.object({
     action: z.literal('equip'),
     characterId: z.string().describe('Character equipping the item'),
     itemId: z.string().describe('Item to equip'),
-    slot: z.enum(['mainhand', 'offhand', 'armor', 'head', 'feet', 'accessory', 'accessory2', 'accessory3']).describe('Equipment slot — #96: three accessory slots (medallion + rings; detector + patch + dosimeter)'),
+    slot: equipSlotSchema().describe('Equipment slot — #96: three accessory slots (medallion + rings; detector + patch + dosimeter)'),
     recomputeAc: recomputeAcSchema()
 });
 
@@ -153,7 +153,7 @@ const UnequipSchema = z.object({
     action: z.literal('unequip'),
     characterId: z.string().describe('Character unequipping the item'),
     itemId: z.string().optional().describe('Item to unequip (or pass slot alone — FINDINGS #34 T3)'),
-    slot: z.enum(['mainhand', 'offhand', 'armor', 'head', 'feet', 'accessory', 'accessory2', 'accessory3']).optional().describe('Unequip whatever occupies this slot'),
+    slot: equipSlotSchema().optional().describe('Unequip whatever occupies this slot'),
     recomputeAc: recomputeAcSchema()
 });
 
@@ -836,23 +836,44 @@ const definitions: Record<InventoryAction, ActionDefinition> = {
             );
 
             if (!hasItem) {
-                throw new Error(`Character does not own item ${params.itemId}`);
+                return { error: true, actionType: 'equip', writes: 'none', itemId: params.itemId, message: `Character does not own item ${params.itemId}. NOTHING was written.` };
             }
 
             const item = itemRepo.findById(params.itemId);
             if (!item) {
-                throw new Error(`Item not found: ${params.itemId}`);
+                return { error: true, actionType: 'equip', writes: 'none', itemId: params.itemId, message: `Item not found: ${params.itemId}. NOTHING was written.` };
             }
 
             const allowedSlots = allowedEquipSlots(item);
             if (item.properties?.requiresSelection === true) {
-                throw new Error(`Item "${item.name}" is an unresolved equipment choice; materialize a concrete item first`);
+                return { error: true, actionType: 'equip', writes: 'none', itemId: item.id, message: `Item "${item.name}" is an unresolved equipment choice; materialize a concrete item first. NOTHING was written.` };
             }
             if (!allowedSlots.includes(params.slot)) {
-                const guidance = allowedSlots.length > 0
-                    ? `Allowed slots: ${allowedSlots.join(', ')}`
-                    : 'This item is not equippable; custom equippable items must define properties.equipSlots';
-                throw new Error(`Cannot equip "${item.name}" in ${params.slot}. ${guidance}`);
+                // Play report 4 #3: the refusal carries the fix. A misc item with
+                // no equipSlots was refused with "must define properties.equipSlots"
+                // and no id, no slot, no call. Now: the real id, the slot that was
+                // tried, the allowed slots, and the exact item_manage update that
+                // makes the item equippable (a typed item in the wrong slot keeps
+                // its current slots and gains the tried one).
+                const fixSlots = [...new Set([...allowedSlots, params.slot])];
+                const slotList = `[${fixSlots.map(s => `'${s}'`).join(', ')}]`;
+                const primary = `item_manage update {itemId: '${item.id}', equipSlots: ${slotList}}`;
+                const alternative = `item_manage update {itemId: '${item.id}', properties: {equipSlots: ${slotList}}, mergeProperties: true}`;
+                const why = allowedSlots.length > 0
+                    ? `it goes in ${allowedSlots.join(' or ')}`
+                    : `a ${item.type} item is not equippable until its properties.equipSlots says where`;
+                return {
+                    error: true,
+                    actionType: 'equip',
+                    writes: 'none',
+                    itemId: item.id,
+                    itemName: item.name,
+                    characterId: params.characterId,
+                    slot: params.slot,
+                    allowedSlots,
+                    fix: { tool: 'item_manage', args: { action: 'update', itemId: item.id, equipSlots: fixSlots } },
+                    message: `Cannot equip "${item.name}" in ${params.slot}: ${why}. To allow it, run ${primary} (or ${alternative}), then equip again. Slots: ${EQUIP_SLOTS.join(', ')}. NOTHING was written.`
+                };
             }
 
             // FINDINGS #69: AC is DERIVED from the full equipped set (armor
@@ -1327,7 +1348,7 @@ export const InventoryManageTool = {
 📦 ITEM WORKFLOW:
 1. Create items with item_manage first (or use existing items)
 2. give - Add items to character inventory
-3. equip - Slot weapons/armor. AC: a sheet that follows its gear (acSource 'derived', or a legacy row whose AC already equals what the gear derives) is recomputed on every equip/unequip and the reply carries ac {before, after, source, derived, parts}. A hand-set AC (character_manage update {ac}, set_form) is KEPT and acChange says what the gear would give; pass recomputeAc: true to take the derived value and let gear drive it from then on. acMatchesDerived: true flags a hand-set AC the gear now derives anyway
+3. equip - Slot weapons/armor. A weapon goes in mainhand/offhand, armor in armor (a shield with acBonus in offhand); anything else, and any item in a different slot, needs properties.equipSlots on its template: a refusal prints the exact item_manage update {itemId, equipSlots: [...]} call (fix: {tool, args}) with nothing written. AC: a sheet that follows its gear (acSource 'derived', or a legacy row whose AC already equals what the gear derives) is recomputed on every equip/unequip and the reply carries ac {before, after, source, derived, parts}. A hand-set AC (character_manage update {ac}, set_form) is KEPT and acChange says what the gear would give; pass recomputeAc: true to take the derived value and let gear drive it from then on. acMatchesDerived: true flags a hand-set AC the gear now derives anyway
 
 🔄 COMMON ACTIONS:
 - transfer: Move items between characters atomically (use this for a player-to-NPC handoff)
@@ -1338,7 +1359,7 @@ export const InventoryManageTool = {
 IMPORTANT: give is a world/DM grant to one character and does not remove an item from another character. For a handoff, always use transfer with fromCharacterId and toCharacterId.
 
 ⚔️ EQUIPMENT SLOTS:
-mainhand, offhand, armor, head, feet, accessory, accessory2, accessory3 (#96)
+${EQUIP_SLOTS.join(', ')} (#96; custom items name theirs in properties.equipSlots via item_manage equipSlots)
 
 Actions: ${ACTIONS.join(', ')}
 Aliases: add→give, take→remove, trade→transfer, consume→use, wield→equip`,
@@ -1353,7 +1374,7 @@ Aliases: add→give, take→remove, trade→transfer, consume→use, wield→equ
         targetId: z.string().optional().describe('Effect target (for use)'),
         // Play report 3 #2 (mirror law): the outer enum lacked accessory2/3 since
         // #96 added them — a direct equip into a second ring slot could not validate.
-        slot: z.enum(['mainhand', 'offhand', 'armor', 'head', 'feet', 'accessory', 'accessory2', 'accessory3']).optional().describe('Equipment slot (equip; unequip by slot)'),
+        slot: equipSlotSchema().optional().describe('Equipment slot (equip; unequip by slot)'),
         recomputeAc: recomputeAcSchema(),
         // FINDINGS #33 (mirror law, 5th strike): amount/reason were never in the
         // outer — direct add_currency was broken since wave 10; only batch worked.

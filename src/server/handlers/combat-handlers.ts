@@ -2087,8 +2087,10 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             dc!,
             damage!,
             damageType,  // HIGH-002: Pass damage type for resistance calculation
-            parsed.advantage,
-            parsed.disadvantage,
+            // Play report 4: an explicit false and an unset flag are the same
+            // straight roll (volley passes its flags through here too).
+            !!parsed.advantage,
+            !!parsed.disadvantage,
             damageLaneBonus || undefined,  // FINDINGS #70: resolver damage lane
             damageLaneLabel,
             outcome,

@@ -5,7 +5,7 @@
  */
 
 import { z } from 'zod';
-import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
+import { createActionRouter, ActionDefinition, McpResponse, ignoredParamsOf, describeIgnoredParams } from '../../utils/action-router.js';
 import { MANEUVER_NAMES } from '../../engine/combat/maneuvers.js';
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
@@ -31,6 +31,7 @@ import { sizeRank } from '../../schema/encounter.js';
 import { READIED_TRIGGERS, ReadiedAttackSchema, type Ability } from '../../schema/token-extras.js';
 import { findActionGrantAcross, patchRowAbility } from '../../engine/combat/abilities.js';
 import { loggedD20, loggedDice, loggedRoll } from '../../math/logged-d20.js';
+import { resolveNamedSources, loadEffectNames, jsonIfString, sourcesField } from '../../engine/advantage-sources.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -48,6 +49,8 @@ import { loggedD20, loggedDice, loggedRoll } from '../../math/logged-d20.js';
 const ACTIONS = ['attack', 'heal', 'move', 'disengage', 'cast_spell', 'dash', 'dodge', 'help', 'ready', 'volley', 'grapple'] as const;
 const ENGINE_ACTIONS = ['attack', 'heal', 'move', 'disengage', 'cast_spell', 'dash', 'dodge', 'help', 'ready', 'volley'] as const;
 type CombatAction = typeof ENGINE_ACTIONS[number];
+const GRAPPLE_MOVES = ['clinch', 'takedown', 'throw', 'slam', 'control', 'break', 'execute'] as const;
+type GrappleMove = typeof GRAPPLE_MOVES[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ACTION SCHEMAS
@@ -142,6 +145,34 @@ const VolleySchema = z.object({
     atPart: z.string().optional(),
     advantage: z.boolean().optional(),
     disadvantage: z.boolean().optional()
+});
+
+const GRAPPLE_SOURCE_NOTE = "grapple: a miss or an ambiguous name REFUSES the move before any roll or spend (writes: none) — a grapple spends the attack and writes conditions, so nothing is guessed. Logged in the roll's purpose.";
+
+/**
+ * FINDINGS #99 / play report 4: grapple is intercepted before the router (it
+ * is not an engine action, see handleCombatAction), so this schema never
+ * parses a call. It is the action's contract for the mirror audit and
+ * search_tools, and the shape the grapple branch checks ignored params
+ * against. Keep it a plain z.object: ignoredParamsOf reads .shape.
+ */
+const GrappleSchema = z.object({
+    action: z.literal('grapple'),
+    encounterId: z.string().optional().describe('Optional: two live tokens in one fight are routed there; none runs on the character sheets'),
+    actorId: z.string(),
+    targetId: z.string(),
+    move: z.enum(GRAPPLE_MOVES).optional().describe('clinch | takedown | throw | slam | control | break | execute — required with action: grapple; the aliases clinch, takedown, slam and break_grapple name it themselves'),
+    surface: z.string().optional().describe('throw/slam: what they land on (earth d4, concrete/wall/table d6, edge/glass d8)'),
+    control: z.boolean().optional().describe('Pin instead of hurt: Grappled + Restrained, no surface damage'),
+    outcome: z.enum(['win', 'lose']).optional().describe('A result the table already resolved: no d20, the attack is still spent'),
+    damage: z.union([z.number(), z.string()]).optional().describe('With a posted win: the throw/slam surface damage (number as posted, dice rolled); execute: the posted crit'),
+    damageType: z.string().optional().describe('execute: the damage type (resistances apply)'),
+    modifier: z.number().optional().describe('Situational bonus to the actor (footing, surprise), summed into the opposed roll'),
+    actionSurge: z.union([z.boolean(), z.string()]).optional().describe('When the action is spent: spend a ready grantsAction ability for an extra action'),
+    advantage: z.boolean().optional().describe('The actor rolls 2d20 keep highest (the GM\'s ruling; cancels against any disadvantage to one die)'),
+    disadvantage: z.boolean().optional().describe('The actor rolls 2d20 keep lowest; the lower band or smaller size is automatic and never stacks'),
+    advantageSources: sourcesField('advantage', GRAPPLE_SOURCE_NOTE),
+    disadvantageSources: sourcesField('disadvantage', GRAPPLE_SOURCE_NOTE)
 });
 
 const DashSchema = z.object({
@@ -664,9 +695,14 @@ Validates spell, rolls damage, applies effects, handles saves - all automatic. A
 Aliases: hit/strike→attack, cast/spell→cast_spell, sprint→dash, evade→dodge.
 
 🤼 GRAPPLE (FINDINGS #99 — unarmed vocabulary):
-{ action: "grapple", encounterId?, actorId, targetId, move: clinch|takedown|throw|slam|control|break|execute, surface?, control?, outcome?: win|lose, damage? }
-Internal opposed check (Athletics vs better of Athletics/Acrobatics) on the fight's logged dice; with encounterId it spends one attack (break spends the action; actionSurge: true reopens a spent action from a grantsAction ability), and tokens without a sheet can grapple. Grapple is the ONE action that works without encounterId: two live tokens in one fight are routed there (routedToEncounter); one side in a fight, or two fights, is refused; neither in a fight runs on the character sheets with logged dice, the world's proficiency curve and expertise. execute on sheets kills through character_manage kill (HP 0, concentration ended, a corpse row; writesTo 'sheet'); in a fight it only drops the token to 0 HP. An execute with no damage is a coup de grâce (its HP, defences bypassed); posted or dice damage respects resistances. The lower band or smaller size rolls at disadvantage automatically (reasons in situational). A target more than one size larger is refused, and throw/slam of anything larger. A helpless target — unconscious, asleep, incapacitated, paralysed, stunned, petrified or at 0 HP, read from its token when it has one, else its sheet — is held without a contest (house ruling; autoWin.reason says why; a break against a helpless holder succeeds the same way); a helpless ACTOR is refused on the sheets as the engine refuses it in a fight. outcome: win|lose posts a result the table already resolved: no d20, the attack is still spent (lose writes nothing); with a win, damage is the throw/slam surface damage (a number as posted, dice rolled on the fight's dice), still band-scaled. Win writes conditions to the character row, and to the live encounter tokens when encounterId is given (clinch→Clinched, takedown/slam→Prone+Grappled, throw→Prone, control→Restrained, break→clears the ACTOR's holds from targetId: holds sourced 'grapple: <holder>' or 'pinned by <holder>' go with their extras; holds sourced to the holder's bare id or name clear only Clinched/Grappled/Restrained/Pinned). control: true pins (Grappled + Restrained, no damage). execute: a pinned lower-band foe takes a posted crit of damage (default its HP); pinned = Restrained or Pinned, or Grappled + Prone, sourced to this actor by id, name, or any 'grapple:'/'pinned by' form — read from the token first, then the sheet (pinFrom); combat_manage add_condition {fromGrapple} writes that source. throw/slam ROLL surface damage (earth d4 / concrete-wall-table d6 / edge-glass d8, margin ≥5 adds a die) and RETURN it — apply via your damage lane; the encounter sheet owns mid-combat HP.`,
-    actionSchemas: router.actionSchemas,
+{ action: "grapple", encounterId?, actorId, targetId, move: clinch|takedown|throw|slam|control|break|execute, surface?, control?, outcome?: win|lose, damage?, modifier?, advantage?, disadvantage?, advantageSources?, disadvantageSources? }
+Internal opposed check (Athletics vs better of Athletics/Acrobatics) on the fight's logged dice; with encounterId it spends one attack (break spends the action; actionSurge: true reopens a spent action from a grantsAction ability), and tokens without a sheet can grapple. Grapple is the ONE action that works without encounterId: two live tokens in one fight are routed there (routedToEncounter); one side in a fight, or two fights, is refused; neither in a fight runs on the character sheets with logged dice, the world's proficiency curve and expertise. execute on sheets kills through character_manage kill (HP 0, concentration ended, a corpse row; writesTo 'sheet'); in a fight it only drops the token to 0 HP. An execute with no damage is a coup de grâce (its HP, defences bypassed); posted or dice damage respects resistances. The lower band or smaller size rolls at disadvantage automatically (reasons in situational). ADVANTAGE (play report 4): the ACTOR's roll mode is the GM's advantage/disadvantage flag plus named sources — advantageSources / disadvantageSources name what is on the actor (its token conditions, sheet conditions or active effects; math_manage's rule: exact beats prefix beats substring, one hit) — plus the automatic band/size rule; advantage and disadvantage together cancel to one die (rollMode {actor, defender}; situational prints 'Marine: advantage (GM; Bulwark)' or the cancel line; the roll_log purpose reads 'grapple (adv: GM, Bulwark; dis: lower band)' and stays 'grapple' with no reasons). The defender keeps only its automatic disadvantage. A source that matches nothing or two things is REFUSED before any roll or spend (writes: none) — a grapple writes, so nothing is guessed; posted outcomes and helpless targets roll no contest, so flags and sources are noted as ignored there. Keys grapple does not use come back in ignoredParams. A target more than one size larger is refused, and throw/slam of anything larger. A helpless target — unconscious, asleep, incapacitated, paralysed, stunned, petrified or at 0 HP, read from its token when it has one, else its sheet — is held without a contest (house ruling; autoWin.reason says why; a break against a helpless holder succeeds the same way); a helpless ACTOR is refused on the sheets as the engine refuses it in a fight. outcome: win|lose posts a result the table already resolved: no d20, the attack is still spent (lose writes nothing); with a win, damage is the throw/slam surface damage (a number as posted, dice rolled on the fight's dice), still band-scaled. Win writes conditions to the character row, and to the live encounter tokens when encounterId is given (clinch→Clinched, takedown/slam→Prone+Grappled, throw→Prone, control→Restrained, break→clears the ACTOR's holds from targetId: holds sourced 'grapple: <holder>' or 'pinned by <holder>' go with their extras; holds sourced to the holder's bare id or name clear only Clinched/Grappled/Restrained/Pinned). control: true pins (Grappled + Restrained, no damage). execute: a pinned lower-band foe takes a posted crit of damage (default its HP); pinned = Restrained or Pinned, or Grappled + Prone, sourced to this actor by id, name, or any 'grapple:'/'pinned by' form — read from the token first, then the sheet (pinFrom); combat_manage add_condition {fromGrapple} writes that source. throw/slam ROLL surface damage (earth d4 / concrete-wall-table d6 / edge-glass d8, margin ≥5 adds a die) and RETURN it — apply via your damage lane; the encounter sheet owns mid-combat HP.`,
+    // Grapple is intercepted before the router: its contract joins the router's
+    // here so the mirror audit, search_tools and ignored-param checks see it.
+    actionSchemas: {
+        ...router.actionSchemas,
+        grapple: { schema: GrappleSchema, aliases: ['clinch', 'takedown', 'slam', 'break_grapple'], description: 'Opposed grapple check on the fight\'s dice (or the sheets); honours advantage/disadvantage and named sources' }
+    },
     inputSchema: z.object({
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
         encounterId: z.string().optional().describe('Encounter ID; required for every action except grapple, which works on character sheets without one (two live tokens in one fight are routed there; placeholders like "none" mean no encounter)'),
@@ -696,12 +732,14 @@ Internal opposed check (Athletics vs better of Athletics/Acrobatics) on the figh
         ammoItemId: z.string().optional().describe('FINDINGS #58 (mirror): ammo template id — dry refuses the shot; decrements after the engine resolves'),
         hand: z.enum(['mainhand', 'offhand']).optional().describe('FINDINGS #96-C (mirror): which weapon the attack resolves with — its coating surfaces and debits (default mainhand)'),
         ammoCount: z.number().optional().describe('FINDINGS #58 (mirror): magazines expended (default 1)'),
-        advantage: z.boolean().optional().describe('Attack with advantage — 2d20 keep highest (mirror of inner schema, Findings #32)'),
+        advantage: z.boolean().optional().describe('attack / volley / grapple: 2d20 keep highest (mirror of inner schema, Findings #32). On a grapple it is the actor\'s roll and cancels against any disadvantage'),
         declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit: declared modifiers already in attackBonus, printed in the breakdown'),
         // FINDINGS #60 (mirror law): declaredEffects — GM names the conditional
         // trait; engine computes and APPLIES the value (incl. valueFromPool).
         declaredEffects: z.array(z.object({ name: z.string(), lane: z.string().optional() })).optional().describe('RESOLVER v2: [{name, lane?}] — engine-computed conditional trait values; do NOT also fold into attackBonus'),
-        disadvantage: z.boolean().optional().describe('Attack with disadvantage — 2d20 keep lowest'),
+        disadvantage: z.boolean().optional().describe('attack / volley / grapple: 2d20 keep lowest. On a grapple the lower band or smaller size is automatic and never stacks'),
+        advantageSources: sourcesField('advantage', GRAPPLE_SOURCE_NOTE),
+        disadvantageSources: sourcesField('disadvantage', GRAPPLE_SOURCE_NOTE),
         dc: z.number().optional().describe('DC for the attack'),
         damage: z.union([z.number(), z.string()]).optional().describe('Damage amount or dice'),
         damageType: z.string().optional().describe('Damage type (fire, slashing, etc.)'),
@@ -731,8 +769,6 @@ Internal opposed check (Athletics vs better of Athletics/Acrobatics) on the figh
 // character hp; apply the number via your damage lane).
 // ═══════════════════════════════════════════════════════════════════════════
 
-const GRAPPLE_MOVES = ['clinch', 'takedown', 'throw', 'slam', 'control', 'break', 'execute'] as const;
-type GrappleMove = typeof GRAPPLE_MOVES[number];
 const GRAPPLE_CONDITIONS = ['Clinched', 'Grappled', 'Restrained', 'Pinned'];
 
 function surfaceDie(surface?: string): { die: number; label: string } {
@@ -750,6 +786,22 @@ type GrappleRow = {
     conditions?: Array<{ name: string; duration?: number; source?: string }>;
     abilities?: Ability[];
 };
+
+/** How one side's d20 is rolled: two keep high, two keep low, one, or one because both applied. */
+type GrappleRollMode = 'advantage' | 'disadvantage' | 'normal' | 'cancelled';
+
+/**
+ * advantageSources / disadvantageSources as the grapple branch sees them: the
+ * outer schema has already turned a JSON string into an array, but batch and
+ * direct callers hand the raw value over, so a JSON string or a bare name is
+ * read here too.
+ */
+function sourceTexts(v: unknown): string[] {
+    const parsed = jsonIfString(v);
+    if (Array.isArray(parsed)) return parsed.map(x => String(x ?? ''));
+    if (typeof parsed === 'string' && parsed.trim()) return [parsed];
+    return [];
+}
 
 /** A GM-posted grapple result: win (hit/crit) or lose (miss); undefined when the contest is rolled. */
 function postedGrappleOutcome(v: unknown): 'win' | 'lose' | undefined {
@@ -1044,17 +1096,67 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
         return { error: true, writes: 'none', message: `${actor.name} (${actor.size}) cannot ${move} ${target.name} (${target.size}): the target is larger` };
     }
 
+    // Play report 4: the flags are booleans. Over MCP the outer schema says
+    // so; batch_manage and direct callers hand the raw value over, and a
+    // 'true' string must be refused, never read as "no advantage".
+    for (const key of ['advantage', 'disadvantage'] as const) {
+        const v = args[key];
+        if (v !== undefined && v !== null && typeof v !== 'boolean') {
+            return { error: true, writes: 'none', actionType: 'grapple', message: `${key} must be true or false, not ${JSON.stringify(v)} — nothing was rolled or spent` };
+        }
+    }
+
     // What a side is judged by: the token when there is one (its conditions
     // and hp), else the sheet — a stale sheet condition never decides a live fight.
     const seen = (s: GrappleSide) => s.tok
         ? { name: s.name, hp: s.tok.hp, conditions: s.tok.conditions }
         : { name: s.name, hp: s.row?.hp, conditions: s.row?.conditions };
 
+    // A helpless actor is refused before anything is spent. In a fight the
+    // engine refuses an incapacitated actor (the standard conditions, 0 HP);
+    // the same helpless list the target is judged by then covers the actor on
+    // both paths — a custom 'Asleep' token, or a sheet at 0 HP with no fight —
+    // so no path is the way round that rule. Play report 4: this used to sit
+    // below the surge spend, which had already marked the ability spent (and
+    // mirrored it to the sheet) under a reply that claimed writes: 'none'.
+    const down = helplessReason(seen(actor));
+    if (down) return { error: true, writes: 'none', message: `${actor.name} cannot grapple now: ${down}` };
+
+    // Play report 2, item 3: no contest when the GM posts the result
+    // (outcome win|lose), nor against a helpless target — unconscious,
+    // asleep, incapacitated, paralysed, stunned, petrified or at 0 HP (a
+    // house ruling; 5e RAW lets an incapacitated creature still roll). For a
+    // break the "target" is the holder: a stunned grappler loses the hold.
+    const posted = postedGrappleOutcome(args.outcome);
+    const auto = posted ? undefined : helplessReason(seen(target));
+    const contested = !posted && !auto;
+    // A posted win may carry the surface damage the GM rolled (a number) or wants rolled (dice).
+    if (posted && typeof args.damage === 'string') {
+        try { parseDiceTerms(args.damage); } catch { return { error: true, writes: 'none', message: `Invalid dice '${args.damage}' for damage: use notation like '2d6' or '1d8+2', or a number` }; }
+    }
+
+    // Play report 4: the GM's advantage/disadvantage and named sources. The
+    // sources are matched against the actor's token conditions, sheet
+    // conditions and active effects (math_manage's resolver). A miss or an
+    // ambiguous name is REFUSED here, before anything is spent — a grapple
+    // spends the attack and writes conditions, where math_manage only warns
+    // and rolls. With no contest nothing would be rolled, so nothing is checked.
+    const gmAdv = args.advantage === true, gmDis = args.disadvantage === true;
+    const advTexts = sourceTexts(args.advantageSources), disTexts = sourceTexts(args.disadvantageSources);
+    let advLabels: string[] = [], disLabels: string[] = [];
+    if (contested && (advTexts.length || disTexts.length)) {
+        const owner = { ownerName: actor.name, conditions: [...tokConditions(actor.tok), ...rowConditions(actor.row)], effectNames: loadEffectNames(db, actor.id) };
+        const adv = resolveNamedSources(advTexts, 'advantage', owner);
+        const dis = resolveNamedSources(disTexts, 'disadvantage', owner);
+        const problems = [...adv.problems, ...dis.problems];
+        if (problems.length) {
+            return { error: true, writes: 'none', actionType: 'grapple', sourceProblems: problems, message: `${actor.name} cannot grapple with these sources: ${problems.join('; ')}. Name what is on ${actor.name}'s token, sheet or active effects (a condition's name or source, an effect's name). Nothing was rolled or spent.` };
+        }
+        advLabels = adv.labels; disLabels = dis.labels;
+    }
+
     // Economy: a grapple replaces one attack of the Attack action; escaping is
-    // the action. In a fight the engine refuses an incapacitated actor (the
-    // standard conditions, 0 HP); the same helpless list the target is judged
-    // by then covers the actor on both paths — a custom 'Asleep' token, or a
-    // sheet at 0 HP with no fight — so no path is the way round that rule.
+    // the action.
     let surge: { ability: Ability; onToken: boolean } | undefined;
     if (engine) {
         const economy = isBreak ? engine.validateActionEconomy(actor.id, 'action') : engine.validateAttackEconomy(actor.id);
@@ -1076,42 +1178,53 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
         const mirroredToCharacter = (!surge.onToken || !surge.ability.recharge) ? patchRowAbility(db, actor.id, surge.ability.name, false).found : false;
         surgeInfo = { spent: true, ability: surge.ability.name, source: surge.onToken ? 'token' : 'sheet', mirroredToCharacter };
     }
-    const down = helplessReason(seen(actor));
-    if (down) return { error: true, writes: 'none', message: `${actor.name} cannot grapple now: ${down}` };
 
-    // Play report 2, item 3: no contest when the GM posts the result
-    // (outcome win|lose), nor against a helpless target — unconscious,
-    // asleep, incapacitated, paralysed, stunned, petrified or at 0 HP (a
-    // house ruling; 5e RAW lets an incapacitated creature still roll). For a
-    // break the "target" is the holder: a stunned grappler loses the hold.
-    const posted = postedGrappleOutcome(args.outcome);
-    const auto = posted ? undefined : helplessReason(seen(target));
-    const contested = !posted && !auto;
-    // A posted win may carry the surface damage the GM rolled (a number) or wants rolled (dice).
-    if (posted && typeof args.damage === 'string') {
-        try { parseDiceTerms(args.damage); } catch { return { error: true, writes: 'none', message: `Invalid dice '${args.damage}' for damage: use notation like '2d6' or '1d8+2', or a number` }; }
-    }
-
-    // The lower band or the smaller size rolls at disadvantage, once (5e: never stacks).
+    // The lower band or the smaller size rolls at disadvantage, once (5e: never
+    // stacks). Short labels go in the roll_log purpose, the detail in the line.
     const cmp = compareBands(g.order, actor.band, target.band);
-    const reasons = (me: GrappleSide, them: GrappleSide, lowerBand: boolean) => [
-        ...(lowerBand ? [`lower band (${me.band} vs ${them.band})`] : []),
-        ...(sizeRank(me.size) < sizeRank(them.size) ? [`smaller (${me.size} vs ${them.size})`] : [])
+    const autoReasons = (me: GrappleSide, them: GrappleSide, lowerBand: boolean): Array<{ label: string; detail: string }> => [
+        ...(lowerBand ? [{ label: 'lower band', detail: `${me.band} vs ${them.band}` }] : []),
+        ...(sizeRank(me.size) < sizeRank(them.size) ? [{ label: 'smaller', detail: `${me.size} vs ${them.size}` }] : [])
     ];
-    const actorDis = contested ? reasons(actor, target, cmp === -1) : [];
-    const defDis = contested ? reasons(target, actor, cmp === 1) : [];
-    const situational = [
-        ...(actorDis.length ? [`${actor.name}: disadvantage (${actorDis.join(', ')})`] : []),
-        ...(defDis.length ? [`${target.name}: disadvantage (${defDis.join(', ')})`] : [])
-    ];
+    const detailed = (r: { label: string; detail: string }) => `${r.label} (${r.detail})`;
+    const actorAuto = contested ? autoReasons(actor, target, cmp === -1) : [];
+    const defAuto = contested ? autoReasons(target, actor, cmp === 1) : [];
+    // The actor's reasons in order: the GM's flag, the automatic rule, the
+    // named sources. The defender has only the automatic rule.
+    const actorAdv = [...(gmAdv ? ['GM'] : []), ...advLabels];
+    const actorDis = { short: [...(gmDis ? ['GM'] : []), ...actorAuto.map(r => r.label), ...disLabels], long: [...(gmDis ? ['GM'] : []), ...actorAuto.map(detailed), ...disLabels] };
+    const defDis = { short: defAuto.map(r => r.label), long: defAuto.map(detailed) };
+    const modeOf = (adv: number, dis: number): GrappleRollMode => adv && dis ? 'cancelled' : adv ? 'advantage' : dis ? 'disadvantage' : 'normal';
+    const actorMode = modeOf(actorAdv.length, actorDis.short.length);
+    const defMode = modeOf(0, defDis.short.length);
+    const sideLine = (name: string, mode: GrappleRollMode, adv: string[], dis: string[]): string | undefined =>
+        mode === 'cancelled' ? `${name}: advantage and disadvantage cancel — one die (adv: ${adv.join('; ')}; dis: ${dis.join('; ')})`
+        : mode === 'advantage' ? `${name}: advantage (${adv.join('; ')})`
+        : mode === 'disadvantage' ? `${name}: disadvantage (${dis.join('; ')})`
+        : undefined;
+    const situational = contested
+        ? [sideLine(actor.name, actorMode, actorAdv, actorDis.long), sideLine(target.name, defMode, [], defDis.long)].filter((l): l is string => !!l)
+        : [
+            ...(gmAdv || advTexts.length ? ['advantage ignored: no contest rolled'] : []),
+            ...(gmDis || disTexts.length ? ['disadvantage ignored: no contest rolled'] : [])
+        ];
+    // The purpose stays exactly 'grapple' with no reasons (roll counts query it).
+    const purposeOf = (adv: string[], dis: string[]) => {
+        const why = [adv.length ? `adv: ${adv.join(', ')}` : '', dis.length ? `dis: ${dis.join(', ')}` : ''].filter(Boolean).join('; ');
+        return why ? `grapple (${why})` : 'grapple';
+    };
 
-    const roll = (me: GrappleSide, them: GrappleSide, disadvantage: boolean): number[] => {
-        const tag = { purpose: 'grapple', forId: me.id, targetId: them.id };
+    const roll = (me: GrappleSide, them: GrappleSide, mode: GrappleRollMode, purpose: string): { rolls: number[]; kept: number } => {
+        const tag = { purpose, forId: me.id, targetId: them.id };
+        const adv = mode === 'advantage', dis = mode === 'disadvantage';
         if (engine) {
             const first = engine.rollD20(tag);
-            return disadvantage ? [first, engine.rollD20(tag)] : [first];
+            if (!adv && !dis) return { rolls: [first], kept: first };
+            const second = engine.rollD20(tag);
+            return { rolls: [first, second], kept: adv ? Math.max(first, second) : Math.min(first, second) };
         }
-        return loggedD20(db, tag, { disadvantage, tool: 'combat_action' }).rolls;
+        const r = loggedD20(db, tag, { advantage: adv, disadvantage: dis, tool: 'combat_action' });
+        return { rolls: r.rolls, kept: r.natural };
     };
 
     const mod = (v?: number) => Math.floor(((v ?? 10) - 10) / 2);
@@ -1137,16 +1250,18 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
     const defSkill = skillProf(target, isBreak ? ['athletics'] : ['athletics', 'acrobatics']);
     const defProf = defSkill.bonus;
 
-    const atkRolls = contested ? roll(actor, target, actorDis.length > 0) : [];
-    const defRolls = contested ? roll(target, actor, defDis.length > 0) : [];
-    const atkTotal = contested ? Math.min(...atkRolls) + atkStat + atkProf + bonus : undefined;
-    const defTotal = contested ? Math.min(...defRolls) + defStat + defProf : undefined;
+    const atk = contested ? roll(actor, target, actorMode, purposeOf(actorAdv, actorDis.short)) : undefined;
+    const def = contested ? roll(target, actor, defMode, purposeOf([], defDis.short)) : undefined;
+    const atkRolls = atk?.rolls ?? [];
+    const defRolls = def?.rolls ?? [];
+    const atkTotal = atk ? atk.kept + atkStat + atkProf + bonus : undefined;
+    const defTotal = def ? def.kept + defStat + defProf : undefined;
     const margin = atkTotal !== undefined && defTotal !== undefined ? atkTotal - defTotal : undefined;
     const win = margin !== undefined ? margin > 0 : posted ? posted === 'win' : true; // tie holds with the defender
 
-    const shown = (rolls: number[]) => rolls.length > 1 ? `d20(${rolls.join(',')} dis → ${Math.min(...rolls)})` : `d20(${rolls[0]})`;
-    const breakdown = contested
-        ? `${actor.name} ${shown(atkRolls)}+${atkStat}stat+${atkProf}prof${atkSkill.expertise ? ' (expertise)' : ''}${bonus ? `+${bonus}situational` : ''} = ${atkTotal}  vs  ${target.name} ${shown(defRolls)}+${defStat}stat+${defProf}prof${defSkill.expertise ? ' (expertise)' : ''} = ${defTotal}`
+    const shown = (r: { rolls: number[]; kept: number }, mode: GrappleRollMode) => r.rolls.length > 1 ? `d20(${r.rolls.join(',')} ${mode === 'advantage' ? 'adv' : 'dis'} → ${r.kept})` : `d20(${r.rolls[0]})`;
+    const breakdown = atk && def
+        ? `${actor.name} ${shown(atk, actorMode)}+${atkStat}stat+${atkProf}prof${atkSkill.expertise ? ' (expertise)' : ''}${bonus ? `+${bonus}situational` : ''} = ${atkTotal}  vs  ${target.name} ${shown(def, defMode)}+${defStat}stat+${defProf}prof${defSkill.expertise ? ' (expertise)' : ''} = ${defTotal}`
         : posted ? `posted by the GM: ${posted.toUpperCase()} — no contest rolled` : `auto-win: ${auto} — no contest rolled`;
 
     let actionSpent: string | undefined;
@@ -1161,7 +1276,9 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
         success: true, actionType: 'grapple', move, breakdown,
         ...(g.encounterId ? { encounterId: g.encounterId } : {}),
         ...(g.routed ? { routedToEncounter: true } : {}),
-        ...(contested ? { margin, rolls: { actor: atkRolls, defender: defRolls } } : {}),
+        ...(contested ? { margin, rolls: { actor: atkRolls, defender: defRolls }, rollMode: { actor: actorMode, defender: defMode } } : {}),
+        ...(advLabels.length ? { advantageSources: advLabels } : {}),
+        ...(disLabels.length ? { disadvantageSources: disLabels } : {}),
         ...(auto ? { autoWin: { reason: auto } } : {}),
         ...(posted ? { outcome: posted, posted: true } : {}),
         ...(situational.length ? { situational } : {}),
@@ -1281,7 +1398,7 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
     // a posted crit through the attack path below.
     const a = args as Record<string, unknown>;
     const actName = String(a?.action ?? '').toLowerCase();
-    let execute: { note: string; pinFrom: 'token' | 'sheet'; encounterId?: string; routed: boolean } | undefined;
+    let execute: { note: string; pinFrom: 'token' | 'sheet'; encounterId?: string; routed: boolean; ignored?: string[]; ignoredNote?: string } | undefined;
     if (actName === 'grapple' || actName === 'clinch' || actName === 'takedown' || actName === 'slam' || actName === 'break_grapple') {
         const moveRaw = String(a.move ?? a.action ?? 'clinch').toLowerCase().replace('break_grapple', 'break');
         const move = (GRAPPLE_MOVES as readonly string[]).includes(moveRaw) ? moveRaw as GrappleMove : null;
@@ -1291,6 +1408,16 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
         };
         if (!move) return refuse(`grapple needs move: ${GRAPPLE_MOVES.join(' | ')}`);
         if (!a.actorId || !a.targetId) return refuse('grapple needs actorId + targetId');
+        // Play report 4: grapple never meets the router, so it checks its own
+        // ignored keys against GrappleSchema (the router's rule: a success
+        // reply names each key and its nearest valid key; a refusal does not).
+        const ignored = ignoredParamsOf(GrappleSchema, a);
+        const ignoredNote = ignored.length ? describeIgnoredParams('grapple', ignored, GrappleSchema) : undefined;
+        const withIgnored = <T extends Record<string, unknown>>(result: T): T => {
+            if (!ignoredNote || result.error) return result;
+            const prior = result.message;
+            return { ...result, ignoredParams: ignored, message: typeof prior === 'string' && prior ? `${prior.replace(/\.?\s*$/, '')}. ${ignoredNote}` : ignoredNote };
+        };
         const g = grappleContext(a, ctx);
         if ('error' in g) return refuse(g.message);
         if (move === 'execute') {
@@ -1299,19 +1426,19 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
             if ('problem' in check) return refuse(check.problem);
             if (!g.engine) {
                 // No encounter: the sheets take it (and the kill makes a corpse).
-                const result = await executeOnSheets(a, g, check);
+                const result = withIgnored(await executeOnSheets(a, g, check));
                 const out = (result.error ? RichFormatter.error(String(result.message)) : RichFormatter.header('Grapple — execute', '🤼') + RichFormatter.alert(String(result.message), 'info'))
                     + RichFormatter.embedJson(result, 'COMBAT_ACTION');
                 return { content: [{ type: 'text', text: out }] };
             }
-            execute = { note: check.note, pinFrom: check.pinFrom, encounterId: g.encounterId, routed: g.routed };
+            execute = { note: check.note, pinFrom: check.pinFrom, encounterId: g.encounterId, routed: g.routed, ...(ignoredNote ? { ignored, ignoredNote } : {}) };
             // Request 11: an execute already gates on band; its posted crit is never
             // band-scaled. A coup de grâce (no damage given) bypasses defences: no
             // damageType reaches the engine, so no resistance halves its HP.
             args = { action: 'attack', encounterId: g.encounterId, actorId: a.actorId, targetId: a.targetId, outcome: 'crit', damage: check.damage, bandScale: false,
                 ...(!check.coupDeGrace && typeof a.damageType === 'string' ? { damageType: a.damageType } : {}) };
         } else {
-            const result = grappleResolve(a, g, move);
+            const result = withIgnored(grappleResolve(a, g, move));
             let out = result.error ? RichFormatter.error(String(result.message)) : RichFormatter.header(`Grapple — ${String(result.move)}`, '🤼') + RichFormatter.alert(String(result.message), 'info');
             if (Array.isArray(result.situational)) out += (result.situational as string[]).map(s => `  ${s}\n`).join('');
             out += RichFormatter.embedJson(result, 'COMBAT_ACTION');
@@ -1327,6 +1454,7 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
         if (execute && !parsed.error) {
             parsed.execute = execute.note; parsed.grappleMove = 'execute'; parsed.pinFrom = execute.pinFrom;
             if (execute.routed) { parsed.routedToEncounter = true; parsed.encounterId = execute.encounterId; }
+            if (execute.ignored) { parsed.ignoredParams = execute.ignored; parsed.message = typeof parsed.message === 'string' && parsed.message ? `${parsed.message.replace(/\.?\s*$/, '')}. ${execute.ignoredNote}` : execute.ignoredNote; }
         }
 
         if (parsed.error) {

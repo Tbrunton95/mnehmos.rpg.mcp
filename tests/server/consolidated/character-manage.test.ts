@@ -106,10 +106,12 @@ describe('character_manage consolidated tool', () => {
             // The row exists and carries none of the ignored keys' effects.
             const row = characterRepo.findById(parsed.id)!;
             expect(row.conditions).toEqual([]);
-            // Only create opted in: an unknown key on update is dropped as before, with no ignoredParams in the reply.
+            // Play report 4 #2: warn is the router's default now — update reports the key it dropped too, and still writes.
             const upd = extractJson((await handleCharacterManage({ action: 'update', characterId: parsed.id, hp: 5, bogusKey: 1 }, ctx)).content[0].text);
             expect(upd.success).toBe(true);
-            expect(upd.ignoredParams).toBeUndefined();
+            expect(upd.ignoredParams).toEqual(['bogusKey']);
+            expect(upd.message).toMatch(/Ignored params \(not update parameters; nothing was written for them\): bogusKey — /);
+            expect(characterRepo.findById(parsed.id)!.hp).toBe(5);
         });
 
         it('should create a character with minimal params', async () => {

@@ -9,6 +9,7 @@ import { handleCharacterManage } from '../../../src/server/consolidated/characte
 import { getDb } from '../../../src/storage/index.js';
 import { CharacterRepository } from '../../../src/storage/repos/character.repo.js';
 import { randomUUID } from 'crypto';
+import { EQUIP_SLOTS } from '../../../src/schema/inventory.js';
 
 // Force test mode
 process.env.NODE_ENV = 'test';
@@ -815,6 +816,95 @@ describe('inventory_manage consolidated tool', () => {
             expect(parsed.success).toBe(true);
             expect((parsed as { data: { recomputeAc?: boolean } }).data.recomputeAc).toBe(true);
             expect(InventoryManageTool.description).toContain('recomputeAc');
+        });
+    });
+
+    // Play report 4 #3: a misc item with no equipSlots could not be equipped and
+    // the refusal was a bare throw with no fix. The refusal now names the real
+    // id, the slot that was tried, the allowed slots, and the exact item_manage
+    // call that makes the item equippable; nothing is written.
+    describe('equippable custom items (play report 4 #3)', () => {
+        const owned = async (name: string, type: string, properties?: Record<string, unknown>) => {
+            const created = parseItemResult(await handleItemManage({ action: 'create', name, type, weight: 1, value: 1, ...(properties ? { properties } : {}) }, ctx));
+            await handleInventoryManage({ action: 'give', characterId: testCharId, itemId: created.item.id, quantity: 1 }, ctx);
+            return created.item.id as string;
+        };
+        const equip = async (itemId: string, slot: string) =>
+            parseResult(await handleInventoryManage({ action: 'equip', characterId: testCharId, itemId, slot }, ctx));
+        const equippedRow = (itemId: string) =>
+            getDb(':memory:').prepare('SELECT equipped, slot FROM inventory_items WHERE character_id = ? AND item_id = ?').get(testCharId, itemId) as { equipped: number; slot: string | null };
+
+        beforeEach(async () => {
+            await handleInventoryManage({ action: 'give', characterId: testCharId, itemId: testItemId, quantity: 1 }, ctx);
+        });
+
+        it('refuses a misc item with no equipSlots, printing the exact fixing call with the real id and the tried slot', async () => {
+            const dosimeter = await owned('Dosimeter', 'misc', { rads: true });
+            const data = await equip(dosimeter, 'accessory');
+            expect(data.error).toBe(true);
+            expect(data.writes).toBe('none');
+            expect(data.actionType).toBe('equip');
+            expect(data.itemId).toBe(dosimeter);
+            expect(data.slot).toBe('accessory');
+            expect(data.allowedSlots).toEqual([]);
+            expect(data.fix).toEqual({ tool: 'item_manage', args: { action: 'update', itemId: dosimeter, equipSlots: ['accessory'] } });
+            expect(data.message).toContain(`item_manage update {itemId: '${dosimeter}', equipSlots: ['accessory']}`);
+            expect(data.message).toContain(`properties: {equipSlots: ['accessory']}, mergeProperties: true`);
+            expect(data.message).toContain('NOTHING was written');
+            expect(equippedRow(dosimeter)).toMatchObject({ equipped: 0 });
+            // The rendered refusal carries the NO WRITE stamp (payload-gated on writes: 'none').
+            const rendered = await handleInventoryManage({ action: 'equip', characterId: testCharId, itemId: dosimeter, slot: 'accessory' }, ctx);
+            expect(rendered.content[0].text).toContain('NO WRITE');
+        });
+
+        it('running the printed fix makes the next equip succeed', async () => {
+            const dosimeter = await owned('Dosimeter', 'misc', { rads: true });
+            const refused = await equip(dosimeter, 'accessory');
+            const fixed = parseItemResult(await handleItemManage(refused.fix.args, ctx));
+            expect(fixed.success).toBe(true);
+            expect(fixed.item.properties).toEqual({ rads: true, equipSlots: ['accessory'] });
+
+            const data = await equip(dosimeter, 'accessory');
+            expect(data.success).toBe(true);
+            expect(data.slot).toBe('accessory');
+            expect(equippedRow(dosimeter)).toMatchObject({ equipped: 1, slot: 'accessory' });
+        });
+
+        it('the properties + mergeProperties alternative fixes it too and keeps the other properties', async () => {
+            const lamp = await owned('Head Lamp', 'misc', { lumens: 200 });
+            expect((await equip(lamp, 'head')).error).toBe(true);
+            const fixed = parseItemResult(await handleItemManage({ action: 'update', itemId: lamp, properties: { equipSlots: ['head'] }, mergeProperties: true }, ctx));
+            expect(fixed.success).toBe(true);
+            expect(fixed.item.properties).toEqual({ lumens: 200, equipSlots: ['head'] });
+            expect((await equip(lamp, 'head')).success).toBe(true);
+        });
+
+        it('a weapon tried in the armor slot keeps mainhand/offhand in the fix and adds the tried slot', async () => {
+            const data = await equip(testItemId, 'armor');
+            expect(data.error).toBe(true);
+            expect(data.writes).toBe('none');
+            expect(data.allowedSlots).toEqual(['mainhand', 'offhand']);
+            expect(data.fix.args).toEqual({ action: 'update', itemId: testItemId, equipSlots: ['mainhand', 'offhand', 'armor'] });
+            expect(data.message).toContain(`item_manage update {itemId: '${testItemId}', equipSlots: ['mainhand', 'offhand', 'armor']}`);
+            expect(data.message).toMatch(/mainhand or offhand/);
+            expect(equippedRow(testItemId)).toMatchObject({ equipped: 0 });
+        });
+
+        it('a slot the item already allows is never duplicated in the fix', async () => {
+            const ring = await owned('Ring', 'misc', { equipSlots: ['accessory'] });
+            const data = await equip(ring, 'accessory2');
+            expect(data.fix.args.equipSlots).toEqual(['accessory', 'accessory2']);
+        });
+
+        it('the slot enum is EQUIP_SLOTS on the inner and outer schemas and in the description', () => {
+            const outer = InventoryManageTool.inputSchema;
+            for (const slot of EQUIP_SLOTS) {
+                expect(outer.safeParse({ action: 'equip', characterId: 'c', itemId: 'i', slot }).success).toBe(true);
+                expect(InventoryManageTool.actionSchemas.equip.schema.safeParse({ action: 'equip', characterId: 'c', itemId: 'i', slot }).success).toBe(true);
+                expect(InventoryManageTool.actionSchemas.unequip.schema.safeParse({ action: 'unequip', characterId: 'c', slot }).success).toBe(true);
+            }
+            expect(outer.safeParse({ action: 'equip', characterId: 'c', itemId: 'i', slot: 'ring' }).success).toBe(false);
+            expect(InventoryManageTool.description).toContain(EQUIP_SLOTS.join(', '));
         });
     });
 

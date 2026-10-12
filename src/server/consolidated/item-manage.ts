@@ -8,6 +8,8 @@ import { randomUUID } from 'crypto';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
 import { ItemRepository } from '../../storage/repos/item.repo.js';
 import { getDb } from '../../storage/index.js';
+import { EQUIP_SLOTS, equipSlotSchema } from '../../schema/inventory.js';
+import { similarity } from '../../utils/fuzzy-enum.js';
 import { journalSnapshot } from '../utils/write-journal.js';
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
@@ -32,6 +34,69 @@ function ensureDb() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// EQUIP SLOTS (play report 4 #3)
+// ═══════════════════════════════════════════════════════════════════════════
+// A template says where it can be equipped in properties.equipSlots; the
+// type defaults (weapon → mainhand/offhand, armor → armor or offhand) apply
+// only when the key is absent. create/update take `equipSlots` at the top
+// level and write it there; the key is validated however it arrives.
+
+/** Refuse before any write: the Error carries writes: 'none' so the renderer prints NO WRITE. */
+function refuse(message: string): never {
+    const e = new Error(message);
+    (e as Error & { writes?: string }).writes = 'none';
+    throw e;
+}
+
+/** A slot named twice is one slot. */
+const uniqueSlots = (slots: readonly string[]): string[] => [...new Set(slots)];
+
+/** properties.equipSlots as written: an array of known slots. An unknown one is refused with its nearest slot; null clears the key. */
+function checkEquipSlots(value: unknown): string[] {
+    if (value === null) return [];
+    if (!Array.isArray(value)) refuse(`properties.equipSlots must be an array of slots, got ${JSON.stringify(value)}. Slots: ${EQUIP_SLOTS.join(', ')}. NOTHING was written.`);
+    for (const s of value as unknown[]) {
+        if (typeof s === 'string' && (EQUIP_SLOTS as readonly string[]).includes(s)) continue;
+        let best: { slot: string; score: number } | undefined;
+        if (typeof s === 'string') {
+            for (const slot of EQUIP_SLOTS) {
+                const score = similarity(s, slot);
+                if (!best || score > best.score) best = { slot, score };
+            }
+        }
+        const text = typeof s === 'string' ? s : JSON.stringify(s);
+        const nearest = best && best.score >= 0.5 ? ` — nearest is '${best.slot}'` : '';
+        refuse(`properties.equipSlots names '${text}', which is not an equipment slot${nearest}. Slots: ${EQUIP_SLOTS.join(', ')}. NOTHING was written.`);
+    }
+    return uniqueSlots(value as string[]);
+}
+
+/**
+ * The slots the caller asked for, from the top-level `equipSlots` and/or
+ * `properties.equipSlots`. undefined: nothing said about slots. []: clear the
+ * key. Both given and disagreeing (as sets) is refused.
+ */
+function resolveEquipSlots(topLevel: readonly string[] | undefined, properties: Record<string, unknown> | undefined): string[] | undefined {
+    const inProps = properties && 'equipSlots' in properties ? checkEquipSlots(properties.equipSlots) : undefined;
+    if (topLevel && inProps) {
+        const same = uniqueSlots(topLevel).sort().join(',') === [...inProps].sort().join(',');
+        if (!same) refuse(`equipSlots [${topLevel.join(', ')}] and properties.equipSlots [${inProps.join(', ')}] disagree — pass one of them. NOTHING was written.`);
+    }
+    return topLevel ? uniqueSlots(topLevel) : inProps;
+}
+
+/** The stored properties with equipSlots set (or, for [], removed). */
+function withEquipSlots(base: Record<string, unknown> | undefined, slots: string[]): Record<string, unknown> {
+    const out = { ...(base ?? {}) };
+    if (slots.length) out.equipSlots = slots;
+    else delete out.equipSlots;
+    return out;
+}
+
+const equipSlotsField = (what: string) => z.array(equipSlotSchema()).optional().describe(what);
+const TYPE_DEFAULTS = 'the type defaults return (weapon: mainhand/offhand; armor: armor, or offhand with acBonus; anything else: not equippable)';
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ACTION SCHEMAS
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -43,6 +108,7 @@ const CreateSchema = z.object({
     weight: z.number().min(0).optional().default(0).describe('Item weight in lbs (default 0)'),
     value: z.number().min(0).optional().default(0).describe('Item value in gold pieces; fractions allowed (default 0)'),
     properties: z.record(z.any()).optional().describe('Additional item properties'),
+    equipSlots: equipSlotsField(`Slots this template may be equipped in (${EQUIP_SLOTS.join(', ')}); written to properties.equipSlots. Needed for anything but a weapon or armor to be equippable`),
     worldId: z.string().optional().describe('World this template belongs to. Omit for a shared (unscoped) template')
 });
 
@@ -96,7 +162,10 @@ const UpdateSchema = z.object({
     // #67: item_manage update replaces properties WHOLESALE — every armour
     // edit forced re-typing the full property set or losing keys silently.
     // mergeProperties folds the passed keys into the stored set instead.
-    mergeProperties: z.boolean().optional().describe('If true, passed properties MERGE into stored properties (shallow) instead of replacing them wholesale. Pass a key with value null to delete it.')
+    mergeProperties: z.boolean().optional().describe('If true, passed properties MERGE into stored properties (shallow) instead of replacing them wholesale. Pass a key with value null to delete it.'),
+    // Play report 4 #3: the slot list as its own param — merged into the stored
+    // properties even without mergeProperties; [] deletes the key.
+    equipSlots: equipSlotsField(`Slots this template may be equipped in (${EQUIP_SLOTS.join(', ')}); merged into properties.equipSlots, the other properties kept. [] removes the key so ${TYPE_DEFAULTS}`)
 });
 
 const DeleteSchema = z.object({
@@ -133,6 +202,9 @@ const definitions: Record<ItemAction, ActionDefinition> = {
         handler: async (params: z.infer<typeof CreateSchema>) => {
             const { itemRepo } = ensureDb();
 
+            // Play report 4 #3: validated before the write; refusals carry writes: 'none'.
+            const slots = resolveEquipSlots(params.equipSlots, params.properties);
+
             const now = new Date().toISOString();
             const item = {
                 name: params.name,
@@ -140,7 +212,7 @@ const definitions: Record<ItemAction, ActionDefinition> = {
                 description: params.description,
                 weight: params.weight ?? 0,
                 value: params.value ?? 0,
-                properties: params.properties,
+                properties: slots !== undefined ? withEquipSlots(params.properties, slots) : params.properties,
                 ...(params.worldId ? { worldId: params.worldId } : {}),
                 id: randomUUID(),
                 createdAt: now,
@@ -152,7 +224,8 @@ const definitions: Record<ItemAction, ActionDefinition> = {
             return {
                 success: true,
                 item,
-                message: `Item template "${item.name}" created (id at item.id; in a sequence reference it as {{<stepId>.item.id}})`
+                ...(slots !== undefined ? { equipSlots: slots } : {}),
+                message: `Item template "${item.name}" created (id at item.id; in a sequence reference it as {{<stepId>.item.id}})${slots?.length ? `; equippable in ${slots.join(', ')}` : ''}`
             };
         },
         aliases: ['new', 'add', 'template']
@@ -281,7 +354,7 @@ const definitions: Record<ItemAction, ActionDefinition> = {
         handler: async (params: z.infer<typeof UpdateSchema>) => {
             const { db, itemRepo } = ensureDb();
 
-            const { itemId, action, mergeProperties, expectName, preview, ...updates } = params;
+            const { itemId, action, mergeProperties, expectName, preview, equipSlots, ...updates } = params;
 
             // FINDINGS #87: guard BEFORE any write path runs.
             const target = itemRepo.findById(itemId);
@@ -289,6 +362,10 @@ const definitions: Record<ItemAction, ActionDefinition> = {
             if (expectName !== undefined && target.name.toLowerCase() !== expectName.toLowerCase()) {
                 throw new Error(`GUARD REFUSAL: item ${itemId} is "${target.name}", not "${expectName}" — NOTHING was written. Check the id (item_manage search by name).`);
             }
+
+            // Play report 4 #3: properties.equipSlots is checked however it
+            // arrives (wholesale, merged, or the top-level param), before any write.
+            const slots = resolveEquipSlots(equipSlots, updates.properties);
 
             // #67: shallow merge lane — stored properties survive; passed keys
             // overwrite; explicit null deletes a key. Silent wholesale loss dies.
@@ -301,6 +378,13 @@ const definitions: Record<ItemAction, ActionDefinition> = {
                     else base[k] = v;
                 }
                 updates.properties = base;
+            }
+
+            // Play report 4 #3: equipSlots rides on whatever properties the
+            // write would otherwise leave — the merged set, the wholesale
+            // replacement, or the stored set when no properties were passed.
+            if (slots !== undefined) {
+                updates.properties = withEquipSlots(updates.properties ?? (target.properties as Record<string, unknown> | undefined), slots);
             }
 
             // FINDINGS #87: preview lane — the diff, no write.
@@ -328,12 +412,16 @@ const definitions: Record<ItemAction, ActionDefinition> = {
                 throw new Error(`Item not found: ${itemId}`);
             }
 
+            const slotNote = slots === undefined ? ''
+                : slots.length ? `; equippable in ${slots.join(', ')}`
+                    : `; equipSlots cleared — ${TYPE_DEFAULTS}`;
             return {
                 success: true,
                 item,
                 journalId,
                 ...(mergedFrom && { propertyMerge: { preservedKeys: mergedFrom, mode: 'shallow-merge' } }),
-                message: `Item "${item.name}" updated${mergedFrom ? ' (properties merged, not replaced)' : ''} — revertable: session_manage revert {writeId:${journalId}}`
+                ...(slots !== undefined ? { equipSlots: slots } : {}),
+                message: `Item "${item.name}" updated${mergedFrom ? ' (properties merged, not replaced)' : ''}${slotNote} — revertable: session_manage revert {writeId:${journalId}}`
             };
         },
         aliases: ['modify', 'edit', 'patch']
@@ -471,6 +559,10 @@ export const ItemManageTool = {
 🛡️ ARMOR PROPERTIES EXAMPLE:
 { baseAC: 14, maxDexBonus: 2 }
 
+🧷 EQUIP SLOTS: ${EQUIP_SLOTS.join(', ')}. By type a weapon equips in mainhand/offhand and armor in armor (offhand with acBonus); anything else (misc, consumable, quest, scroll), or a different slot, needs properties.equipSlots. Pass equipSlots: ['accessory'] on create or update — update merges it into the stored properties (other keys kept, no mergeProperties needed); equipSlots: [] removes the key so the type defaults return. properties: {equipSlots: [...]} works too and is validated the same way: an unknown slot is refused with the nearest slot and nothing written. An inventory_manage equip refusal prints the exact update call to run.
+
+✏️ UPDATE PROPERTIES: update {properties} REPLACES the stored set wholesale. update {properties, mergeProperties: true} merges the passed keys into the stored set (shallow; a key set to null is deleted) and the reply's propertyMerge names the keys that were preserved. Both are journaled and revertable; preview: true shows the diff and writes nothing.
+
 Actions: ${ACTIONS.join(', ')}
 Aliases: new→create, fetch→get, query→search`,
     actionSchemas: router.actionSchemas,
@@ -484,6 +576,8 @@ Aliases: new→create, fetch→get, query→search`,
         value: z.number().optional().describe('Item value in gp'),
         properties: z.record(z.any()).optional().describe('Additional properties'),
         mergeProperties: z.boolean().optional().describe('update: MERGE passed properties into stored set (shallow) instead of wholesale replace; null value deletes a key'),
+        // Play report 4 #3 (mirror law): equipSlots on create/update
+        equipSlots: equipSlotsField(`create/update: slots the template may be equipped in (${EQUIP_SLOTS.join(', ')}) — written to properties.equipSlots; update merges it, [] clears it`),
         // FINDINGS #87 (mirror law): the destructive-write guard params
         expectName: z.string().optional().describe('update/delete guard: refuse unless the row\'s name matches (case-insensitive) — names what IS there on refusal'),
         preview: z.boolean().optional().describe('update: return the field-by-field diff, write NOTHING'),
@@ -515,6 +609,8 @@ export async function handleItemManage(args: unknown, _ctx: SessionContext): Pro
     if (parsed.error) {
         output = RichFormatter.header('Error', '❌');
         output += RichFormatter.alert(parsed.message || 'Unknown error', 'error');
+        // Play report 4 #3: a refusal that asserted write-freedom says so on the card.
+        if (parsed.writes === 'none') output += RichFormatter.alert('NO WRITE', 'info');
         if (parsed.suggestions) {
             output += '\n**Did you mean:**\n';
             parsed.suggestions.forEach((s: { value: string; similarity: number }) => {
@@ -540,6 +636,7 @@ export async function handleItemManage(args: unknown, _ctx: SessionContext): Pro
             'Type': item.type,
             'Weight': `${item.weight} lbs`,
             'Value': `${item.value} gp`,
+            ...(Array.isArray(item.properties?.equipSlots) ? { 'Equips in': item.properties.equipSlots.join(', ') } : {}),
         });
         if (item.description) {
             output += `\n${item.description}\n`;

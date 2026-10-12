@@ -322,6 +322,17 @@ describe('world_manage consolidated tool', () => {
             expect(data.aliased).toBeUndefined();
         });
 
+        // Play report 4 #2: update's schema sits behind z.preprocess; the
+        // ignored-key check used to see no shape there and say nothing.
+        it('a key update does not declare is reported, not dropped silently, through the preprocess wrapper', async () => {
+            const data = parseResult(await handleWorldManage({ action: 'update', id: worldId, environment: { season: 'autumn' }, bogus: 1, correctoin: true }, ctx));
+            expect(data.success).toBe(true);
+            expect(data.environment.season).toBe('autumn');
+            expect(data.ignoredParams).toEqual(['bogus', 'correctoin']);
+            expect(data.message).toMatch(/Ignored params \(not update parameters; nothing was written for them\): bogus — no close match among update's parameters; correctoin — nearest valid key 'correction'\./);
+            expect(data.correction).toBeUndefined();
+        });
+
         it('the tool text lists the aliases', () => {
             expect(WorldManageTool.description).toMatch(/weatherConditions \(alias weather\)/);
             expect(WorldManageTool.inputSchema.shape.environment.description).toMatch(/location/);

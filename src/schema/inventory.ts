@@ -8,6 +8,19 @@ export const INVENTORY_LIMITS = {
     DEFAULT_WEIGHT_CAPACITY: 100 // Default carry weight (based on STR in future)
 } as const;
 
+/**
+ * Play report 4 #3: the one equipment-slot list. inventory_manage equip/unequip
+ * validate against it (inner and outer schemas, description), item_manage
+ * create/update accept `equipSlots` from it, and a custom item's
+ * properties.equipSlots is checked against it on write. #96 added the three
+ * accessory slots (medallion + rings; detector + patch + dosimeter).
+ */
+export const EQUIP_SLOTS = ['mainhand', 'offhand', 'armor', 'head', 'feet', 'accessory', 'accessory2', 'accessory3'] as const;
+export type EquipSlot = typeof EQUIP_SLOTS[number];
+
+/** A fresh zod enum per call: the mirror law forbids one zod instance twice inside an outer schema object. */
+export const equipSlotSchema = () => z.enum(EQUIP_SLOTS);
+
 export const ItemSchema = z.object({
     id: z.string(),
     name: z.string()
