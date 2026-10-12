@@ -798,6 +798,14 @@ function runMigrations(db: Database.Database) {
     }
   }
 
+  // Play report 3: party upkeep. Stores live in a linked character pool
+  // (mouth-days); the party row keeps only the link, the mouth pools, the
+  // roles counted, the starvation rule and the last day charged, as JSON.
+  if (!partyColumns.some(col => col.name === 'upkeep')) {
+    console.error('[Migration] Adding upkeep column to parties table');
+    db.exec('ALTER TABLE parties ADD COLUMN upkeep TEXT;');
+  }
+
   // Set safe default positions for existing parties (map center)
   db.exec(`
     UPDATE parties

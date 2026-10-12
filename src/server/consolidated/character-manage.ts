@@ -36,6 +36,7 @@ import {
     SkillProficiencySchema,
     SaveProficiencySchema,
     resourcePoolSchema,
+    acSourceSchema,
     type ResourcePool,
 } from '../../schema/character.js';
 import { resolveInstance, mintInstance } from './inventory-manage.js';
@@ -133,8 +134,11 @@ export function mergeConditions(current: SheetCondition[], add: SheetCondition[]
  * The legendary counters and lair flag are older columns exposed here too.
  */
 const COMBAT_PROFILE_FIELDS = ['size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'attacksPerAction', 'attacks', 'abilities', 'fightingStyle', 'superiorityDie', 'maneuverAbility', 'cr', 'autoLegendaryResistance',
-    'legendaryActions', 'legendaryResistances', 'legendaryResistancesRemaining', 'hasLairActions'] as const;
+    'legendaryActions', 'legendaryResistances', 'legendaryResistancesRemaining', 'hasLairActions', 'acSource'] as const;
 const CombatProfileShape = {
+    // Play report 3 #2: update {ac} sets manual by itself; pass acSource:
+    // 'derived' alone to hand the AC back to the gear without touching it.
+    acSource: acSourceSchema().optional().describe("Where the AC comes from. manual (set by update {ac} and set_form): inventory_manage equip/unequip keep the number and say what the gear would give. derived: gear drives it, every equip/unequip recomputes. Pass acSource: 'derived' alone to switch without touching gear (the number changes at the next equip/unequip)"),
     size: ParticipantExtrasShape.size,
     reach: ParticipantExtrasShape.reach,
     speed: z.number().int().min(0).optional().describe("Walking speed in feet (the token's movementSpeed; a species rule sets it at create)"),
@@ -1239,7 +1243,9 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     if (args.class !== undefined) updateData.characterClass = args.class;
     if (args.hp !== undefined) updateData.hp = args.hp;
     if (args.maxHp !== undefined) updateData.maxHp = args.maxHp;
-    if (args.ac !== undefined) updateData.ac = args.ac;
+    // Play report 3 #2: a hand-set AC is marked so equip/unequip keep it. An
+    // explicit acSource beside it wins (the COMBAT_PROFILE_FIELDS loop below).
+    if (args.ac !== undefined) { updateData.ac = args.ac; updateData.acSource = 'manual'; }
     if (args.level !== undefined) updateData.level = args.level;
     if (args.xp !== undefined) updateData.xp = args.xp;   // Findings #43: the correction verb
     if (args.characterType !== undefined) updateData.characterType = args.characterType;
@@ -1425,13 +1431,20 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
         } catch { /* no ledger on this db */ }
     }
 
+    // Play report 3 #2: say what the AC source now means for equip/unequip.
+    const acNote = updateData.acSource === 'derived'
+        ? ` — AC ${updated.ac} follows its gear from the next equip or unequip (inventory_manage recomputes it then)`
+        : updateData.acSource === 'manual'
+            ? ` — AC ${updated.ac} is hand-set: equip/unequip keep it and report what the gear would give (recomputeAc: true there, or update {acSource: 'derived'}, lets gear drive it)`
+            : '';
+
     return {
         ...updated,
         success: true,
         changed: Object.keys(updateData).filter(k => k !== 'updatedAt'),
         ...(columnSync && { columnSync }),
         ...(ledgerAcknowledged.length && { ledgerAcknowledged }),
-        message: `Character updated successfully${columnSync ? ` — column sync: ${Object.entries(columnSync).map(([k, v]) => `${k} ${v.from}→${v.to} (offset ${v.offset >= 0 ? '+' : ''}${v.offset} preserved)`).join(', ')}` : ''}${ledgerAcknowledged.length ? ` — the skill_override_migrated finding for ${ledgerAcknowledged.join('/')} is acknowledged` : ''}`
+        message: `Character updated successfully${columnSync ? ` — column sync: ${Object.entries(columnSync).map(([k, v]) => `${k} ${v.from}→${v.to} (offset ${v.offset >= 0 ? '+' : ''}${v.offset} preserved)`).join(', ')}` : ''}${ledgerAcknowledged.length ? ` — the skill_override_migrated finding for ${ledgerAcknowledged.join('/')} is acknowledged` : ''}${acNote}`
     };
 }
 
@@ -1609,6 +1622,9 @@ export function setForm(args: { characterId: string; form: string; hpMode?: HpMo
         updates.maxHp = newMax;
         updates.hp = nextHp(args.hpMode, char.hp, char.maxHp, newMax);
         updates.form = undefined;
+        // Play report 3 #2: the base AC comes back with its own source (a
+        // snapshot from before acSource existed restores none: compare rule).
+        updates.acSource = base.acSource ?? undefined;
         formName = 'base';
         const stats = (updates.stats ?? char.stats) as Record<string, number>;
         tokenFields = {
@@ -1620,11 +1636,14 @@ export function setForm(args: { characterId: string; form: string; hpMode?: HpMo
         const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] });
         const creature = resolveCreature(db, worldId, args.form);
         if (!creature) return { error: true, actionType: 'set_form', message: `No creature '${args.form}' in this world's bestiary or the presets. Nothing was written.`, writes: 'none' };
-        const base = char.form?.base ?? snapshotBase(char);
+        // Play report 3 #2: the snapshot keeps the sheet's own acSource beside
+        // its AC; the form's AC is a stat-block number, so it is hand-set.
+        const base = char.form?.base ?? { ...snapshotBase(char), acSource: char.acSource ?? null };
         const shape = sheetFromCreature(creature.spec);
         for (const k of FORM_KEYS) updates[k] = shape[k] !== undefined ? shape[k] : (base[k] === null ? undefined : base[k]);
         updates.stats = { ...((base.stats as Record<string, number> | null) ?? char.stats), ...((shape.stats as Record<string, number> | undefined) ?? {}) };
         updates.hp = nextHp(args.hpMode, char.hp, char.maxHp, updates.maxHp as number);
+        updates.acSource = 'manual';
         updates.form = { name: creature.name, since: new Date().toISOString(), base };
         formName = creature.name;
         source = creature.source;
@@ -3237,6 +3256,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         band: z.string().optional().describe("Table rules: power band, as named in the world's band rule (e.g. 'Astartes')"),
         regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds, in and out of combat'),
         // Combat profile (create/update): tokens made from this sheet start with it
+        acSource: acSourceSchema().optional().describe("create/update (mirror, play report 3 #2): manual = hand-set, equip/unequip keep the AC (update {ac} sets this by itself); derived = gear drives it. Pass acSource: 'derived' alone to hand a hand-set AC back to the gear"),
         size: SizeCategorySchema.optional().describe('create/update: tiny | small | medium | large | huge | gargantuan'),
         reach: z.number().int().min(0).optional().describe('create/update: melee reach in feet'),
         speed: z.number().int().min(0).optional().describe("create/update: walking speed in feet (the token's movementSpeed; a species rule sets it at create)"),

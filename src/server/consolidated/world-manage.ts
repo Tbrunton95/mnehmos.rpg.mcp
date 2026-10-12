@@ -21,6 +21,7 @@ import { readWorldClock, clockAt, clockAfter, dayClock, clockLabel, clockWarning
 import { parseExposure, tickExposure, type ExposureTickLine } from '../../engine/exposure.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { fireDueScheduledRows } from './character-manage.js';
+import { tickWorldUpkeep, reanchorWorldUpkeep, upkeepLineText, type UpkeepTickLine } from './party-manage.js';
 import { reconcileWorld, reconcileLine, acknowledgeFindings, RECONCILE_KINDS, type ReconcileFinding } from '../reconcile.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -376,6 +377,14 @@ function writeEnvironment(worldId: string, patch: Partial<z.infer<typeof WorldEn
     if (opts.correction) {
         const db = getDb();
         const warning = clockWarning(db, worldId);
+        // Play report 3: party upkeep never charges on a correction — its
+        // anchor moves with the clock, so the next advance charges only the
+        // days it crosses (an era_jump of years starves nobody). Only a
+        // correction that changes the DAY moves it: a weather or time-of-day
+        // fix says nothing about the days, so a hand tick ahead stays paid
+        // and the midnights a plain update skipped stay owed.
+        const dayChanged = newClock !== null && (priorClock === null || Math.floor(newClock + 1e-9) !== Math.floor(priorClock + 1e-9));
+        const upkeepAnchored = dayChanged ? reanchorWorldUpkeep(db, worldId, newClock!) : [];
         return {
             success: true,
             actionType,
@@ -386,6 +395,7 @@ function writeEnvironment(worldId: string, patch: Partial<z.infer<typeof WorldEn
                 to: newClock !== null ? dayClock(newClock) : null,
                 deltaHours
             },
+            ...(upkeepAnchored.length ? { upkeepAnchored } : {}),
             ...(warning ? { clockWarning: warning } : {}),
             message: `Clock corrected for world ${worldId}${newClock !== null ? ` to ${dayClock(newClock)}` : ''} — no time passed: no regeneration, no time_passed check`
         };
@@ -508,6 +518,10 @@ export function advanceWorldClock(worldId: string, hours: number, opts: { fireSc
     const at = clockAt(next)!;
     // Request 10: exposure timers tick with the clock; a correction never lands here.
     const exposure = tickWorldExposure(db, args.worldId, hours);
+    // Play report 3: party upkeep charges every whole day the clock crossed
+    // since each party's lastDay; travel and montage time eat stores because
+    // they come through here. A correction never lands here either.
+    const upkeep: UpkeepTickLine[] = tickWorldUpkeep(db, args.worldId, at);
     // Request 10: fireScheduled fires the due rows here instead of only counting them.
     let fired: Array<Record<string, unknown>> | undefined; let firedWarning: string | undefined;
     if (opts.fireScheduled) {
@@ -535,13 +549,15 @@ export function advanceWorldClock(worldId: string, hours: number, opts: { fireSc
     const exposureNote = exposure.length
         ? `; exposure: ${exposure.map(e => `${e.name} ${e.pool} ${e.from}→${e.to}${e.conditionsAdded.length ? ` +${e.conditionsAdded.join(', ')}` : ''}`).join('; ')}`
         : '';
+    const upkeepNote = upkeep.length ? `; upkeep: ${upkeep.map(upkeepLineText).join('; ')}` : '';
     return {
         ...result,
         clock: label,
         dueNow: { scheduled, debts, ...(congregations > 0 ? { congregations } : {}) },
         ...(exposure.length ? { exposure } : {}),
+        ...(upkeep.length ? { upkeep } : {}),
         ...(fired ? { fired, firedCount: fired.length, ...(firedWarning ? { backlogWarning: firedWarning } : {}) } : {}),
-        message: `Clock advanced ${Math.round(hours * 100) / 100}h to ${label}${result.regenerated ? `; regenerated to full: ${(result.regenerated as Array<{ name: string }>).map(r => r.name).join(', ')}` : ''}${exposureNote}${fired ? `; fired ${fired.length} scheduled row(s)` : ''}${due.length ? ` — ${due.join('; ')}` : ''}`
+        message: `Clock advanced ${Math.round(hours * 100) / 100}h to ${label}${result.regenerated ? `; regenerated to full: ${(result.regenerated as Array<{ name: string }>).map(r => r.name).join(', ')}` : ''}${exposureNote}${upkeepNote}${fired ? `; fired ${fired.length} scheduled row(s)` : ''}${due.length ? ` — ${due.join('; ')}` : ''}`
     };
 }
 
@@ -667,6 +683,7 @@ async function handleEraJump(args: z.infer<typeof EraJumpSchema>): Promise<objec
     const after = readWorldClock(db, args.worldId);
     return {
         ...report,
+        ...(clockResult.upkeepAnchored ? { upkeepAnchored: clockResult.upkeepAnchored } : {}),
         ...(clockResult.clockWarning ? { clockWarning: clockResult.clockWarning } : {}),
         message: `Era '${args.label}' begins at ${after ? clockLabel(after) : `Day ${args.day}`} (from ${prior ? clockLabel(prior) : 'no clock'}; no time passed, no regeneration): ${summary}.`
     };
@@ -943,7 +960,7 @@ const definitions: Record<WorldManageAction, ActionDefinition> = {
         schema: AdvanceSchema,
         handler: async (args) => handleAdvance(args as z.infer<typeof AdvanceSchema>),
         aliases: ['pass_time', 'tick'],
-        description: 'Move the world clock forward by minutes, hours or days (midnight rollover handled); same side effects as update, plus exposure timers ticked, dueNow counts, and fireScheduled: true fires the due scheduled rows'
+        description: 'Move the world clock forward by minutes, hours or days (midnight rollover handled); same side effects as update, plus exposure timers ticked, party upkeep charged for every whole day crossed (stores in mouth-days; a shortfall starves and docks loyalty), dueNow counts, and fireScheduled: true fires the due scheduled rows'
     },
     era_jump: {
         schema: EraJumpSchema,
@@ -1025,7 +1042,7 @@ Aliases: new→create, fetch→get, all→list, remove→delete, set→update, g
 1. generate - Create procedural world with terrain/biomes
 2. get_state - Check world status
 3. update {worldId, environment: {day, time, weatherConditions (alias weather), season, location (alias currentLocation / place), era, …}} - a misspelt key is refused naming the nearest accepted key; correction:true when fixing a wrong clock (no regeneration, no time_passed)
-   advance {worldId, minutes?|hours?|days?, fireScheduled?} - move the clock forward; ticks every exposure timer in the world (character_manage set_exposure; reply exposure: [{characterId, name, pool, from, to, conditionsAdded}]); returns dueNow {scheduled, debts, congregations?}; fireScheduled: true also fires the due scheduled rows (reply fired[]) instead of only counting them
+   advance {worldId, minutes?|hours?|days?, fireScheduled?} - move the clock forward; ticks every exposure timer in the world (character_manage set_exposure; reply exposure: [{characterId, name, pool, from, to, conditionsAdded}]); charges party upkeep for every whole day crossed (party_manage set_upkeep; stores are mouth-days in a linked character pool; reply upkeep: [{partyId, name, days, storesFrom, storesTo, mouths, starvedDays, loyalty: [{characterId, from, to}]}]; a starving day docks loyalty from everyone but the leader and mounts); returns dueNow {scheduled, debts, congregations?}; fireScheduled: true also fires the due scheduled rows (reply fired[]) instead of only counting them. A correction (update {correction: true}, era_jump) ticks neither: when it changes the day, upkeep's anchor moves with the clock (reply upkeepAnchored[]); a weather or time-of-day correction leaves the anchor alone
    era_jump {worldId, day, time?, label, threads?: dormant|archived|keep, scheduled?: cancel|keep, resetAbilities?: true, dryRun?} - years pass between campaigns: clock corrected (no regeneration), environment.era = label, active threads parked with a '[era: label]' section, unfired scheduled rows cancelled (stamped; list_scheduled {includeCancelled} shows them), abilities ready and legendary pools full, wall-clock effects expired. Reply: {from, to, threads, scheduledCancelled, abilitiesReset, effectsCleared}; dryRun writes nothing
    reconcile {worldId, characterId?, acknowledge?: [kind]} - after fights run in chat: {findings: [{kind, characterId, characterName, detail, fix}], count}. Kinds: equipped_missing (equipped row with quantity ≤ 0 or no item), attack_duplicate (two profiles share a name), attack_item_missing (profile.item not in inventory), condition_stale_precedent (source/note cites a prec-id that is superseded or missing), ability_spent_outside_combat, legendary_depleted_outside_combat, xp_unposted, skill_override_migrated (the 2026-10-11 migration moved a stealth/perception column: a born-0 default nulled, a legacy additive bonus folded into an override; the fix names the restore call). Read-only except acknowledge: ['skill_override_migrated'], which marks those ledger rows seen (reply acknowledged: {kind: n}); a character_manage update that sets stealthOverride/perceptionOverride acknowledges that skill's row itself, and a column back at its old number is no longer listed (one moved elsewhere, e.g. by the stat-change sync, stays listed with its live value); boot shows 'RECONCILE: n findings' when n > 0
 4. For map operations, use world_map tool instead`,
@@ -1125,6 +1142,7 @@ export async function handleWorldManage(args: unknown, _ctx: SessionContext): Pr
                 output += RichFormatter.keyValue({ 'World ID': `\`${parsed.worldId}\``, ...(parsed.elapsedHours !== undefined && parsed.elapsedHours !== null ? { 'Elapsed': `${parsed.elapsedHours}h` } : {}) });
                 if (parsed.aliased) output += RichFormatter.alert(`Aliased: ${Object.entries(parsed.aliased as Record<string, string>).map(([a, c]) => `${a} → ${c}`).join(', ')}`, 'info');
                 if (parsed.correction) output += RichFormatter.alert(`Correction: ${parsed.correction.from ?? '?'} → ${parsed.correction.to ?? '?'} (${parsed.correction.deltaHours ?? '?'}h) — no time passed`, 'info');
+                if (parsed.upkeepAnchored?.length) output += RichFormatter.alert(`Upkeep anchored, nothing charged: ${(parsed.upkeepAnchored as Array<{ name: string; from: number; to: number }>).map(u => `${u.name} Day ${u.from} → Day ${u.to}`).join('; ')}`, 'info');
                 if (parsed.elapsedNote) output += RichFormatter.alert(parsed.elapsedNote, 'info');
                 if (parsed.hint) output += RichFormatter.alert(parsed.hint, 'warning');
                 if (parsed.clockWarning) output += RichFormatter.alert(parsed.clockWarning, 'warning');
@@ -1135,6 +1153,10 @@ export async function handleWorldManage(args: unknown, _ctx: SessionContext): Pr
                 if (parsed.exposure?.length) {
                     output += RichFormatter.section('Exposure');
                     output += RichFormatter.list((parsed.exposure as Array<{ characterId: string; name: string; pool: string; from: number; to: number; conditionsAdded: string[] }>).map(e => `${e.characterId} · ${e.name}: ${e.pool} ${e.from} → ${e.to}${e.conditionsAdded.length ? ` (+${e.conditionsAdded.join(', ')})` : ''}`));
+                }
+                if (parsed.upkeep?.length) {
+                    output += RichFormatter.section('Upkeep (mouth-days)');
+                    output += RichFormatter.list((parsed.upkeep as UpkeepTickLine[]).map(u => `${upkeepLineText(u)}${u.loyalty?.length ? ` — ${u.loyalty.map(l => `${l.name ?? l.characterId} ${l.from}→${l.to}`).join(', ')}` : ''}`));
                 }
                 if (parsed.fired?.length) {
                     output += RichFormatter.section(`Fired (${parsed.fired.length})`);

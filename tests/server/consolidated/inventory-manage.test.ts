@@ -5,6 +5,7 @@
 
 import { handleInventoryManage, InventoryManageTool } from '../../../src/server/consolidated/inventory-manage.js';
 import { handleItemManage } from '../../../src/server/consolidated/item-manage.js';
+import { handleCharacterManage } from '../../../src/server/consolidated/character-manage.js';
 import { getDb } from '../../../src/storage/index.js';
 import { CharacterRepository } from '../../../src/storage/repos/character.repo.js';
 import { randomUUID } from 'crypto';
@@ -50,7 +51,9 @@ describe('inventory_manage consolidated tool', () => {
             race: 'human',
             hp: 10,
             maxHp: 10,
-             ac: 10,
+             // 10 + DEX 12 = 11: the sheet follows its gear. A stored AC that
+             // differs from the derived value reads as hand-set (play report 3 #2).
+             ac: 11,
              stats: { str: 14, dex: 12, con: 13, int: 10, wis: 11, cha: 10 },
              currency: { gold: 5, silver: 0, copper: 0 },
              speed: 30,
@@ -548,7 +551,12 @@ describe('inventory_manage consolidated tool', () => {
 
             expect(equipped.success).toBe(true);
             expect(equipped.acChange).toContain('now 16');
-            expect(new CharacterRepository(getDb(':memory:')).findById(testCharId)?.ac).toBe(16);
+            expect(equipped.ac).toMatchObject({ before: 11, after: 16, source: 'derived', derived: 16 });
+            expect(equipped.ac.parts[0]).toContain('Chain Mail base 16 (no DEX)');
+            const afterArmour = new CharacterRepository(getDb(':memory:')).findById(testCharId)!;
+            expect(afterArmour.ac).toBe(16);
+            // A derived write stamps the source, so the sheet follows gear from here.
+            expect(afterArmour.acSource).toBe('derived');
 
             const shieldResult = await handleItemManage({
                 action: 'create',
@@ -613,6 +621,200 @@ describe('inventory_manage consolidated tool', () => {
             const data = parseResult(result);
             expect(data.error).toBeDefined();
             expect(data.message).toContain('does not own');
+        });
+    });
+
+    // Play report 3 #2: a hand-set AC survives gear changes. acSource lives in
+    // combat_profile: character_manage update {ac} and set_form mark it manual,
+    // a derived write marks it derived, and a legacy row with no source follows
+    // its gear only when the stored AC already equals what the gear derives.
+    describe('hand-set AC survives gear changes (play report 3 #2)', () => {
+        const sheet = () => new CharacterRepository(getDb(':memory:')).findById(testCharId)! as { ac: number; acSource?: string };
+        const makeItem = async (name: string, type: string, properties: Record<string, unknown>) => {
+            const created = parseItemResult(await handleItemManage({ action: 'create', name, type, weight: 1, value: 1, properties }, ctx));
+            await handleInventoryManage({ action: 'give', characterId: testCharId, itemId: created.item.id, quantity: 1 }, ctx);
+            return created.item.id as string;
+        };
+        const equip = async (itemId: string, slot: string, extra: Record<string, unknown> = {}) =>
+            parseResult(await handleInventoryManage({ action: 'equip', characterId: testCharId, itemId, slot, ...extra }, ctx));
+        const handSet = async (ac: number) => {
+            await handleCharacterManage({ action: 'update', characterId: testCharId, ac }, ctx);
+            expect(sheet()).toMatchObject({ ac, acSource: 'manual' });
+        };
+
+        beforeEach(async () => {
+            await handleInventoryManage({ action: 'give', characterId: testCharId, itemId: testItemId, quantity: 1 }, ctx);
+        });
+
+        it('a hand-set 17 survives weapon, armour and accessory equips and an unequip', async () => {
+            await handSet(17);
+            const chainMail = await makeItem('Chain Mail', 'armor', { ac: 16, strengthRequired: 13 });
+            const shield = await makeItem('Shield', 'armor', { acBonus: 2 });
+            const ring = await makeItem('Ring of Protection', 'misc', { acBonus: 1, equipSlots: ['accessory', 'accessory2', 'accessory3'] });
+
+            const sword = await equip(testItemId, 'mainhand');
+            expect(sword.success).toBe(true);
+            expect(sword.ac).toMatchObject({ before: 17, after: 17, source: 'manual', derived: 11 });
+            expect(sword.acChange).toContain('AC kept at 17 (hand-set; gear gives 11');
+            expect(sword.acChange).toContain('Pass recomputeAc: true to take it');
+            expect(sword.acMatchesDerived).toBeUndefined();
+            expect(sheet()).toMatchObject({ ac: 17, acSource: 'manual' });
+
+            const armour = await equip(chainMail, 'armor');
+            expect(armour.ac).toMatchObject({ before: 17, after: 17, source: 'manual', derived: 16 });
+            expect(sheet()).toMatchObject({ ac: 17, acSource: 'manual' });
+
+            const offhand = await equip(shield, 'offhand');
+            expect(offhand.ac).toMatchObject({ after: 17, source: 'manual', derived: 18 });
+            expect(offhand.acChange).toContain('gear gives 18');
+            expect(sheet()).toMatchObject({ ac: 17, acSource: 'manual' });
+
+            const accessory = await equip(ring, 'accessory2');
+            expect(accessory.success).toBe(true);
+            expect(accessory.ac).toMatchObject({ after: 17, source: 'manual', derived: 19 });
+            expect(sheet()).toMatchObject({ ac: 17, acSource: 'manual' });
+
+            const doffed = parseResult(await handleInventoryManage({ action: 'unequip', characterId: testCharId, itemId: chainMail }, ctx));
+            expect(doffed.success).toBe(true);
+            expect(doffed.ac).toMatchObject({ before: 17, after: 17, source: 'manual', derived: 14 });
+            expect(doffed.acChange).toContain('AC kept at 17 (hand-set; gear gives 14');
+            expect(sheet()).toMatchObject({ ac: 17, acSource: 'manual' });
+        });
+
+        it('recomputeAc: true takes the derived value and lets gear drive the sheet from then on', async () => {
+            await handSet(17);
+            const chainMail = await makeItem('Chain Mail', 'armor', { ac: 16, strengthRequired: 13 });
+            const shield = await makeItem('Shield', 'armor', { acBonus: 2 });
+
+            const taken = await equip(chainMail, 'armor', { recomputeAc: true });
+            expect(taken.success).toBe(true);
+            expect(taken.ac).toMatchObject({ before: 17, after: 16, source: 'derived', derived: 16 });
+            expect(taken.acChange).toContain('AC 17 → 16');
+            expect(sheet()).toMatchObject({ ac: 16, acSource: 'derived' });
+
+            // No flag needed any more: the sheet follows its gear.
+            const shieldOn = await equip(shield, 'offhand');
+            expect(shieldOn.ac).toMatchObject({ before: 16, after: 18, source: 'derived' });
+            expect(sheet()).toMatchObject({ ac: 18, acSource: 'derived' });
+
+            const doffed = parseResult(await handleInventoryManage({ action: 'unequip', characterId: testCharId, slot: 'armor', recomputeAc: true }, ctx));
+            expect(doffed.ac).toMatchObject({ before: 18, after: 13, source: 'derived' });
+            expect(sheet()).toMatchObject({ ac: 13, acSource: 'derived' });
+        });
+
+        it('says when a kept hand-set AC equals what the gear now derives', async () => {
+            await handSet(16);
+            const chainMail = await makeItem('Chain Mail', 'armor', { ac: 16, strengthRequired: 13 });
+
+            const armour = await equip(chainMail, 'armor');
+            expect(armour.success).toBe(true);
+            expect(armour.acMatchesDerived).toBe(true);
+            expect(armour.ac).toMatchObject({ before: 16, after: 16, source: 'manual', derived: 16 });
+            expect(armour.acChange).toContain('AC 16 is hand-set and the gear now derives 16 too; pass recomputeAc: true to let gear drive it from here');
+            expect(armour.message).toContain('hand-set and the gear now derives 16 too');
+            // Still manual: nothing flipped behind the GM's back.
+            expect(sheet()).toMatchObject({ ac: 16, acSource: 'manual' });
+        });
+
+        it('a gear-following sheet (acSource derived) still recomputes without the flag', async () => {
+            new CharacterRepository(getDb(':memory:')).update(testCharId, { ac: 11, acSource: 'derived' } as any);
+            const shield = await makeItem('Shield', 'armor', { acBonus: 2 });
+            const r = await equip(shield, 'offhand');
+            expect(r.ac).toMatchObject({ before: 11, after: 13, source: 'derived', derived: 13 });
+            expect(r.acChange).toContain('AC 11 → 13');
+            expect(sheet()).toMatchObject({ ac: 13, acSource: 'derived' });
+        });
+
+        it('a legacy row with no acSource follows gear only when its AC already equals the derived value', async () => {
+            // The fixture (11 = 10 + DEX 12, no source) follows: covered above.
+            // A legacy 14 on the same stats does not; it is kept and stamped manual.
+            new CharacterRepository(getDb(':memory:')).update(testCharId, { ac: 14 } as any);
+            expect(sheet().acSource).toBeUndefined();
+            const chainMail = await makeItem('Chain Mail', 'armor', { ac: 16, strengthRequired: 13 });
+            const r = await equip(chainMail, 'armor');
+            expect(r.ac).toMatchObject({ before: 14, after: 14, source: 'manual', derived: 16 });
+            expect(r.acChange).toContain('AC kept at 14 (hand-set');
+            expect(r.acChange).toContain('gear gives 16');
+            // Review: the stamp is a durable write on the sheet, so the reply names it.
+            expect(r.acChange).toContain('marked hand-set from here');
+            expect(sheet()).toMatchObject({ ac: 14, acSource: 'manual' });
+        });
+
+        // Review: the compare rule's other arm is a write too — a legacy row whose
+        // AC equalled its gear is stamped derived — and the reply has to say so,
+        // or the GM's old hand-set 13 (that happened to equal the apron) starts
+        // following gear with only "AC unchanged" to show for it.
+        it('a legacy row that equalled its gear says gear drives it from here when first stamped derived', async () => {
+            const apron = await makeItem('Leather Apron', 'misc', { equipSlots: ['armor'], ac: 12 });
+            getDb(':memory:').prepare('UPDATE inventory_items SET equipped = 1, slot = ? WHERE character_id = ? AND item_id = ?').run('armor', testCharId, apron);
+            new CharacterRepository(getDb(':memory:')).update(testCharId, { ac: 13 } as any);   // 12 + DEX +1, hand-set before acSource existed
+            expect(sheet().acSource).toBeUndefined();
+
+            const r = await equip(testItemId, 'mainhand');
+            expect(r.ac).toMatchObject({ before: 13, after: 13, source: 'derived', derived: 13 });
+            expect(r.acChange).toContain('AC unchanged (now 13: Leather Apron base 12 + DEX');
+            expect(r.acChange).toContain('matched its gear, so gear drives it from here');
+            expect(sheet()).toMatchObject({ ac: 13, acSource: 'derived' });
+
+            // Already derived: no stamp, so no note.
+            const again = parseResult(await handleInventoryManage({ action: 'unequip', characterId: testCharId, itemId: testItemId }, ctx));
+            expect(again.acChange).toBe('AC unchanged (now 13: Leather Apron base 12 + DEX)');
+        });
+
+        // Play report 3 #2, the GM's case: Varek's hand-set 13 equals what the
+        // apron derives (12 + DEX +1). The apron is an equipSlots item, not armor.
+        it("Varek: a hand-set 13 survives the apron that derives 13, flags the match, and recomputeAc hands it to the gear", async () => {
+            await handSet(13);
+            const apron = await makeItem('Leather Apron', 'misc', { equipSlots: ['armor'], ac: 12 });
+
+            const worn = await equip(apron, 'armor');
+            expect(worn.success).toBe(true);
+            expect(worn.ac).toMatchObject({ before: 13, after: 13, source: 'manual', derived: 13, parts: ['Leather Apron base 12 + DEX'] });
+            expect(worn.acMatchesDerived).toBe(true);
+            expect(worn.acChange).toContain('AC 13 is hand-set and the gear now derives 13 too; pass recomputeAc: true');
+            expect(sheet()).toMatchObject({ ac: 13, acSource: 'manual' });
+
+            // A weapon next: still kept, still flagged (the apron still derives 13).
+            const sword = await equip(testItemId, 'mainhand');
+            expect(sword.ac).toMatchObject({ after: 13, source: 'manual', derived: 13 });
+            expect(sword.acMatchesDerived).toBe(true);
+
+            // Taking the hint flips the source without moving the number...
+            const taken = parseResult(await handleInventoryManage({ action: 'unequip', characterId: testCharId, itemId: testItemId, recomputeAc: true }, ctx));
+            expect(taken.ac).toMatchObject({ before: 13, after: 13, source: 'derived', derived: 13 });
+            expect(taken.acChange).toContain('gear drives it from here');
+            expect(taken.acMatchesDerived).toBeUndefined();
+            expect(sheet()).toMatchObject({ ac: 13, acSource: 'derived' });
+
+            // ...and from then on the apron coming off is felt.
+            const doffed = parseResult(await handleInventoryManage({ action: 'unequip', characterId: testCharId, slot: 'armor' }, ctx));
+            expect(doffed.ac).toMatchObject({ before: 13, after: 11, source: 'derived' });
+            expect(sheet()).toMatchObject({ ac: 11, acSource: 'derived' });
+        });
+
+        it("character_manage update {acSource: 'derived'} switches without touching gear", async () => {
+            await handSet(17);
+            const switched = JSON.parse((await handleCharacterManage({ action: 'update', characterId: testCharId, acSource: 'derived' }, ctx)).content[0].text.match(/<!-- CHARACTER_MANAGE_JSON\n([\s\S]*?)\nCHARACTER_MANAGE_JSON -->/)![1]);
+            expect(switched.success).toBe(true);
+            expect(switched.changed).toContain('acSource');
+            // The number stays until the next gear change.
+            expect(sheet()).toMatchObject({ ac: 17, acSource: 'derived' });
+
+            const chainMail = await makeItem('Chain Mail', 'armor', { ac: 16, strengthRequired: 13 });
+            const r = await equip(chainMail, 'armor');
+            expect(r.ac).toMatchObject({ before: 17, after: 16, source: 'derived' });
+            expect(sheet()).toMatchObject({ ac: 16, acSource: 'derived' });
+        });
+
+        it('the outer schema names every accessory slot and mirrors recomputeAc', () => {
+            const outer = InventoryManageTool.inputSchema;
+            for (const slot of ['accessory', 'accessory2', 'accessory3']) {
+                expect(outer.safeParse({ action: 'equip', characterId: 'c', itemId: 'i', slot }).success).toBe(true);
+            }
+            const parsed = outer.safeParse({ action: 'equip', characterId: 'c', itemId: 'i', slot: 'armor', recomputeAc: true });
+            expect(parsed.success).toBe(true);
+            expect((parsed as { data: { recomputeAc?: boolean } }).data.recomputeAc).toBe(true);
+            expect(InventoryManageTool.description).toContain('recomputeAc');
         });
     });
 

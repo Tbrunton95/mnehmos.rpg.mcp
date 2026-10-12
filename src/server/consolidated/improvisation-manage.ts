@@ -1142,7 +1142,7 @@ async function handleMontage(args: z.infer<typeof MontageSchema>): Promise<objec
     let timePassed: Record<string, unknown> | undefined;
     if (args.hours && worldId) {
         const adv = advanceWorldClock(worldId, args.hours);
-        timePassed = adv.error ? { error: true, message: adv.message } : { hours: args.hours, clock: adv.clock, dueNow: adv.dueNow, message: adv.message };
+        timePassed = adv.error ? { error: true, message: adv.message } : { hours: args.hours, clock: adv.clock, dueNow: adv.dueNow, ...(adv.upkeep ? { upkeep: adv.upkeep } : {}), message: adv.message };
     }
 
     // One line in the session log: the latest active one for the world, or a new one.

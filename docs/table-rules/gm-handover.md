@@ -66,6 +66,12 @@ The Deep One campaign ran four days of fights outside the engine because its dic
 - **Battle Master.** `superiorityDie`, a `superiority` pool with `refresh: 'short'`, and `attack {maneuver}`; fighting styles on `fightingStyle`. Guide: `docs/table-rules/fighter.md`.
 - **Friction gone.** A failed call leaves its `opId` free; `world_manage create {name}` is enough; summary replies keep ids; `environment.weather` and `environment.location` are accepted.
 
+## After play report 3 (Harl Sluice, the apron, the herd's food)
+
+- **Only those who fought feel a fight.** `party_manage after_battle {partyId, victory, participants: ['Varek', 'Scurv'], encounterId: ['raid-watcher', 'raid-sleeper']}`. Names or ids, one encounter or a list; everyone else is listed under `absent` and untouched. Leave both off and every member counts, as before.
+- **A hand-set AC survives equipping.** `character_manage update {ac}` marks the sheet manual; equip and unequip keep it and say what the gear would give. `recomputeAc: true` on an equip, or `update {acSource: 'derived'}`, hands AC back to the gear. When a manual AC equals what the gear derives, the reply says so.
+- **Stores are mouth-days in one pool.** Before linking an old pool counted in camp-days, convert it: `character_manage adjust_pool {characterId, pool: 'stores', value: 200, max: 600, label: 'Stores (mouth-days)'}`. Never link a pool in old units: the first advance would starve the herd. Then `party_manage set_upkeep {partyId, linkPool: {characterId, pool: 'stores'}, mouthsFromPool: [{characterId, pool: 'captives'}]}`; it starts from today and charges nothing before. Guide: `docs/table-rules/upkeep.md`.
+
 ## Never do these
 
 - **Never fake a result with a huge `attackBonus`.** Post it with `outcome`.
@@ -193,3 +199,19 @@ The Deep One campaign ran four days of fights outside the engine because its dic
 | Turn a near miss | `combat_action attack {..., maneuver: 'precision'}` (rolled only on a miss within the die; a natural 1 is never turned) |
 | Answer a melee miss | `combat_action attack {..., maneuver: 'riposte', reaction: true}` |
 | Audit the superiority dice | `session_manage rolls {encounterId, purpose: 'superiority'}`; the pool's history on `character_manage get` |
+| Book a fight only those who fought should feel | `party_manage after_battle {partyId, victory, participants: ['Varek', 'mira-0a1b'], encounterId: ['raid-gate', 'raid-hall']}` — ids or names (case-insensitive) and/or the fight's encounter ids (a raid run as several fights takes a list; boardings count under their parent); the reply's `absent` lists who was left untouched. Leave both off and every member counts, and the reply says so |
+| A member was removed mid-fight, or a prisoner should feel the loss | prisoners are never tokens and `remove_participant` strips the token, so with `encounterId` both read as absent: name them in `participants` (ids or names) alongside the encounter ids; the two are unioned |
+| after_battle refuses a participant | an unknown name or id, a non-member, or a name two members share (the reply names both ids): pass the character id; nothing was written. A missing encounter, or one with no member token (nor in its boardings), is refused the same way: drop it or name who fought in `participants` |
+| A character's AC was set by hand (stat block, house rule) and gear is equipped or removed | `character_manage update {characterId, ac: 17}` marks it hand-set; `inventory_manage equip/unequip` then keep 17 and acChange says what the gear gives. Nothing to pass. |
+| You want the gear to drive the AC after all | `inventory_manage equip {characterId, itemId, slot, recomputeAc: true}` (or unequip) takes the derived value and sets acSource 'derived'; or `character_manage update {characterId, acSource: 'derived'}` to switch without touching gear (number changes at the next equip/unequip). |
+| The reply says acMatchesDerived: true | The hand-set AC equals what the gear derives; pass `recomputeAc: true` on the next equip/unequip, or `update {acSource: 'derived'}`, to let gear drive it and stop the sheet staying manual by accident. |
+| A legacy sheet (made before acSource existed) is equipped for the first time | It follows gear only if its stored AC equals what the gear derived before the change; otherwise it is kept and stamped manual. Read `ac.source` in the reply; `recomputeAc: true` if the kept value was never meant to be hand-set. |
+| A token made before a hand-set AC change is still in a fight | Live tokens keep the AC they were made with; `combat_manage update_participant {ac}` on the token if it must change mid-fight. |
+| Link the camp's stores to upkeep | FIRST convert the pool to mouth-days: `character_manage adjust_pool {characterId, pool: 'stores', value: 200, max: 600, label: 'Stores (mouth-days)'}` (the old pool was camp-days for 10 mouths, max 60; never link a pool in old units), THEN `party_manage set_upkeep {partyId, linkPool: {characterId, pool: 'stores'}, mouthsFromPool?: [{characterId, pool: 'captives'}], extraMouths?, countRoles?, starvation?: {loyaltyDelta: -1, perDay: true}}`; the reply says "upkeep starts from Day N; nothing before it is charged" and prints stores against mouths as days left — check that number before moving on |
+| Days pass (advance, travel, montage) | `world_manage advance {worldId, days}` charges every midnight crossed; read `upkeep[]` (stores from→to, mouths, starvedDays, loyalty hits). A starving day sets stores to 0 and docks loyalty from everyone but the leader and mounts |
+| Resupply, loot or spoilage | `character_manage adjust_pool {characterId, pool: 'stores', delta: +120, reason}` on the linked pool; there is no adjust_stores |
+| How long will the stores last? | `party_manage muster {partyId}` → `upkeep.daysLeft`, the mouth breakdown (members, each mouth pool, extra) and `starving` |
+| Captives taken or freed, a unit shrinks | nothing to do: mouth pools and unitModels are read live at the next charge |
+| Time passed outside advance | `party_manage upkeep {partyId, days}` charges by hand; the clock catches up to it before charging again |
+| Fixing a wrong clock or jumping an era | `world_manage update {worldId, correction: true, environment: {day, time}}` / `era_jump` charge nothing and move the upkeep anchor (reply `upkeepAnchored[]`); a plain `update` that moves the clock is caught up by the next advance |
+| Stop tracking stores | `party_manage set_upkeep {partyId, clear: true}` (the pool keeps its value) |

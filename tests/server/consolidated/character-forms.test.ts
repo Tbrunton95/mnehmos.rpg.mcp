@@ -85,6 +85,8 @@ describe('character_manage set_form', () => {
         expect(s).toMatchObject({ hp: 90, maxHp: 180, ac: 19, size: 'huge', reach: 10, attacksPerAction: 3, regeneration: 10, band: 'Monster/Lord', cr: 15, resistances: ['fire'] });
         expect(s.stats).toMatchObject({ str: 24, con: 22, dex: 16 });
         expect(s.form).toMatchObject({ name: 'Daemon Prince', base: { maxHp: 30, ac: 15 } });
+        // Play report 3 #2: a form's AC is a stat-block number, not gear — hand-set.
+        expect(s.acSource).toBe('manual');
 
         const back = await char({ action: 'set_form', characterId: 'vex', form: 'base', hpMode: 'keep_fraction' });
         expect(back).toMatchObject({ success: true, form: 'base', hp: 15, maxHp: 30 });
@@ -95,6 +97,17 @@ describe('character_manage set_form', () => {
         expect(b.regeneration).toBeUndefined();
         expect(b.attacks).toEqual([{ name: 'sword', attackBonus: 6, damage: '1d8+3' }]);
         expect(b.stats).toEqual({ str: 14, dex: 16, con: 12, int: 10, wis: 10, cha: 14 });
+        // The base had no acSource, so none comes back (legacy compare rule applies).
+        expect(b.acSource).toBeUndefined();
+    });
+
+    it("putting a form down restores the base's acSource (play report 3 #2)", async () => {
+        new CharacterRepository(getDb()).update('vex', { acSource: 'derived' } as any);
+        await char({ action: 'set_form', characterId: 'vex', form: 'Chaos Spawn' });
+        expect(sheet()).toMatchObject({ ac: 12, acSource: 'manual' });
+        expect(sheet().form.base).toMatchObject({ ac: 15, acSource: 'derived' });
+        await char({ action: 'set_form', characterId: 'vex', form: 'base' });
+        expect(sheet()).toMatchObject({ ac: 15, acSource: 'derived' });
     });
 
     it('form to form keeps the original base; hpMode full', async () => {

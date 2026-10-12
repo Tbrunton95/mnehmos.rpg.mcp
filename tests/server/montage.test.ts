@@ -1,4 +1,5 @@
 import { handleImprovisationManage, ImprovisationManageTool } from '../../src/server/consolidated/improvisation-manage.js';
+import { handlePartyManage, PartyManageTool } from '../../src/server/consolidated/party-manage.js';
 import { CharacterRepository } from '../../src/storage/repos/character.repo.js';
 import { WorldRepository } from '../../src/storage/repos/world.repo.js';
 import { readWorldClock } from '../../src/engine/world-clock.js';
@@ -15,6 +16,7 @@ const W = 'drowned';
 const ctx = { sessionId: 'montage' } as any;
 const json = (res: any) => { const t = res.content[0].text; const m = t.match(/<!-- ([A-Z_]+JSON)\n([\s\S]*?)\n\1 -->/); return m ? JSON.parse(m[2]) : JSON.parse(t); };
 const montage = async (a: Record<string, unknown>) => json(await handleImprovisationManage(ImprovisationManageTool.inputSchema.parse({ action: 'montage', ...a }), ctx));
+const pm = async (a: Record<string, unknown>) => json(await handlePartyManage(PartyManageTool.inputSchema.parse(a), ctx));
 
 beforeEach(() => {
     closeDb();
@@ -92,6 +94,18 @@ describe('improvisation_manage montage', () => {
         // Without hours the clock does not move.
         await montage({ characterId: 'wake', task: 'x', dc: 10, worldId: W, seed: 'montage-22', journal: false });
         expect(readWorldClock(getDb(), W)).toMatchObject({ day: 10, time: '14:00' });
+    });
+
+    it('hours that cross a midnight charge party upkeep through advance, and timePassed reports it', async () => {
+        const db = getDb();
+        new CharacterRepository(db).update('wake', { resourcePools: { grit: { current: 5, max: 5 }, stores: { current: 30, max: 30 } } } as any);
+        const pid = (await pm({ action: 'create', name: 'The Wake Crew', worldId: W, initialMembers: [{ characterId: 'wake', role: 'leader' }] })).party.id;
+        expect((await pm({ action: 'set_upkeep', partyId: pid, linkPool: { characterId: 'wake', pool: 'stores' } })).startDay).toBe(10);
+        const r = await montage({ characterId: 'wake', task: 'a day at the oars', dc: 10, hours: 24, worldId: W, seed: 'montage-22', journal: false });
+        expect(r.timePassed).toMatchObject({ hours: 24, clock: 'Day 11, 08:00', upkeep: [expect.objectContaining({ partyId: pid, name: 'The Wake Crew', days: 1, storesFrom: 30, storesTo: 29, mouths: 1 })] });
+        expect(r.timePassed.message).toMatch(/upkeep: The Wake Crew 30→29 \(1d × 1\)/);
+        expect((new CharacterRepository(db).findById('wake') as any).resourcePools.stores.current).toBe(29);
+        expect((new CharacterRepository(db).findById('wake') as any).resourcePools.grit.current).toBe(5);
     });
 
     it('journal writes one [montage] line to the latest active session_log, creating one when none exists', async () => {

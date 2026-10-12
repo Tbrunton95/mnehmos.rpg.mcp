@@ -4,7 +4,7 @@ import { Character, CharacterSchema, NPC, NPCSchema } from '../../schema/charact
 import { CharacterType } from '../../schema/party.js';
 
 /** The sheet fields stored together in the combat_profile JSON column. */
-const COMBAT_PROFILE_KEYS = ['size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'attacksPerAction', 'attacks', 'abilities', 'fightingStyle', 'superiorityDie', 'maneuverAbility', 'cr', 'autoLegendaryResistance', 'form', 'vessel'] as const;
+const COMBAT_PROFILE_KEYS = ['size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'attacksPerAction', 'attacks', 'abilities', 'fightingStyle', 'superiorityDie', 'maneuverAbility', 'cr', 'autoLegendaryResistance', 'form', 'vessel', 'acSource'] as const;
 
 /** Pack the combat profile for the column; null when the sheet sets none of it. */
 function packCombatProfile(c: Character | NPC): string | null {
