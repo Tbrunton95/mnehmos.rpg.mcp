@@ -27,11 +27,12 @@ import { armourStealthDisadvantage } from '../../engine/armor.js';
 import { loggedD20, loggedRoller, type DiceRoller } from '../../math/logged-d20.js';
 import { resolveWorldId, worldSkillAbility } from '../../engine/table-rules.js';
 import { worldProgression } from '../../engine/progression.js';
-import { skillModifier as sheetSkillModifier, overrideColumn, signed, type SkillSheet, type ShortAbility } from '../../engine/skill-modifier.js';
+import { skillModifier as sheetSkillModifier, abilityModifier as sheetAbilityModifier, overrideColumn, signed, type SkillSheet, type ShortAbility, type SkillModifier } from '../../engine/skill-modifier.js';
 import { getOrLoadEngine, syncParticipantHpFromDb } from '../handlers/combat-handlers.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { v4 as uuidv4 } from 'uuid';
-import { applyScheduledOps, scheduledWriteOpSchema } from '../../engine/scheduled-ops.js';
+import { applyScheduledOps, scheduledWriteOpSchema, SCHEDULED_OP_SHAPE, MONTAGE_COSTS_EXAMPLE, describeReceived } from '../../engine/scheduled-ops.js';
+import { commitScheduledWrites } from '../scheduled-commit.js';
 import { advanceWorldClock } from './world-manage.js';
 import { readWorldClock, clockLabel } from '../../engine/world-clock.js';
 import { recordAward } from '../../storage/xp-awards.js';
@@ -147,11 +148,6 @@ function rollD20(advantage: boolean | undefined, disadvantage: boolean | undefin
     const r = roll('2d20', tag);
     const [roll1, roll2] = r.rolls;
     return { roll: advantage ? Math.max(roll1, roll2) : Math.min(roll1, roll2), rolls: [roll1, roll2] };
-}
-
-function getSkillModifier(stats: Record<string, number>, ability: string): number {
-    const abilityScore = stats[ability.substring(0, 3)] ?? stats[ability] ?? 10;
-    return Math.floor((abilityScore - 10) / 2);
 }
 
 function getAbilityModifier(score: number): number {
@@ -1084,24 +1080,63 @@ async function handleGetSpellbook(args: z.infer<typeof GetSpellbookSchema>): Pro
 // clock may move, and the session log gets one line so the cost is on record.
 // ═══════════════════════════════════════════════════════════════════════════
 const montageJsonIfString = (v: unknown) => { if (typeof v === 'string') { try { return JSON.parse(v); } catch { return v; } } return v; };
+// Play report 6 #2: a cost is an op object or a plain string. The GM's
+// costs: {hardWon: ['Varek loses the trail for a day']} failed the op schema
+// with a raw type error and the hunt ran without its cost. A string is a note
+// (logged, journaled, shown; nothing on the sheet changes); a string that
+// opens a brace or bracket is JSON-parsed first, so a stringified op still
+// writes; a lone string or a lone op object is a list of one. The same
+// preprocess sits on the outer mirror with items left open, so the montage
+// schema is the one place that refuses and its message is what the GM reads.
+const montageJsonIfBraced = (v: unknown) => { if (typeof v === 'string' && /^\s*[[{]/.test(v)) { try { return JSON.parse(v); } catch { return v; } } return v; };
+// A string is a note; 'note: x' is the note x (not 'note: note: x').
+const montageCostEntry = (e: unknown) => { const p = montageJsonIfBraced(e); return typeof p === 'string' ? { op: 'note', text: p.replace(/^\s*note:\s*/i, '') } : p; };
+// null is no cost (a client's "nothing here"), not a refusal.
+const montageCostList = (v: unknown) => {
+    if (v === null) return [];
+    const parsed = montageJsonIfBraced(v);
+    const list = typeof parsed === 'string' || (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) ? [parsed] : parsed;
+    return Array.isArray(list) ? list.map(montageCostEntry) : list;
+};
+const montageCostsObject = (v: unknown) => v === null ? {} : montageJsonIfString(v);
+const MONTAGE_TIERS = ['hardWon', 'costly'] as const;
+const nearestMontageTier = (key: string) => {
+    const k = key.toLowerCase().replace(/[\s_-]+/g, '');
+    return MONTAGE_TIERS.find(t => t.toLowerCase() === k)
+        ?? MONTAGE_TIERS.find(t => k.length >= 4 && (t.toLowerCase().startsWith(k.slice(0, 4)) || k.startsWith(t.toLowerCase().slice(0, 4))));
+};
+const montageTierErrorMap: z.ZodErrorMap = (issue, ctx) => issue.code === z.ZodIssueCode.invalid_type
+    ? { message: `a tier is a list of costs, not ${describeReceived(issue.received)} — ${SCHEDULED_OP_SHAPE}` }
+    : { message: ctx.defaultError };
+// A misspelt tier (hard_won) is named with its nearest tier instead of being dropped and the montage running at no
+// cost; a costs that is not an object (a list, a number, loose text) says what it should be. The same map sits on
+// the outer mirror, so the SDK's own refusal of a non-object carries this line instead of 'Expected object'.
+const montageCostsErrorMap: z.ZodErrorMap = (issue, ctx) => {
+    if (issue.code === z.ZodIssueCode.unrecognized_keys) return { message: `${issue.keys.map(k => { const t = nearestMontageTier(k); return `'${k}' is not a tier${t ? ` — did you mean ${t}?` : ''}`; }).join('; ')} (tiers: hardWon, costly; clean costs nothing)` };
+    if (issue.code === z.ZodIssueCode.invalid_type) return { message: `costs is an object of tiers, not ${describeReceived(issue.received)} — ${MONTAGE_COSTS_EXAMPLE} (tiers: hardWon, costly; clean costs nothing; each cost is an op object or a plain-string note)` };
+    return { message: ctx.defaultError };
+};
+const MONTAGE_COST_DESCRIBE = "op objects or plain strings, applied in order. A plain string is a note (logged, journaled and shown; nothing on the sheet changes). Ops: {op: 'adjust_pool', pool, delta, max?} | {op: 'adjust_hp' | 'adjust_max_hp', delta} | {op: 'add_condition', name, duration?, source?} | {op: 'remove_condition', name} | {op: 'note', text} | {op: 'set_part', part, state, kind?, hp?, maxHp?, ac?, holds?, note?, breakAt?} | {op: 'remove_part', part} (a part op writes the sheet's part and the same part on every live token; latched cannot be set here). A lone string, a lone op or a JSON string is accepted; null is no cost";
+const montageCostTier = () => z.preprocess(montageCostList, z.array(scheduledWriteOpSchema(), { errorMap: montageTierErrorMap }));
 const MontageSchema = z.object({
     action: z.literal('montage'),
     characterId: z.string().describe('Who does the work'),
     task: z.string().min(1).describe('What the montage covers, in one line'),
     dc: z.number().describe('Hard-won at or above this; clean at dc + cleanMargin; costly below'),
     dice: z.string().optional().default('1d20').describe('Dice notation for the one roll (default 1d20)'),
-    ability: stuntAbilityField().optional().describe('Ability whose modifier adds to the roll (str/dex/con/int/wis/cha); with skill and no ability, the skill\'s 5e or world ability'),
+    ability: stuntAbilityField().optional().describe("Ability the roll uses (str/dex/con/int/wis/cha). With skill it overrides the skill's governing stat and proficiency still applies; alone it adds just that ability's modifier; omitted with skill, the skill's 5e or world ability"),
     // Play report 5 #8c: the skill the long task rolls, so the sheet's conditional traits and worn armour apply.
-    skill: z.string().optional().describe("Play report 5 #8c: the skill the montage rolls ('survival'); its skillAdvantage traits fire on a matching context tag and stealthDisadvantage armour applies to stealth"),
+    // Play report 6 #1: and its skill modifier — ability + proficiency (doubled by expertise) on the world's curve, or the stealth/perception override.
+    skill: z.string().optional().describe("The skill the montage rolls ('survival'): the total adds its skill modifier (ability + proficiency, doubled by expertise, or the sheet's stealth/perception override), the sheet number roll_skill_check rolls; apply_effect skill_bonus effects and declaredEffects are not added here. Its skillAdvantage traits fire on a matching context tag and stealthDisadvantage armour applies to stealth"),
     context: z.preprocess(v => typeof v === 'string' ? [v] : v, z.array(z.string().min(1))).optional().describe("Play report 5 #8c: tags on the montage (['scent']); a skillAdvantage trait whose `when` matches rolls the dice twice and keeps the higher; a scene senseDenial removes it and is quoted"),
-    modifier: z.number().optional().default(0).describe('Flat situational modifier'),
+    modifier: z.number().optional().default(0).describe("Flat situational modifier the GM adds this call (footing, tools, time); the sheet's skill modifier is computed from skill, not passed here"),
     cleanMargin: z.number().optional().default(5).describe('Clean tier starts at dc + cleanMargin (default 5)'),
-    costs: z.object({
-        hardWon: z.preprocess(montageJsonIfString, z.array(scheduledWriteOpSchema())).optional().describe('Writes applied on a hard-won result'),
-        costly: z.preprocess(montageJsonIfString, z.array(scheduledWriteOpSchema())).optional().describe('Writes applied on a costly result')
-    }).optional().default({}).describe('What each tier costs; clean costs nothing'),
+    costs: z.preprocess(montageCostsObject, z.object({
+        hardWon: montageCostTier().optional().describe(`Costs applied on a hard-won result: ${MONTAGE_COST_DESCRIBE}; e.g. ['Varek loses the trail for a day', {op: 'adjust_hp', delta: -4}]`),
+        costly: montageCostTier().optional().describe('Costs applied on a costly result; the same shape as hardWon')
+    }, { errorMap: montageCostsErrorMap }).strict()).optional().default({}).describe('What each tier costs (tiers: hardWon, costly; clean costs nothing). A misspelt tier is refused and named, not dropped'),
     hours: z.number().positive().optional().describe('Hours the montage takes; with worldId the world clock advances'),
-    worldId: z.string().optional().describe("World whose clock moves and whose session log takes the line (default: the character's world)"),
+    worldId: z.string().optional().describe("World whose clock moves, whose session log takes the line and whose table_rules progression sets the proficiency bonus (default: the character's world)"),
     journal: z.boolean().optional().default(true).describe('Append a [montage] line to the latest active session_log (created if none)'),
     seed: z.string().optional().describe('Replay seed; omit for crypto dice')
 });
@@ -1127,7 +1162,7 @@ async function handleMontage(args: z.infer<typeof MontageSchema>): Promise<objec
     // traits (skillAdvantage + context) and the worn armour's stealth penalty;
     // advantage rolls the notation twice and keeps the higher total, disadvantage
     // the lower, and the two cancel as normal. A scene denial is quoted.
-    const skillKey = args.skill ? args.skill.toLowerCase().replace(/ /g, '_') : undefined;
+    const skillKey = args.skill ? args.skill.trim().toLowerCase().replace(/[\s-]+/g, '_') : undefined;
     const advFrom: string[] = [];
     const disFrom: string[] = [];
     let deniedAdvantage: Array<{ trait: string; when: string; reason: string }> | undefined;
@@ -1165,25 +1200,44 @@ async function handleMontage(args: z.infer<typeof MontageSchema>): Promise<objec
         animal_handling: 'wis', insight: 'wis', medicine: 'wis', perception: 'wis', survival: 'wis',
         deception: 'cha', intimidation: 'cha', performance: 'cha', persuasion: 'cha'
     };
-    const ability = args.ability ?? (skillKey ? (worldSkillAbility(db, worldId, args.skill) ?? MONTAGE_SKILL_ABILITY[skillKey]) : undefined);
-    const abilityMod = ability ? getSkillModifier((char.stats ?? {}) as Record<string, number>, ability) : 0;
-    // A skill the engine cannot map rolls with no ability modifier: said, not swallowed.
+    // Play report 6 #1: the montage rolls the SAME number roll_skill_check and
+    // stunts roll (src/engine/skill-modifier.ts) — ability + proficiency
+    // (doubled by expertise) on the world's progression curve, or the
+    // stealth/perception override that replaces it. `ability` overrides the
+    // skill's governing stat only; proficiency still applies. Ability alone
+    // (no skill) adds just that ability's modifier. Varek rolled 16 where
+    // roll_skill_check rolled 19 because this line added the bare stat.
+    const abilityName = args.ability ?? (skillKey ? (worldSkillAbility(db, worldId, args.skill) ?? MONTAGE_SKILL_ABILITY[skillKey]) : undefined);
+    const ability = abilityName ? abilityName.substring(0, 3).toLowerCase() as ShortAbility : undefined;
+    let sm: SkillModifier | undefined;
+    let abilityMod = 0;
+    let skillMod = 0;
+    if (ability && skillKey) {
+        sm = sheetSkillModifier(char as SkillSheet, skillKey, ability, worldProgression(db, worldId).profBonus(char.level));
+        abilityMod = sm.abilityMod;
+        skillMod = sm.value;
+    } else if (ability) {
+        abilityMod = sheetAbilityModifier(((char.stats ?? {}) as Record<string, number>)[ability]);
+        skillMod = abilityMod;
+    }
+    // A skill the engine cannot map rolls with no skill modifier: said, not swallowed.
     const montageWarnings: string[] = [];
-    if (skillKey && !ability) montageWarnings.push(`skill '${args.skill}' names no ability (not an SRD skill or a world skill): rolled with no ability modifier — pass ability, or define it with table_rules {kind: 'skill', name: '${args.skill}', spec: {ability}}`);
-    const total = rolled.total + abilityMod + args.modifier;
+    if (skillKey && !ability) montageWarnings.push(`skill '${args.skill}' names no ability (not an SRD skill or a world skill): rolled with no skill modifier (no ability, no proficiency) — pass ability, or define it with table_rules {kind: 'skill', name: '${args.skill}', spec: {ability}}`);
+    const total = rolled.total + skillMod + args.modifier;
     const cleanAt = args.dc + args.cleanMargin;
     const tier: MontageTier = total >= cleanAt ? 'clean' : total >= args.dc ? 'hard_won' : 'costly';
 
     // The tier's cost, through the same op grammar as mend clocks and tables.
     const ops = tier === 'hard_won' ? (args.costs.hardWon ?? []) : tier === 'costly' ? (args.costs.costly ?? []) : [];
     let applied: string[] = [];
+    let liveTokens: string[] = [];
     if (ops.length) {
-        const res = applyScheduledOps(char, ops, { defaultSource: `montage: ${args.task}`, reason: `montage: ${args.task} (${tier})` });
-        applied = res.applied;
-        if (Object.keys(res.updates).length) {
-            const written = charRepo.update(char.id, res.updates as Partial<import('../../schema/character.js').Character>);
-            if (!written) throw new Error(`montage cost write FAILED for ${char.id} — nothing applied`);
-        }
+        // Play report 6 #3: the shared commit step — sheet row, linked
+        // charges, part ops replayed onto every live token.
+        const commit = commitScheduledWrites(char.id, applyScheduledOps(char, ops, { defaultSource: `montage: ${args.task}`, reason: `montage: ${args.task} (${tier})` }), { repo: charRepo });
+        if (commit.writeFailed) throw new Error(`montage cost write FAILED for ${char.id} — nothing applied`);
+        applied = commit.applied;
+        liveTokens = commit.liveTokens;
     }
 
     // Time passes, when the caller says how much and whose clock.
@@ -1194,7 +1248,8 @@ async function handleMontage(args: z.infer<typeof MontageSchema>): Promise<objec
     }
 
     // One line in the session log: the latest active one for the world, or a new one.
-    const costText = applied.length ? applied.join('; ') : 'none';
+    // Prose reads a note as its text; applied[] keeps the 'note: ' marker.
+    const costText = applied.length ? applied.map(a => a.startsWith('note: ') ? a.slice('note: '.length) : a).join('; ') : 'none';
     const journalLine = `[montage] ${args.task} — ${tier.replace('_', '-')} (roll ${total} vs DC ${args.dc}) — cost: ${costText}`;
     let journalNoteId: string | undefined;
     let journalCreated = false;
@@ -1216,7 +1271,12 @@ async function handleMontage(args: z.infer<typeof MontageSchema>): Promise<objec
 
     const breakdown = [
         `${args.dice} ${rolled.total}${advantageRoll ? ` (2 dice, ${advantageRoll.mode}: ${advantageRoll.rolls.join(', ')})` : ''}`,
-        ...(ability ? [`${ability} ${abilityMod >= 0 ? '+' : ''}${abilityMod}`] : []),
+        // The working, in stunt's wording: the short ability label, then proficiency or expertise; an override replaces both.
+        ...(sm?.source === 'override'
+            ? [`${skillKey} override ${signed(sm.value)} (replaces computed ${signed(sm.computed)})`]
+            : ability
+                ? [`${ability} ${signed(abilityMod)}`, ...(sm?.expertise ? [`expertise +${sm.proficiency}`] : sm?.proficiency ? [`proficiency +${sm.proficiency}`] : [])]
+                : []),
         ...(args.modifier ? [`modifier ${args.modifier >= 0 ? '+' : ''}${args.modifier}`] : []),
         ...advFrom.map(a => `advantage ← ${a}`),
         ...disFrom.map(d => `disadvantage ← ${d}`),
@@ -1241,12 +1301,18 @@ async function handleMontage(args: z.infer<typeof MontageSchema>): Promise<objec
         ...(deniedAdvantage ? { deniedAdvantage } : {}),
         ...(montageWarnings.length ? { warnings: montageWarnings } : {}),
         abilityModifier: abilityMod,
+        skillModifier: skillMod,
+        proficiency: sm?.proficiency ?? 0,
+        expertise: sm?.expertise ?? false,
+        ...(sm ? { skillSource: sm.source, ...(sm.source === 'override' ? { computedSkillModifier: sm.computed } : {}) } : {}),
         modifier: args.modifier,
         total,
         dc: args.dc,
         cleanAt,
         breakdown,
         applied,
+        // The encounters whose live token took a part write, as schedule_change and roll tables report them.
+        ...(liveTokens.length ? { liveTokens } : {}),
         timePassed,
         journalNoteId,
         journalCreated: journalCreated || undefined,
@@ -1321,7 +1387,7 @@ const definitions: Record<ImprovisationAction, ActionDefinition> = {
         schema: MontageSchema,
         handler: handleMontage,
         aliases: ['downtime_roll', 'long_task'],
-        description: 'Forty-eight cells, one roll: resolve a long task on one logged die with fixed tiers (clean >= dc+cleanMargin, hard_won >= dc, costly below), apply the tier\'s writes, advance the clock, log the cost. {characterId, task, dc, dice?, ability?, modifier?, cleanMargin?, costs?: {hardWon, costly}, hours?, worldId?, journal?}'
+        description: "Forty-eight cells, one roll: resolve a long task on one logged die with fixed tiers (clean >= dc+cleanMargin, hard_won >= dc, costly below), apply the tier's costs (op objects or plain-text notes), advance the clock, log the cost. skill adds the sheet's skill modifier (ability + proficiency, doubled by expertise, or the stealth/perception override) and fires skillAdvantage traits on a matching context tag. {characterId, task, dc, dice?, ability?, skill?, context?, modifier?, cleanMargin?, costs?: {hardWon, costly}, hours?, worldId?, journal?}"
     },
     get_spellbook: {
         schema: GetSpellbookSchema,
@@ -1365,10 +1431,11 @@ CUSTOM EFFECTS (apply_effect):
 - Example: { action: "apply_effect", targetId: "char_1", targetType: "character", name: "Forge Blessing", category: "boon", powerLevel: 2, durationType: "until_removed", mechanics: [{ type: "attack_bonus", value: 2, condition: "melee" }, { type: "damage_resistance", value: "fire" }] }
 
 MONTAGE (forty-eight cells, one roll):
-- montage {characterId, task, dc, dice?: '1d20', ability?, skill?, context?: ['scent'], modifier?, cleanMargin?: 5, costs?: {hardWon: writes[], costly: writes[]}, hours?, worldId?, journal?: true} — one logged roll (purpose 'montage'); total = roll + ability mod + modifier. skill + context fire the sheet's skillAdvantage traits (two rolls, higher kept; a scene senseDenial removes it and is quoted); stealth in stealthDisadvantage armour rolls twice, lower kept
-- Tiers: clean (total ≥ dc + cleanMargin, no cost) · hard_won (≥ dc, costs.hardWon applied) · costly (below dc, costs.costly applied). Writes use the schedule_change op grammar: adjust_pool, adjust_hp, adjust_max_hp, add_condition, remove_condition
+- montage {characterId, task, dc, dice?: '1d20', ability?, skill?, context?: ['scent'], modifier?, cleanMargin?: 5, costs?: {hardWon: writes[], costly: writes[]}, hours?, worldId?, journal?: true} — one logged roll (purpose 'montage'); total = roll + skill modifier (ability + proficiency, doubled by expertise, or the sheet's stealth/perception override) + modifier; ability alone adds just that ability's modifier; ability with skill overrides the governing stat and proficiency still applies. The proficiency bonus follows the progression curve of worldId (default: the character's world). apply_effect skill_bonus mechanics and declaredEffects are not added (roll_skill_check adds them; a montage takes only the sheet and the GM's modifier). The breakdown prints the working: 'str +2', then 'proficiency +2' or 'expertise +4', or 'stealth override +7 (replaces computed +2)'. skill + context fire the sheet's skillAdvantage traits (two rolls, higher kept; a scene senseDenial removes it and is quoted); stealth in stealthDisadvantage armour rolls twice, lower kept
+- Tiers: clean (total ≥ dc + cleanMargin, no cost) · hard_won (≥ dc, costs.hardWon applied) · costly (below dc, costs.costly applied). Each cost is an op in the schedule_change grammar or a plain string: {op: 'adjust_pool', pool, delta, max?} | {op: 'adjust_hp' | 'adjust_max_hp', delta} | {op: 'add_condition', name, duration?, source?} | {op: 'remove_condition', name} | {op: 'note', text} | {op: 'set_part', part, state, kind?, hp?, maxHp?, ac?, holds?, note?, breakAt?} | {op: 'remove_part', part} (ops: adjust_pool, adjust_hp, adjust_max_hp, add_condition, remove_condition, set_part, remove_part, note; {op: 'set_part', part: 'left arm', state: 'crippled'} writes the sheet's part and the same part on every live token; the applied line names the encounter)
+- A plain string is a note: logged, journaled and shown, nothing on the sheet changes — costs: {hardWon: ['Varek loses the trail for a day'], costly: [{op: 'adjust_hp', delta: -4}, 'a Gor is wounded']}. A malformed cost or a misspelt tier (hard_won) is refused before the roll, with the shape; applied[] lists what each tier did
 - hours + worldId advance the world clock; journal appends '[montage] task — tier (roll X vs DC Y) — cost: …' to the latest active session_log (created as 'Session log' if none)
-- Reply: {tier, roll, total, dc, applied, timePassed?, journalNoteId?, hook} — hook is a one-line narration seed per tier for the GM to expand
+- Reply: {tier, roll, abilityModifier, skillModifier, proficiency, expertise, skillSource?, total, dc, breakdown, applied, liveTokens?, timePassed?, journalNoteId?, hook} — liveTokens lists the encounters whose token took a part cost; hook is a one-line narration seed per tier for the GM to expand
 
 ARCANE SYNTHESIS:
 - DC = 10 + (spell level x 2) + modifiers
@@ -1384,14 +1451,14 @@ ARCANE SYNTHESIS:
         targetIds: z.array(z.string()).optional(),
         targetTypes: z.array(z.enum(['character', 'npc'])).optional(),
         narrativeIntent: z.string().optional(),
-        skill: z.string().optional().describe('Stunt: any skill. SRD skills and world skills (table_rules skill) know their ability; others need ability. montage (play report 5 #8c): the skill the long task rolls, so skillAdvantage traits (with context) and stealthDisadvantage armour apply'),
-        ability: z.string().optional().describe('Stunt: the ability to roll with (str/dex/con/int/wis/cha, long or short)'),
+        skill: z.string().optional().describe("Stunt: any skill. SRD skills and world skills (table_rules skill) know their ability; others need ability. montage: the skill the long task rolls — its skill modifier (ability + proficiency, doubled by expertise, or the sheet's stealth/perception override) adds to the total, and skillAdvantage traits (with context) and stealthDisadvantage armour apply"),
+        ability: z.string().optional().describe("Stunt / montage: the ability to roll with (str/dex/con/int/wis/cha, long or short). montage: with skill it overrides the skill's governing stat and proficiency still applies; alone it adds just that ability's modifier"),
         dc: z.number().optional(),
         xpAward: z.number().optional().describe('XP credited to the actor (stunt)'),
         advantage: z.boolean().optional(),
         disadvantage: z.boolean().optional(),
         // #66-S mirror law: stunt roll-composition channels on the outer flat schema.
-        modifier: z.number().optional().describe('Stunt: situational bonus (cover, footing) — SITUATIONAL lane, summed'),
+        modifier: z.number().optional().describe("Stunt / montage: situational bonus the GM adds this call (cover, footing, tools) — SITUATIONAL lane, summed; the sheet's skill modifier is computed from skill, not passed here"),
         declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Stunt: itemized situational — summed unless colliding with declaredEffects (guard)'),
         declaredEffects: z.array(z.object({ name: z.string(), lane: z.string().optional() })).optional().describe('RESOLVER v2 on stunts: GM names the conditional trait; engine computes the value'),
         actionCost: z.string().optional(),
@@ -1452,10 +1519,13 @@ ARCANE SYNTHESIS:
         task: z.string().optional().describe('montage: what the montage covers, one line'),
         dice: z.string().optional().describe("montage: dice notation for the one roll (default '1d20')"),
         cleanMargin: z.number().optional().describe('montage: clean tier starts at dc + cleanMargin (default 5)'),
-        costs: z.object({
-            hardWon: z.array(z.any()).optional().describe('montage: writes applied on a hard-won result'),
-            costly: z.array(z.any()).optional().describe('montage: writes applied on a costly result')
-        }).optional().describe('montage: per-tier costs as schedule_change write ops; clean costs nothing'),
+        // Play report 6 #2: the same preprocess as the inner schema with the tier left untyped (a list, a
+        // string, an op or a JSON string all arrive) and the tier object passthrough, so a bare string tier,
+        // a number and a misspelt tier all reach the montage schema's own refusal instead of an SDK Zod dump.
+        costs: z.preprocess(montageCostsObject, z.object({
+            hardWon: z.preprocess(montageCostList, z.any()).optional().describe(`montage: costs applied on a hard-won result — ${MONTAGE_COST_DESCRIBE}`),
+            costly: z.preprocess(montageCostList, z.any()).optional().describe('montage: costs applied on a costly result; the same shape as hardWon')
+        }, { errorMap: montageCostsErrorMap }).passthrough()).optional().describe('montage: per-tier costs (tiers: hardWon, costly; clean costs nothing) as schedule_change write ops or plain-text notes'),
         hours: z.number().optional().describe('montage: hours the task takes; with worldId the clock advances'),
         worldId: z.string().optional().describe('montage: world whose clock moves and whose session log takes the line'),
         journal: z.boolean().optional().describe('montage: append a [montage] line to the latest active session_log (default true)'),
@@ -1472,6 +1542,12 @@ export async function handleImprovisationManage(args: unknown, ctx: SessionConte
     if (parsed.error) {
         output = RichFormatter.header('Error', '');
         output += RichFormatter.alert(parsed.message || 'Unknown error', 'error');
+        // Play report 6 #2: a validation refusal lists its issues; "Validation
+        // failed for action montage" alone left the GM guessing at the shape.
+        if (Array.isArray(parsed.issues) && parsed.issues.length) {
+            output += RichFormatter.section('Validation Issues');
+            output += RichFormatter.list(parsed.issues.map((i: { path: string; message: string }) => `${i.path}: ${i.message}`));
+        }
         if (parsed.suggestions) {
             output += '\n**Did you mean:**\n';
             parsed.suggestions.forEach((s: { value: string; similarity: number }) => {

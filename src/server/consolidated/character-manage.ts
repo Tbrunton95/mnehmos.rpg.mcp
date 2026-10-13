@@ -22,7 +22,8 @@ import { liveEncounterFor } from '../handlers/combat-handlers.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { findAbility } from '../../engine/combat/abilities.js';
 import { readWorldClock, readWorldConditions, dayClock, SET_CLOCK_HINT, scheduleInWorldSql, scheduleLiveSql } from '../../engine/world-clock.js';
-import { scheduledWriteOpSchema, applyScheduledOps, type ScheduledWriteOp } from '../../engine/scheduled-ops.js';
+import { scheduledWriteOpSchema, applyScheduledOps, scheduledOpMissing, SCHEDULED_OP_SHAPE, describeReceived, type ScheduledWriteOp } from '../../engine/scheduled-ops.js';
+import { commitScheduledWrites } from '../scheduled-commit.js';
 import { exposureThresholdSchema, exposureCap, exposureSummary, ensureExposureColumn, readExposure, writeExposure, type ExposureEntry } from '../../engine/exposure.js';
 import { applyFamilyDelta, familyMember, type FamilyMove } from '../../engine/pool-family.js';
 import { z } from 'zod';
@@ -409,6 +410,11 @@ const DeleteSchema = z.object({
 const mendJsonIfString = (v: unknown) => { if (typeof v === 'string') { try { return JSON.parse(v); } catch { return v; } } return v; };
 
 const ScheduledWriteOpSchema = scheduledWriteOpSchema();
+// Play report 6 #2: a writes that is not a list (a bare string, one op, null) says what a list of ops looks like.
+// The same map sits on the outer mirror, so the SDK's refusal carries this line instead of 'Expected array'.
+const writesListErrorMap: z.ZodErrorMap = (issue, ctx) => issue.code === z.ZodIssueCode.invalid_type
+    ? { message: `writes is a list of ops, not ${describeReceived(issue.received)} — writes: [{op: 'note', text: 'the arm has healed'}]; ${SCHEDULED_OP_SHAPE}` }
+    : { message: ctx.defaultError };
 
 const ScheduleChangeSchema = z.object({
     action: z.literal('schedule_change'),
@@ -422,7 +428,7 @@ const ScheduleChangeSchema = z.object({
     currentDay: z.number().optional().describe('Base day for firesInHours (fractional ok). Omit to use the world clock'),
     currentTime: z.string().regex(/^\d{1,2}:\d{2}$/).optional().describe('Base time HH:MM for firesInHours — combined with currentDay into a fractional base'),
     worldId: z.string().optional().describe('FINDINGS #91: scope this row to a world — process_scheduled {worldId} fires ONLY matching rows. Multi-world dbs pass it ALWAYS (KEEPER discipline §13); single-world saves may omit'),
-    writes: z.preprocess(mendJsonIfString, z.array(ScheduledWriteOpSchema)).default([]).describe('Ordered ops applied when due. ARRAY param — batch law #16a: direct calls only. May be empty ONLY with event: true'),
+    writes: z.preprocess(mendJsonIfString, z.array(ScheduledWriteOpSchema, { errorMap: writesListErrorMap })).default([]).describe("Ordered ops applied when due: {op: 'adjust_pool', pool, delta, max?} | {op: 'adjust_hp' | 'adjust_max_hp', delta} | {op: 'add_condition', name, duration?, source?} | {op: 'remove_condition', name} | {op: 'note', text} | {op: 'set_part', part: 'left arm', state: 'intact', kind?, hp?, maxHp?, ac?, holds?, note?, breakAt?} / {op: 'remove_part', part}. A note prints its text when the clock fires and writes nothing; a part op writes the sheet's part and the same part on every live token when it fires (latched cannot be scheduled). ARRAY param — batch law #16a: direct calls only. May be empty ONLY with event: true"),
     note: z.string().optional().describe('What this clock is ("suture out, L-forearm", "Akkuratnyy mend +1") — for events, the note IS the payload'),
     event: z.boolean().optional().describe('FINDINGS #82: GM EVENT — a clock that fires a NOTIFICATION instead of writes (NPC deliveries, deadlines, reminders). Fires through process_scheduled as 📣 GM EVENT DUE, surfaces as due at session boot. Combines with recurEveryDays for recurring reminders'),
     recurEveryDays: z.number().positive().optional().describe('FINDINGS #69: RECURRING clock — after firing, re-arms at +N days automatically. A hunger clock set once climbs forever; process_scheduled catches up every missed recurrence individually'),
@@ -2429,6 +2435,19 @@ async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>):
     if ((!args.writes || args.writes.length === 0) && !args.event) {
         throw new Error(`schedule_change with empty writes needs event: true — a clock that writes nothing is either a GM EVENT (say so) or a mistake (refused). Nothing was inserted.`);
     }
+    // Play report 6 #3 (review): an op that lacks what it needs ({op:
+    // 'set_part', part: 'left arm'} with no state) would fire nothing but a
+    // '⚠ … skipped' line days from now and the arm would never heal. Refused
+    // here, with the field named, before the insert (#82, refuse-not-fake).
+    // An event row is a notification; its writes are not read.
+    if (!args.event) {
+        const incomplete = (args.writes as ScheduledWriteOp[]).map((op, i) => ({ i, why: scheduledOpMissing(op) })).filter(x => x.why);
+        if (incomplete.length) {
+            const err = new Error(`schedule_change refused: ${incomplete.map(x => `writes[${x.i}] ${x.why}`).join('; ')} — ${SCHEDULED_OP_SHAPE}. Nothing was inserted.`);
+            (err as Error & { writes?: string }).writes = 'none';
+            throw err;
+        }
+    }
     const now = new Date().toISOString();
     // FINDINGS #88: resolve the hour lanes into ONE fractional day before any
     // insert — the recurrence re-arm and the fireNow stamp both ride it.
@@ -2471,24 +2490,23 @@ async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>):
     // Same op arithmetic as the processor; a recurring row fired now re-arms
     // exactly as it would from process_scheduled.
     let firedNowApplied: string[] | null = null;
+    let firedNowLiveTokens: string[] = [];
     if (args.fireNow) {
         let applied: string[];
         if (args.event) {
             // FINDINGS #82: an event fired now is just its notification.
             applied = [`📣 GM EVENT${args.note ? `: ${args.note}` : ''} (fired immediately)`];
         } else {
-            const opResult = applyScheduledOps(char, args.writes as ScheduledWriteOp[]);
-            applied = opResult.applied;
-            const updates = opResult.updates;
-            if (Object.keys(updates).length) {
-                // FINDINGS #77: the FIRED NOW report derives from the STORE's answer,
-                // not the input arithmetic — a null here leaves the row unfired and
-                // throws loud instead of fabricating a transition (#76's 0→7 on a
-                // pool that never existed).
-                const written = characterRepo.update(args.characterId, updates as Partial<import('../../schema/character.js').Character>);
-                if (!written) throw new Error(`fireNow write FAILED for ${args.characterId} — ledger row ${info.lastInsertRowid} left unfired, nothing applied`);
-                if (updates.resourcePools) mirrorLinkedCharges(args.characterId, updates.resourcePools as Record<string, ResourcePool>);
-            }
+            // Play report 6 #3: one commit step — sheet row, linked charges,
+            // part ops replayed onto every live token.
+            const commit = commitScheduledWrites(args.characterId, applyScheduledOps(char, args.writes as ScheduledWriteOp[]));
+            // FINDINGS #77: the FIRED NOW report derives from the STORE's answer,
+            // not the input arithmetic — a null here leaves the row unfired and
+            // throws loud instead of fabricating a transition (#76's 0→7 on a
+            // pool that never existed).
+            if (commit.writeFailed) throw new Error(`fireNow write FAILED for ${args.characterId} — ledger row ${info.lastInsertRowid} left unfired, nothing applied`);
+            applied = commit.applied;
+            firedNowLiveTokens = commit.liveTokens;
         }
         db.prepare('UPDATE scheduled_state_changes SET fired = 1, fired_at = ? WHERE id = ?').run(now, Number(info.lastInsertRowid));
         if (args.recurEveryDays && args.recurEveryDays > 0) {
@@ -2500,7 +2518,7 @@ async function handleScheduleChange(args: z.infer<typeof ScheduleChangeSchema>):
     return {
         success: true,
         actionType: 'schedule_change',
-        ...(firedNowApplied ? { firedNow: true, applied: firedNowApplied } : {}),
+        ...(firedNowApplied ? { firedNow: true, applied: firedNowApplied, ...(firedNowLiveTokens.length ? { liveTokens: firedNowLiveTokens } : {}) } : {}),
         scheduleId: Number(info.lastInsertRowid),
         kind: args.event ? 'event' : 'clock',
         characterId: args.characterId,
@@ -2611,11 +2629,12 @@ export function fireDueScheduledRows(opts: { worldId: string; effectiveDay: numb
             // NPC-delivery timers. Marked fired and re-armed like any clock.
             // FINDINGS #73: shared op application — one arithmetic for clocks and one-offs.
             const isEvent = (row.is_event ?? 0) === 1;
-            const { applied, updates } = isEvent
-                ? { applied: [`📣 GM EVENT DUE${row.note ? `: ${row.note}` : ''}`], updates: {} as Record<string, unknown> }
-                : applyScheduledOps(char, ops);
-            if (Object.keys(updates).length) characterRepo.update(row.character_id, updates as Partial<import('../../schema/character.js').Character>);
-            if (updates.resourcePools) mirrorLinkedCharges(row.character_id, updates.resourcePools as Record<string, ResourcePool>);
+            // Play report 6 #3: one commit step — sheet row, linked charges,
+            // part ops replayed onto every live token (named in the line).
+            const commit = isEvent
+                ? { applied: [`📣 GM EVENT DUE${row.note ? `: ${row.note}` : ''}`], liveTokens: [] as string[] }
+                : commitScheduledWrites(row.character_id, applyScheduledOps(char, ops));
+            const applied = commit.applied;
             db.prepare('UPDATE scheduled_state_changes SET fired = 1, fired_at = ? WHERE id = ?').run(now, row.id);
             // FINDINGS #69: a recurring clock re-arms itself the moment it fires —
             // the next row inherits writes, note, and recurrence. The loop above
@@ -2626,7 +2645,7 @@ export function fireDueScheduledRows(opts: { worldId: string; effectiveDay: numb
                     .run(row.character_id, row.fires_at_day + row.recur_every_days, row.writes, row.note, now, row.recur_every_days, row.is_event ?? 0, row.world_id ?? opts.worldId);
                 rearmedAs = Number(next.lastInsertRowid);
             }
-            results.push({ scheduleId: row.id, kind: (row.is_event ?? 0) === 1 ? 'event' : 'clock', characterId: row.character_id, characterName: char.name, firesAtDay: row.fires_at_day, note: row.note, applied, ...(rearmedAs !== null ? { recurring: true, rearmedAs, nextFiresAtDay: row.fires_at_day + (row.recur_every_days ?? 0) } : {}) });
+            results.push({ scheduleId: row.id, kind: (row.is_event ?? 0) === 1 ? 'event' : 'clock', characterId: row.character_id, characterName: char.name, firesAtDay: row.fires_at_day, note: row.note, applied, ...(commit.liveTokens.length ? { liveTokens: commit.liveTokens } : {}), ...(rearmedAs !== null ? { recurring: true, rearmedAs, nextFiresAtDay: row.fires_at_day + (row.recur_every_days ?? 0) } : {}) });
         }
         due = db.prepare(dueSql).all(opts.effectiveDay, ...scopeParams) as ScheduleRow[];
     }
@@ -3086,7 +3105,7 @@ const definitions: Record<CharacterAction, ActionDefinition> = {
         schema: ScheduleChangeSchema,
         handler: handleScheduleChange,
         aliases: ['schedule', 'mend', 'schedule_write'],
-        description: 'FINDINGS #60 MEND CLOCK: schedule state changes (pools, hp, maxHp, conditions) to fire at an in-fiction day — the boot executes them instead of a chair remembering them'
+        description: "FINDINGS #60 MEND CLOCK: schedule state changes (pools, hp, maxHp, conditions, body parts) to fire at an in-fiction day — the boot executes them instead of a chair remembering them. writes: [{op: 'set_part', part: 'left arm', state: 'intact'}] heals a part on the sheet and on every live token when it fires (process_scheduled, world_manage advance {fireScheduled}, or fireNow)"
     },
     process_scheduled: {
         schema: ProcessScheduledSchema,
@@ -3506,7 +3525,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         recurEveryDays: z.number().optional().describe('FINDINGS #69 (mirror): recurring clock — re-arms at +N days after each fire; process_scheduled catches up missed recurrences individually'),
         fireNow: z.boolean().optional().describe('FINDINGS #73 (mirror): fire the entry immediately in the same call — ledger one-off, applied[] reported'),
         event: z.boolean().optional().describe('FINDINGS #82 (mirror): GM EVENT — a clock that fires a notification instead of writes; empty writes allowed with this flag'),
-        writes: z.preprocess(mendJsonIfString, z.array(ScheduledWriteOpSchema)).optional().describe('MEND CLOCK: ordered ops (schedule_change). ARRAY — direct calls only per batch law #16a'),
+        writes: z.preprocess(mendJsonIfString, z.array(ScheduledWriteOpSchema, { errorMap: writesListErrorMap })).optional().describe("MEND CLOCK: ordered ops (schedule_change): {op: 'adjust_pool', pool, delta, max?} | {op: 'adjust_hp' | 'adjust_max_hp', delta} | {op: 'add_condition', name, duration?, source?} | {op: 'remove_condition', name} | {op: 'note', text} | {op: 'set_part', part: 'left arm', state: 'intact', kind?, hp?, maxHp?, ac?, holds?, note?, breakAt?} / {op: 'remove_part', part}. A note prints when it fires; part ops write the sheet's part and the same part on every live token when the clock fires (latched cannot be scheduled). ARRAY — direct calls only per batch law #16a"),
         note: z.string().optional().describe('MEND CLOCK: what this clock is (schedule_change); adjust_pool: what the counter is; set_exposure: what the timer is'),
         currentDay: z.number().optional().describe('MEND CLOCK: current in-fiction day (process_scheduled)'),
         scheduleId: z.number().optional().describe('MEND CLOCK: row id (cancel_scheduled, scope_scheduled)'),

@@ -35,6 +35,63 @@ export function upsertPart(parts: Part[], next: Partial<Part> & { name: string }
     return out;
 }
 
+/**
+ * The fields a set_part write carries: the shape combat_manage set_part and
+ * the scheduled grammar's set_part op share.
+ */
+export interface PartWrite {
+    part: string;
+    state: Part['state'];
+    kind?: Part['kind'];
+    latchedTo?: Part['latchedTo'];
+    note?: string;
+    holds?: string[];
+    ac?: number;
+    hp?: number;
+    maxHp?: number;
+    breakAt?: number;
+}
+
+/**
+ * Play report 6 #3: set a part by name with the token handler's merge rules,
+ * pure, so a clock, a montage cost or a table entry writes a part the way
+ * set_part does and the same write replays onto live tokens. kind defaults
+ * to the part's current kind, else other; latchedTo is kept only while
+ * latched (the write's, else the previous hold); maxHp defaults to
+ * max(1, hp) the first time hp is set; every other field given replaces and
+ * every field left out survives. Names match trimmed, case-insensitive (no
+ * singular/plural). Returns a new array, the part as it was and as it is.
+ */
+export function setPartOn(parts: Part[], write: PartWrite): { parts: Part[]; prev?: Part; next: Part } {
+    const key = norm(write.part);
+    const prev = parts.find(p => norm(p.name) === key);
+    const out = upsertPart(parts, {
+        name: prev ? prev.name : write.part.trim(),
+        kind: write.kind ?? prev?.kind ?? 'other',
+        state: write.state,
+        latchedTo: write.state === 'latched' ? (write.latchedTo ?? prev?.latchedTo) : undefined,
+        ...(write.note !== undefined ? { note: write.note } : {}),
+        ...(write.holds !== undefined ? { holds: write.holds } : {}),
+        ...(write.ac !== undefined ? { ac: write.ac } : {}),
+        ...(write.hp !== undefined ? { hp: write.hp } : {}),
+        ...(write.maxHp !== undefined ? { maxHp: write.maxHp }
+            : write.hp !== undefined && prev?.maxHp === undefined ? { maxHp: Math.max(1, write.hp) } : {}),
+        ...(write.breakAt !== undefined ? { breakAt: write.breakAt } : {})
+    });
+    const next = out.find(p => norm(p.name) === key)!;
+    return { parts: out, ...(prev ? { prev } : {}), next };
+}
+
+/**
+ * Remove a part by trimmed, case-insensitive name. Returns a new array and
+ * the part removed; no `removed` when the name is not there.
+ */
+export function removePartFrom(parts: Part[], name: string): { parts: Part[]; removed?: Part } {
+    const key = norm(name);
+    const removed = parts.find(p => norm(p.name) === key);
+    return { parts: removed ? parts.filter(p => p !== removed) : [...parts], ...(removed ? { removed } : {}) };
+}
+
 /** A profile by exact name, then by unique prefix; undefined when neither. */
 export function matchProfile(profiles: AttackProfile[], name: string): AttackProfile | undefined {
     const key = norm(name);

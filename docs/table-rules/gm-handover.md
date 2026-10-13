@@ -92,6 +92,13 @@ The Deep One campaign ran four days of fights outside the engine because its dic
 - **Keen Smell is a trait, not a condition.** `character_manage update {skillAdvantage: [{name: 'Keen Smell', skills: ['perception', 'survival'], when: 'scent', passiveBonus: 5}], removeConditions: ['Keen Smell']}`. Tag the check: `math_manage roll_skill_check {…, context: ['scent']}`; deny it before the roll with `scene_manage set {senseDenial: {scent: '<reason>'}}`. The status block shows passive Perception (scent). Guide: `docs/table-rules/senses-and-traits.md`.
 - **Two refusals now explain themselves.** `knowledge_manage record` with a bare string knower prints the knower shape and takes `knowers: ['luciel', 'vigil'], how: 'witnessed'` as a shorthand (never assuming a road; a refused knower writes no fact). `editConditions` with a `find` that lives in the source prints the exact `replaceSource` call to paste.
 
+## After play report 6 (the scent hunt, the costs, Many-Skins' arm)
+
+- **The montage rolls the whole skill.** `improvisation_manage montage {characterId, task, dc, skill: 'survival', context: ['scent']}` adds ability + proficiency (doubled by expertise) or the sheet's stealth/perception override, the same number `roll_skill_check` rolls, and prints the working. `ability` beside `skill` swaps the stat and keeps proficiency.
+- **Costs in plain words.** `costs: {hardWon: ['Varek loses the trail for a day'], costly: [{op: 'adjust_hp', delta: -2}, 'a Gor is wounded']}`: a string is a note (journaled and shown, nothing written); objects write. A bad cost or a misspelt tier is refused before the roll and the refusal prints the shape.
+- **A clock that only reminds.** `character_manage schedule_change {characterId, firesInHours, writes: [{op: 'note', text: 'the arm has healed'}]}` prints its text when it fires and writes nothing.
+- **Body parts on the clock.** `schedule_change {…, writes: [{op: 'set_part', part: 'left arm', state: 'intact'}]}` writes the sheet's part and the same part on every live token when it fires; `remove_part` drops one; `latched` cannot be scheduled.
+
 ## Never do these
 
 - **Never fake a result with a huge `attackBonus`.** Post it with `outcome`.
@@ -179,7 +186,7 @@ The Deep One campaign ran four days of fights outside the engine because its dic
 | Years pass between arcs | `world_manage era_jump {worldId, day, label, dryRun?}` |
 | After fights ran in chat | `world_manage reconcile {worldId}`; fix each finding with the call it names |
 | XP said aloud, not yet applied | `character_manage award_note {characterId, amount, reason}` then `post_awards {worldId}` |
-| Forty-eight cells, one roll | `improvisation_manage montage {characterId, task, dc, costs, hours, worldId}` |
+| Forty-eight cells, one roll | `improvisation_manage montage {characterId, task, dc, skill?, context?, costs?: {hardWon: [...], costly: [...]}, hours, worldId}`: one logged die, skill modifier applied, tiers clean / hard-won / costly; costs are op objects or plain-text notes |
 | Hours of exposure | `character_manage set_exposure {characterId, name, pool, perHour, cap, thresholds}`; `world_manage advance` ticks it |
 | An oath or an owed meeting | `ledger_manage create {worldId, kind: 'oath' \| 'meeting' \| 'border' \| 'favour', debtor, creditor, consequence, dueDay?}` |
 | A fight in the water | `combat_manage create {..., environment: {medium: 'water', depthFt}}` or `set_environment`; give swimmers `swimSpeed` and the tag `aquatic` |
@@ -278,3 +285,10 @@ The Deep One campaign ran four days of fights outside the engine because its dic
 | Record a fact several people saw | `knowledge_manage record {worldId, key, statement, knowers: ['luciel', 'inquisitor'], how: 'witnessed'}` (bare ids share the top-level how; a knower object's own how wins; told takes `fromId`) |
 | A condition edit is refused as 'not in the name' | read the refusal: it prints the `replaceSource` (or `replace`) call that hits, with your match and with; a case-only miss shows the casing that is there |
 | Edit text that lives in a condition's source | `character_manage update {characterId, editConditions: [{match: 'oath', replaceSource: {find: 'Karanak', with: 'the Mouth'}}]}` (match reads names only; find is case-sensitive) |
+| A proficient skill over a long task | `improvisation_manage montage {characterId, task, dc, skill: 'survival', context?: ['scent']}` adds ability + proficiency (doubled by expertise) or the sheet's stealth/perception override and prints the working; `ability` beside `skill` swaps the stat and keeps proficiency |
+| Montage and roll_skill_check disagree | both read the same sheet number; compare `breakdown` on each. Only auto-apply effect bonuses differ: roll_skill_check applies them, montage takes them as `modifier` |
+| A montage cost in plain words | `costs: {hardWon: ['Varek loses the trail for a day'], costly: [{op: 'adjust_hp', delta: -4}, 'a Gor is wounded']}`: a string is a note (in applied[], the journal line and the message; nothing written); a bad cost or a misspelt tier is refused before the roll with the shape |
+| A reminder that fires on a day | `character_manage schedule_change {characterId, firesAtDay \| firesInHours, writes: [{op: 'note', text: 'the arm has healed'}], note?}`: prints its text on `process_scheduled`, `world_manage advance {fireScheduled: true}` or `fireNow: true`, writes nothing, mixes with real writes |
+| A wound heals on a clock (Many-Skins' arm knits in three days) | `character_manage schedule_change {characterId, worldId, firesInHours: 72, writes: [{op: 'set_part', part: 'left arm', state: 'intact'}], note: 'the arm knits'}`; it fires on `world_manage advance {fireScheduled: true}` or `process_scheduled`, writing the sheet and the token in every live fight (the applied line names the encounters) |
+| Heal or cripple a part this instant, sheet and fight together | `character_manage schedule_change {characterId, worldId, firesAtDay, fireNow: true, writes: [{op: 'set_part', part, state, kind?, holds?, hp?}]}`; `{op: 'remove_part', part}` drops a part; `latched` is refused (use `combat_manage set_part` on the token) |
+| A montage or a table costs a limb | `improvisation_manage montage {…, costs: {costly: [{op: 'set_part', part: 'left arm', state: 'crippled'}]}}`; `table_rules define {kind: 'roll_table', spec: {entries: [{text, apply: {writes: [{op: 'set_part', part, state}]}}]}}` then `roll {name, characterId}` |
