@@ -2,9 +2,10 @@ import Database from 'better-sqlite3';
 import { getToolContext } from '../../server/tool-context.js';
 import { Character, CharacterSchema, NPC, NPCSchema } from '../../schema/character.js';
 import { CharacterType } from '../../schema/party.js';
+import { stripDyingRowConditions, type RowCondition } from '../../engine/combat/dying.js';
 
 /** The sheet fields stored together in the combat_profile JSON column. */
-const COMBAT_PROFILE_KEYS = ['size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'attacksPerAction', 'attacks', 'abilities', 'fightingStyle', 'superiorityDie', 'maneuverAbility', 'cr', 'autoLegendaryResistance', 'form', 'vessel', 'acSource'] as const;
+const COMBAT_PROFILE_KEYS = ['size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'senses', 'naturalArmor', 'skillAdvantage', 'attacksPerAction', 'attacks', 'abilities', 'fightingStyle', 'superiorityDie', 'maneuverAbility', 'cr', 'autoLegendaryResistance', 'form', 'vessel', 'acSource', 'ignoreCover', 'deathSaves', 'deathSaveMode'] as const;
 
 /** Pack the combat profile for the column; null when the sheet sets none of it. */
 function packCombatProfile(c: Character | NPC): string | null {
@@ -169,6 +170,16 @@ export class CharacterRepository {
         // happened, then matched zero rows and returned the merged object as if
         // written. The audit logging the lie is the worst family variant found.
         const canonicalId = existing.id;
+
+        // Play report 5 #5: one rule for every road that heals a sheet above 0
+        // (a potion, a spell's write-back, a scheduled return, a hand update,
+        // the token sync): consciousness returns, so the dying rules' marks
+        // (Unconscious/Prone sourced 'dying', Stable) come off. A call that
+        // sets conditions itself owns that list and is left alone.
+        if (updates.hp !== undefined && updates.hp > 0 && existing.hp <= 0 && updates.conditions === undefined) {
+            const woke = stripDyingRowConditions((existing as { conditions?: RowCondition[] }).conditions);
+            if (woke.removed.length) updates = { ...updates, conditions: woke.conditions as Character['conditions'] };
+        }
 
         const updated = {
             ...existing,

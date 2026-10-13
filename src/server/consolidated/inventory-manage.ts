@@ -5,12 +5,12 @@
 
 import { z } from 'zod';
 import { createActionRouter, ActionDefinition, McpResponse } from '../../utils/action-router.js';
-import { ItemRepository } from '../../storage/repos/item.repo.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { CustomEffectsRepository } from '../../storage/repos/custom-effects.repo.js';
 import { journalSnapshot } from '../utils/write-journal.js';
 import { INVENTORY_LIMITS, EQUIP_SLOTS, equipSlotSchema } from '../../schema/inventory.js';
 import type { AcSource } from '../../schema/character.js';
+import { deriveArmorClass, defaultArmorSlots, type ArmorClassReport } from '../../engine/armor.js';
 import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
 import { characterLexicon } from '../../engine/table-rules.js';
@@ -64,9 +64,9 @@ function allowedEquipSlots(item: {
     }
 
     if (item.type === 'weapon') return ['mainhand', 'offhand'];
-    if (item.type === 'armor') {
-        return typeof properties.acBonus === 'number' ? ['offhand'] : ['armor'];
-    }
+    // Play report 5 #7: armorCategory first (shield → offhand, body armour →
+    // armor), then a readable base, then the legacy acBonus-only heuristic.
+    if (item.type === 'armor') return defaultArmorSlots(properties);
     return [];
 }
 
@@ -321,46 +321,15 @@ function attachGateCheck(gunProps: Record<string, unknown>, attProps: Record<str
 // FINDINGS #69: ONE armor-class derivation, used by equip AND unequip. The old
 // per-path arithmetic ignored the head slot (Sphere-08's +1 vanished on every
 // re-equip) and the unequip path could write AC while reporting acChange: null.
-// Derivation: armor-slot baseAC + min(DEX, maxDexBonus), else unarmored
-// 10 + DEX; PLUS every other equipped item's acBonus (head, accessory).
-function deriveArmorClass(
-    db: ReturnType<typeof getDb>,
-    characterId: string
-): { ac: number; parts: string[] } {
-    const charRepo = new CharacterRepository(db);
-    const itemRepo = new ItemRepository(db);
-    const character = charRepo.findById(characterId);
-    const dexMod = Math.floor((((character?.stats as { dex?: number })?.dex ?? 10) - 10) / 2);
-    let base = 10 + dexMod;
-    let baseDesc = `unarmored 10 + DEX ${dexMod >= 0 ? '+' : ''}${dexMod}`;
-    let bonus = 0;
-    const bonusParts: string[] = [];
-    const rows = db.prepare('SELECT item_id, slot FROM inventory_items WHERE character_id = ? AND equipped = 1').all(characterId) as Array<{ item_id: string; slot: string | null }>;
-    for (const row of rows) {
-        const t = itemRepo.findById(row.item_id);
-        const p = (t?.properties ?? {}) as { baseAC?: number; ac?: number; maxDexBonus?: number; strengthRequired?: number; acBonus?: number };
-        // Legacy starter armor carries `ac` instead of `baseAC`.
-        const armorBase = typeof p.baseAC === 'number' ? p.baseAC : typeof p.ac === 'number' ? p.ac : null;
-        if (row.slot === 'armor' && armorBase !== null) {
-            // Legacy heavy armor has no maxDexBonus but carries a Strength
-            // requirement; heavy armor never adds Dexterity.
-            const maxDex = typeof p.maxDexBonus === 'number' ? p.maxDexBonus
-                : typeof p.strengthRequired === 'number' ? 0 : 99;
-            // Worn armor replaces the unarmored base (5e), even when lower.
-            base = armorBase + (maxDex > 0 ? Math.min(dexMod, maxDex) : 0);
-            baseDesc = `${t?.name ?? 'armor'} base ${armorBase}${maxDex === 0 ? ' (no DEX)' : maxDex < 99 ? ` + DEX(max ${maxDex})` : ' + DEX'}`;
-        }
-        // acBonus stacks from every equipped item, magic armor included.
-        if (typeof p.acBonus === 'number' && p.acBonus !== 0) {
-            bonus += p.acBonus;
-            bonusParts.push(`${t?.name ?? row.item_id} ${p.acBonus >= 0 ? '+' : ''}${p.acBonus}`);
-        }
-    }
-    return { ac: base + bonus, parts: [baseDesc, ...bonusParts] };
-}
+// Play report 5 #7: the derivation lives in src/engine/armor.ts now, shared
+// with character_manage (natural armour) and the Stealth readers: armour-slot
+// base in any spelling + the category-capped DEX, or natural armour when it
+// is higher, else unarmoured 10 + DEX; PLUS every equipped acBonus. An
+// armour-slot item with no readable base is a warning, never a silent fall back.
 
 // AcSource comes from the schema (one source of truth with COMBAT_PROFILE_KEYS).
 type AcReport = { before: number; after: number; source: AcSource; derived: number; parts: string[] };
+type ArmorSettlement = { ac: AcReport; acChange: string; acMatchesDerived?: true; armor?: ArmorClassReport['armor']; warnings: string[] };
 
 // Play report 3 #2: a hand-set AC survives gear changes. Before this, equip
 // and unequip wrote the derived value whenever it differed, so a GM's AC 17
@@ -378,9 +347,10 @@ function settleArmorClass(
     before: { ac: number; acSource?: AcSource },
     derivedBefore: number,
     recomputeAc: boolean | undefined
-): { ac: AcReport; acChange: string; acMatchesDerived?: true } {
+): ArmorSettlement {
     const derived = deriveArmorClass(db, characterId);
     const gear = derived.parts.join(' + ');
+    const extras = { ...(derived.armor ? { armor: derived.armor } : {}), warnings: derived.warnings };
     const follows = recomputeAc === true
         || before.acSource === 'derived'
         || (before.acSource === undefined && before.ac === derivedBefore);
@@ -397,7 +367,7 @@ function settleArmorClass(
         const acChange = derived.ac !== before.ac
             ? `AC ${before.ac} → ${derived.ac} (now ${derived.ac}: ${gear}${taken})`
             : `AC unchanged (now ${derived.ac}: ${gear}${taken})`;
-        return { ac: { before: before.ac, after: derived.ac, source: 'derived', derived: derived.ac, parts: derived.parts }, acChange };
+        return { ac: { before: before.ac, after: derived.ac, source: 'derived', derived: derived.ac, parts: derived.parts }, acChange, ...extras };
     }
     // Review: same for the 'manual' stamp on a legacy row — said once, here.
     const stamped = before.acSource !== 'manual';
@@ -410,7 +380,18 @@ function settleArmorClass(
     return {
         ac: { before: before.ac, after: before.ac, source: 'manual', derived: derived.ac, parts: derived.parts },
         acChange,
-        ...(matches ? { acMatchesDerived: true as const } : {})
+        ...(matches ? { acMatchesDerived: true as const } : {}),
+        ...extras
+    };
+}
+
+/** The armour fields an equip/unequip reply carries: the worn armour as read and any warnings, which also ride the message. */
+function armorReply(settled: ArmorSettlement | null): { armor?: ArmorClassReport['armor']; warnings?: string[]; warningText: string } {
+    if (!settled) return { warningText: '' };
+    return {
+        ...(settled.armor ? { armor: settled.armor } : {}),
+        ...(settled.warnings.length ? { warnings: settled.warnings } : {}),
+        warningText: settled.warnings.length ? ` ⚠ ${settled.warnings.join(' ⚠ ')}` : ''
     };
 }
 
@@ -889,6 +870,7 @@ const definitions: Record<InventoryAction, ActionDefinition> = {
             inventoryRepo.equipItem(params.characterId, params.itemId, params.slot);
 
             const settled = before ? settleArmorClass(db, charRepo, params.characterId, before, derivedBefore, params.recomputeAc) : null;
+            const { warningText, ...armorFields } = armorReply(settled);
 
             return {
                 success: true,
@@ -899,7 +881,8 @@ const definitions: Record<InventoryAction, ActionDefinition> = {
                 acChange: settled?.acChange ?? null,
                 ...(settled ? { ac: settled.ac } : {}),
                 ...(settled?.acMatchesDerived ? { acMatchesDerived: true } : {}),
-                message: `Equipped ${item.name} in ${params.slot} slot${settled ? `. ${settled.acChange}` : ''}`
+                ...armorFields,
+                message: `Equipped ${item.name} in ${params.slot} slot${settled ? `. ${settled.acChange}` : ''}${warningText}`
             };
         },
         aliases: ['wear', 'wield', 'don']
@@ -940,6 +923,7 @@ const definitions: Record<InventoryAction, ActionDefinition> = {
             inventoryRepo.unequipItem(params.characterId, itemId);
 
             const settled = before ? settleArmorClass(db, charRepo, params.characterId, before, derivedBefore, params.recomputeAc) : null;
+            const { warningText, ...armorFields } = armorReply(settled);
 
             return {
                 success: true,
@@ -949,7 +933,8 @@ const definitions: Record<InventoryAction, ActionDefinition> = {
                 acChange: settled?.acChange ?? null,
                 ...(settled ? { ac: settled.ac } : {}),
                 ...(settled?.acMatchesDerived ? { acMatchesDerived: true } : {}),
-                message: `Unequipped ${item?.name || itemId}${settled ? `. ${settled.acChange}` : ''}`
+                ...armorFields,
+                message: `Unequipped ${item?.name || itemId}${settled ? `. ${settled.acChange}` : ''}${warningText}`
             };
         },
         aliases: ['remove_equipped', 'doff', 'unwield']
@@ -1348,7 +1333,7 @@ export const InventoryManageTool = {
 📦 ITEM WORKFLOW:
 1. Create items with item_manage first (or use existing items)
 2. give - Add items to character inventory
-3. equip - Slot weapons/armor. A weapon goes in mainhand/offhand, armor in armor (a shield with acBonus in offhand); anything else, and any item in a different slot, needs properties.equipSlots on its template: a refusal prints the exact item_manage update {itemId, equipSlots: [...]} call (fix: {tool, args}) with nothing written. AC: a sheet that follows its gear (acSource 'derived', or a legacy row whose AC already equals what the gear derives) is recomputed on every equip/unequip and the reply carries ac {before, after, source, derived, parts}. A hand-set AC (character_manage update {ac}, set_form) is KEPT and acChange says what the gear would give; pass recomputeAc: true to take the derived value and let gear drive it from then on. acMatchesDerived: true flags a hand-set AC the gear now derives anyway
+3. equip - Slot weapons/armor. A weapon goes in mainhand/offhand, armor in armor (a shield with acBonus in offhand); anything else, and any item in a different slot, needs properties.equipSlots on its template: a refusal prints the exact item_manage update {itemId, equipSlots: [...]} call (fix: {tool, args}) with nothing written. AC: a sheet that follows its gear (acSource 'derived', or a legacy row whose AC already equals what the gear derives) is recomputed on every equip/unequip and the reply carries ac {before, after, source, derived, parts}. A hand-set AC (character_manage update {ac}, set_form) is KEPT and acChange says what the gear would give; pass recomputeAc: true to take the derived value and let gear drive it from then on. acMatchesDerived: true flags a hand-set AC the gear now derives anyway. Armour is read from the template's baseAC (any spelling: baseAc, base_ac, ac, armorClass) with the DEX cap from maxDexBonus or the armorCategory (heavy: no DEX; medium: cap 2; light: full); natural armour on the sheet (character_manage naturalArmor) is the floor the worn armour must beat; shields and every other equipped acBonus add on top. The reply's armor {item, category, baseAC, dexApplied, dexCap, stealthDisadvantage, strengthRequired, meetsStrength, aliased} shows what was read, and warnings[] (also on the message) say when an armour-slot item has no readable base (with the item_manage update that fixes it) or the wearer's STR is below the requirement (5e speed -10 ft, reported only)
 
 🔄 COMMON ACTIONS:
 - transfer: Move items between characters atomically (use this for a player-to-NPC handoff)

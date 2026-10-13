@@ -23,13 +23,13 @@ const GLYPHS = Object.freeze({
     // #62-b (Tom's ruling): technical dingbats are in — the phone-game set
     // stays banned. ☢ owns radiation everywhere it appears; ☠ is reserved
     // for death saves and the flatline (Wave B).
-    rad: '☢', death: '☠'
+    rad: '☢', death: '☠', sleep: '💤'
 });
 const PLAIN_GLYPHS = Object.freeze({
     rail: '|', pass: 'OK', fail: 'X', nat20: '*20*', nat1: '*1*', warn: '!',
     dmg: '>', ammo: '#', barFull: '#', barEmpty: '-', compFull: '#',
     pipLive: 'o', pipEmpty: '.', pipDead: 'x', sep: '.', to: '->', badge: 'PDA',
-    rad: '[R]', death: '[D]'
+    rad: '[R]', death: '[D]', sleep: '[KO]'
 });
 // plainOutput: theme is never load-bearing. Env-flag only.
 export const plain = (): boolean => process.env.PDA_PLAIN === '1';
@@ -384,7 +384,22 @@ export interface StatusInput {
     // Speeds from the sheet (shown when one is set) and the medium of the
     // active encounter the character is in (shown when it is not air).
     speed?: number; swimSpeed?: number; flySpeed?: number;
+    // Play report 5 #8a: senses in feet, shown on the SPD row (DV 60 · BS 10).
+    senses?: { darkvisionFt?: number; blindsightFt?: number; tremorsenseFt?: number; truesightFt?: number };
+    // Play report 5 #8c: passive Perception and the sense passives (passive Perception (scent) 16).
+    passive?: { perception: number; senses?: Array<{ label: string }> };
     environment?: { medium: string; depthFt?: number };
+}
+
+/** 'DV 60 · BS 10 · TS 10 · TRU 60' from whichever senses are set; empty when none is. */
+export function sensesText(s?: { darkvisionFt?: number; blindsightFt?: number; tremorsenseFt?: number; truesightFt?: number } | null): string {
+    if (!s) return '';
+    const parts: string[] = [];
+    if (typeof s.darkvisionFt === 'number' && s.darkvisionFt > 0) parts.push(`DV ${s.darkvisionFt}`);
+    if (typeof s.blindsightFt === 'number' && s.blindsightFt > 0) parts.push(`BS ${s.blindsightFt}`);
+    if (typeof s.tremorsenseFt === 'number' && s.tremorsenseFt > 0) parts.push(`TS ${s.tremorsenseFt}`);
+    if (typeof s.truesightFt === 'number' && s.truesightFt > 0) parts.push(`TRU ${s.truesightFt}`);
+    return parts.join(` ${G().sep} `);
 }
 
 /**
@@ -471,12 +486,18 @@ export function renderStatusBlock(d: StatusInput): string {
         }
     }
     const spd = speedText(d);
+    const senses = sensesText(d.senses);
     const env = environmentGlyph(d.environment);
-    if (spd || env) {
+    if (spd || senses || env) {
         const move: Cell[] = [];
         if (spd) move.push(L('SPD '), V(spd));
-        if (env) move.push(L(spd ? '   ' : ''), V(env));
+        if (senses) move.push(L(spd ? '   ' : ''), V(senses));
+        if (env) move.push(L(spd || senses ? '   ' : ''), V(env));
         rows.push(move);
+    }
+    if (d.passive) {
+        const items = [`Perception ${d.passive.perception}`, ...(d.passive.senses ?? []).map(s => s.label.replace(/^passive\s+/i, ''))];
+        rows.push([L('PASSIVE '), V(items.join(` ${g.sep} `))]);
     }
     const conds = (d.conditions ?? []).map(c => typeof c === 'string' ? c : `${c.name}${c.duration ? ` (${c.duration}d)` : ''}`);
     rows.push([L('WOUNDS: '), conds.length ? V(conds.join(` ${g.sep} `)) : L('none')]);
@@ -511,6 +532,8 @@ export interface ContactInput {
     bandScale?: { multiplier: number; before: number; after: number };
     jamCheckOwed?: { weapon?: string; condition?: number; jamsOn?: string };
     hpBefore?: number; hpAfter?: number; defeated?: boolean;
+    /** Play report 5: the blow was non-lethal — the target is knocked out (stable), not down. */
+    knockedOut?: boolean;
     /** The GM resolved the attack at the table; the engine rolled no d20. */
     resolved?: 'hit' | 'crit' | 'miss';
 }
@@ -563,7 +586,9 @@ export function renderContact(c: ContactInput): string {
             dmg.push(L('         '), V(callsign(c.targetName ?? '???')), L(' '), V(c.hpBefore), L(` ${g.to} `), V(c.hpAfter));
         rows.push(dmg);
     }
-    if (c.defeated) rows.push([V(`${g.death} ${callsign(c.targetName ?? '???')} DOWN`)]);
+    if (c.defeated) rows.push([V(c.knockedOut
+        ? `${g.sleep} ${callsign(c.targetName ?? '???')} KNOCKED OUT — stable`
+        : `${g.death} ${callsign(c.targetName ?? '???')} DOWN`)]);
     return head + emit(rows);
 }
 

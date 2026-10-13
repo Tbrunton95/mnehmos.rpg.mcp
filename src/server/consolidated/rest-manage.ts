@@ -24,10 +24,12 @@ import { CLASS_DATA } from '../../data/class-starting-data.js';
 import { loggedRoll } from '../../math/logged-d20.js';
 import { pushPoolHistory } from '../../engine/scheduled-ops.js';
 import { restoreByRest } from '../../engine/combat/abilities.js';
+import { wakeRowFromKnockout } from '../../engine/combat/nonlethal.js';
 import { liveEncountersFor } from '../reconcile.js';
 import { mirrorLinkedCharges } from './character-manage.js';
 import type { Ability } from '../../schema/token-extras.js';
 import type { ResourcePool } from '../../schema/character.js';
+import { stripDyingRowConditions, type RowCondition } from '../../engine/combat/dying.js';
 import type Database from 'better-sqlite3';
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -265,7 +267,6 @@ async function handleLongRest(args: z.infer<typeof LongRestSchema>, _ctx?: Sessi
 
     const hpRestored = character.maxHp - character.hp;
     const newHp = character.maxHp;
-
     // Pools by policy, perRest abilities and legendary resistances first;
     // then a long rest regains half the character's hit dice (minimum one).
     const refresh = refreshForRest(character, 'long');
@@ -274,10 +275,17 @@ async function handleLongRest(args: z.infer<typeof LongRestSchema>, _ctx?: Sessi
     const pools = withHitDice(refresh.pools, dice.current + hitDiceRegained, dice.max);
 
     const slots = restoreSlotsForRest(getDb(), character, 'long');
+    // Play report 5 #5: a long rest clears the dying track on the sheet (the
+    // dying Unconscious/Prone and a Stable marker); HP is full anyway.
+    const dyingCleared = stripDyingRowConditions((character as { conditions?: RowCondition[] }).conditions);
+    // Play report 5 #4: a knocked-out sheet (Unconscious sourced 'nonlethal: …')
+    // that the rest lifts above 0 comes round too; its other conditions stay.
+    const woke = wakeRowFromKnockout(character.hp, newHp, dyingCleared.conditions as Array<{ name: string; source?: string }>);
     const updatedChar: Record<string, unknown> = {
         hp: newHp, resourcePools: pools,
         ...(refresh.abilities ? { abilities: refresh.abilities } : {}),
         ...(refresh.legendaryResistancesRestored ? { legendaryResistancesRemaining: refresh.legendaryResistancesRestored.to } : {}),
+        ...((woke || dyingCleared.removed.length) ? { conditions: woke ? woke.conditions : dyingCleared.conditions } : {}),
         ...slots.updates
     };
 
@@ -286,13 +294,15 @@ async function handleLongRest(args: z.infer<typeof LongRestSchema>, _ctx?: Sessi
     const refilledLine = describeRefilled(refresh);
 
     return {
-        message: `${character.name} completes a long rest.${refilledLine ? ` Refreshed: ${refilledLine}.` : ''}`,
+        message: `${character.name} completes a long rest.${woke ? ` ${character.name} comes round (${woke.removed.join(', ')} cleared).` : ''}${refilledLine ? ` Refreshed: ${refilledLine}.` : ''}`,
         character: character.name,
         previousHp: character.hp,
         newHp,
         maxHp: character.maxHp,
         hpRestored,
+        ...(woke ? { woke: { conditionsRemoved: woke.removed } } : {}),
         restType: 'long',
+        ...(dyingCleared.removed.length ? { deathSavesCleared: true, dyingConditionsCleared: dyingCleared.removed } : {}),
         hitDiceRegained,
         hitDiceRemaining: dice.current + hitDiceRegained,
         spellSlotsRestored: slots.spellSlotsRestored,
@@ -331,6 +341,8 @@ async function handleShortRest(args: z.infer<typeof ShortRestSchema>, _ctx?: Ses
 
     const actualHealing = Math.min(totalHealing, character.maxHp - character.hp);
     const newHp = character.hp + actualHealing;
+    // Play report 5: hit dice that lift a knocked-out sheet above 0 wake it.
+    const woke = wakeRowFromKnockout(character.hp, newHp, (character as { conditions?: Array<{ name: string; source?: string }> }).conditions);
 
     // Pools with refresh short, perRest short abilities; pact slots (item 8: casting.as).
     const refresh = refreshForRest(character, 'short');
@@ -340,6 +352,7 @@ async function handleShortRest(args: z.infer<typeof ShortRestSchema>, _ctx?: Ses
     const updatedChar: Record<string, unknown> = {
         hp: newHp, resourcePools: pools,
         ...(refresh.abilities ? { abilities: refresh.abilities } : {}),
+        ...(woke ? { conditions: woke.conditions } : {}),
         ...slots.updates
     };
 
@@ -348,12 +361,13 @@ async function handleShortRest(args: z.infer<typeof ShortRestSchema>, _ctx?: Ses
     const refilledLine = describeRefilled(refresh);
 
     return {
-        message: `${character.name} completes a short rest.${refilledLine ? ` Refreshed: ${refilledLine}.` : ''}`,
+        message: `${character.name} completes a short rest.${woke ? ` ${character.name} comes round (${woke.removed.join(', ')} cleared).` : ''}${refilledLine ? ` Refreshed: ${refilledLine}.` : ''}`,
         character: character.name,
         previousHp: character.hp,
         newHp,
         maxHp: character.maxHp,
         hpRestored: actualHealing,
+        ...(woke ? { woke: { conditionsRemoved: woke.removed } } : {}),
         hitDiceSpent: hitDiceToSpend,
         hitDiceRequested: args.hitDiceToSpend ?? 1,
         hitDiceRemaining,

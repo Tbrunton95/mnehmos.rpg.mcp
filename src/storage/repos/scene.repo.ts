@@ -12,6 +12,7 @@
  */
 
 import Database from 'better-sqlite3';
+import { normalizeSenseDenial, type SenseDenialEntry } from '../../engine/senses.js';
 
 export interface SceneRow {
     id: string;
@@ -24,6 +25,10 @@ export interface SceneRow {
     participants: string;
     previous_scene_id: string | null;
     created_at: string;
+    /** Play report 5 #8c: JSON [{targetId?, senses: {scent: reason}}]. */
+    sense_denial?: string | null;
+    /** Play report 5 #8c: 'from W'. */
+    wind?: string | null;
 }
 
 export interface Scene {
@@ -37,6 +42,10 @@ export interface Scene {
     participants: string[];
     previousSceneId: string | null;
     createdAt: string;
+    /** Play report 5 #8c: senses the scene denies, scene-wide or per target, with the stated reason. */
+    senseDenial: SenseDenialEntry[];
+    /** Play report 5 #8c: the wind ('from W'); with token positions the engine computes upwind and downwind. */
+    wind: string | null;
 }
 
 export interface CreateSceneInput {
@@ -50,9 +59,13 @@ export interface CreateSceneInput {
     participants: string[];
     previousSceneId?: string | null;
     createdAt: string;
+    senseDenial?: SenseDenialEntry[];
+    wind?: string | null;
 }
 
 function rowToScene(row: SceneRow): Scene {
+    let senseDenial: SenseDenialEntry[] = [];
+    if (row.sense_denial) { try { senseDenial = normalizeSenseDenial(JSON.parse(row.sense_denial)); } catch { senseDenial = []; } }
     return {
         id: row.id,
         worldId: row.world_id,
@@ -63,7 +76,9 @@ function rowToScene(row: SceneRow): Scene {
         engineState: row.engine_state ? JSON.parse(row.engine_state) : {},
         participants: row.participants ? JSON.parse(row.participants) : [],
         previousSceneId: row.previous_scene_id,
-        createdAt: row.created_at
+        createdAt: row.created_at,
+        senseDenial,
+        wind: row.wind ?? null
     };
 }
 
@@ -72,8 +87,8 @@ export class SceneRepository {
 
     create(input: CreateSceneInput): Scene {
         this.db.prepare(`
-            INSERT INTO scenes (id, world_id, title, when_label, place_label, narration, engine_state, participants, previous_scene_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO scenes (id, world_id, title, when_label, place_label, narration, engine_state, participants, previous_scene_id, created_at, sense_denial, wind)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
             input.id,
             input.worldId,
@@ -84,7 +99,9 @@ export class SceneRepository {
             JSON.stringify(input.engineState ?? {}),
             JSON.stringify(input.participants),
             input.previousSceneId ?? null,
-            input.createdAt
+            input.createdAt,
+            input.senseDenial?.length ? JSON.stringify(input.senseDenial) : null,
+            input.wind ?? null
         );
         return this.findById(input.id)!;
     }
@@ -122,14 +139,14 @@ export class SceneRepository {
                 SELECT * FROM scenes
                 WHERE world_id = ?
                   AND participants LIKE ?
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, rowid DESC
                 LIMIT ?
             `).all(worldId, `%"${characterId}"%`, overFetch) as SceneRow[];
         } else {
             rows = this.db.prepare(`
                 SELECT * FROM scenes
                 WHERE participants LIKE ?
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, rowid DESC
                 LIMIT ?
             `).all(`%"${characterId}"%`, overFetch) as SceneRow[];
         }
@@ -143,7 +160,7 @@ export class SceneRepository {
         const rows = this.db.prepare(`
             SELECT * FROM scenes
             WHERE world_id = ?
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, rowid DESC
             LIMIT ?
         `).all(worldId, limit) as SceneRow[];
         return rows.map(rowToScene);

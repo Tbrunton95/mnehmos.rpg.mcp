@@ -251,3 +251,37 @@ describe('castWorldSpell', () => {
         expect(sheet('lex').spellSlots.level3.current).toBe(before - 1);
     });
 });
+
+describe("play report 5 #5: a world spell's damage follows the dying track", () => {
+    const corpses = (id: string) => getDb().prepare('SELECT * FROM corpses WHERE character_id = ?').all(id) as any[];
+    const conds = (id: string) => (sheet(id).conditions as Array<{ name: string; source?: string }>).map(c => `${c.name}:${c.source}`);
+
+    it('a world spell that drops a tracked PC mirrors the sheet and says DYING; massive damage kills with a corpse', async () => {
+        mkChar('mara', { hp: 5, maxHp: 7 });
+        await define('spell', 'Bolt', { castingRoll: { target: 5 }, effects: [{ type: 'damage', dice: '2d6', damageType: 'force' }] });
+        fixCasting({ 'cast ': [6, 5], 'Bolt': [3, 3] });
+        const encounterId = await encounter([{ id: 'mara', name: 'Mara', hp: 5, maxHp: 7, initiative: 10 }]);
+        const res = await act({ encounterId, action: 'cast_spell', actorId: 'lex', spellName: 'Bolt', targetId: 'mara' });
+        const text = res.content[0].text;
+        const ar = stateOf(text).actionResult;
+        expect(ar.worldSpell.effects[0]).toMatchObject({ targetId: 'mara', damage: 6, hpAfter: 0, dying: { dropped: true, dead: false } });
+        expect(ar.dying).toMatchObject({ dropped: true });
+        expect(text).toMatch(/DYING ✓0 ✗0/);
+        expect(text).not.toMatch(/DEFEATED/);
+        expect(conds('mara')).toEqual(expect.arrayContaining(['Unconscious:dying', 'Prone:dying']));
+        expect(corpses('mara')).toHaveLength(0);
+
+        // Massive damage in a fresh fight: 12 force on 5 HP with 7 max is 7 past 0 — dead outright, the kill runs.
+        vi.restoreAllMocks();
+        new CharacterRepository(getDb()).update('mara', { hp: 5, conditions: [] } as any);
+        fixCasting({ 'cast ': [6, 5], 'Bolt': [6, 6] });
+        const enc2 = await encounter([{ id: 'mara', name: 'Mara', hp: 5, maxHp: 7, initiative: 10 }]);
+        const k = await act({ encounterId: enc2, action: 'cast_spell', actorId: 'lex', spellName: 'Bolt', targetId: 'mara' });
+        const kt = k.content[0].text;
+        const kar = stateOf(kt).actionResult;
+        expect(kar.worldSpell.effects[0].dying).toMatchObject({ dead: true, instantDeath: true });
+        expect(kar.killed).toEqual([expect.objectContaining({ participantId: 'mara' })]);
+        expect(kt).toMatch(/☠ Mara is dead/);
+        expect(corpses('mara')).toHaveLength(1);
+    });
+});

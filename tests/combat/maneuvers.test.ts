@@ -217,7 +217,9 @@ describe('trip attack', () => {
         expect(r.maneuver).toMatchObject({ name: 'trip', spent: true, roll: 6, pool: { before: 4, after: 3 } });
         expect(r.maneuver.save).toBeUndefined();
         expect(r.maneuver.applied.note).toMatch(/Orc is down: no save/);
-        expect(tok('orc').conditions.some((c: any) => c.type === 'prone')).toBe(false);
+        // Play report 5 #5: the drop itself puts a tracked (npc row) target unconscious and prone,
+        // sourced 'dying'; the trip's prone is what must not land.
+        expect(tok('orc').conditions.some((c: any) => c.type === 'prone' && c.sourceId !== 'dying')).toBe(false);
         expect(rolls().some(x => /save/.test(x.purpose))).toBe(false);
         expect(pool().current).toBe(3);
         expect(text).toMatch(/RULE maneuver trip: .*Orc is down: no save/);

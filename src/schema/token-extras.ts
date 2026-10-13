@@ -3,6 +3,8 @@
  * mortal units as one token, and telegraphed intent / readied actions.
  */
 import { z } from 'zod';
+import { IGNORE_COVER, ignoreCoverSchema, IGNORE_COVER_DESCRIBE } from './cover.js';
+import { deathSaveModeSchema } from '../engine/combat/dying.js';
 
 export const PART_KINDS = ['head', 'arm', 'leg', 'wing', 'torso', 'system', 'other'] as const;
 export const PART_STATES = ['intact', 'crippled', 'dead', 'latched', 'breached'] as const;
@@ -78,8 +80,21 @@ export const FIGHTING_STYLES = ['great_weapon', 'dueling', 'archery', 'defense']
 export const FightingStyleSchema = z.enum(FIGHTING_STYLES);
 export type FightingStyle = z.infer<typeof FightingStyleSchema>;
 
+/**
+ * Play report 5, item 3: the trigger a profile needs. A fresh instance each
+ * call: the attack schema and the outer mirror must not hold one zod object twice.
+ */
+export const attackRequiresSchema = () => z.object({
+    dashed: z.boolean().optional().describe('The attacker must have taken the Dash action this turn'),
+    movedAtLeast: z.number().int().min(0).optional().describe("Feet the attacker must have moved this turn (after the Dash when dashed is set). A token without a position uses the call's movedFt and the reply says it was declared"),
+    hitThisTurn: z.boolean().optional().describe('The attacker must have hit this target with a melee attack this turn')
+});
+export type AttackRequires = z.infer<ReturnType<typeof attackRequiresSchema>>;
+
 /** A named attack: its bonus, damage and the part that makes it ('whip' in the left arm). */
 export const AttackProfileSchema = z.object({
+    bonusAction: z.boolean().optional().describe("A bonus-action attack (Goring Rush, an off-hand strike): attack {using} spends the bonus action, not the Attack action, on the actor's own turn only"),
+    requires: attackRequiresSchema().optional().describe('The trigger this attack needs: {dashed?, movedAtLeast?, hitThisTurn?} — refused with nothing spent when it is not met, naming what is missing'),
     name: z.string().min(1).describe("Profile name ('axe', 'whip'); attack {using} picks it"),
     attackBonus: z.number().int(),
     damage: z.union([z.number(), z.string()]).describe("Flat damage or dice ('2d8+6')"),
@@ -90,6 +105,8 @@ export const AttackProfileSchema = z.object({
     ranged: z.boolean().optional().describe('A ranged weapon: archery applies, great weapon fighting and dueling do not. Unset: read from the grid when both tokens are placed, else melee'),
     twoHanded: z.boolean().optional().describe('Wielded in both hands: great weapon fighting applies, dueling does not'),
     default: z.boolean().optional().describe('Used when an attack names no profile'),
+    ignoreCover: z.enum(IGNORE_COVER).optional().describe("Play report 5 #1: this weapon ignores cover by itself: 'half-and-three-quarters' (Sharpshooter) or 'all'; total cover still refuses unless 'all'"),
+    breaksCover: z.boolean().optional().describe("Play report 5 #1: swinging it drops the attacker's own standing cover for the round (a charge out of the rubble)"),
     note: z.string().optional()
 });
 export type AttackProfile = z.infer<typeof AttackProfileSchema>;
@@ -148,6 +165,50 @@ export const BuffSchema = z.object({
 export type Buff = z.infer<typeof BuffSchema>;
 
 /**
+ * Play report 5 #8a: the senses a sheet or token sees with, in feet. Spatial
+ * look reads them in a DARKNESS room, the status block shows them, tokens
+ * carry them for display. A fresh instance each call: outer schemas never
+ * share one zod instance twice.
+ */
+export const SENSE_KEYS = ['darkvisionFt', 'blindsightFt', 'tremorsenseFt', 'truesightFt'] as const;
+export const sensesSchema = () => z.object({
+    darkvisionFt: z.number().int().min(0).optional().describe('Darkvision in feet: darkness seen as dim light (no colour; sight-based Perception at disadvantage)'),
+    blindsightFt: z.number().int().min(0).optional().describe('Blindsight in feet: perceives without sight; darkness does not hinder it'),
+    tremorsenseFt: z.number().int().min(0).optional().describe('Tremorsense in feet: vibrations through the ground'),
+    truesightFt: z.number().int().min(0).optional().describe('Truesight in feet: sees in darkness, through illusions and invisibility')
+}).strict();
+export type Senses = z.infer<ReturnType<typeof sensesSchema>>;
+
+/**
+ * Play report 5 #8b: natural armour, the AC floor worn armour must beat.
+ * Unarmoured AC is the higher of 10 + DEX and base + DEX; shields and every
+ * other equipped acBonus add on top of whichever wins.
+ */
+export const naturalArmorSchema = () => z.object({
+    base: z.number().int().min(0).describe('Base AC of the hide or plates (12 for a thick hide)'),
+    addDex: z.boolean().default(true).describe('Add the DEX modifier (default true)'),
+    maxDex: z.number().int().min(0).optional().describe('Cap on the DEX modifier added')
+}).strict();
+export type NaturalArmor = z.infer<ReturnType<typeof naturalArmorSchema>>;
+
+/**
+ * Play report 5 #8c: a conditional skill trait as data. Advantage on the
+ * listed skills when a check is tagged with `when` (roll_skill_check
+ * {context: ['scent']}); passiveBonus (default 5) lifts the passive for that
+ * sense (passive Perception (scent) 16). The same shape covers Stonecunning
+ * (history, stonework), Keen Hearing (perception, hearing), Sure-Footed
+ * (acrobatics, ice).
+ */
+export const skillAdvantageTraitSchema = () => z.object({
+    name: z.string().min(1).describe("The trait's name ('Keen Smell')"),
+    skills: z.array(z.string().min(1)).min(1).describe("Skills it covers (['perception', 'survival'])"),
+    when: z.string().min(1).describe("The context tag that fires it ('scent'); a check passes context: ['scent']"),
+    passiveBonus: z.number().int().optional().describe('Added to the passive for this sense (default 5, advantage on a passive)'),
+    note: z.string().optional().describe("What it covers in prose ('scent-based Perception; tracking by scent')")
+}).strict();
+export type SkillAdvantageTrait = z.infer<ReturnType<typeof skillAdvantageTraitSchema>>;
+
+/**
  * Participant extras shared by combat_manage create, add_participant and the
  * internal create_encounter schema. A plain shape so each schema can spread
  * it; outer mirrors list the same keys flat (arrays of objects as z.any).
@@ -158,11 +219,13 @@ export const ParticipantExtrasShape = {
     movementSpeed: z.number().int().min(0).optional().describe('Speed in feet (default 30)'),
     swimSpeed: z.number().int().min(0).optional().describe('Swim speed in feet: the movement budget underwater (else half speed)'),
     flySpeed: z.number().int().min(0).optional().describe('Fly speed in feet'),
+    senses: sensesSchema().optional().describe('Senses in feet {darkvisionFt, blindsightFt, tremorsenseFt, truesightFt}; default from the sheet; shown on the token'),
     attackBonus: z.number().int().optional().describe('Default attack bonus'),
     attackDamage: z.string().optional().describe("Default attack damage ('1d6+2')"),
     attackDamageType: z.string().optional().describe('Damage type of the default attack'),
     attacksPerAction: z.number().int().min(1).optional().describe('Multiattack: attacks one Attack action allows (default 1)'),
-    attacks: z.array(AttackProfileSchema).optional().describe('Named attack profiles {name, attackBonus, damage, damageType?, part?, reachFt?, default?}'),
+    attacks: z.array(AttackProfileSchema).optional().describe('Named attack profiles {name, attackBonus, damage, damageType?, part?, reachFt?, default?, ignoreCover?, breaksCover?}'),
+    ignoreCover: ignoreCoverSchema().optional().describe(IGNORE_COVER_DESCRIBE),
     abilities: z.array(AbilityInputSchema).optional().describe('Limited abilities {name, recharge?, perRest?: short | long, grantsAction?, actionCost?, ready?}; ready unset lets a spent sheet ability stay spent'),
     legendaryActions: z.number().int().min(0).optional().describe('Legendary actions per round'),
     legendaryResistances: z.number().int().min(0).optional().describe('Legendary resistances per day'),
@@ -172,7 +235,9 @@ export const ParticipantExtrasShape = {
     cr: z.number().min(0).optional().describe('Challenge rating'),
     species: z.string().optional().describe("Species ('Orruk'): nearby counts and battle cries match it"),
     tags: z.array(z.string()).optional().describe("Free tags ('mob', 'ladz') that nearby matches read"),
-    fightingStyle: FightingStyleSchema.optional().describe('great_weapon | dueling | archery | defense: applied by the engine on its attacks (defense on attacks against it); default from the sheet')
+    fightingStyle: FightingStyleSchema.optional().describe('great_weapon | dueling | archery | defense: applied by the engine on its attacks (defense on attacks against it); default from the sheet'),
+    deathSaves: z.boolean().optional().describe('Play report 5 #5: tracks death saves at 0 HP (default from the character row: pc/npc yes, enemy no; a token with no row is a mook and just dies). true opts a sheetless villain in, false opts a named character out'),
+    deathSaveMode: deathSaveModeSchema().optional().describe("Play report 5 #5: auto (the engine rolls the save on advance) | prompt (DEATH SAVE DUE; advance refused until death_save). Default from the sheet, else the world's environment.deathSaveMode, else auto")
 };
 
 export const UnitTierSchema = z.object({

@@ -30,7 +30,8 @@ export const ConditionSchema = z.object({
  * Checks live in superRefine so they report per field rather than as a bare
  * union "Invalid input".
  */
-export const ConditionInputSchema = z.union([
+export function conditionInputSchema() {
+    return z.union([
     z.string(),
     z.object({
         id: z.string().optional(),
@@ -81,6 +82,10 @@ export const ConditionInputSchema = z.union([
         }
     })
 ]);
+}
+
+/** The shared instance; schemas that sit twice inside one outer object take conditionInputSchema() instead. */
+export const ConditionInputSchema = conditionInputSchema();
 
 // CRIT-003: Position schema for spatial combat
 export const PositionSchema = z.object({
@@ -295,6 +300,7 @@ export const EnvironmentSchema = z.object({
         unlessTag: z.string().optional().describe('Tokens with this tag are spared (default: the swim tag)')
     }).optional(),
     rangedAllowed: z.boolean().optional().describe('Allow ranged attacks underwater (default false)'),
+    light: z.enum(['bright', 'dim', 'darkness']).optional().describe("Play report 5 #1: the light in the fight. 'darkness' lets a token attempt a Hide from any foe without darkvision (canHide in the state view)"),
     meleeDisadvantageUnlessDamageType: z.array(z.string()).optional().describe("Damage types that swing freely underwater (default ['piercing'])"),
     swimTag: z.string().optional().describe("Token tag that marks a swimmer: no melee penalty, pressure-adapted (default 'aquatic')")
 });

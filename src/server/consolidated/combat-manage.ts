@@ -5,8 +5,9 @@
  * advance_turn, roll_death_save, execute_lair_action
  */
 
-import { PartSchema, UnitSchema, ReadiedSchema, ReadiedAttackSchema, PART_STATES, PART_KINDS, ParticipantExtrasShape, SizeCategorySchema, FightingStyleSchema, nearbyMatchSchema, mobRuleSchema, type Buff } from '../../schema/token-extras.js';
+import { PartSchema, UnitSchema, ReadiedSchema, ReadiedAttackSchema, PART_STATES, PART_KINDS, ParticipantExtrasShape, SizeCategorySchema, FightingStyleSchema, nearbyMatchSchema, mobRuleSchema, sensesSchema, type Buff } from '../../schema/token-extras.js';
 import { hydrateExtras, type ExtrasRow } from '../../engine/combat/participant-extras.js';
+import { applyDyingConditions, wakeFromDying, tracksDeathSaves, dyingLabel, rowTracksDeathSaves, withDyingRowConditions, DEATH_SAVE_OUTCOMES, type RowCondition } from '../../engine/combat/dying.js';
 import { environmentGlyph } from '../../render/pda.js';
 import { upsertPart } from '../../engine/combat/parts.js';
 import { patchRowAbility, perRestSpentNote } from '../../engine/combat/abilities.js';
@@ -26,15 +27,18 @@ import {
     handleLoadEncounter,
     handleAdvanceTurn,
     handleRollDeathSave,
+    settleAreaDeaths, killedLines, markRowDying, clearDyingOnRow, settleAttackDying,
     handleExecuteLairAction,
     getOrLoadEngine,
     liveEncounterFor,
     syncParticipantHpFromDb,
     saveEncounterState,
     mirrorConditionToRow,
+    clearNonlethalOnRow,
     resolveReadiedAttack,
     reactionAttackData,
-    resolveAreaSave
+    resolveAreaSave,
+    areaSaveRiderSchema
 } from '../handlers/combat-handlers.js';
 import { budgetEncounter, describeParty, type BudgetMonster } from '../../engine/encounter-budget.js';
 import { toLongAbility, rollCharacterSave } from '../../engine/combat/saves.js';
@@ -48,8 +52,11 @@ import { resolveCreature, creatureToParticipant, resolveWorldId, loadRules, band
 import { getDomainServices } from '../domain-services.js';
 import { getDb } from '../../storage/index.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
+import { CorpseRepository } from '../../storage/repos/corpse.repo.js';
 import { CombatEngine } from '../../engine/combat/engine.js';
 import { ConditionInputSchema, SIZE_TABLE, EnvironmentSchema } from '../../schema/encounter.js';
+import { coverEnum, coverByTargetSchema, standingAgainstSchema, ignoreCoverSchema, normalizeCover, COVER_BY_TARGET_DESCRIBE, IGNORE_COVER_DESCRIBE, type CoverKind, type StandingCover } from '../../schema/cover.js';
+import { saveArithmetic, coverBonus, type CoverResolution } from '../../engine/combat/cover.js';
 import { normalizeCondition, normalizeConditions, sourceNamesHolder, grappleSource } from '../../engine/combat/conditions.js';
 import { getCombatManager } from '../state/combat-manager.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
@@ -63,7 +70,7 @@ import { ProviderFactory } from '../../agent/provider/factory.js';
 // CONSTANTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_environment', 'set_intent', 'trigger_readied', 'legendary_action', 'legendary_resistance', 'use_ability', 'apply_damage', 'battle_cry', 'set_surprised', 'budget', 'get_history', 'list', 'board'] as const;
+const ACTIONS = ['create', 'get', 'end', 'load', 'advance', 'death_save', 'lair_action', 'spawn_quick_enemy', 'add_participant', 'remove_participant', 'adjust_hp', 'add_condition', 'remove_condition', 'set_part', 'remove_part', 'set_unit', 'set_environment', 'set_intent', 'trigger_readied', 'legendary_action', 'legendary_resistance', 'use_ability', 'apply_damage', 'battle_cry', 'set_surprised', 'budget', 'get_history', 'list', 'board', 'set_cover', 'clear_cover'] as const;
 type CombatManageAction = typeof ACTIONS[number];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -147,7 +154,7 @@ const CreateSchema = z.object({
     seed: z.string().optional().describe('Omit for crypto dice (default). A seed makes the fight a deterministic, replayable stream; the id echoes it'),
     participants: z.array(ParticipantSchema).min(1),
     terrain: TerrainSchema,
-    environment: environmentField().optional().describe("The medium of the fight: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed? (default false in water), meleeDisadvantageUnlessDamageType? (default ['piercing']), swimTag? (default 'aquatic')}"),
+    environment: environmentField().optional().describe("The medium and light of the fight: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed? (default false in water), meleeDisadvantageUnlessDamageType? (default ['piercing']), swimTag? (default 'aquatic'), light?: 'bright' | 'dim' | 'darkness' (darkness: tokens can attempt a Hide from foes without darkvision; get shows canHide)}"),
     includeParty: z.boolean().optional().describe('T1.2 (Findings #34): prepend the active party as PC-side participants'),
     partyId: z.string().optional().describe('Party to include (defaults to the only active party)'),
     worldId: z.string().optional().describe('FINDINGS #105: stamp the encounter to this world; omitted → derived from the first participant whose character row is claimed'),
@@ -205,11 +212,16 @@ const AdjustHpSchema = z.object({
     revive: z.boolean().optional().describe('Required to raise a participant marked dead above 0 HP')
 });
 
+// Play report 5 #5: participantId is the convention every other combat_manage
+// action uses; characterId stays as the alias the first version took. A
+// posted outcome applies the table's roll without a die.
 const DeathSaveSchema = z.object({
     action: z.literal('death_save'),
     encounterId: z.string().describe('The ID of the encounter'),
-    characterId: z.string().describe('The ID of the character at 0 HP')
-});
+    participantId: z.string().optional().describe('The participant/token id at 0 HP'),
+    characterId: z.string().optional().describe('Alias of participantId (a sheet-backed token has its character id)'),
+    outcome: z.union([z.enum(DEATH_SAVE_OUTCOMES), z.string(), z.number()]).optional().describe("A result the table rolled: success | failure | nat20 | nat1 (also pass/fail, 'natural 20', or the natural die 1-20). No d20 is rolled; the counters move as posted and the sheet follows")
+}).refine(p => !!(p.participantId || p.characterId), { message: 'death_save needs participantId (the token at 0 HP)', path: ['participantId'] });
 
 const LairActionSchema = z.object({
     action: z.literal('lair_action'),
@@ -220,9 +232,12 @@ const LairActionSchema = z.object({
     damageType: z.string().optional(),
     savingThrow: z.object({
         ability: z.enum(['strength', 'dexterity', 'constitution', 'intelligence', 'wisdom', 'charisma']),
-        dc: z.number().int().min(1).max(30)
+        dc: z.number().int().min(1).max(30),
+        onFail: areaSaveRiderSchema().optional().describe("Play report 5 #6: conditions for a target that fails ({conditions: ['prone', {name, duration?, source?}], mirrorToCharacter?})"),
+        onSuccess: areaSaveRiderSchema().optional().describe('Play report 5 #6: conditions for a target that saves')
     }).optional(),
-    halfDamageOnSave: z.boolean().default(true)
+    halfDamageOnSave: z.boolean().default(true),
+    cover: coverByTargetSchema().optional().describe(COVER_BY_TARGET_DESCRIBE)
 });
 
 const UseAbilitySchema = z.object({
@@ -235,9 +250,12 @@ const UseAbilitySchema = z.object({
     damageType: z.string().optional(),
     savingThrow: z.object({
         ability: z.string().describe("'dex', 'Dexterity' or 'dexterity'"),
-        dc: z.number().int().min(1).max(30)
+        dc: z.number().int().min(1).max(30),
+        onFail: areaSaveRiderSchema().optional().describe("Play report 5 #6: conditions for a target that fails ({conditions: ['prone', {name, duration?, source?}], mirrorToCharacter?})"),
+        onSuccess: areaSaveRiderSchema().optional().describe('Play report 5 #6: conditions for a target that saves')
     }).optional(),
     halfDamageOnSave: z.boolean().default(true),
+    cover: coverByTargetSchema().optional().describe(`${COVER_BY_TARGET_DESCRIBE}. Unset: computed from the user's token to each target`),
     reason: z.string().optional()
 });
 
@@ -252,8 +270,26 @@ const ApplyDamageSchema = z.object({
     save: z.object({
         ability: z.string().describe("'dex', 'Dexterity' or 'dexterity'"),
         dc: z.number().int().min(1).max(30),
-        half: z.boolean().default(true).describe('A save halves the damage (false: a save takes none)')
-    }).optional().describe('Each target saves on its own die')
+        half: z.boolean().default(true).describe('A save halves the damage (false: a save takes none)'),
+        onFail: areaSaveRiderSchema().optional().describe("Play report 5 #6: conditions applied to each target that FAILS: {conditions: ['prone', {name: 'Buried', source: 'rockslide'}], mirrorToCharacter?}. Token only by default; the sheet path writes the row"),
+        onSuccess: areaSaveRiderSchema().optional().describe('Play report 5 #6: conditions applied to each target that SAVES')
+    }).optional().describe('Each target saves on its own die; onFail / onSuccess carry riders'),
+    cover: coverByTargetSchema().optional().describe(`${COVER_BY_TARGET_DESCRIBE}. Unset in an encounter with actorId: computed from the actor's token to each target. The sheet path takes the stated value only`)
+});
+
+const SetCoverSchema = z.object({
+    action: z.literal('set_cover'),
+    encounterId: z.string(),
+    participantId: z.string().describe('The token taking cover'),
+    level: coverEnum().describe("half (+2 AC and DEX saves) | three-quarters (+5) | total (cannot be targeted directly) | none (same as clear_cover)"),
+    against: standingAgainstSchema().optional().describe("Who it protects against: ['fg-handguns', 'fg-crossbows'] (participant ids or names), or {direction: 'west'} (attackers to the west of the token, read from both positions). Unset: everyone"),
+    reason: z.string().optional().describe("What gives it ('rubble crest'): printed in every arithmetic line and refusal")
+});
+
+const ClearCoverSchema = z.object({
+    action: z.literal('clear_cover'),
+    encounterId: z.string(),
+    participantId: z.string()
 });
 
 /** A dice notation ('1d4', '2d6+1') or a plain number for a buff's damage bonus. */
@@ -386,7 +422,7 @@ const RemovePartSchema = z.object({
 const SetEnvironmentSchema = z.object({
     action: z.literal('set_environment'),
     encounterId: z.string(),
-    environment: environmentField().describe("{medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?} — replaces the encounter's environment"),
+    environment: environmentField().describe("{medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?, light?: 'bright' | 'dim' | 'darkness'} — replaces the whole environment (medium defaults to air: pass it again when setting light in a water fight). Darkness lets tokens attempt a Hide from foes without darkvision (get shows canHide)"),
     reason: z.string().optional()
 });
 
@@ -419,6 +455,7 @@ const TriggerReadiedSchema = z.object({
     action: z.literal('trigger_readied'),
     encounterId: z.string(),
     participantId: z.string(),
+    cover: coverByTargetSchema().optional().describe("Play report 5 #1: the target's cover as the GM states it ('half', or {targetId: kind}); unset: standing cover, else the map"),
     note: z.string().optional().describe('What happened when it fired'),
     targetId: z.string().optional().describe("Who the readied attack strikes (default: the readied action's watch, when it names a participant)"),
     attack: ReadiedAttackSchema.optional().describe('{using?, attackBonus?, damage?, damageType?, withPart?, twoHanded?}: the attack to roll, over the stored one (twoHanded: great weapon fighting applies, dueling does not)')
@@ -893,13 +930,18 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         schema: DeathSaveSchema,
         handler: async (params: z.infer<typeof DeathSaveSchema>, ctx?: SessionContext) => {
             if (!ctx) throw new Error('No session context');
+            if (params.participantId && params.characterId && params.participantId !== params.characterId) {
+                return { error: true, actionType: 'death_save', writes: 'none', message: `death_save: participantId '${params.participantId}' and characterId '${params.characterId}' name different participants; pass one. Nothing was written.` };
+            }
             const result = await handleRollDeathSave({
                 encounterId: params.encounterId,
-                characterId: params.characterId
+                participantId: params.participantId ?? params.characterId,
+                ...(params.outcome !== undefined ? { outcome: String(params.outcome) } : {})
             }, ctx);
             return extractResultData(result, 'death_save');
         },
-        aliases: ['death_saving_throw', 'save_death', 'dying']
+        aliases: ['death_saving_throw', 'save_death', 'dying'],
+        description: "Play report 5 #5: roll a death save for a participant at 0 HP on the fight's dice (10+ success, 9- failure, nat 1 two failures, nat 20 back to 1 HP and the sheet says so), or post the table's result with outcome. Three successes: stable; three failures: dead — the sheet is killed with a corpse. In prompt mode this clears DEATH SAVE DUE so advance may proceed"
     },
 
     lair_action: {
@@ -1339,14 +1381,31 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 return refuse(`${p.name} is dead — pass revive: true to bring them back`);
             }
             // Bookkeeping, not damage: crossing 0 in either direction starts the
-            // death-save track fresh; it never adds failures.
+            // death-save track fresh; it never adds failures. Play report 5 #5:
+            // a correction above 0 wakes the dying (the dying Unconscious goes,
+            // on the token and the sheet); one down to 0 on a tracked token
+            // puts it unconscious and prone like a real drop.
+            let woke: string[] = [];
             if ((before <= 0) !== (after <= 0)) {
                 p.deathSaveSuccesses = 0;
                 p.deathSaveFailures = 0;
                 p.isStabilized = false;
+                if (after > 0) {
+                    wakeFromDying(p);
+                    woke = clearDyingOnRow(p.id);
+                } else if (tracksDeathSaves(p)) {
+                    applyDyingConditions(p);
+                    markRowDying(p.id);
+                }
             }
             if (params.revive && after > 0) p.isDead = false;
             p.hp = after;
+            // Play report 5: a correction that lifts a knocked-out token above 0
+            // wakes it — the knockout's Unconscious leaves the token and the sheet.
+            const wokeFrom = before <= 0 && after > 0 ? engine.wakeFromNonlethal(p.id) : [];
+            const wokeKo = wokeFrom.length ? { conditionsRemoved: wokeFrom, sheetUpdated: clearNonlethalOnRow(p.id) } : undefined;
+            // One woke for the reply: the knockout's Unconscious (token + sheet) and the dying conditions cleared on the row.
+            const wokeAll = (wokeKo || woke.length) ? { conditionsRemoved: [...(wokeKo?.conditionsRemoved ?? []), ...woke], sheetUpdated: Boolean(wokeKo?.sheetUpdated) || woke.length > 0 } : undefined;
 
             // Item 12: a unit carried through its breakAt owes a break test.
             const breakTest = p.unit ? breakTestDue(p, before, { moraleBonus: moraleModifiers(p, state.participants, sheetSpecies(getDb())) }) : null;
@@ -1371,9 +1430,11 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 clamped: after !== wanted,
                 defeated: after <= 0,
                 deathSaves: { successes: p.deathSaveSuccesses ?? 0, failures: p.deathSaveFailures ?? 0 },
+                ...(after <= 0 && dyingLabel(p) ? { dying: dyingLabel(p) } : {}),
                 reason: params.reason,
                 ...(breakTest ? { breakTest } : {}),
-                message: `${p.name}: HP ${before} → ${after}/${p.maxHp} (GM correction: ${params.reason})${breakTest ? `\n${breakTest.line}` : ''}`
+                ...(wokeAll ? { woke: wokeAll } : {}),
+                message: `${p.name}: HP ${before} → ${after}/${p.maxHp} (GM correction: ${params.reason})${after <= 0 && dyingLabel(p) ? ` — ${dyingLabel(p)}` : ''}${wokeAll ? ` — comes round (${wokeAll.conditionsRemoved.join(', ')} cleared)` : ''}${breakTest ? `\n${breakTest.line}` : ''}`
             };
         },
         aliases: ['set_hp', 'fix_hp', 'correct_hp', 'hp_correction'],
@@ -1603,7 +1664,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             };
         },
         aliases: ['environment', 'medium'],
-        description: "Set the encounter's environment {medium: air | water | vacuum, depthFt?, pressure?, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?}: water runs the underwater rules (swim speed or half speed, no ranged attacks, melee at disadvantage unless piercing or a swimmer, pressure damage at turn start)"
+        description: "Set the encounter's environment {medium: air | water | vacuum, depthFt?, pressure?, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?, light?: bright | dim | darkness}: water runs the underwater rules (swim speed or half speed, no ranged attacks, melee at disadvantage unless piercing or a swimmer, pressure damage at turn start); darkness lets tokens attempt a Hide from foes without darkvision (get shows canHide). Replaces the whole object: pass medium again when setting light in a water fight"
     },
     set_intent: {
         schema: SetIntentSchema,
@@ -1628,6 +1689,66 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
         aliases: ['intent', 'telegraph', 'ready_action'],
         description: 'Telegraph a token\'s intent (clears when its turn ends) and/or a readied action {action, trigger} (stays until triggered)'
     },
+    set_cover: {
+        schema: SetCoverSchema,
+        handler: async (params: z.infer<typeof SetCoverSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'set_cover', message, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            const level = normalizeCover(params.level) as CoverKind;
+            if (level === 'none') {
+                p.cover = undefined;
+                new EncounterRepository(getDb()).saveState(params.encounterId, state);
+                return { success: true, actionType: 'set_cover', encounterId: params.encounterId, participantId: p.id, cover: null, message: `${p.name}: cover cleared` };
+            }
+            const against = params.against as { ids?: string[]; direction?: StandingCover['direction'] } | undefined;
+            if (against?.ids?.length && against.direction) return refuse('against takes ids OR a direction, not both');
+            const unknown = (against?.ids ?? []).filter(id => !state.participants.some(x => x.id.toLowerCase() === id.toLowerCase() || x.name.toLowerCase() === id.toLowerCase()));
+            const cover: StandingCover = {
+                level,
+                ...(against?.ids?.length ? { against: against.ids } : {}),
+                ...(against?.direction ? { direction: against.direction } : {}),
+                ...(params.reason ? { reason: params.reason } : {})
+            };
+            p.cover = cover;
+            p.coverBrokenRound = undefined;
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            logConditionChange(params.encounterId, state, 'set_cover', p.id, `${p.name} takes ${level} cover${cover.reason ? ` (${cover.reason})` : ''}`, params.reason);
+            const bonus = coverBonus(level);
+            const scope = Array.isArray(cover.against) ? ` against ${cover.against.join(', ')}` : cover.direction ? ` to the ${cover.direction}` : '';
+            return {
+                success: true, actionType: 'set_cover', encounterId: params.encounterId, participantId: p.id, cover,
+                ...(unknown.length ? { warnings: [`not in this encounter: ${unknown.join(', ')} (kept; matched by id or name when they join)`] } : {}),
+                message: `🛡 ${p.name}: ${level} cover${scope}${cover.reason ? ` (${cover.reason})` : ''}${level === 'total' ? ' — cannot be targeted directly by those attackers' : ` — +${bonus} AC and +${bonus} on DEX saves against them`}. Stays until clear_cover; an attack with breaksCover drops it for the round${unknown.length ? `. Not in this encounter: ${unknown.join(', ')}` : ''}`
+            };
+        },
+        aliases: ['take_cover', 'cover'],
+        description: "Play report 5 #1: standing cover on a token: level half | three-quarters | total, against named attackers or a direction, with a reason that every arithmetic line prints. Stays until clear_cover; attack {breaksCover} drops it for the round"
+    },
+    clear_cover: {
+        schema: ClearCoverSchema,
+        handler: async (params: z.infer<typeof ClearCoverSchema>, ctx?: SessionContext) => {
+            if (!ctx) throw new Error('No session context');
+            const refuse = (message: string) => ({ error: true, actionType: 'clear_cover', message, writes: 'none' });
+            const engine = getOrLoadEngine(ctx, params.encounterId);
+            const state = engine?.getState();
+            if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            const p = state.participants.find(x => x.id === params.participantId);
+            if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            const had = p.cover ?? null;
+            p.cover = undefined;
+            p.coverBrokenRound = undefined;
+            new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            if (had) logConditionChange(params.encounterId, state, 'clear_cover', p.id, `${p.name} leaves cover (${had.level}${had.reason ? `, ${had.reason}` : ''})`);
+            return { success: true, actionType: 'clear_cover', encounterId: params.encounterId, participantId: p.id, cleared: had, message: had ? `${p.name} leaves ${had.level} cover${had.reason ? ` (${had.reason})` : ''}` : `${p.name} had no standing cover` };
+        },
+        aliases: ['leave_cover'],
+        description: 'Play report 5 #1: remove a token\'s standing cover'
+    },
     trigger_readied: {
         schema: TriggerReadiedSchema,
         handler: async (params: z.infer<typeof TriggerReadiedSchema>, ctx?: SessionContext) => {
@@ -1636,6 +1757,10 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             const engine = getOrLoadEngine(ctx, params.encounterId);
             const state = engine?.getState();
             if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
+            // Read the sheets first: HP corrections made between calls, and who
+            // tracks death saves (play report 5 #5) — a readied blow on a named
+            // character must find the flag hydrated like any attack would.
+            syncParticipantHpFromDb(state);
             const p = state.participants.find(x => x.id === params.participantId);
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
             if (!p.readied) return refuse(`${p.name} has no readied action`);
@@ -1654,7 +1779,8 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 const target = state.participants.find(x => x.id === targetId);
                 if (!target) return refuse(`Target ${targetId} not in this encounter`);
                 try {
-                    attack = resolveReadiedAttack(engine, p, target, spec);
+                    const stated = (params.cover as Record<string, unknown> | undefined);
+                    attack = resolveReadiedAttack(engine, p, target, spec, { cover: stated?.[targetId] ?? stated?.['*'] });
                 } catch (err) {
                     return refuse(err instanceof Error ? err.message : String(err));
                 }
@@ -1662,14 +1788,19 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 engine.commitAction(p.id, 'reaction');
             }
             p.readied = undefined;
+            // Play report 5 #5: a readied blow that drops or kills a tracked target follows through to its sheet.
+            const struck = attack ? state.participants.find(x => x.id === attack!.target?.id) : undefined;
+            const settled = attack && struck ? await settleAttackDying(attack, struck, p.name, params.encounterId) : { lines: [] as string[] };
             saveEncounterState(new EncounterRepository(getDb()), params.encounterId, state);
             logConditionChange(params.encounterId, state, 'trigger_readied', p.id, `${p.name}'s readied action fires: ${fired.action} (${fired.trigger})${attack ? ` — ${attack.message}` : ''}${params.note ? ` — ${params.note}` : ''}`, params.note);
             const attackData = attack ? { targetId: attack.target?.id, ...reactionAttackData(attack) } : undefined;
             return {
                 success: true, actionType: 'trigger_readied', encounterId: params.encounterId, participantId: p.id, fired, reaction: true,
                 ...(attackData ? { attack: attackData } : {}),
+                ...(attack?.dying ? { dying: attack.dying } : {}),
+                ...(settled.killed ? { killed: settled.killed } : {}),
                 message: attack
-                    ? `${p.name}: ${fired.action} fires (${fired.trigger}); reaction spent.\n${attack.detailedBreakdown}`
+                    ? `${p.name}: ${fired.action} fires (${fired.trigger}); reaction spent.\n${attack.detailedBreakdown}${settled.lines.length ? `\n${settled.lines.join('\n')}` : ''}`
                     : `${p.name}: ${fired.action} fires (${fired.trigger}); reaction spent. Resolve its effect now (an attack: pass attack {…} and targetId here next time to roll it in one call).`
             };
         },
@@ -1830,8 +1961,13 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             const mirroredToCharacter = (grants || perRest) && !ability.recharge ? patchRowAbility(getDb(), p.id, ability.name, false).found : false;
             const area = resolveAreaSave(engine, {
                 targetIds: params.targetIds, damage: params.damage, damageType: params.damageType,
-                savingThrow: params.savingThrow, halfDamageOnSave: params.halfDamageOnSave
+                savingThrow: params.savingThrow, halfDamageOnSave: params.halfDamageOnSave,
+                // Play report 5: cover from the user to each target (stated per target wins), riders on the save.
+                originId: p.id, cover: params.cover as Record<string, unknown> | undefined,
+                onFail: params.savingThrow?.onFail, onSuccess: params.savingThrow?.onSuccess
             }, ability.name);
+            // Play report 5 #5: a tracked token the ability killed is killed on its sheet.
+            const killed = await settleAreaDeaths(params.encounterId, state, area.targets, ability.name);
             saveEncounterState(new EncounterRepository(getDb()), params.encounterId, state);
             const summary = `${p.name} uses ${ability.name}${grants ? ' (one extra action this turn)' : ''}${area.targets.length ? ` on ${area.targets.map(t => `${t.targetName} (${t.saved ? 'saved, ' : ''}${t.damageTaken})`).join(', ')}` : ''}${params.reason ? ` — ${params.reason}` : ''}`;
             logConditionChange(params.encounterId, state, 'use_ability', p.id, summary, params.reason);
@@ -1840,6 +1976,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 : `✴ ${p.name} uses ${ability.name}${cost === 'none' ? ' (free)' : cost !== 'action' ? ` (${cost})` : ''}`;
             if (typeof params.damage === 'string') message += ` (${params.damage}: ${area.damageRolled})`;
             if (area.lines.length) message += '\n' + area.lines.join('\n');
+            if (killed.length) message += '\n' + killedLines(killed).join('\n');
             if (ability.recharge) message += `\n${ability.name} is spent; it recharges on a d6 of ${ability.recharge}+ at the start of ${p.name}'s turn.`;
             else if (perRest) message += `\n${perRestSpentNote(ability)}${mirroredToCharacter ? '; the sheet shows it spent too' : ''}.`;
             else if (grants) message += `\n${ability.name} is spent (character_manage restore_ability or a rest readies it)${mirroredToCharacter ? '; the sheet shows it spent too' : ''}.`;
@@ -1853,6 +1990,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 ...(area.damageRolls ? { damageRolls: area.damageRolls } : {}),
                 targets: area.targets,
                 ...(area.missing.length ? { missingTargets: area.missing } : {}),
+                ...(killed.length ? { killed } : {}),
                 message
             };
         },
@@ -2212,6 +2350,10 @@ async function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionCon
         savingThrow: params.save ? { ability: params.save.ability, dc: params.save.dc } : undefined,
         halfDamageOnSave: params.save?.half ?? true,
         damagePurpose: `damage: ${params.source}`,
+        // Play report 5: cover (stated per target, else from the actor's token), riders on the save.
+        ...(params.actorId && state.participants.some(p => p.id === params.actorId) ? { originId: params.actorId } : {}),
+        cover: params.cover as Record<string, unknown> | undefined,
+        onFail: params.save?.onFail, onSuccess: params.save?.onSuccess,
         ...(bandRule && actorBand ? { bandScaleFor: (t: { band?: string }) => bandDamageMultiplier(bandRule, actorBand, t.band) } : {})
     }, params.source);
     // Play report 2, item 6: with an actor, every target it dropped to 0 is a
@@ -2228,10 +2370,12 @@ async function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionCon
             if (state.participants.some(p => p.id === params.actorId)) growthConditionsOnToken(engine, params.actorId, credit);
         }
     }
+    // Play report 5 #5: a tracked token the damage killed is killed on its sheet.
+    const killed = await settleAreaDeaths(encounterId, state, area.targets, params.source);
     saveEncounterState(new EncounterRepository(getDb()), encounterId, state);
     const hpChanges: Record<string, { before: number; after: number }> = {};
     for (const t of area.targets) if (t.hpBefore !== undefined && t.hpAfter !== undefined) hpChanges[t.targetId] = { before: t.hpBefore, after: t.hpAfter };
-    const summary = `${params.source}: ${area.targets.map(t => `${t.targetName} ${t.saved ? 'saved, ' : ''}${t.damageTaken}${params.damageType ? ` ${params.damageType}` : ''}`).join(', ')}`;
+    const summary = `${params.source}: ${area.targets.map(t => `${t.targetName} ${t.cover?.unaffected ? 'unaffected (total cover)' : `${t.saved ? 'saved, ' : ''}${t.damageTaken}${params.damageType ? ` ${params.damageType}` : ''}${t.conditionsApplied?.length ? ` +${t.conditionsApplied.join(',')}` : ''}`}`).join(', ')}`;
     getDomainServices().combatActionLog.log({
         encounterId, round: state.round, turnIndex: state.currentTurnIndex,
         actorId: params.actorId ?? 'environment', actorName: params.source, actionType: 'apply_damage',
@@ -2240,6 +2384,7 @@ async function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionCon
     });
     let message = `💥 ${params.source}${typeof params.dice === 'string' ? ` (${params.dice}: ${area.damageRolled})` : ` (${area.damageRolled})`}`;
     if (area.lines.length) message += '\n' + area.lines.join('\n');
+    if (killed.length) message += '\n' + killedLines(killed).join('\n');
     if (growth.length) message += '\n' + growth.map(g => `⬆ ${growthLine(g)}`).join('\n');
     return {
         success: true, actionType: 'apply_damage', encounterId, ...(routed ? { routedToEncounter: true } : {}),
@@ -2248,6 +2393,7 @@ async function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionCon
         ...(params.damageType ? { damageType: params.damageType } : {}),
         targets: area.targets,
         ...(area.breakTests.length ? { breakTests: area.breakTests } : {}),
+        ...(killed.length ? { killed } : {}),
         ...(growth.length ? { growth } : {}),
         message
     };
@@ -2270,13 +2416,34 @@ async function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string
     const actorBand = params.actorId ? (charRepo.findById(params.actorId) as { band?: string } | null)?.band : undefined;
     const ruleWorld = params.actorId ? resolveWorldId(db, { characterIds: [params.actorId, ...params.targetIds] }) : null;
     const bandRule = params.actorId ? bandRuleFor(db, ruleWorld, [actorBand]) : undefined;
+    const statedCover = params.cover as Record<string, unknown> | undefined;
+    const sheetKills: Array<{ id: string; name: string; cause: string }> = [];
     const targets = rows.map(({ id, row }) => {
         const sheet = row!;
         let damageTaken = damageRolled;
         let save: ReturnType<typeof rollCharacterSave> | undefined;
+        // Play report 5 #1: no map here, so only the stated cover applies; total leaves the sheet untouched.
+        const coverKind = normalizeCover(statedCover?.[id] ?? statedCover?.['*']);
+        const cover: CoverResolution | undefined = coverKind && coverKind !== 'none' ? { kind: coverKind, acBonus: coverBonus(coverKind), source: 'declared', via: 'call' } : undefined;
+        if (cover?.kind === 'total') {
+            lines.push(`🎯 ${sheet.name} — unaffected: total cover (declared)`);
+            return { targetId: id, targetName: sheet.name, saved: false, damageTaken: 0, hpBefore: sheet.hp, hpAfter: sheet.hp, defeated: sheet.hp <= 0, cover: { kind: 'total', source: 'declared', via: 'call', saveBonus: 0, unaffected: true as const } };
+        }
+        const dexSave = !!params.save && (toLongAbility(params.save.ability) ?? 'dexterity') === 'dexterity';
+        const saveBonus = cover && dexSave ? cover.acBonus : 0;
         if (params.save) {
-            save = rollCharacterSave(db, sheet, params.save.ability, params.save.dc, { purpose: `${params.source} save (${toLongAbility(params.save.ability)})`, tool: 'combat_manage' });
+            save = rollCharacterSave(db, sheet, params.save.ability, params.save.dc, { purpose: `${params.source} save (${toLongAbility(params.save.ability)})${saveBonus ? ` (cover +${saveBonus})` : ''}`, tool: 'combat_manage', ...(saveBonus ? { extraBonus: saveBonus } : {}) });
             if (save.saved) damageTaken = (params.save.half ?? true) ? Math.floor(damageTaken / 2) : 0;
+        }
+        // Play report 5 #6: riders on the sheet: upsert by name, sourced to the effect unless the entry names its own.
+        const rider = save ? (save.saved ? params.save?.onSuccess : params.save?.onFail) : undefined;
+        const conditionsApplied: string[] = [];
+        for (const entry of rider?.conditions ?? []) {
+            const label = typeof entry === 'string' ? entry : String(entry.type || entry.name || '');
+            if (!label.trim()) continue;
+            const norm = normalizeCondition(entry, id);
+            mirrorConditionToRow(id, 'add', label, norm?.duration, norm?.sourceId ?? `${params.source} (${save!.saved ? 'saved' : 'failed save'})`);
+            conditionsApplied.push(label);
         }
         const mod = damageWithModifiers(damageTaken, params.damageType, sheet as DamageDefences);
         damageTaken = mod.finalDamage;
@@ -2294,21 +2461,67 @@ async function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string
         const concentration = damageTaken > 0
             ? concentrationAfterDamage(id, damageTaken, defeated && hpBefore > 0, () => loggedD20(db, { purpose: 'concentration', forId: id }, { tool: 'combat_manage' }).natural, concentrationRepo, charRepo)
             : undefined;
+        // Play report 5 #5, outside a fight: a tracked sheet dropped to 0 is
+        // DYING (unconscious, prone; no saves are rolled round by round — the
+        // reply offers the stabilise call); massive damage kills it outright.
+        const tracked = rowTracksDeathSaves(sheet as { characterType?: string; deathSaves?: boolean }) === true;
+        let dying = false; let dead = false; let deadNote = ''; let noLongerStable = false;
+        // A sheet that already has a corpse is dead, not dying: nothing to track.
+        const alreadyDead = tracked && defeated && (() => { try { return !!new CorpseRepository(db).findByCharacterId(id); } catch { return false; } })();
+        if (tracked && defeated && damageTaken > 0 && !alreadyDead) {
+            // The leftover past 0: the whole blow when already down.
+            const overflow = hpBefore > 0 ? damageTaken - hpBefore : damageTaken;
+            if (overflow >= sheet.maxHp && sheet.maxHp > 0) {
+                dead = true;
+                deadNote = `${params.source} (massive damage)`;
+                sheetKills.push({ id, name: sheet.name, cause: deadNote });
+            } else {
+                // Dropped now, or hit while already down: dying either way (no
+                // counters outside a fight; the table stabilises or heals). A
+                // Stable marker comes off: damage to a stable creature makes it dying again.
+                dying = true;
+                const own = (sheet as { conditions?: RowCondition[] }).conditions ?? [];
+                noLongerStable = own.some(c => c.name.toLowerCase() === 'stable');
+                const next = withDyingRowConditions(noLongerStable ? own.filter(c => c.name.toLowerCase() !== 'stable') : own);
+                if (next.added.length || noLongerStable) charRepo.update(id, { conditions: next.conditions } as never);
+            }
+        }
         let line = `🎯 ${sheet.name}`;
-        if (save && params.save) line += ` - ${save.ability} save: ${save.natural} + ${save.modifier} = ${save.total} vs DC ${params.save.dc} ${save.saved ? '✓ SAVED' : '✗ FAILED'}`;
+        if (save && params.save) {
+            line += saveBonus && cover
+                ? ` - ${saveArithmetic(save.ability, save.natural, save.modifier - saveBonus, cover, save.total, params.save.dc)} ${save.saved ? '✓ SAVED' : '✗ FAILED'}`
+                : ` - ${save.ability} save: ${save.natural} + ${save.modifier} = ${save.total} vs DC ${params.save.dc} ${save.saved ? '✓ SAVED' : '✗ FAILED'}`;
+        }
         line += `\n   Damage: ${damageTaken}${params.damageType ? ` ${params.damageType}` : ''}${mod.modifier !== 'normal' ? ` (${mod.modifier})` : ''}${bandScale ? ` ×${bandScale.multiplier} band (${bandScale.before} → ${bandScale.after})` : ''}`;
-        line += `\n   HP: ${hpAfter}/${sheet.maxHp}${defeated ? ' 💀 DOWN' : ''}`;
+        line += `\n   HP: ${hpAfter}/${sheet.maxHp}${dead ? ' ☠ DEAD (massive damage)' : dying ? ' 🩸 DYING' : alreadyDead ? ' ☠ DEAD' : defeated ? ' 💀 DOWN' : ''}`;
+        if (noLongerStable) line += `\n   💤→🩸 ${sheet.name} was stable: the blow makes it dying again (no longer stable)`;
+        if (dying) line += `\n   🩸 ${sheet.name} is dying: unconscious and prone. No death saves outside a fight — stabilise: combat_action stabilize {actorId: '<healer>', targetId: '${id}'} (Medicine DC 10; a healer's kit or Spare the Dying is automatic), or heal above 0`;
         if (concentration) line += `\n   Concentration on ${concentration.spell}: ${concentration.reason === 'death' ? 'ends at 0 HP' : `CON save ${concentration.saveTotal} vs DC ${concentration.saveDC} ${concentration.broken ? '✗ BROKEN' : '✓ held'}`}`;
+        if (conditionsApplied.length) line += `\n   Conditions: ${conditionsApplied.join(', ')}`;
         lines.push(line);
         return {
             targetId: id, targetName: sheet.name,
             ...(save ? { saveRoll: save.natural, saveTotal: save.total } : {}),
             saved: !!save?.saved, damageTaken, hpBefore, hpAfter, defeated,
+            ...(cover ? { cover: { kind: cover.kind, source: cover.source, via: cover.via, saveBonus, ...(params.save && !dexSave ? { note: 'cover adds to DEX saves only' } : {}) } } : {}),
+            ...(conditionsApplied.length ? { conditionsApplied } : {}),
+            ...(dying ? { dying: true, stabilize: { tool: 'combat_action', args: { action: 'stabilize', actorId: '<healer>', targetId: id } } } : {}),
+            ...(noLongerStable ? { wasStable: true } : {}),
+            ...(dead ? { dead: true, massiveDamage: true } : {}),
             ...(mod.modifier !== 'normal' ? { damageModifier: mod.modifier } : {}),
             ...(bandScale ? { bandScale } : {}),
             ...(concentration ? { concentration } : {})
         };
     });
+    // Play report 5 #5: the kills, through character_manage kill (HP 0, concentration, a corpse).
+    const killed: Array<{ characterId: string; name: string; cause: string; corpseId?: string }> = [];
+    if (sheetKills.length) {
+        const { handleKill } = await import('./character-manage.js');
+        for (const k of sheetKills) {
+            const r = await handleKill({ action: 'kill', characterId: k.id, cause: k.cause }) as Record<string, unknown>;
+            killed.push({ characterId: k.id, name: k.name, cause: k.cause, ...(typeof r.corpseId === 'string' ? { corpseId: r.corpseId } : {}) });
+        }
+    }
     // Play report 2, item 6: the same kill credit as the encounter path; an
     // auto rung's condition already reaches the sheet through applyGrowth.
     const growth: KillCredit[] = [];
@@ -2322,12 +2535,14 @@ async function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string
     }
     let message = `💥 ${params.source}${typeof params.dice === 'string' ? ` (${params.dice}: ${damageRolled})` : ` (${damageRolled})`} — no encounter, written to the sheet${targets.length === 1 ? '' : 's'}`;
     if (lines.length) message += '\n' + lines.join('\n');
+    if (killed.length) message += '\n' + killed.map(k => `☠ ${k.name} is dead (${k.cause})${k.corpseId ? ` — corpse ${k.corpseId.slice(0, 8)}` : ''}`).join('\n');
     if (growth.length) message += '\n' + growth.map(g => `⬆ ${growthLine(g)}`).join('\n');
     return {
         success: true, actionType: 'apply_damage', source: params.source, damageRolled,
         ...(damageRolls ? { damageRolls } : {}),
         ...(params.damageType ? { damageType: params.damageType } : {}),
         targets,
+        ...(killed.length ? { killed } : {}),
         ...(growth.length ? { growth } : {}),
         message
     };
@@ -2357,7 +2572,7 @@ Aliases: start/begin→create, state/status→get, finish/stop→end, restore/re
 1. create - Start encounter with custom participants and terrain
 2. get - View current state
 3. advance - Move to next turn
-4. death_save - Roll death save for downed character
+4. death_save {participantId, outcome?} - roll (or post) a death save for a downed tracked character; advance rolls them itself on the creature's turn unless deathSaveMode is prompt (DEATH SAVE DUE); stabilise with combat_action stabilize. See docs/table-rules/dying.md
 5. lair_action - Execute boss lair action (LAIR turn only; once per round; damage takes dice; a creature that rolled 20 acts first)
    legendary_action {participantId, cost?, description} - a non-attack legendary action off its turn (attacks: combat_action attack with legendaryCost)
    legendary_resistance {participantId, reason} - turn a failed save into a success
@@ -2380,7 +2595,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         seed: z.string().optional().describe('Seed for a replayable new encounter (create only; omit for crypto dice)'),
         participants: z.array(z.any()).optional().describe("Array of participants (create only). Shape per entry: { id: <character UUID — always the UUID>, name, hp, maxHp, initiativeBonus?: number (default 0, #103), ac?: number (falls back to attacker-side derivation), isEnemy?: boolean, position?: {x,y}, plus optional statline: size, reach, movementSpeed, attackBonus, attackDamage, attackDamageType, attacksPerAction, attacks [{name, attackBonus, damage, damageType?, part?, item?, reachFt?, ranged?, twoHanded?, default?}], abilities [{name, recharge?, perRest?, grantsAction?, ready?}], fightingStyle, legendaryActions, legendaryResistances, legendaryResistancesRemaining, autoLegendaryResistance, hasLairActions, cr, band, regeneration, parts, unit, intent, species, tags }"),
         terrain: z.any().optional().describe('Terrain configuration (create only); water: ["x,y"] cells run the underwater rules for a token standing there'),
-        environment: z.any().optional().describe("create / set_environment: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed? (default false in water), meleeDisadvantageUnlessDamageType? (default ['piercing']), swimTag? (default 'aquatic')}"),
+        environment: z.any().optional().describe("create / set_environment: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed? (default false in water), meleeDisadvantageUnlessDamageType? (default ['piercing']), swimTag? (default 'aquatic'), light?: 'bright' | 'dim' | 'darkness'}. set_environment replaces the whole object (medium defaults to air). light: 'darkness' lets tokens attempt a Hide from foes without darkvision (get shows canHide)"),
         characterId: z.string().optional().describe('Character ID (death_save, add_participant)'),
         // FINDINGS #34 mirror block — add_participant + includeParty params
         includeParty: z.boolean().optional().describe('Include the active party in the new encounter (create / spawn_quick_enemy)'),
@@ -2390,7 +2605,10 @@ For CORPSES after combat, use corpse_manage tool.`,
         maxHp: z.number().optional().describe('Participant max HP (add_participant); set_part: the part\'s max HP'),
         ac: z.number().optional().describe('Participant AC (add_participant); set_part: AC to hit the part when aimed at'),
         initiativeBonus: z.number().optional().describe('Initiative bonus (add_participant)'),
-        participantId: z.string().optional().describe('remove_participant / adjust_hp: participant/token id'),
+        participantId: z.string().optional().describe('remove_participant / adjust_hp / death_save / add_condition / set_part / use_ability …: participant/token id (death_save takes participantId or characterId)'),
+        outcome: z.union([z.string(), z.number()]).optional().describe("death_save (mirror): a result the table rolled — success | failure | nat20 | nat1 (also pass/fail, 'natural 20', or the natural die 1-20). No d20 is rolled; the counters move as posted"),
+        deathSaves: z.boolean().optional().describe('add_participant (mirror; create takes it per participant): the token tracks death saves at 0 HP (default from its row: pc/npc yes, enemy no; a token with no row dies at 0). true opts a sheetless villain in, false a named character out'),
+        deathSaveMode: z.enum(['auto', 'prompt']).optional().describe("add_participant (mirror; create takes it per participant): auto rolls the death save on advance; prompt prints DEATH SAVE DUE and refuses advance until death_save. Default from the sheet, else the world's environment.deathSaveMode"),
         participantIds: z.array(z.string()).optional().describe('set_surprised: the participants caught flat-footed'),
         surprised: z.union([z.array(z.string()), z.boolean()]).optional().describe("create: participant ids caught flat-footed (their round-1 turn passes; no reactions until it has). set_surprised: true (default) flags participantIds, false clears"),
         value: z.number().optional().describe('adjust_hp: set HP to exactly this'),
@@ -2412,6 +2630,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         movementSpeed: z.number().optional().describe('add_participant: speed in feet (default 30; defaults from the character row\'s speed)'),
         swimSpeed: z.number().optional().describe('add_participant: swim speed in feet, the movement budget underwater (else half speed)'),
         flySpeed: z.number().optional().describe('add_participant: fly speed in feet'),
+        senses: sensesSchema().optional().describe('add_participant: senses in feet {darkvisionFt, blindsightFt, tremorsenseFt, truesightFt} (defaults from the character row); carried on the token and shown in get'),
         attackBonus: z.number().optional().describe('add_participant: default attack bonus'),
         attackDamage: z.string().optional().describe("add_participant: default attack damage ('1d6+2')"),
         attackDamageType: z.string().optional().describe('add_participant: damage type of the default attack'),
@@ -2419,6 +2638,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         attacks: z.array(z.any()).optional().describe('add_participant: named attack profiles [{name, attackBonus, damage, damageType?, part?, reachFt?, ranged?, twoHanded?, default?}]'),
         abilities: z.array(z.any()).optional().describe('add_participant: limited abilities [{name, recharge?, perRest?: short | long, grantsAction?, actionCost?, ready?}]; ready unset lets a spent sheet ability stay spent'),
         fightingStyle: FightingStyleSchema.optional().describe('add_participant: great_weapon | dueling | archery | defense (default from the sheet); attacks [{twoHanded?, ranged?}] decide when it applies'),
+        ignoreCover: ignoreCoverSchema().optional().describe(`add_participant: ${IGNORE_COVER_DESCRIBE} (default from the sheet)`),
         legendaryActions: z.number().optional().describe('add_participant: legendary actions per round'),
         legendaryResistances: z.number().optional().describe('add_participant: legendary resistances per day'),
         legendaryResistancesRemaining: z.number().optional().describe('add_participant: legendary resistances left'),
@@ -2486,8 +2706,13 @@ For CORPSES after combat, use corpse_manage tool.`,
         save: z.object({
             ability: z.string(),
             dc: z.number(),
-            half: z.boolean().optional()
-        }).optional().describe('apply_damage: {ability, dc, half? (default true)} each target saves'),
+            half: z.boolean().optional(),
+            onFail: areaSaveRiderSchema().optional(),
+            onSuccess: areaSaveRiderSchema().optional()
+        }).optional().describe("apply_damage: {ability, dc, half? (default true), onFail?: {conditions: ['prone', {name, duration?, source?}], mirrorToCharacter?}, onSuccess?} each target saves; riders land on the targets with that result"),
+        cover: coverByTargetSchema().optional().describe(`apply_damage / use_ability / lair_action / trigger_readied (mirror): ${COVER_BY_TARGET_DESCRIBE}`),
+        level: coverEnum().optional().describe('set_cover: half | three-quarters | total | none'),
+        against: z.any().optional().describe("set_cover: ['id', 'name'] (attackers it protects against) or {direction: 'west'} (attackers in that direction); unset: everyone"),
         // spawn_quick_enemy fields
         creature: z.string().optional().describe('spawn_quick_enemy / add_participant: a world bestiary creature (table_rules kind creature) or built-in template ("goblin", "orc:warrior")'),
         count: z.number().optional().describe('spawn_quick_enemy / add_participant creature: how many (1-10)'),
@@ -2598,6 +2823,10 @@ export async function handleCombatManage(args: unknown, ctx: SessionContext): Pr
                 case 'set_intent':
                 case 'trigger_readied':
                     output = RichFormatter.header('Intent', '⚑');
+                    break;
+                case 'set_cover':
+                case 'clear_cover':
+                    output = RichFormatter.header('Cover', '🛡');
                     break;
                 case 'legendary_action':
                 case 'legendary_resistance':

@@ -69,6 +69,15 @@ function formatScene(scene: Scene, characterRepo: CharacterRepository, isCurrent
         parts.push('');
         parts.push(engineState);
     }
+    // Play report 5 #8c: what the senses cannot do here, and the wind.
+    if (scene.wind || scene.senseDenial?.length) {
+        parts.push('');
+        if (scene.wind) parts.push(`WIND: ${scene.wind}`);
+        for (const d of scene.senseDenial ?? []) {
+            const who = d.targetId ? ` (${characterRepo.findById(d.targetId)?.name ?? d.targetId})` : '';
+            for (const [sense, reason] of Object.entries(d.senses)) parts.push(`SENSE DENIED${who}: ${sense} — ${reason}`);
+        }
+    }
     parts.push('');
     parts.push('PARTICIPANTS (this is your party — they are at the table with you):');
     parts.push(formatRoster(scene.participants, characterRepo));

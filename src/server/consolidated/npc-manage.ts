@@ -19,6 +19,7 @@ import { InventoryRepository } from '../../storage/repos/inventory.repo.js';
 import { calculateHearingRadius, VolumeLevel } from '../../engine/social/hearing.js';
 import { rollStealthVsPerception, isDeafened, getEnvironmentModifier } from '../../engine/social/stealth-perception.js';
 import { loggedD20 } from '../../math/logged-d20.js';
+import { armourStealthDisadvantage } from '../../engine/armor.js';
 import { worldProgression } from '../../engine/progression.js';
 import { resolveWorldId } from '../../engine/table-rules.js';
 import { handleCreate as handleCharacterCreate } from './character-manage.js';
@@ -1025,10 +1026,14 @@ async function handleInteract(args: z.infer<typeof InteractSchema>): Promise<obj
     // key, one row per side) and the modifiers are each sheet's ONE
     // stealth/perception number on the world's proficiency curve.
     const progression = worldProgression(db, resolveWorldId(db, { characterIds: [speaker.id] }));
+    // Play report 5 #7: the speaker's worn armour with stealthDisadvantage
+    // puts the eavesdrop Stealth die at disadvantage, named in the result.
+    const armour = armourStealthDisadvantage(db, speaker.id);
     const opposedOpts = {
         profBonus: (level: number) => progression.profBonus(level),
         roll: (purpose: 'stealth' | 'perception', forId: string) =>
-            loggedD20(db, { purpose: `eavesdrop_${purpose}`, forId }, { tool: 'npc_manage' }).natural
+            loggedD20(db, { purpose: `eavesdrop_${purpose}`, forId }, { tool: 'npc_manage' }).natural,
+        ...(armour ? { speakerDisadvantage: `${armour.name} (stealth disadvantage)` } : {})
     };
     for (const listener of eavesdroppers) {
         const roll = rollStealthVsPerception(speaker, listener, envModifier, opposedOpts);
@@ -1039,6 +1044,7 @@ async function handleInteract(args: z.infer<typeof InteractSchema>): Promise<obj
             heardFully: false,
             opposedRoll: {
                 speakerRoll: roll.speakerRoll,
+                ...(roll.speakerRolls.length > 1 ? { speakerRolls: roll.speakerRolls, speakerDisadvantage: roll.speakerDisadvantage } : {}),
                 speakerTotal: roll.speakerTotal,
                 listenerRoll: roll.listenerRoll,
                 listenerTotal: roll.listenerTotal,

@@ -61,3 +61,27 @@ describe('rollStealthVsPerception', () => {
         expect(out.get('h')!.success).toBe(true);
     });
 });
+
+// Play report 5 #7: the eavesdrop roller takes the speaker's armour into
+// account. The caller names the worn armour that puts Stealth at
+// disadvantage; the speaker's die is then rolled twice and the lower kept,
+// both dice and the reason reported.
+describe('rollStealthVsPerception: stealth disadvantage from worn armour', () => {
+    it('rolls the speaker twice and keeps the lower when speakerDisadvantage is given', () => {
+        const dice = [14, 6, 10];
+        const speaker = sheet({ id: 's' });
+        const listener = sheet({ id: 'l' });
+        const r = rollStealthVsPerception(speaker, listener, 0, { roll: () => dice.shift()!, speakerDisadvantage: 'Scale mail (stealth disadvantage)' });
+        expect(r.speakerRolls).toEqual([14, 6]);
+        expect(r.speakerRoll).toBe(6);
+        expect(r.speakerDisadvantage).toBe('Scale mail (stealth disadvantage)');
+        expect(r.listenerRoll).toBe(10);
+        expect(r.success).toBe(true);
+    });
+
+    it('without it the speaker rolls one die and reports no reason', () => {
+        const r = rollStealthVsPerception(sheet({ id: 's' }), sheet({ id: 'l' }), 0, { roll: () => 10 });
+        expect(r.speakerRolls).toEqual([10]);
+        expect(r.speakerDisadvantage).toBeUndefined();
+    });
+});

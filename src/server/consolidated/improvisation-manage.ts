@@ -22,6 +22,8 @@ import {
     ActorType
 } from '../../schema/improvisation.js';
 import { loadAutoMechanics, autoSkillBonus, applyDeclaredEffects } from '../../engine/effects-resolver.js';
+import { matchSkillAdvantage, denialFor, sceneSensesFor, type SkillAdvantageTrait } from '../../engine/senses.js';
+import { armourStealthDisadvantage } from '../../engine/armor.js';
 import { loggedD20, loggedRoller, type DiceRoller } from '../../math/logged-d20.js';
 import { resolveWorldId, worldSkillAbility } from '../../engine/table-rules.js';
 import { worldProgression } from '../../engine/progression.js';
@@ -1088,7 +1090,10 @@ const MontageSchema = z.object({
     task: z.string().min(1).describe('What the montage covers, in one line'),
     dc: z.number().describe('Hard-won at or above this; clean at dc + cleanMargin; costly below'),
     dice: z.string().optional().default('1d20').describe('Dice notation for the one roll (default 1d20)'),
-    ability: stuntAbilityField().optional().describe('Ability whose modifier adds to the roll (str/dex/con/int/wis/cha)'),
+    ability: stuntAbilityField().optional().describe('Ability whose modifier adds to the roll (str/dex/con/int/wis/cha); with skill and no ability, the skill\'s 5e or world ability'),
+    // Play report 5 #8c: the skill the long task rolls, so the sheet's conditional traits and worn armour apply.
+    skill: z.string().optional().describe("Play report 5 #8c: the skill the montage rolls ('survival'); its skillAdvantage traits fire on a matching context tag and stealthDisadvantage armour applies to stealth"),
+    context: z.preprocess(v => typeof v === 'string' ? [v] : v, z.array(z.string().min(1))).optional().describe("Play report 5 #8c: tags on the montage (['scent']); a skillAdvantage trait whose `when` matches rolls the dice twice and keeps the higher; a scene senseDenial removes it and is quoted"),
     modifier: z.number().optional().default(0).describe('Flat situational modifier'),
     cleanMargin: z.number().optional().default(5).describe('Clean tier starts at dc + cleanMargin (default 5)'),
     costs: z.object({
@@ -1118,10 +1123,53 @@ async function handleMontage(args: z.infer<typeof MontageSchema>): Promise<objec
     }
     const worldId = args.worldId ?? resolveWorldId(db, { characterIds: [char.id] }) ?? undefined;
 
-    // One logged roll, purpose 'montage'. Crypto unless a seed is given.
+    // Play report 5 #8c: a skill-tagged montage takes the sheet's conditional
+    // traits (skillAdvantage + context) and the worn armour's stealth penalty;
+    // advantage rolls the notation twice and keeps the higher total, disadvantage
+    // the lower, and the two cancel as normal. A scene denial is quoted.
+    const skillKey = args.skill ? args.skill.toLowerCase().replace(/ /g, '_') : undefined;
+    const advFrom: string[] = [];
+    const disFrom: string[] = [];
+    let deniedAdvantage: Array<{ trait: string; when: string; reason: string }> | undefined;
+    if (skillKey) {
+        const matched = matchSkillAdvantage((char as { skillAdvantage?: SkillAdvantageTrait[] }).skillAdvantage, skillKey, args.context ?? []);
+        if (matched.applied.length) {
+            const senses = sceneSensesFor(db, char.id, worldId);
+            for (const t of matched.applied) {
+                const reason = denialFor(senses.senseDenial, char.id, t.when);
+                if (reason) (deniedAdvantage ??= []).push({ trait: t.name, when: t.when, reason });
+                else advFrom.push(t.label);
+            }
+        }
+        if (skillKey === 'stealth') {
+            const worn = armourStealthDisadvantage(db, char.id);
+            if (worn) disFrom.push(`${worn.name} (stealth disadvantage)`);
+        }
+    }
+    const advantage = advFrom.length > 0 && disFrom.length === 0;
+    const disadvantage = disFrom.length > 0 && advFrom.length === 0;
+
+    // One logged roll, purpose 'montage' (two with advantage or disadvantage). Crypto unless a seed is given.
     const roller = loggedRoller(db, { forId: char.id, tool: 'improvisation_manage', seed: args.seed });
-    const rolled = roller(args.dice, 'montage');
-    const abilityMod = args.ability ? getSkillModifier((char.stats ?? {}) as Record<string, number>, args.ability) : 0;
+    let rolled = roller(args.dice, 'montage');
+    let advantageRoll: { rolls: number[]; kept: number; mode: 'higher kept' | 'lower kept' } | undefined;
+    if (advantage || disadvantage) {
+        const second = roller(args.dice, `montage (${advantage ? 'advantage' : 'disadvantage'})`);
+        const kept = advantage ? (second.total > rolled.total ? second : rolled) : (second.total < rolled.total ? second : rolled);
+        advantageRoll = { rolls: [rolled.total, second.total], kept: kept.total, mode: advantage ? 'higher kept' : 'lower kept' };
+        rolled = kept;
+    }
+    const MONTAGE_SKILL_ABILITY: Record<string, string> = {
+        athletics: 'str', acrobatics: 'dex', sleight_of_hand: 'dex', stealth: 'dex',
+        arcana: 'int', history: 'int', investigation: 'int', nature: 'int', religion: 'int',
+        animal_handling: 'wis', insight: 'wis', medicine: 'wis', perception: 'wis', survival: 'wis',
+        deception: 'cha', intimidation: 'cha', performance: 'cha', persuasion: 'cha'
+    };
+    const ability = args.ability ?? (skillKey ? (worldSkillAbility(db, worldId, args.skill) ?? MONTAGE_SKILL_ABILITY[skillKey]) : undefined);
+    const abilityMod = ability ? getSkillModifier((char.stats ?? {}) as Record<string, number>, ability) : 0;
+    // A skill the engine cannot map rolls with no ability modifier: said, not swallowed.
+    const montageWarnings: string[] = [];
+    if (skillKey && !ability) montageWarnings.push(`skill '${args.skill}' names no ability (not an SRD skill or a world skill): rolled with no ability modifier — pass ability, or define it with table_rules {kind: 'skill', name: '${args.skill}', spec: {ability}}`);
     const total = rolled.total + abilityMod + args.modifier;
     const cleanAt = args.dc + args.cleanMargin;
     const tier: MontageTier = total >= cleanAt ? 'clean' : total >= args.dc ? 'hard_won' : 'costly';
@@ -1166,17 +1214,32 @@ async function handleMontage(args: z.infer<typeof MontageSchema>): Promise<objec
         db.prepare('UPDATE narrative_notes SET content = content || ?, updated_at = ? WHERE id = ?').run(`\n\n── [${stamp}] ──\n${journalLine}`, now, journalNoteId);
     }
 
-    const breakdown = [`${args.dice} ${rolled.total}`, ...(args.ability ? [`${args.ability} ${abilityMod >= 0 ? '+' : ''}${abilityMod}`] : []), ...(args.modifier ? [`modifier ${args.modifier >= 0 ? '+' : ''}${args.modifier}`] : [])];
+    const breakdown = [
+        `${args.dice} ${rolled.total}${advantageRoll ? ` (2 dice, ${advantageRoll.mode}: ${advantageRoll.rolls.join(', ')})` : ''}`,
+        ...(ability ? [`${ability} ${abilityMod >= 0 ? '+' : ''}${abilityMod}`] : []),
+        ...(args.modifier ? [`modifier ${args.modifier >= 0 ? '+' : ''}${args.modifier}`] : []),
+        ...advFrom.map(a => `advantage ← ${a}`),
+        ...disFrom.map(d => `disadvantage ← ${d}`),
+        ...(deniedAdvantage ?? []).map(d => `⚠ ${d.trait} (${d.when}) denied: ${d.reason}`),
+        ...montageWarnings.map(w => `⚠ ${w}`)
+    ];
     return {
         success: true,
         actionType: 'montage',
         characterId: char.id,
         characterName: char.name,
         task: args.task,
+        ...(args.skill ? { skill: args.skill } : {}),
+        ...(args.context?.length ? { context: args.context } : {}),
         tier,
         roll: rolled.total,
         rolls: rolled.rolls,
         rollId: rolled.rollId,
+        ...(advantageRoll ? { advantageRoll } : {}),
+        ...(advFrom.length ? { advantageSources: advFrom } : {}),
+        ...(disFrom.length ? { disadvantageSources: disFrom } : {}),
+        ...(deniedAdvantage ? { deniedAdvantage } : {}),
+        ...(montageWarnings.length ? { warnings: montageWarnings } : {}),
         abilityModifier: abilityMod,
         modifier: args.modifier,
         total,
@@ -1302,7 +1365,7 @@ CUSTOM EFFECTS (apply_effect):
 - Example: { action: "apply_effect", targetId: "char_1", targetType: "character", name: "Forge Blessing", category: "boon", powerLevel: 2, durationType: "until_removed", mechanics: [{ type: "attack_bonus", value: 2, condition: "melee" }, { type: "damage_resistance", value: "fire" }] }
 
 MONTAGE (forty-eight cells, one roll):
-- montage {characterId, task, dc, dice?: '1d20', ability?, modifier?, cleanMargin?: 5, costs?: {hardWon: writes[], costly: writes[]}, hours?, worldId?, journal?: true} — one logged roll (purpose 'montage'); total = roll + ability mod + modifier
+- montage {characterId, task, dc, dice?: '1d20', ability?, skill?, context?: ['scent'], modifier?, cleanMargin?: 5, costs?: {hardWon: writes[], costly: writes[]}, hours?, worldId?, journal?: true} — one logged roll (purpose 'montage'); total = roll + ability mod + modifier. skill + context fire the sheet's skillAdvantage traits (two rolls, higher kept; a scene senseDenial removes it and is quoted); stealth in stealthDisadvantage armour rolls twice, lower kept
 - Tiers: clean (total ≥ dc + cleanMargin, no cost) · hard_won (≥ dc, costs.hardWon applied) · costly (below dc, costs.costly applied). Writes use the schedule_change op grammar: adjust_pool, adjust_hp, adjust_max_hp, add_condition, remove_condition
 - hours + worldId advance the world clock; journal appends '[montage] task — tier (roll X vs DC Y) — cost: …' to the latest active session_log (created as 'Session log' if none)
 - Reply: {tier, roll, total, dc, applied, timePassed?, journalNoteId?, hook} — hook is a one-line narration seed per tier for the GM to expand
@@ -1321,7 +1384,7 @@ ARCANE SYNTHESIS:
         targetIds: z.array(z.string()).optional(),
         targetTypes: z.array(z.enum(['character', 'npc'])).optional(),
         narrativeIntent: z.string().optional(),
-        skill: z.string().optional().describe('Stunt: any skill. SRD skills and world skills (table_rules skill) know their ability; others need ability'),
+        skill: z.string().optional().describe('Stunt: any skill. SRD skills and world skills (table_rules skill) know their ability; others need ability. montage (play report 5 #8c): the skill the long task rolls, so skillAdvantage traits (with context) and stealthDisadvantage armour apply'),
         ability: z.string().optional().describe('Stunt: the ability to roll with (str/dex/con/int/wis/cha, long or short)'),
         dc: z.number().optional(),
         xpAward: z.number().optional().describe('XP credited to the actor (stunt)'),
@@ -1362,7 +1425,8 @@ ARCANE SYNTHESIS:
         effectName: z.string().optional(),
         includeInactive: z.boolean().optional(),
         event: z.string().optional(),
-        context: z.record(z.any()).optional(),
+        // process_triggers takes an event context object; montage (play report 5 #8c) takes tags (['scent']) — each inner schema validates its own shape.
+        context: z.any().optional().describe("process_triggers: {…} event context. montage: tags (['scent']) that fire a skillAdvantage trait on the montage skill"),
         rounds: z.number().optional(),
         // Synthesis params
         casterId: z.string().optional(),

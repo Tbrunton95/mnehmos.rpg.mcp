@@ -5,6 +5,7 @@
  * updates; the caller writes them through the character repository.
  */
 import { z } from 'zod';
+import { stripDyingRowConditions, type RowCondition } from './combat/dying.js';
 
 /** A fresh schema each call, so no outer schema holds one zod instance twice. */
 export function scheduledWriteOpSchema() {
@@ -65,6 +66,17 @@ export function applyScheduledOps(
                 hp = Math.min(maxHp, Math.max(0, hp + (op.delta ?? 0)));
                 if (hp !== before) hpTouched = true;
                 applied.push(`hp: ${before} → ${hp}`);
+                // Play report 5 #5: back above 0 (the stable creature's 1d4-hour
+                // return, any healing clock) wakes the sheet: the dying rules'
+                // Unconscious and Prone and a Stable marker come off.
+                if (before <= 0 && hp > 0) {
+                    const woke = stripDyingRowConditions(conditions as RowCondition[]);
+                    if (woke.removed.length) {
+                        conditions = woke.conditions as typeof conditions;
+                        condsTouched = true;
+                        applied.push(`wakes: ${woke.removed.join(', ')} cleared`);
+                    }
+                }
                 break;
             }
             case 'adjust_max_hp': {

@@ -7,7 +7,8 @@
  * on a double, a failure or a fumble.
  */
 import type Database from 'better-sqlite3';
-import type { CombatEngine, CombatParticipant, CombatActionResult } from '../../engine/combat/engine.js';
+import type { CombatEngine, CombatParticipant, CombatActionResult, DyingUpdate } from '../../engine/combat/engine.js';
+import { dyingTail } from '../../engine/combat/dying.js';
 import { normalizeCondition } from '../../engine/combat/conditions.js';
 import { rollParticipantSave, toLongAbility, type ParticipantSaveResult } from '../../engine/combat/saves.js';
 import { findPool, type RuleSpec, type TableRule } from '../../engine/table-rules.js';
@@ -151,6 +152,8 @@ interface EffectResult {
     hpBefore?: number;
     hpAfter?: number;
     defeated?: boolean;
+    /** Play report 5 #5: what this damage did to a tracked target at or into 0 HP (the caller mirrors the sheet and runs the kill). */
+    dying?: DyingUpdate;
 }
 
 /**
@@ -336,7 +339,8 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
                     const typed = engine.calculateDamageWithModifiers(dmg, effect.damageType ?? 'force', tp);
                     dmg = typed.finalDamage;
                     out.hpBefore = tp.hp;
-                    if (dmg > 0) engine.applyDamage(tp.id, dmg);
+                    const dying = dmg > 0 ? engine.applyDamage(tp.id, dmg) : undefined;
+                    if (dying) out.dying = dying;
                     const after = engine.getState()?.participants.find(p => p.id === tp.id);
                     out.hpAfter = after?.hp ?? 0;
                     out.defeated = out.hpAfter <= 0;
@@ -359,7 +363,7 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
                             }
                         }
                     }
-                    out.line = `💥 ${tp.name}: ${dmg} ${effect.damageType ?? 'force'}${typed.modifier !== 'normal' ? ` (${typed.modifier})` : ''} | ${out.hpBefore} → ${out.hpAfter} HP${out.defeated ? ' 💀 DEFEATED' : ''}`;
+                    out.line = `💥 ${tp.name}: ${dmg} ${effect.damageType ?? 'force'}${typed.modifier !== 'normal' ? ` (${typed.modifier})` : ''} | ${out.hpBefore} → ${out.hpAfter} HP${out.defeated ? (after && dying ? dyingTail(after, dying) : ' 💀 DEFEATED') : ''}${dying?.failuresAdded ? ` — hit while down: +${dying.failuresAdded} failed death save${dying.failuresAdded > 1 ? 's' : ''}` : ''}`;
                 } else if (effect.type === 'healing') {
                     out.rolled = rolled!.total;
                     out.hpBefore = tp.hp;

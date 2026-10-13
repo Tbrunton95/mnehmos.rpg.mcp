@@ -189,12 +189,15 @@ describe('pinned Open5e engine authority', () => {
         expect(created.maxHp).toBe(10);
         expect(created.languages).toEqual(['Common', 'Dwarvish']);
         expect(created._rules.species.abilityBonusesApplied).toBe(true);
+        // Play report 5 #8a: Darkvision is a sense on the sheet now (60 ft), so
+        // it is applied rather than listed as unsupported.
         expect(created._rules.species.appliedMechanics).toEqual(expect.arrayContaining([
-            'ability_score_increases', 'fixed_languages', 'max_hp_per_level'
+            'ability_score_increases', 'fixed_languages', 'max_hp_per_level', 'senses'
         ]));
-        expect(created._rules.species.unsupportedFeatureNames).toEqual(expect.arrayContaining([
-            'Darkvision', 'Dwarven Resilience'
-        ]));
+        expect(created._rules.species.senses).toEqual({ darkvisionFt: 60 });
+        expect(created.senses).toEqual({ darkvisionFt: 60 });
+        expect(created._rules.species.unsupportedFeatureNames).toEqual(expect.arrayContaining(['Dwarven Resilience']));
+        expect(created._rules.species.unsupportedFeatureNames).not.toContain('Darkvision');
         expect(created.statsNote).toBe('No stats given: 10 baseline + Hill Dwarf bonuses (+2 CON, +1 WIS).');
         expect(res.content[0].text).toContain('No stats given: 10 baseline + Hill Dwarf bonuses');
     });

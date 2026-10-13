@@ -9,7 +9,7 @@
  */
 import type Database from 'better-sqlite3';
 import { z } from 'zod';
-import { PartSchema, UnitSchema, ParticipantExtrasShape, nearbyMatchSchema, type AttackProfile, type Part } from '../schema/token-extras.js';
+import { PartSchema, UnitSchema, ParticipantExtrasShape, nearbyMatchSchema, sensesSchema, naturalArmorSchema, skillAdvantageTraitSchema, type AttackProfile, type Part } from '../schema/token-extras.js';
 import { expandCreatureTemplate, type CreaturePreset } from '../data/creature-presets.js';
 import { UNPRINTABLE_POOLS } from '../render/pda.js';
 import { scheduledWriteOpSchema } from './scheduled-ops.js';
@@ -325,6 +325,12 @@ export const RuleSpecSchemas = {
         speed: z.number().int().min(0).optional(),
         swimSpeed: ParticipantExtrasShape.swimSpeed,
         flySpeed: ParticipantExtrasShape.flySpeed,
+        /** Play report 5 #8a: senses the species is born with ({darkvisionFt: 60}); create copies them onto the sheet. */
+        senses: sensesSchema().optional(),
+        /** Play report 5 #8b: natural armour the species is born with ({base: 12, addDex: true}). */
+        naturalArmor: naturalArmorSchema().optional(),
+        /** Play report 5 #8c: conditional skill traits the species is born with (Keen Smell). */
+        skillAdvantage: z.array(skillAdvantageTraitSchema()).optional(),
         abilityBonuses: abilityBonusesSchema().optional(),
         languages: z.array(z.string()).default([]),
         traits: z.array(z.string()).default([]),
@@ -785,7 +791,8 @@ export function creatureToParticipant(spec: CreatureSpec, opts: { id: string; na
         species: spec.species,
         tags: spec.tags ? [...spec.tags] : undefined,
         swimSpeed: spec.swimSpeed,
-        flySpeed: spec.flySpeed
+        flySpeed: spec.flySpeed,
+        senses: spec.senses ? { ...spec.senses } : undefined
     };
     for (const [k, v] of Object.entries(optional)) if (v !== undefined) out[k] = v;
     return out;

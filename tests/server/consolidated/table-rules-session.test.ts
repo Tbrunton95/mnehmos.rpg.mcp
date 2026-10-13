@@ -91,7 +91,8 @@ describe('milestone XP, tiny status, principles at boot', () => {
         const got = tagJson((await handleCharacterManage({ action: 'get', characterId: 'luciel' }, ctx as any)).content[0].text, 'CHARACTER_MANAGE');
         expect(got.conditions.find((c: { name: string }) => c.name === 'Day 366 reset').source).toBe('Luciel is the Unclaimed Prince.');
         const miss = (await handleCharacterManage({ action: 'update', characterId: 'luciel', editConditions: [{ match: 'day 366', replaceSource: { find: 'Primarch', with: 'x' } }] }, ctx as any)).content[0].text;
-        expect(miss).toMatch(/not in the matched condition's source\. Nothing was written/);
+        // Play report 5 #10: the miss names the field, the other field, and what the condition holds.
+        expect(miss).toMatch(/'Primarch' is not in the source of 'Day 366 reset' nor in its name\. It holds: name 'Day 366 reset'; source 'Luciel is the Unclaimed Prince\.'\. Nothing was written/);
     });
 
     it('an ambiguous editConditions match names the candidates', async () => {

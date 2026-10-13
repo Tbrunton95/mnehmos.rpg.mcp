@@ -447,3 +447,63 @@ describe('math_manage consolidated tool', () => {
         });
     });
 });
+
+// Play report 5 #7: stealth disadvantage from worn armour. The sheet's worn
+// armour (src/engine/armor.ts wornArmour) with stealthDisadvantage puts every
+// Stealth check at disadvantage, named in the breakdown; Perception is not
+// touched; the opposed initiator rolls through the same composition.
+describe('math_manage: stealth disadvantage from worn armour (play report 5 #7)', () => {
+    const ctx = { sessionId: 'armour-stealth' };
+    let heroId: string;
+    let watcherId: string;
+    const roll = async (args: Record<string, unknown>) => parseResult(await handleMathManage(args, ctx));
+
+    beforeEach(async () => {
+        closeDb();
+        const db = getDb(':memory:');
+        const { CharacterRepository } = await import('../../../src/storage/repos/character.repo.js');
+        const { handleItemManage } = await import('../../../src/server/consolidated/item-manage.js');
+        const { handleInventoryManage } = await import('../../../src/server/consolidated/inventory-manage.js');
+        const { randomUUID } = await import('crypto');
+        const repo = new CharacterRepository(db);
+        const now = new Date().toISOString();
+        heroId = randomUUID(); watcherId = randomUUID();
+        for (const [id, name] of [[heroId, 'Hero'], [watcherId, 'Watcher']] as const) {
+            repo.create({ id, name, class: 'fighter', level: 1, race: 'human', hp: 10, maxHp: 10, ac: 11,
+                stats: { str: 14, dex: 12, con: 13, int: 10, wis: 11, cha: 10 }, currency: { gold: 0, silver: 0, copper: 0 }, speed: 30,
+                createdAt: now, updatedAt: now } as any);
+        }
+        const itemText = (await handleItemManage({ action: 'create', name: 'Scale mail', type: 'armor', properties: { baseAC: 14, armorCategory: 'medium', stealthDisadvantage: true } }, ctx)).content[0].text;
+        const scale = JSON.parse(itemText.match(/<!-- ITEM_MANAGE_JSON\n([\s\S]*?)\nITEM_MANAGE_JSON -->/)![1]).item.id;
+        await handleInventoryManage({ action: 'give', characterId: heroId, itemId: scale, quantity: 1 }, ctx);
+        await handleInventoryManage({ action: 'equip', characterId: heroId, itemId: scale, slot: 'armor' }, ctx);
+    });
+    afterEach(() => closeDb());
+
+    it('roll_skill_check stealth rolls 2d20kl1 and names the armour', async () => {
+        const data = await roll({ action: 'roll_skill_check', characterId: heroId, skill: 'stealth', dc: 10 });
+        expect(data.success).toBe(true);
+        expect(data.rolls).toHaveLength(2);
+        expect(data.natural).toBe(Math.min(...data.rolls));
+        expect(data.disadvantageSources).toEqual(['Scale mail (stealth disadvantage)']);
+        expect(data.breakdown).toContain('disadvantage ← Scale mail (stealth disadvantage)');
+        expect(data.contributions).toContainEqual({ label: 'DIS ← Scale mail (stealth disadvantage)', value: 0, lane: 'SHEET' });
+    });
+
+    it('perception is untouched, and a GM advantage cancels the armour to one die', async () => {
+        const perception = await roll({ action: 'roll_skill_check', characterId: heroId, skill: 'perception' });
+        expect(perception.rolls).toHaveLength(1);
+        expect(perception.disadvantageSources).toBeUndefined();
+        const cancelled = await roll({ action: 'roll_skill_check', characterId: heroId, skill: 'stealth', advantage: true });
+        expect(cancelled.rolls).toHaveLength(1);
+        expect(cancelled.disadvantageSources).toEqual(['Scale mail (stealth disadvantage)']);
+    });
+
+    it('the opposed initiator sneaking in armour rolls at disadvantage; the unarmoured watcher does not', async () => {
+        const data = await roll({ action: 'opposed', characterId: heroId, skill: 'stealth', targetId: watcherId, targetSkill: 'perception' });
+        expect(data.success).toBe(true);
+        expect(data.initiator.rolls).toHaveLength(2);
+        expect(data.initiator.disadvantageSources).toEqual(['Scale mail (stealth disadvantage)']);
+        expect(data.defender.rolls).toHaveLength(1);
+    });
+});

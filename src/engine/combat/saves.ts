@@ -123,13 +123,18 @@ export function rollCharacterSave(
     row: SheetLike,
     ability: string,
     dc: number,
-    opts: { purpose?: string; advantage?: boolean; disadvantage?: boolean; tool?: string } = {}
+    opts: { purpose?: string; advantage?: boolean; disadvantage?: boolean; tool?: string; extraBonus?: number } = {}
 ): ParticipantSaveResult {
     const long = toLongAbility(ability) ?? 'dexterity';
     const m = saveModifier(sheetSaveSource(db, row), long);
     const die = loggedD20(db, { purpose: opts.purpose ?? `${long} save`, forId: row.id }, { advantage: opts.advantage, disadvantage: opts.disadvantage, tool: opts.tool });
-    const total = die.natural + m.total;
-    return { ability: long, dc, rolls: die.rolls, natural: die.natural, modifier: m.total, total, saved: total >= dc, parts: [...m.parts] };
+    // Play report 5 #1: a situational bonus (cover on a DEX save) rides the modifier.
+    const extra = opts.extraBonus ?? 0;
+    const parts = [...m.parts];
+    if (extra) parts.push(`bonus ${extra >= 0 ? '+' : ''}${extra}`);
+    const modifier = m.total + extra;
+    const total = die.natural + modifier;
+    return { ability: long, dc, rolls: die.rolls, natural: die.natural, modifier, total, saved: total >= dc, parts };
 }
 
 /**
