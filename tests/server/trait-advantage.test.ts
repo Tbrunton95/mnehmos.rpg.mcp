@@ -372,4 +372,36 @@ describe('montage with a context tag', () => {
         expect(cancelled.advantageSources).toEqual(['Shadow Step (dim)']);
         expect(cancelled.disadvantageSources).toEqual(['Scale mail (stealth disadvantage)']);
     });
+
+    it("play report 6 #1: a proficient Survival montage rolls roll_skill_check's bonus (ability + proficiency) and prints the working", async () => {
+        // Varek at level 5, proficient in Survival: WIS +1, proficiency +3 → +4 either way.
+        new CharacterRepository(getDb()).update('varek', { level: 5, skillProficiencies: ['Survival'] } as any);
+        const check = await math({ action: 'roll_skill_check', characterId: 'varek', skill: 'survival', dc: 15, context: ['scent'], seed: 'montage-6' });
+        expect(check.bonus).toBe(4);
+        const m = await improv({ action: 'montage', characterId: 'varek', task: 'hunt across the moor', dc: 15, skill: 'survival', context: ['scent'], seed: 'montage-6' });
+        expect(m.success).toBe(true);
+        expect(m.advantageSources).toEqual(['Keen Smell (scent)']);
+        expect(m.total - m.roll).toBe(check.bonus);
+        expect(m).toMatchObject({ abilityModifier: 1, proficiency: 3, expertise: false, skillModifier: 4, skillSource: 'computed' });
+        expect(m.breakdown).toContain('wis +1');
+        expect(m.breakdown).toContain('proficiency +3');
+    });
+
+    it('play report 6 #1 review: proficient Stealth in stealthDisadvantage armour rolls the lower die with the full modifier, as roll_skill_check does', async () => {
+        new CharacterRepository(getDb()).update('varek', { skillProficiencies: ['Stealth'] } as any);
+        const { handleItemManage } = await import('../../src/server/consolidated/item-manage.js');
+        const { handleInventoryManage } = await import('../../src/server/consolidated/inventory-manage.js');
+        const scale = json(await handleItemManage({ action: 'create', name: 'Scale mail', type: 'armor', weight: 45, value: 50, properties: { baseAC: 14, armorCategory: 'medium', stealthDisadvantage: true } }, ctx)).item.id;
+        await handleInventoryManage({ action: 'give', characterId: 'varek', itemId: scale, quantity: 1 }, ctx);
+        await handleInventoryManage({ action: 'equip', characterId: 'varek', itemId: scale, slot: 'armor' }, ctx);
+        const check = await math({ action: 'roll_skill_check', characterId: 'varek', skill: 'stealth', dc: 10, seed: 'montage-6' });
+        expect(check.bonus).toBe(2);
+        const m = await improv({ action: 'montage', characterId: 'varek', task: 'sneak past the camp', dc: 10, skill: 'stealth', seed: 'montage-6' });
+        expect(m.advantageRoll).toMatchObject({ mode: 'lower kept' });
+        expect(m.roll).toBe(Math.min(...m.advantageRoll.rolls));
+        expect(m.disadvantageSources).toEqual(['Scale mail (stealth disadvantage)']);
+        expect(m.total - m.roll).toBe(check.bonus);
+        expect(m).toMatchObject({ abilityModifier: 0, proficiency: 2, skillModifier: 2, skillSource: 'computed' });
+        expect(m.breakdown).toEqual(expect.arrayContaining(['dex +0', 'proficiency +2', 'disadvantage ← Scale mail (stealth disadvantage)']));
+    });
 });

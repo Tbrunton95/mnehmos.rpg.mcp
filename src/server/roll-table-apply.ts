@@ -13,6 +13,7 @@ import { listRules, findPool, type RuleSpec, type TableRule } from '../engine/ta
 import { rollTable, type TableRoll, type RollTableEntry } from '../engine/roll-table.js';
 import { loggedRoller, type DiceRoller } from '../math/logged-d20.js';
 import { applyScheduledOps, type ScheduledWriteOp } from '../engine/scheduled-ops.js';
+import { commitScheduledWrites } from './scheduled-commit.js';
 import { applyGrowthFromPools, type GrowthReady, type GrowthApplied } from './growth.js';
 import type { HpMode } from '../engine/forms.js';
 import { CharacterRepository } from '../storage/repos/character.repo.js';
@@ -56,6 +57,8 @@ export interface AppliedEntry {
     gift?: { name: string; effectId?: number; refreshedExisting: boolean };
     condition?: string;
     writes?: string[];
+    /** Encounters whose live token took a part write. */
+    liveTokens?: string[];
     form?: Record<string, unknown>;
     killed?: true;
     corpseId?: string;
@@ -116,13 +119,17 @@ async function applyEntry(db: Database.Database, worldId: string, characterId: s
                 ...(spec.condition ? [{ op: 'add_condition' as const, name: spec.condition.name, ...(spec.condition.duration !== undefined ? { duration: spec.condition.duration } : {}), source: spec.condition.source ?? source }] : []),
                 ...(spec.writes ?? [])
             ];
-            const { applied, updates } = applyScheduledOps(char, ops, { defaultSource: source, reason: `${source}: ${entry.text}` });
+            const res = applyScheduledOps(char, ops, { defaultSource: source, reason: `${source}: ${entry.text}` });
+            const { updates } = res;
             if (spec.condition?.pinned && Array.isArray(updates.conditions)) {
                 updates.conditions = (updates.conditions as Array<{ name: string; pinned?: boolean }>).map(c => c.name === spec.condition!.name ? { ...c, pinned: true } : c);
             }
-            if (Object.keys(updates).length) repo.update(characterId, updates as never);
+            // Play report 6 #3: the shared commit step — sheet row, linked
+            // charges, part ops replayed onto every live token.
+            const commit = commitScheduledWrites(characterId, res, { repo });
             if (spec.condition) out.condition = spec.condition.name;
-            out.writes = applied;
+            out.writes = commit.applied;
+            if (commit.liveTokens.length) out.liveTokens = commit.liveTokens;
             if (updates.resourcePools) {
                 // Written first, so an auto growth step reads the new pool.
                 const g = await applyGrowthFromPools(db, worldId, characterId, char.resourcePools as never, updates.resourcePools as never, { depth: growthDepth, ...(roller ? { roller } : {}) });

@@ -9,7 +9,7 @@ import { PartSchema, UnitSchema, ReadiedSchema, ReadiedAttackSchema, PART_STATES
 import { hydrateExtras, type ExtrasRow } from '../../engine/combat/participant-extras.js';
 import { applyDyingConditions, wakeFromDying, tracksDeathSaves, dyingLabel, rowTracksDeathSaves, withDyingRowConditions, DEATH_SAVE_OUTCOMES, type RowCondition } from '../../engine/combat/dying.js';
 import { environmentGlyph } from '../../render/pda.js';
-import { upsertPart } from '../../engine/combat/parts.js';
+import { setPartOn, removePartFrom } from '../../engine/combat/parts.js';
 import { patchRowAbility, perRestSpentNote } from '../../engine/combat/abilities.js';
 import { volleyTier, describeUnit, breakTestDue, moraleModifiers, liveModels } from '../../engine/combat/units.js';
 import { sheetSpecies } from '../handlers/world-spell.js';
@@ -1542,29 +1542,29 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
             const p = state.participants.find(x => x.id === params.participantId);
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
-            if (params.state === 'latched') {
-                const held = (p.parts ?? []).find(x => x.name.toLowerCase() === params.part.toLowerCase());
-                // A part already latched keeps its hold when only the note or kind changes.
-                if (!params.latchedTo && !(held?.state === 'latched' && held.latchedTo)) return refuse('latched needs latchedTo {participantId, part?}');
-                if (params.latchedTo && !state.participants.some(x => x.id === params.latchedTo!.participantId)) return refuse(`latchedTo ${params.latchedTo.participantId} is not in this encounter`);
-            }
-            const prev = (p.parts ?? []).find(x => x.name.toLowerCase() === params.part.toLowerCase());
             // Merge, never replace: holds, ac, hp and any later part field
             // survive a state change. Leaving 'latched' releases the hold.
-            const parts = upsertPart(p.parts ?? [], {
-                name: params.part,
-                kind: params.kind ?? prev?.kind ?? 'other',
+            // Play report 6 #3: the merge rules live in setPartOn, shared with
+            // the scheduled set_part op; pure, so the refusals below cost nothing.
+            const write = setPartOn(p.parts ?? [], {
+                part: params.part,
                 state: params.state,
-                latchedTo: params.state === 'latched' ? (params.latchedTo ?? prev?.latchedTo) : undefined,
+                ...(params.kind !== undefined ? { kind: params.kind } : {}),
+                ...(params.latchedTo !== undefined ? { latchedTo: params.latchedTo } : {}),
                 ...(params.note !== undefined ? { note: params.note } : {}),
                 ...(params.holds !== undefined ? { holds: params.holds } : {}),
                 ...(params.ac !== undefined ? { ac: params.ac } : {}),
                 ...(params.hp !== undefined ? { hp: params.hp } : {}),
-                ...(params.maxHp !== undefined ? { maxHp: params.maxHp }
-                    : params.hp !== undefined && prev?.maxHp === undefined ? { maxHp: Math.max(1, params.hp) } : {}),
+                ...(params.maxHp !== undefined ? { maxHp: params.maxHp } : {}),
                 ...(params.breakAt !== undefined ? { breakAt: params.breakAt } : {})
             });
-            const next = parts.find(x => x.name.toLowerCase() === params.part.toLowerCase())!;
+            const prev = write.prev;
+            if (params.state === 'latched') {
+                // A part already latched keeps its hold when only the note or kind changes.
+                if (!params.latchedTo && !(prev?.state === 'latched' && prev.latchedTo)) return refuse('latched needs latchedTo {participantId, part?}');
+                if (params.latchedTo && !state.participants.some(x => x.id === params.latchedTo!.participantId)) return refuse(`latchedTo ${params.latchedTo.participantId} is not in this encounter`);
+            }
+            const { parts, next } = write;
             p.parts = parts;
             engine.refreshVessel(p);
             new EncounterRepository(getDb()).saveState(params.encounterId, state);
@@ -1587,8 +1587,8 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             const p = state.participants.find(x => x.id === params.participantId);
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
             const before = p.parts ?? [];
-            const after = before.filter(x => x.name.toLowerCase() !== params.part.toLowerCase());
-            if (after.length === before.length) return refuse(`${p.name} has no part '${params.part}' (parts: ${before.map(x => x.name).join(', ') || 'none'})`);
+            const { parts: after, removed } = removePartFrom(before, params.part);
+            if (!removed) return refuse(`${p.name} has no part '${params.part}' (parts: ${before.map(x => x.name).join(', ') || 'none'})`);
             p.parts = after;
             new EncounterRepository(getDb()).saveState(params.encounterId, state);
             const mirrored = params.mirrorToCharacter ? mirrorPartsToRow(p.id, after) : false;
