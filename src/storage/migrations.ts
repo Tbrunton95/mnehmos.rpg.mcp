@@ -1390,6 +1390,19 @@ function createPostMigrationIndexes(db: Database.Database) {
     db.exec('ALTER TABLE encounters ADD COLUMN notes TEXT;');
   }
 
+  // Play report 5 #8c: a scene states what the senses cannot do (sense_denial,
+  // a JSON array of {targetId?, senses: {scent: reason}}) and the wind
+  // ('from W'). Tagged checks read the latest scene at roll time.
+  const sceneColumns = db.prepare("PRAGMA table_info(scenes)").all() as { name: string }[];
+  if (sceneColumns.length && !sceneColumns.some(col => col.name === 'sense_denial')) {
+    console.error('[Migration] Adding sense_denial column to scenes table');
+    db.exec('ALTER TABLE scenes ADD COLUMN sense_denial TEXT;');
+  }
+  if (sceneColumns.length && !sceneColumns.some(col => col.name === 'wind')) {
+    console.error('[Migration] Adding wind column to scenes table');
+    db.exec('ALTER TABLE scenes ADD COLUMN wind TEXT;');
+  }
+
   // POI + rooms tables for travel_manage / spawn_preset_location / spawn_location
   // (camelCase columns to match the raw SQL in those handlers)
   db.exec(`

@@ -10,7 +10,7 @@ import type { AttackProfile, Part } from '../schema/token-extras.js';
 
 /** The sheet fields a form sets and a revert restores. */
 export const FORM_KEYS = [
-    'stats', 'hp', 'maxHp', 'ac', 'size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'attacksPerAction', 'attacks', 'abilities', 'cr',
+    'stats', 'hp', 'maxHp', 'ac', 'size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'senses', 'attacksPerAction', 'attacks', 'abilities', 'cr',
     'resistances', 'vulnerabilities', 'immunities', 'regeneration', 'band', 'parts',
     'legendaryActions', 'legendaryResistances'
 ] as const;
@@ -54,6 +54,8 @@ export function sheetFromCreature(spec: CreatureSpec): Partial<Record<FormKey, u
         speed: spec.movementSpeed,
         swimSpeed: spec.swimSpeed,
         flySpeed: spec.flySpeed,
+        // Play report 5 #8a: a form sees with the creature's senses; revert restores the sheet's.
+        senses: spec.senses ? { ...spec.senses } : undefined,
         attacksPerAction: spec.attacksPerAction,
         attacks,
         abilities: spec.abilities?.map(a => ({ ...a, ready: true })),

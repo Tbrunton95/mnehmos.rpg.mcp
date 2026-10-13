@@ -20,6 +20,11 @@ export const WorldEnvironmentSchema = z.object({
   // Play report 2, #14: where the party is, as free text ('Vorago docks').
   // The status block, boot and get_context show it when no room says otherwise.
   location: z.string().optional(),
+  // Play report 5 #5: how a dying tracked combatant's slot behaves on advance
+  // in this world: auto (the engine rolls the death save) | prompt (DEATH
+  // SAVE DUE, advance refused until death_save). A character's own
+  // combat_profile.deathSaveMode overrides it.
+  deathSaveMode: z.enum(['auto', 'prompt']).optional(),
 }).strict();
 
 export type WorldEnvironment = z.infer<typeof WorldEnvironmentSchema>;

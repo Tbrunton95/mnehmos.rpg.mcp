@@ -12,7 +12,7 @@ import { sameName } from './abilities.js';
 type ExtrasKey = 'size' | 'reach' | 'movementSpeed' | 'attackBonus' | 'attackDamage' | 'attackDamageType' |
     'attacksPerAction' | 'attacks' | 'abilities' | 'legendaryActions' | 'legendaryResistances' |
     'legendaryResistancesRemaining' | 'autoLegendaryResistance' | 'hasLairActions' | 'cr' |
-    'band' | 'regeneration' | 'parts' | 'ac' | 'species' | 'tags' | 'swimSpeed' | 'flySpeed' | 'vessel' | 'shields' | 'fightingStyle';
+    'band' | 'regeneration' | 'parts' | 'ac' | 'species' | 'tags' | 'swimSpeed' | 'flySpeed' | 'senses' | 'vessel' | 'shields' | 'fightingStyle' | 'ignoreCover' | 'deathSaves' | 'deathSaveMode';
 
 /** What hydrateExtras hands the token: every ability carries a boolean ready. */
 export type ExtrasOutput = Partial<Pick<CombatParticipant, ExtrasKey>>;
@@ -28,10 +28,10 @@ export type ExtrasRow = ExtrasInput & { parts?: Part[]; speed?: number; resource
 
 const ROW_KEYS = [
     'band', 'regeneration', 'parts', 'ac',
-    'size', 'reach', 'movementSpeed', 'swimSpeed', 'flySpeed', 'attackBonus', 'attackDamage', 'attackDamageType',
+    'size', 'reach', 'movementSpeed', 'swimSpeed', 'flySpeed', 'senses', 'attackBonus', 'attackDamage', 'attackDamageType',
     'attacksPerAction', 'attacks', 'abilities', 'legendaryActions', 'legendaryResistances',
     'legendaryResistancesRemaining', 'autoLegendaryResistance', 'hasLairActions', 'cr',
-    'species', 'tags', 'vessel', 'fightingStyle'
+    'species', 'tags', 'vessel', 'fightingStyle', 'ignoreCover', 'deathSaves', 'deathSaveMode'
 ] as const;
 
 /** The preset side: CreaturePreset names its fields differently. */

@@ -28,6 +28,32 @@ const EffectOnKnowerSchema = z.object({
     mechanics: z.array(EffectMechanicSchema).default([])
 });
 
+/**
+ * Play report 5 #9: the shape of one knower, in words a GM can act on. The
+ * SDK validates every tools/call against the registered schema before any
+ * tool code runs and prints the zod issue as is, so the only place these
+ * words can live is on the schema itself (invalid_type_error / errorMap).
+ */
+const ROAD_LIST = ROADS.join(' | ');
+const KNOWER_SHAPE = `each knower is an object {id, how, fromId?, note?, day?}; how is one of ${ROAD_LIST} (told needs fromId); e.g. knowers: [{id: 'luciel', how: 'witnessed'}, {id: 'vigil', how: 'told', fromId: 'luciel'}]`;
+const ONE_ROAD_FOR_ALL = `or give one road for all as bare ids: knowers: ['luciel', 'vigil'], how: 'witnessed'`;
+
+const KnowerSchema = z.object({
+    id: z.string({ required_error: `knowers: a knower needs id. ${KNOWER_SHAPE}`, invalid_type_error: `knowers: id must be a string. ${KNOWER_SHAPE}` }),
+    name: z.string().optional(),
+    // Optional on the element only so a bare id can borrow the call's
+    // top-level how; route() refuses a knower whose road is still missing.
+    // It never defaults: the road is written into NPC prompts as what they saw.
+    how: z.enum(ROADS, { errorMap: () => ({ message: `knowers: how must be one of ${ROAD_LIST}. ${KNOWER_SHAPE}` }) }).optional(),
+    fromId: z.string().optional(),
+    note: z.string().optional(),
+    day: z.number().optional()
+}, { invalid_type_error: `knowers: ${KNOWER_SHAPE}`, required_error: `knowers: ${KNOWER_SHAPE}` });
+// A bare string is an id; preprocess (not a union) so a missing inner field
+// keeps its own message instead of zod's bare 'Invalid input'.
+const KnowerElementSchema = z.preprocess(v => typeof v === 'string' ? { id: v } : v, KnowerSchema);
+type KnowerInput = z.infer<typeof KnowerSchema>;
+
 const KnowledgeInputSchema = z.object({
     action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
     worldId: z.string().describe('REQUIRED: knowledge is world-scoped'),
@@ -37,13 +63,14 @@ const KnowledgeInputSchema = z.object({
     effectOnKnower: EffectOnKnowerSchema.optional().describe('record: an effect every knower gains while they know it (applied on learn, removed on forget)'),
     knowerId: z.string().optional().describe('learn / what_knows / can_know / forget: the character or NPC id'),
     knowerName: z.string().optional().describe('learn: display name when the knower has no character row'),
-    how: z.enum(ROADS).optional().describe('learn: witnessed | told | position | deduced | read | rumour'),
-    fromId: z.string().optional().describe('learn how=told: who told them (must know it already)'),
+    how: z.enum(ROADS).optional().describe(`learn: ${ROAD_LIST}. record: one road for every knower given as a bare id (knowers: ['luciel', 'vigil'], how: 'witnessed'); a knower object's own how wins`),
+    fromId: z.string().optional().describe('learn how=told: who told them (must know it already). record: the teller for bare-id knowers told (must be listed ahead of them with its own road)'),
     note: z.string().optional().describe('learn: how exactly ("overheard in the Oszaverek quarter")'),
     day: z.number().optional().describe('learn: in-fiction day (default: the world clock)'),
-    knowers: z.array(z.object({
-        id: z.string(), name: z.string().optional(), how: z.enum(ROADS), fromId: z.string().optional(), note: z.string().optional(), day: z.number().optional()
-    })).optional().describe('record: who knows it from the start'),
+    // The array carries the shape too: knowers: 'luciel' (one bare string, no
+    // array) is the next slip after knowers: ['luciel'], and zod's own text
+    // for it ("Expected array, received string") never says what goes inside.
+    knowers: z.array(KnowerElementSchema, { invalid_type_error: `knowers: must be an array; ${KNOWER_SHAPE}; ${ONE_ROAD_FOR_ALL}` }).optional().describe(`record: who knows it from the start; ${KNOWER_SHAPE}; ${ONE_ROAD_FOR_ALL}`),
     sessionId: z.string().optional()
 });
 
@@ -95,7 +122,8 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
     const db = kdb();
     const now = new Date().toISOString();
     const fact = (key?: string) => key ? db.prepare('SELECT * FROM knowledge_facts WHERE world_id = ? AND key = ?').get(input.worldId, key) as FactRow | undefined : undefined;
-    const holders = (f: FactRow) => db.prepare('SELECT * FROM knowledge_holders WHERE fact_id = ? ORDER BY created_at').all(f.id) as HolderRow[];
+    // Knowers of one record call share a timestamp; rowid keeps the list order.
+    const holders = (f: FactRow) => db.prepare('SELECT * FROM knowledge_holders WHERE fact_id = ? ORDER BY created_at, rowid').all(f.id) as HolderRow[];
     const holderOf = (f: FactRow, id: string) => db.prepare('SELECT * FROM knowledge_holders WHERE fact_id = ? AND knower_id = ?').get(f.id, id) as HolderRow | undefined;
 
     // Item 14: an unstamped road takes the world day.
@@ -113,12 +141,30 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
 
     switch (input.action) {
         case 'record': case 'add': {
-            if (!input.key || !input.statement) return { error: true, message: 'record needs key and statement' };
-            if (fact(input.key)) return { error: true, message: `'${input.key}' already exists in this world; use learn to add knowers` };
+            if (!input.key || !input.statement) return { error: true, message: 'record needs key and statement', writes: 'none' };
+            if (fact(input.key)) return { error: true, message: `'${input.key}' already exists in this world; use learn to add knowers`, writes: 'none' };
+            // Play report 5 #9: every knower is checked BEFORE the fact is
+            // written, so a refusal here leaves nothing behind (the fact used
+            // to land first, and a retry was then refused as 'already exists').
+            // A bare id, or an object without how, takes the call's top-level
+            // how (and fromId for told); a road is never assumed.
+            const refuse = (message: string) => ({ error: true, actionType: 'record', message: `${message} Nothing was written.`, writes: 'none' });
+            const resolved: Array<KnowerInput & { how: string }> = [];
+            for (const [i, k] of ((input.knowers ?? []) as KnowerInput[]).entries()) {
+                const how = k.how ?? input.how;
+                if (!how) return refuse(`knowers[${i}] '${k.id}' needs how (its road to the fact). ${KNOWER_SHAPE}; ${ONE_ROAD_FOR_ALL}.`);
+                const fromId = k.fromId ?? (how === 'told' ? input.fromId : undefined);
+                if (how === 'told') {
+                    const who = k.name ?? nameOf(k.id);
+                    if (!fromId) return refuse(`told needs fromId: who told ${who}? Put it on the knower ({id: '${k.id}', how: 'told', fromId: '<teller>'}) or at the top level for bare ids.`);
+                    if (!resolved.some(r => r.id === fromId)) return refuse(`${nameOf(fromId)} does not know '${input.key}' (list the teller, with its own road, ahead of the one told), so could not have told ${who}.`);
+                }
+                resolved.push({ ...k, how, fromId });
+            }
             db.prepare('INSERT INTO knowledge_facts (id, world_id, key, statement, secrecy, effect, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
                 .run(`fact-${randomUUID().slice(0, 8)}`, input.worldId, input.key, input.statement, input.secrecy ?? 'secret', input.effectOnKnower ? JSON.stringify(input.effectOnKnower) : null, now);
             const f = fact(input.key)!;
-            const effects = (input.knowers ?? []).map(k => addHolder(f, k)).filter(Boolean);
+            const effects = resolved.map(k => addHolder(f, k)).filter(Boolean);
             return { success: true, actionType: 'record', key: f.key, statement: f.statement, secrecy: f.secrecy, knowers: holders(f).map(road), effects, message: `Recorded '${f.key}' with ${holders(f).length} knower(s)` };
         }
         case 'learn': case 'tell': {
@@ -176,7 +222,11 @@ export async function handleKnowledgeManage(args: unknown, _ctx: SessionContext)
         output += RichFormatter.embedJson(result, 'KNOWLEDGE_MANAGE');
         return { content: [{ type: 'text', text: output }] };
     } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
+        // Play report 5 #9: a schema miss reads as `path: message` lines (the
+        // messages carry the knower shape), not zod's JSON issue dump.
+        const msg = e instanceof z.ZodError
+            ? e.issues.map(i => `${i.path.join('.') || '(root)'}: ${i.message}`).join('; ')
+            : e instanceof Error ? e.message : String(e);
         return { content: [{ type: 'text', text: RichFormatter.error(msg) + RichFormatter.embedJson({ error: true, message: msg, writes: 'none' }, 'KNOWLEDGE_MANAGE') }] };
     }
 }
@@ -186,7 +236,7 @@ export const KnowledgeManageTool = {
     description: `Who knows what, and how they came to know it. Ask can_know before any character states a fact.
 
 Actions: record, learn, who_knows, what_knows, can_know, forget, list
-- record {worldId, key, statement, secrecy?, effectOnKnower?, knowers?}: a fact and who knows it from the start.
+- record {worldId, key, statement, secrecy?, effectOnKnower?, knowers?: [{id, how, fromId?, note?, day?}]}: a fact and who knows it from the start. Every knower needs a road (how); bare ids take one top-level how for all (knowers: ['luciel', 'vigil'], how: 'witnessed'). A refused knower writes nothing.
 - learn {worldId, key, knowerId, how: witnessed | told | position | deduced | read | rumour, fromId?, note?, day?}: told needs a teller who already knows (refused otherwise).
 - can_know {worldId, key, knowerId}: yes with the road, or "no road: they cannot state it".
 - who_knows {key} / what_knows {knowerId}: the spread of a secret, or one character's journal of what they know.

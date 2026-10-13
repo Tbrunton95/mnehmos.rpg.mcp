@@ -78,6 +78,20 @@ The Deep One campaign ran four days of fights outside the engine because its dic
 - **A key an action doesn't use is reported, not dropped.** Every consolidated tool now returns `ignoredParams` with the nearest valid key when a call carries one, including keys the tool never declared. Read it when a call "worked" but did nothing you asked.
 - **Custom items equip by slot.** `item_manage create {…, equipSlots: ['mainhand']}` (or `update {itemId, equipSlots}`); an equip refused for a missing slot prints the exact update call to run. Slots: mainhand, offhand, armor, head, feet, accessory, accessory2, accessory3.
 
+## After play report 5 (the boulder, the Bull's shove, Brenna on the ground)
+
+- **Cover is read from the map and printed.** `combat_action attack` adds +2 (half) or +5 (three-quarters) to the AC by itself from props with a cover rating and from creatures on the line of fire, and prints `AC 12 +5 (three-quarters, boulder) = 17`. State it with `cover: 'half'` when the map is silent or wrong, `cover: 'none'` to override; `combat_manage set_cover {participantId, level, against, reason}` for a token dug in for the fight. Total cover refuses the shot before anything is spent. DEX saves take it too (`apply_damage`, `use_ability`, `lair_action`, `cast_spell`). Never add it to `dc` as well. Guide: `docs/table-rules/cover.md`.
+- **Riders on area saves.** `apply_damage {…, save: {ability: 'dex', dc, onFail: {conditions: ['prone']}}}` applies the condition to every failing target in the same call; `onSuccess` the other way; `mirrorToCharacter: true` writes the sheet too.
+- **Shove.** `combat_action grapple {move: 'shove', push: 10 | prone: true, save?: {ability: 'str'}, bonusAction?: true}`. The push is forced movement on the grid and stops at the first blocked square; it provokes nothing. Push 10 is a labelled house rule.
+- **Goring Rush and other trigger-tied bonus attacks.** Put `bonusAction: true, requires: {dashed: true, movedAtLeast: 20}` on the profile; `dash {targetPosition}` moves in one call; the attack is refused with the exact gap when the trigger is not met.
+- **Non-lethal.** `attack {nonlethal: true}` (melee only). A drop is `[KNOCKED OUT — stable]`: no death saves, no corpse, no kill credit. Healing above 0 wakes them.
+- **Dying.** A named character (pc or npc row) at 0 HP is Unconscious + Prone and `DYING ✓0 ✗0`. `advance` into their slot rolls the death save itself and prints it; a nat 20 stops on them at 1 HP. `deathSaveMode: 'prompt'` (world environment or per character) holds the slot with `DEATH SAVE DUE` instead. `death_save {participantId, outcome?}` posts a table roll. A hit while down is a failure, two from 5 ft or on a crit; massive damage kills outright. Mooks still just die. Guide: `docs/table-rules/dying.md`.
+- **Stabilise.** `combat_action stabilize {encounterId, actorId, targetId}`: adjacent, an action, Medicine DC 10; a healer's kit (`properties.healersKit: true`) or Spare the Dying makes it automatic. The 1 HP after 1d4 hours is filed on the world clock and fires with `world_manage advance {fireScheduled: true}`. Outside a fight `apply_damage` says DYING and prints the stabilise call.
+- **Custom armour in any spelling.** `item_manage create {type: 'armor', properties: {baseAc: 13, maxDexBonus: 2}}` is stored canonically and equips at 14 on DEX 12; the equip reply explains the AC and warns when a base is unreadable, with the fix.
+- **Senses and natural armour are data.** `character_manage update {senses: {darkvisionFt: 60}}`; `spatial_manage look` sees a DARKNESS room with them. `naturalArmor: {base: 12, addDex: true}` is the floor worn armour must beat.
+- **Keen Smell is a trait, not a condition.** `character_manage update {skillAdvantage: [{name: 'Keen Smell', skills: ['perception', 'survival'], when: 'scent', passiveBonus: 5}], removeConditions: ['Keen Smell']}`. Tag the check: `math_manage roll_skill_check {…, context: ['scent']}`; deny it before the roll with `scene_manage set {senseDenial: {scent: '<reason>'}}`. The status block shows passive Perception (scent). Guide: `docs/table-rules/senses-and-traits.md`.
+- **Two refusals now explain themselves.** `knowledge_manage record` with a bare string knower prints the knower shape and takes `knowers: ['luciel', 'vigil'], how: 'witnessed'` as a shorthand (never assuming a road; a refused knower writes no fact). `editConditions` with a `find` that lives in the source prints the exact `replaceSource` call to paste.
+
 ## Never do these
 
 - **Never fake a result with a huge `attackBonus`.** Post it with `outcome`.
@@ -91,6 +105,8 @@ The Deep One campaign ran four days of fights outside the engine because its dic
 - **Never narrate Luciel's choices, thoughts or words.**
 - **Never work around a refusal.** It is a rule; say so in the fiction.
 - **Never read whole sheets when you need two numbers.** Add `fields: ['hp', 'conditions']` or `output_mode: 'summary'`.
+- **Never add cover to `dc` or `declaredModifiers` as well.** Pass `cover` once, or let the map decide; the breakdown prints the arithmetic either way.
+- **Never kill a knocked-out or dying character by hand.** Three failed saves or massive damage run the kill; a knockout is stable until healed or hit again.
 
 ## Quick reference
 
@@ -234,3 +250,31 @@ The Deep One campaign ran four days of fights outside the engine because its dic
 | A validation error names a key you did not send | read `unknownParams` and the issue's "you sent 'nmae'; did you mean 'name'?" — nothing was written |
 | Chair wants only two fields but must still see dropped keys | `any_tool {..., fields: ['worldId']}` — `ignoredParams` rides along with success/error/actionType/message |
 | An action should accept stray keys quietly (rare) | set `unknownKeys: 'strip'` on that action's definition (or on its createActionRouter config) |
+| A shot at a foe behind a boulder, a wall or another creature | `combat_action attack {encounterId, actorId, targetId}` reads the map's cover (`AC 12 +5 (three-quarters, boulder) = 17`); `cover: 'half'` when the map is silent, `cover: 'none'` to override |
+| A token digs in behind rubble for the fight | `combat_manage set_cover {encounterId, participantId, level: 'three-quarters', against: ['fg-handguns'] or {direction: 'west'}, reason}`; `clear_cover` when it leaves; `attack {breaksCover: true}` when it charges out |
+| Nothing can reach the target (closed door, full wall) | the engine refuses (`refused: total cover (rubble crest) from fg-crossbows … Nothing was rolled or spent`); for an area that gets round it pass `cover: {id: 'none'}` (`coverByTarget` on `cast_spell`) |
+| A breath weapon, rockslide or Fireball against covered targets | `combat_manage apply_damage / use_ability / lair_action {…, save: {ability: 'dex', dc}, cover: {grot: 'half'}}`, `cast_spell {…, coverByTarget}`: +2/+5 on the DEX save, printed |
+| A Sharpshooter or Spell Sniper on the sheet | `character_manage update {characterId, ignoreCover: {ranged: 'half-and-three-quarters'}}` or `{spells: …}`; or `ignoreCover` on the attack profile |
+| The player asks whether they can hide | `combat_manage get` prints `🫥 can hide from Grot (…)` per token; `set_environment {light: 'darkness'}` for a dark room (darkvision tokens still see) |
+| A failed save should knock them prone or bury them | `combat_manage apply_damage {…, save: {ability: 'dex', dc: 15, onFail: {conditions: ['prone', {name: 'Buried', source: 'rockslide'}], mirrorToCharacter: true}}}` |
+| A shove pushes the foe back | `combat_action grapple {action: 'grapple', move: 'shove', encounterId, actorId, targetId, push: 10}` (`prone: true` to floor it instead); reply `pushed {feet, from, to, stoppedBy?}` |
+| A shove by STR save (Hammering Horns, Shield Master) | `combat_action grapple {move: 'shove', …, save: {ability: 'str'}, bonusAction: true}`; dc defaults to 8 + prof + STR |
+| Goring Rush after a charge | `combat_action dash {encounterId, actorId, targetPosition: {x, y}}` then `attack {…, using: 'Goring Rush'}` with `bonusAction: true, requires: {dashed: true, movedAtLeast: 20}` on the profile; a refusal names the gap |
+| Knock a foe out instead of killing | `combat_action attack {…, nonlethal: true}` (melee only); `[KNOCKED OUT — stable]`, no death saves, no corpse; `heal` or `adjust_hp` above 0 wakes them (`woke`) |
+| A named character drops to 0 HP | nothing: Unconscious + Prone and `[DYING ✓0 ✗0]` are applied; `combat_manage get` shows 🩸 DYING ✓s ✗f |
+| Their turn comes up | `combat_manage advance {encounterId}` rolls and prints the save; a nat 20 stops on them at 1 HP. Prompt mode: `death_save {encounterId, participantId}` first |
+| The table rolled the save itself | `combat_manage death_save {encounterId, participantId, outcome: 'nat20' \| 'success' \| 'failure' \| 'nat1' \| 1-20}` |
+| A healer reaches the body | `combat_action stabilize {encounterId, actorId, targetId}` (adjacent, action, Medicine DC 10; kit or Spare the Dying automatic); the 1 HP fires with `world_manage advance {worldId, hours, fireScheduled: true}` |
+| Someone is dropped outside a fight | `combat_manage apply_damage {targetIds, dice, source}` says DYING; then `combat_action stabilize {actorId, targetId}` or heal above 0 |
+| Hold the slot instead of auto-rolling | `world_manage update {worldId, environment: {deathSaveMode: 'prompt'}}`; per character `character_manage update {characterId, deathSaveMode: 'prompt'}`; `deathSaves: false` makes a location NPC just die at 0 |
+| A GM types baseAc on a mail shirt | `item_manage create {name, type: 'armor', properties: {baseAc: 13, maxDexBonus: 2}}` is stored as baseAC (`aliased` in the reply); `inventory_manage equip` derives 14 on DEX 12 and explains it |
+| Sneaking in scale mail | `math_manage roll_skill_check {characterId, skill: 'stealth'}` rolls at disadvantage by itself, named in the breakdown |
+| A character sees in the dark | `character_manage update {characterId, senses: {darkvisionFt: 60}}`; `spatial_manage look` returns a DARKNESS room as dim light (`seenWith`, `visionNote`) |
+| A thick hide | `character_manage update {characterId, naturalArmor: {base: 12, addDex: true}}`; worn armour must beat it, shields add on top |
+| Keen Smell as a trait | `character_manage update {characterId, skillAdvantage: [{name: 'Keen Smell', skills: ['perception', 'survival'], when: 'scent', passiveBonus: 5}], removeConditions: ['Keen Smell']}` |
+| A scent-based check, or tracking by scent | `math_manage roll_skill_check {characterId, skill: 'perception' \| 'survival', dc, context: ['scent']}`; `improvisation_manage montage {…, skill: 'survival', context: ['scent']}` |
+| The wind is wrong, or smoke fills the hollow | `scene_manage set {worldId, senseDenial: {scent: 'wind from the east carries everything away'}}` (scene-wide) or `{targetId, scent: 'buried in peat-smoke'}`; `wind: 'from W'` lets the engine place upwind and downwind |
+| Someone sneaks past Varek | `math_manage opposed {characterId: hider, skill: 'stealth', targetId: 'varek', targetSkill: 'perception'}`: a Stealth total below passive Perception (scent) 16 is noticed unless scent is denied |
+| Record a fact several people saw | `knowledge_manage record {worldId, key, statement, knowers: ['luciel', 'inquisitor'], how: 'witnessed'}` (bare ids share the top-level how; a knower object's own how wins; told takes `fromId`) |
+| A condition edit is refused as 'not in the name' | read the refusal: it prints the `replaceSource` (or `replace`) call that hits, with your match and with; a case-only miss shows the casing that is there |
+| Edit text that lives in a condition's source | `character_manage update {characterId, editConditions: [{match: 'oath', replaceSource: {find: 'Karanak', with: 'the Mouth'}}]}` (match reads names only; find is case-sensitive) |

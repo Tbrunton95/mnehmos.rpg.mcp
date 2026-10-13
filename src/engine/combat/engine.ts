@@ -1,4 +1,4 @@
-import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile, Buff, VesselProfile, Shields, FightingStyle } from '../../schema/token-extras.js';
+import type { Part, Unit, Readied, AttackProfile, Ability as AbilityProfile, Buff, VesselProfile, Shields, FightingStyle, Senses } from '../../schema/token-extras.js';
 import { fightingStyleEffects } from './fighting-style.js';
 import { absorbWithShields, roleState, sectionRole } from './vessel.js';
 import { damageWithModifiers } from './damage-modifiers.js';
@@ -7,7 +7,11 @@ import { CombatRNG, CheckResult } from './rng.js';
 import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS, conditionAttackModifiers, conditionSpeedFactor } from './conditions.js';
 
 import { SizeCategory, GridBounds, edgeDistanceSquares, effectiveReachFt, type EncounterEnvironment } from '../../schema/encounter.js';
+import { resolveCover, coverArithmetic, ignoredCoverLine, totalCoverRefusal, ignoreCoverFor, type CoverResolution, type StandingCover, type IgnoreCoverScopes, type IgnoreCover } from './cover.js';
 import { mobAttackBonus } from './units.js';
+import { nonlethalSource, isNonlethalUnconscious, clearNonlethalUnconscious } from './nonlethal.js';
+import { applyDeathSaveOutcome, damageAtZero, deathSaveCall, dyingLabel, dyingTail, isDying, outcomeOfRoll, wakeFromDying, markStable, counters as deathCounters, type DeathSaveMode, type DeathSaveOutcome, type DeathSaveResult, type DyingUpdate } from './dying.js';
+export type { DeathSaveResult, DyingUpdate, DeathSaveMode, DeathSaveOutcome } from './dying.js';
 
 /**
  * Character interface for combat participants
@@ -39,6 +43,7 @@ export interface CombatParticipant {
     movementSpeed?: number;       // Base speed in feet (default 30)
     swimSpeed?: number;           // Swim speed in feet: the budget underwater (else half movementSpeed)
     flySpeed?: number;            // Fly speed in feet
+    senses?: Senses;              // Play report 5 #8a: senses in feet (darkvision, blindsight, tremorsense, truesight), from the sheet; display and hiding read them
     movementRemaining?: number;   // Remaining movement this turn (in feet)
     size?: SizeCategory;          // Creature size for footprint calculation
     hasDashed?: boolean;          // Whether dash action was used this turn
@@ -87,6 +92,12 @@ export interface CombatParticipant {
     deathSaveFailures?: number;   // 0-3, 3 = dead
     isStabilized?: boolean;       // Unconscious but won't die
     isDead?: boolean;             // Permanently defeated
+    // Play report 5 #5 (dying): who tracks death saves and how the slot behaves.
+    deathSaves?: boolean;         // Tracks death saves at 0 HP (hydrated from the character row: pc/npc yes, enemy no; combat_profile.deathSaves overrides). Unset = a mook: dies at 0
+    deathSaveMode?: DeathSaveMode; // auto (the engine rolls on advance) | prompt (DEATH SAVE DUE, advance refused until rolled); unset = the world's environment.deathSaveMode, else auto
+    deathSaveRound?: number;      // The round the last death save was rolled or posted in
+    deathSaveDue?: boolean;       // Prompt mode: its slot is up and the save has not been rolled
+    deathSaveTaken?: boolean;     // A save rolled or posted by hand (death_save) before the slot: it is that slot's save, the engine rolls no second one
     // COMBAT STATS (Auto-resolution)
     /**
      * Armor Class. Used by the attack resolver. If omitted, the engine falls
@@ -110,6 +121,14 @@ export interface CombatParticipant {
     buffs?: Buff[];                  // Battle-cry buffs (combat_manage battle_cry)
     fightingStyle?: FightingStyle;   // Item 17: applied by executeAttack on its attacks (defense: by the handler on attacks against it)
     lastMeleeMisses?: Array<{ attackerId: string; round: number }>; // Item 16: who missed this token in melee this round (riposte)
+    // Play report 5 #1: standing cover (combat_manage set_cover), the round an attack with breaksCover dropped it, and a feature that ignores cover.
+    cover?: StandingCover;
+    coverBrokenRound?: number;
+    ignoreCover?: IgnoreCoverScopes;
+    // Play report 5, item 3: per-turn movement and hits for trigger-tied attacks (Goring Rush).
+    movedThisTurn?: number;          // Feet walked this turn (the move handler adds them; reset at turn start)
+    movedSinceDash?: number;         // Feet walked since this turn's Dash (Dash resets it; requires.dashed + movedAtLeast reads it)
+    meleeHitsThisTurn?: string[];    // Targets this token hit in melee this turn (requires.hitThisTurn)
     // REQUEST 5: the void-combat lane (a token made from a create_vessel row)
     vessel?: VesselProfile;          // Section roles, shield regen; marks the token a vessel
     shields?: Shields;               // Drained before the hull; regen at the start of its turn
@@ -187,9 +206,20 @@ export interface CombatActionResult {
     // Item 16: extra dice rolled on a hit (a superiority die), doubled on a crit,
     // added before resistance; never touched by great weapon fighting.
     extraDamage?: Array<{ label: string; dice: string; rolls: number[]; total: number }>;
+    // Play report 5 #1: the cover on this attack: the AC arithmetic, or `ignored` on a posted outcome (no roll) or when a feature lifted it.
+    cover?: Omit<CoverResolution, 'ignored'> & { acBefore?: number; acAfter?: number; ignored?: string | CoverResolution['ignored'] };
     
+    // Play report 5, item 4: a non-lethal blow dropped the target — Unconscious
+    // (sourced 'nonlethal: <actor>') and stable; no death saves, no kill, no corpse.
+    knockedOut?: { by: string; stable: true };
+    // A heal from 0 removed these (the knockout's Unconscious) from the target.
+    woke?: { conditionsRemoved: string[] };
+
     // Heal specifics (if type === 'heal')
     healAmount?: number;
+    // Play report 5 #5: what this blow did to a tracked target at or into 0 HP
+    // (dropped, failed saves added, massive damage, the counters after).
+    dying?: DyingUpdate;
     
     // Status
     success: boolean;
@@ -217,18 +247,15 @@ export interface LegendaryResistanceResult {
 }
 
 /**
- * MED-003: Result of a death saving throw
+ * Play report 5 #5: a death save the engine rolled (or a posted one applied)
+ * while advancing into a dying slot, for the handler to print and to run
+ * the kill on. The outcome line is in turnStartNotes too.
  */
-export interface DeathSaveResult {
-    roll: number;           // d20 result
-    isNat20: boolean;       // Regain 1 HP
-    isNat1: boolean;        // Counts as 2 failures
-    success: boolean;       // 10+ = success
-    successes: number;      // Total successes (0-3)
-    failures: number;       // Total failures (0-3)
-    isStabilized: boolean;  // 3 successes
-    isDead: boolean;        // 3 failures
-    regainedHp: boolean;    // Nat 20 - character is conscious again
+export interface DeathSaveEvent extends DeathSaveResult {
+    participantId: string;
+    name: string;
+    round: number;
+    note: string;
 }
 
 export interface EventEmitter {
@@ -247,6 +274,10 @@ export interface EventEmitter {
 export class CombatEngine {
     /** What happened at the start of the new turn (regeneration), for the advance output. */
     turnStartNotes: string[] = [];
+    /** Play report 5 #5: the death saves the last advance rolled on dying slots it passed (or stopped at). */
+    deathSaveEvents: DeathSaveEvent[] = [];
+    /** The world's default death-save mode for the advance in progress (handler-supplied; auto when unset). */
+    private deathSaveModeDefault: DeathSaveMode | undefined;
     private rng: CombatRNG;
     private state: CombatState | null = null;
     private emitter?: EventEmitter;
@@ -255,9 +286,13 @@ export class CombatEngine {
      * @param seed a seed string for a replayable (seeded) stream, or
      * `{ mode: 'crypto' }` for crypto dice: the default for play.
      */
+    /** The encounter this engine runs (the handlers construct it with the id; the DEATH SAVE DUE call quotes it). */
+    encounterId: string | undefined;
+
     constructor(seed: string | { mode: 'crypto' }, emitter?: EventEmitter) {
         this.rng = new CombatRNG(seed);
         this.emitter = emitter;
+        if (typeof seed === 'string' && seed) this.encounterId = seed;
     }
 
     /** A CombatEngine on crypto dice. */
@@ -832,12 +867,21 @@ export class CombatEngine {
         // added before resistance; attackBonusDie is rolled after the d20 and
         // folded into the total (onlyIfMiss: only when the swing missed and
         // not on a natural 1; maxMissBy: only when the die could make it up).
+        // Play report 5 #1: cover. `cover` is the resolution the caller
+        // already made (an explicit value, or standing/computed); unset, the
+        // engine resolves standing and computed cover itself, lifting what the
+        // attacker's ignoreCover names. Total cover refuses before anything is
+        // spent. The bonus is added to dc here, so every path (attack, volley,
+        // opportunity, readied, legendary) prints the same arithmetic.
+        // Play report 5: nonlethal knocks out instead of defeating (melee only).
         partOpts?: {
             withPart?: string; atPart?: string; uncapped?: boolean; ranged?: boolean; ignoreConditions?: boolean; opportunity?: boolean;
+            nonlethal?: boolean;
             bandScale?: { steps: number; multiplier: number };
             fightingStyle?: FightingStyle; twoHanded?: boolean; offhand?: boolean; dualWielding?: boolean; reachFt?: number;
             extraDamageDice?: Array<{ dice: string; label: string }>;
             attackBonusDie?: { dice: string; label: string; onlyIfMiss?: boolean; maxMissBy?: number };
+            cover?: CoverResolution; ignoreCover?: IgnoreCoverScopes | IgnoreCover;
         }
     ): CombatActionResult {
         if (!this.state) throw new Error('No active combat');
@@ -877,9 +921,47 @@ export class CombatEngine {
             throw new Error(`${actor.name} is underwater: ranged attacks are refused here (combat_manage set_environment {rangedAllowed: true} to allow them). Nothing was spent.`);
         }
 
+        // Play report 5 #1: cover, resolved before anything is spent. Total
+        // cover refuses the attack outright (writes: none); half and
+        // three-quarters raise the AC with the arithmetic printed; a posted
+        // outcome rolls nothing, so the cover is reported as ignored.
+        const situational: string[] = [];
+        const coverLane: 'ranged' | 'melee' = (partOpts?.ranged ?? (actor.position && target.position
+            ? edgeDistanceSquares(actor, target) * 5 > effectiveReachFt(actor, partOpts?.reachFt !== undefined ? { reachFt: partOpts.reachFt } : undefined)
+            : false)) ? 'ranged' : 'melee';
+        const coverRes = partOpts?.cover ?? resolveCover(this.state, actor, target, { ignoreCover: ignoreCoverFor(partOpts?.ignoreCover ?? actor.ignoreCover, coverLane) });
+        if (coverRes.kind === 'total') throw totalCoverRefusal(coverRes, actor.name, target.name);
+        let coverInfo: CombatActionResult['cover'];
+        if (resolved) {
+            coverInfo = { ...coverRes, acBonus: 0, ...(coverRes.kind !== 'none' ? { ignored: 'posted outcome: no roll, the AC was not used' } : {}) };
+        } else if (coverRes.acBonus > 0) {
+            const acBefore = dc;
+            dc += coverRes.acBonus;
+            coverInfo = { ...coverRes, acBefore, acAfter: dc };
+            situational.push(`cover: ${coverArithmetic('AC', acBefore, coverRes)}`);
+        } else {
+            coverInfo = { ...coverRes, acBefore: dc, acAfter: dc };
+            const lifted = ignoredCoverLine(coverRes, actor.name);
+            if (lifted) situational.push(lifted);
+        }
+        for (const note of coverRes.notes ?? []) situational.push(note);
+        // Play report 5, item 4: a non-lethal blow is melee only (5e). The
+        // handler refuses an explicit ranged flag; a shot the grid infers
+        // (beyond the attacker's reach with no flag) is refused here, before
+        // Help or anything else is spent.
+        if (partOpts?.nonlethal) {
+            const apart = actor.position && target.position ? edgeDistanceSquares(actor, target) * 5 : undefined;
+            const reach = effectiveReachFt(actor, partOpts.reachFt !== undefined ? { reachFt: partOpts.reachFt } : undefined);
+            const gridRanged = partOpts.ranged ?? (apart !== undefined ? apart > reach : false);
+            if (gridRanged) {
+                const refusal = new Error(`${actor.name} cannot knock ${target.name} out from there: non-lethal blows are melee only (5e) and this attack is ranged${partOpts.ranged === undefined && apart !== undefined ? ` (${apart} ft apart, reach ${reach} ft)` : ''}. Nothing was spent.`) as Error & { writes?: string };
+                refusal.writes = 'none';
+                throw refusal;
+            }
+        }
+
         // Dodge and Help feed the roll. Help is spent by the attack even when
         // the GM posts the result.
-        const situational: string[] = [];
         if (target.isDodging) { disadvantage = true; situational.push(`${target.name} is dodging (disadvantage)`); }
         if (actor.helpedBy) {
             advantage = true;
@@ -1030,6 +1112,11 @@ export class CombatEngine {
             const round = this.state.round;
             target.lastMeleeMisses = [...(target.lastMeleeMisses ?? []).filter(m => m.round === round && m.attackerId !== actor.id), { attackerId: actor.id, round }];
         }
+        // Play report 5: a melee hit is remembered on the attacker for the turn
+        // (requires.hitThisTurn on a follow-up attack).
+        if (attackRoll.isHit && !styleRanged) {
+            actor.meleeHitsThisTurn = [...(actor.meleeHitsThisTurn ?? []).filter(id => id !== target.id), target.id];
+        }
 
         let damageDealt = 0;
         let damageModifier: 'immune' | 'resistant' | 'vulnerable' | 'normal' = 'normal';
@@ -1131,7 +1218,30 @@ export class CombatEngine {
             this.refreshVessel(target);
         }
 
+        // Play report 5, item 4: a non-lethal blow that drops the body leaves
+        // it at 0, Unconscious (sourced to the attacker) and stable — no death
+        // saves; the handler credits no kill and makes no corpse. An
+        // Unconscious from another source (a sleep spell) is left alone.
+        let knockedOut: CombatActionResult['knockedOut'];
+        if (partOpts?.nonlethal && attackRoll.isHit && !partHit && hpBefore > 0 && target.hp <= 0) {
+            knockedOut = { by: actor.id, stable: true };
+            target.isStabilized = true;
+            target.deathSaveSuccesses = 0;
+            target.deathSaveFailures = 0;
+            if (!target.conditions.some(isNonlethalUnconscious)) {
+                this.applyCondition(target.id, { type: ConditionType.UNCONSCIOUS, durationType: DurationType.PERMANENT, sourceId: nonlethalSource(actor.id) });
+            }
+        }
+
         const defeated = target.hp <= 0;
+        // Play report 5 #5: a tracked target dropped to 0 goes unconscious and
+        // prone; one already down takes a failed save, two on a crit or any
+        // melee hit (within 5 ft: the unconscious are auto-crit when rolled; a
+        // posted hit from 5 ft counts the same). Massive damage kills outright.
+        // A non-lethal knockout is never a dying event: the GM chose to subdue, so no counters, no massive-damage death.
+        const dying: DyingUpdate | undefined = attackRoll.isHit && damageDealt > 0 && !knockedOut
+            ? damageAtZero(target, hpBefore, damageDealt, { crit: attackRoll.isCrit, melee: !partOpts?.ranged && (actor.position && target.position ? edgeDistanceSquares(actor, target) <= 1 : true) })
+            : undefined;
 
         // Build detailed breakdown
         const diceShown = attackRoll.allRolls.length > 1
@@ -1174,8 +1284,9 @@ export class CombatEngine {
             }
             breakdown += `   ${target.name}: ${hpBefore} → ${target.hp}/${target.maxHp} HP`;
             if (defeated) {
-                breakdown += ` [DEFEATED]`;
+                breakdown += knockedOut ? ` [KNOCKED OUT — stable]` : dying ? dyingTail(target, dying) : ` [DEFEATED]`;
             }
+            if (dying?.failuresAdded) breakdown += `\n   🩸 hit while down: +${dying.failuresAdded} failed death save${dying.failuresAdded > 1 ? 's' : ''}${attackRoll.isCrit ? ' (crit)' : ''}`;
         }
 
         if (situational.length) breakdown += `\n   ⚖️ ${situational.join('; ')}`;
@@ -1186,7 +1297,7 @@ export class CombatEngine {
             message = partHit
                 ? `${attackRoll.isCrit ? 'CRITICAL ' : ''}HIT! ${actor.name} deals ${partHit.damage} damage to ${target.name}'s ${partHit.name}${partHit.broken ? ' [SEVERED]' : ''}`
                 : `${attackRoll.isCrit ? 'CRITICAL ' : ''}HIT! ${actor.name} deals ${damageDealt} damage to ${target.name}`;
-            if (defeated) message += ' [DEFEATED]';
+            if (defeated) message += knockedOut ? ' [KNOCKED OUT — stable]' : dying ? ` [${dyingLabel(target) ?? 'DEFEATED'}${dying.instantDeath ? ' — massive damage' : ''}]` : ' [DEFEATED]';
         } else {
             message = `MISS! ${actor.name}'s attack misses ${target.name}`;
         }
@@ -1211,6 +1322,7 @@ export class CombatEngine {
             actor: { id: actor.id, name: actor.name },
             target: { id: target.id, name: target.name, hpBefore, hpAfter: target.hp, maxHp: target.maxHp },
             attackRoll,
+            ...(coverInfo ? { cover: coverInfo } : {}),
             damage: damageDealt,
             damageRolls: capturedDamageRolls,
             damageType,   // Findings #40: the AP-vs-expanding lane and every resistance list key off it
@@ -1228,12 +1340,14 @@ export class CombatEngine {
             ...(attackBonusDie ? { attackBonusDie } : {}),
             ...(attackBonusDieSkipped ? { attackBonusDieSkipped } : {}),
             ...(extraDamage ? { extraDamage } : {}),
+            ...(knockedOut ? { knockedOut } : {}),
             success: attackRoll.isHit,
             defeated,
             message,
             detailedBreakdown: breakdown,
             ...(situational.length ? { situational } : {}),
-            ...(partHit ? { partHit } : {})
+            ...(partHit ? { partHit } : {}),
+            ...(dying ? { dying } : {})
         };
     }
 
@@ -1278,10 +1392,13 @@ export class CombatEngine {
         const hpBefore = target.hp;
         const actualHeal = Math.min(amount, target.maxHp - target.hp);
         target.hp = Math.min(target.maxHp, target.hp + amount);
+        // Coming back above 0 clears the death-save track and wakes a knockout.
+        const woke = hpBefore <= 0 && target.hp > 0 ? this.riseFromZero(target) : [];
 
         const breakdown = `💚 Heal: ${amount} HP\n` +
             `   ${target.name}: ${hpBefore} → ${target.hp}/${target.maxHp} HP\n` +
-            (actualHeal < amount ? `   (${amount - actualHeal} HP wasted - at max)` : '');
+            (actualHeal < amount ? `   (${amount - actualHeal} HP wasted - at max)` : '') +
+            (woke.length ? `\n   💤→👁 ${target.name} comes round (${woke.join(', ')} cleared)` : '');
 
         const message = `${actor.name} heals ${target.name} for ${actualHeal} HP`;
 
@@ -1300,11 +1417,32 @@ export class CombatEngine {
             actor: { id: actor.id, name: actor.name },
             target: { id: target.id, name: target.name, hpBefore, hpAfter: target.hp, maxHp: target.maxHp },
             healAmount: actualHeal,
+            ...(woke.length ? { woke: { conditionsRemoved: woke } } : {}),
             success: true,
             defeated: false,
             message,
             detailedBreakdown: breakdown
         };
+    }
+
+    /**
+     * MED-003 / play report 5: a participant that comes back above 0 starts
+     * the death-save track fresh, is no longer "stable", and a non-lethal
+     * knockout's Unconscious leaves (an Unconscious from another source stays).
+     * Returns the condition types removed.
+     */
+    private riseFromZero(participant: CombatParticipant): string[] {
+        // Play report 5 #4/#5: both counters, the stable and due flags and the
+        // dying Unconscious go (prone stays until they stand); a knockout's
+        // Unconscious goes too and is the list the reply names.
+        wakeFromDying(participant);
+        return clearNonlethalUnconscious(participant);
+    }
+
+    /** Play report 5: a posted correction that lifts a knocked-out token above 0 wakes it. */
+    wakeFromNonlethal(participantId: string): string[] {
+        const participant = this.state?.participants.find(p => p.id === participantId);
+        return participant ? clearNonlethalUnconscious(participant) : [];
     }
 
     /**
@@ -1327,23 +1465,28 @@ export class CombatEngine {
     /**
      * Apply damage to a participant
      */
-    applyDamage(participantId: string, damage: number): void {
-        if (!this.state) return;
+    applyDamage(participantId: string, damage: number, opts: { crit?: boolean; melee?: boolean } = {}): DyingUpdate | undefined {
+        if (!this.state) return undefined;
 
         const participant = this.state.participants.find(p => p.id === participantId);
-        if (participant) {
-            // Request 5: a vessel's shields take it first.
-            const soak = absorbWithShields(participant, damage);
-            participant.hp = Math.max(0, participant.hp - soak.through);
-            this.refreshVessel(participant);
-            this.emitter?.publish('combat', {
-                type: 'damage_applied',
-                participantId,
-                amount: damage,
-                ...(soak.absorbed ? { shieldsAbsorbed: soak.absorbed } : {}),
-                newHp: participant.hp
-            });
-        }
+        if (!participant) return undefined;
+        // Request 5: a vessel's shields take it first.
+        const hpBefore = participant.hp;
+        const soak = absorbWithShields(participant, damage);
+        participant.hp = Math.max(0, participant.hp - soak.through);
+        this.refreshVessel(participant);
+        // Play report 5 #5: a tracked token dropped to 0 goes unconscious and
+        // prone; one already down takes a failed save (two on a crit).
+        const dying = damageAtZero(participant, hpBefore, soak.through, opts);
+        this.emitter?.publish('combat', {
+            type: 'damage_applied',
+            participantId,
+            amount: damage,
+            ...(soak.absorbed ? { shieldsAbsorbed: soak.absorbed } : {}),
+            newHp: participant.hp,
+            ...(dying ? { dying } : {})
+        });
+        return dying;
     }
 
     /**
@@ -1398,12 +1541,8 @@ export class CombatEngine {
             const wasAtZero = participant.hp === 0;
             participant.hp = Math.min(participant.maxHp, participant.hp + amount);
 
-            // MED-003: Reset death saves when healed from 0 HP
-            if (wasAtZero && participant.hp > 0) {
-                participant.deathSaveSuccesses = 0;
-                participant.deathSaveFailures = 0;
-                participant.isStabilized = false;
-            }
+            // MED-003: Reset death saves when healed from 0 HP (and wake a knockout, play report 5)
+            if (wasAtZero && participant.hp > 0) this.riseFromZero(participant);
 
             this.emitter?.publish('combat', {
                 type: 'healed',
@@ -1446,55 +1585,13 @@ export class CombatEngine {
             return null;
         }
 
-        // Initialize death save counters if needed
-        if (participant.deathSaveSuccesses === undefined) {
-            participant.deathSaveSuccesses = 0;
-        }
-        if (participant.deathSaveFailures === undefined) {
-            participant.deathSaveFailures = 0;
-        }
-
-        // Roll the d20 on the encounter's seeded stream (recorded, replayable)
-        const roll = this.tagged({ purpose: 'death save', forId: participantId }, () => this.rng.d20(0));
-        const isNat20 = roll === 20;
-        const isNat1 = roll === 1;
-        const success = roll >= 10;
-
-        // Apply results
-        if (isNat20) {
-            // Natural 20: regain 1 HP, reset death saves
-            participant.hp = 1;
-            participant.deathSaveSuccesses = 0;
-            participant.deathSaveFailures = 0;
-            participant.isStabilized = false;
-        } else if (isNat1) {
-            // Natural 1: counts as 2 failures
-            participant.deathSaveFailures = Math.min(3, participant.deathSaveFailures + 2);
-        } else if (success) {
-            participant.deathSaveSuccesses = Math.min(3, participant.deathSaveSuccesses + 1);
-        } else {
-            participant.deathSaveFailures = Math.min(3, participant.deathSaveFailures + 1);
-        }
-
-        // Check for stabilization or death
-        if (participant.deathSaveSuccesses >= 3) {
-            participant.isStabilized = true;
-        }
-        if (participant.deathSaveFailures >= 3) {
-            participant.isDead = true;
-        }
-
-        const result: DeathSaveResult = {
-            roll,
-            isNat20,
-            isNat1,
-            success,
-            successes: participant.deathSaveSuccesses,
-            failures: participant.deathSaveFailures,
-            isStabilized: participant.isStabilized ?? false,
-            isDead: participant.isDead ?? false,
-            regainedHp: isNat20
-        };
+        // Roll the d20 on the encounter's seeded stream (recorded, replayable:
+        // purpose 'death save', forId the creature). Play report 5 #5: the
+        // outcome arithmetic is shared with posted saves (applyDeathSaveOutcome).
+        const answersDue = !!participant.deathSaveDue;
+        const roll = this.rollD20({ purpose: 'death save', forId: participantId });
+        const result: DeathSaveResult = applyDeathSaveOutcome(participant, outcomeOfRoll(roll), roll, this.state.round);
+        this.afterDeathSave(participant, result, answersDue);
 
         this.emitter?.publish('combat', {
             type: 'death_save',
@@ -1503,6 +1600,19 @@ export class CombatEngine {
         });
 
         return result;
+    }
+
+    /**
+     * Play report 5 #5: what every death save leaves behind. A natural 20
+     * wakes the creature fully: a knockout's Unconscious (a token knocked out
+     * earlier, then hit lethally) goes with the dying one. A save made by
+     * hand before the slot comes up is banked as that slot's save, so the
+     * advance rolls no second die; one that answers DEATH SAVE DUE is the
+     * slot's own and is consumed at once.
+     */
+    private afterDeathSave(participant: CombatParticipant, result: DeathSaveResult, answersDue: boolean): void {
+        if (result.regainedHp) clearNonlethalUnconscious(participant);
+        participant.deathSaveTaken = !answersDue && !result.regainedHp && !result.isDead && !result.isStabilized;
     }
 
     /**
@@ -1646,6 +1756,10 @@ export class CombatEngine {
         participant.bonusActionUsed = false;
         participant.spellsCast = {};
         participant.movementRemaining = this.effectiveSpeed(participant);
+        // Play report 5: trigger-tied attacks read these; a new turn starts them fresh.
+        participant.movedThisTurn = 0;
+        participant.movedSinceDash = 0;
+        participant.meleeHitsThisTurn = [];
     }
 
     /**
@@ -1821,6 +1935,8 @@ export class CombatEngine {
         participant.movementRemaining = currentRemaining + baseSpeed;
         participant.dashes = (participant.dashes ?? 0) + 1;
         participant.hasDashed = true;
+        // Play report 5: Goring Rush counts the feet moved AFTER the Dash.
+        participant.movedSinceDash = 0;
 
         return { ok: true, movementRemaining: participant.movementRemaining };
     }
@@ -2026,9 +2142,12 @@ export class CombatEngine {
      * Enhanced nextTurn with condition processing and legendary action reset
      * Now auto-skips dead participants (HP <= 0)
      */
-    nextTurnWithConditions(): CombatParticipant | null {
+    nextTurnWithConditions(opts: { deathSaveMode?: DeathSaveMode; encounterId?: string } = {}): CombatParticipant | null {
         if (!this.state) return null;
         this.turnStartNotes = [];
+        this.deathSaveEvents = [];
+        this.deathSaveModeDefault = opts.deathSaveMode;
+        if (opts.encounterId) this.encounterId = opts.encounterId;
 
         // Process end-of-turn conditions for current participant (if not LAIR)
         const currentParticipant = this.getCurrentParticipant();
@@ -2069,6 +2188,9 @@ export class CombatEngine {
         const maxIterations = this.state.turnOrder.length * 2 + 1;
         let newParticipant: CombatParticipant | null = null;
         let passed = false;
+        // Play report 5 #5: a dying tracked slot in prompt mode stops the
+        // advance here (DEATH SAVE DUE) instead of passing.
+        let stopHere = false;
 
         do {
             this.state.currentTurnIndex++;
@@ -2085,6 +2207,7 @@ export class CombatEngine {
             // alive or not: a downed one clears the flag without a pass note,
             // so a heal in round 2 does not lose it another turn.
             passed = false;
+            stopHere = false;
             if (newParticipant?.surprised) {
                 if (newParticipant.hp > 0) {
                     this.passSurprisedTurn(newParticipant);
@@ -2093,7 +2216,14 @@ export class CombatEngine {
                     newParticipant.surprised = false;
                 }
             }
+            // The dying slot: auto rolls the save (a natural 20 means the
+            // creature takes this turn); prompt stops and owes the GM a call.
+            // Mooks, the stable and the dead pass as they always did.
+            if (!passed && newParticipant && isDying(newParticipant)) {
+                stopHere = this.dyingSlot(newParticipant);
+            }
         } while (
+            !stopHere &&
             (passed || (newParticipant && newParticipant.hp <= 0) || this.lairOwnerDown()) &&
             iterations < maxIterations
         );
@@ -2103,6 +2233,72 @@ export class CombatEngine {
             this.processStartOfTurnConditions(newParticipant);
         }
         return newParticipant;
+    }
+
+    /**
+     * Play report 5 #5: the advance has landed on a dying tracked slot. In
+     * prompt mode (the token's deathSaveMode, else the world's) the slot is
+     * held: DEATH SAVE DUE with the exact call, nothing rolled, and the
+     * handler refuses the next advance until death_save clears the flag.
+     * In auto mode the save is rolled here on the fight's dice (purpose
+     * 'death save', forId the creature): a natural 20 brings it back to 1 HP
+     * and it takes this turn; anything else is noted and the slot passes.
+     * Returns true when the advance stops on this slot.
+     */
+    private dyingSlot(p: CombatParticipant): boolean {
+        if (!this.state) return false;
+        const mode: DeathSaveMode = p.deathSaveMode ?? this.deathSaveModeDefault ?? 'auto';
+        const c = deathCounters(p);
+        // A save the table already rolled or posted for this slot (death_save
+        // before the advance: the player rolled their own) is the slot's save
+        // in either mode: nothing is rolled, nothing is owed, the slot passes.
+        if (p.deathSaveTaken) {
+            p.deathSaveTaken = false;
+            this.turnStartNotes.push(`🩸 ${p.name}: death save already made this round by hand (✓${c.successes} ✗${c.failures}) — no second roll; the slot passes`);
+            return false;
+        }
+        if (mode === 'prompt') {
+            p.deathSaveDue = true;
+            this.turnStartNotes.push(`🩸 DEATH SAVE DUE: ${p.name} (0 HP, ✓${c.successes} ✗${c.failures}) — ${deathSaveCall(this.encounterId ?? '<encounterId>', p.id)} (or post it: outcome: success | failure | nat20 | nat1). advance is refused until it is rolled`);
+            return true;
+        }
+        const result = this.rollDeathSave(p.id);
+        if (!result) return false;
+        p.deathSaveTaken = false; // the engine's own roll is this slot's save, not a banked one
+        const after = `✓${result.successes} ✗${result.failures}`;
+        let note: string;
+        if (result.isNat20) note = `🩸 ${p.name}: death save d20=20 — NATURAL 20: back to 1 HP, conscious, and takes this turn`;
+        else if (result.isDead) note = `☠ ${p.name}: death save d20=${result.roll} — ${result.isNat1 ? 'NATURAL 1, two failures: ' : 'failure: '}DEAD (${after})`;
+        else if (result.isStabilized) note = `💤 ${p.name}: death save d20=${result.roll} — success: STABLE (${after}); unconscious, no more saves`;
+        else if (result.isNat1) note = `🩸 ${p.name}: death save d20=1 — NATURAL 1: two failures (${after})`;
+        else note = `🩸 ${p.name}: death save d20=${result.roll} — ${result.success ? 'success' : 'failure'} (${after})`;
+        this.turnStartNotes.push(note);
+        this.deathSaveEvents.push({ ...result, participantId: p.id, name: p.name, round: this.state.round, note });
+        return result.isNat20;
+    }
+
+    /**
+     * Play report 5 #5: a GM-posted death save (the table rolled it). No die
+     * is thrown; the outcome lands exactly as posted and the due flag clears.
+     */
+    postDeathSave(participantId: string, outcome: DeathSaveOutcome): (DeathSaveResult & { posted: DeathSaveOutcome }) | null {
+        if (!this.state) return null;
+        const participant = this.state.participants.find(p => p.id === participantId);
+        if (!participant || participant.hp > 0 || participant.isDead || participant.isStabilized) return null;
+        const answersDue = !!participant.deathSaveDue;
+        const result = applyDeathSaveOutcome(participant, outcome, undefined, this.state.round);
+        this.afterDeathSave(participant, result, answersDue);
+        this.emitter?.publish('combat', { type: 'death_save', participantId, result: { ...result, posted: outcome } });
+        return { ...result, posted: outcome };
+    }
+
+    /** Play report 5 #5: stabilise a creature at 0 HP (combat_action stabilize): unconscious, no more saves, counters fresh. */
+    stabilize(participantId: string): boolean {
+        const participant = this.state?.participants.find(p => p.id === participantId);
+        if (!participant || participant.hp > 0 || participant.isDead) return false;
+        markStable(participant);
+        this.emitter?.publish('combat', { type: 'stabilized', participantId });
+        return true;
     }
 
     /**

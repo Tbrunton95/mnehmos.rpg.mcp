@@ -277,10 +277,28 @@ function getCharacterRepo(): CharacterRepository {
 }
 
 /**
- * A perception d20 for the observer: crypto dice, logged to roll_log.
+ * A perception d20 for the observer: crypto dice, logged to roll_log. At
+ * disadvantage (darkvision in darkness: dim light) two dice, the lower kept.
  */
-function rollPerceptionD20(observerId: string): number {
-  return loggedD20(getDb(), { purpose: "perception", forId: observerId }, { tool: "spatial_manage" }).natural;
+function rollPerceptionD20(observerId: string, disadvantage = false): number {
+  return loggedD20(getDb(), { purpose: "perception", forId: observerId }, { tool: "spatial_manage", disadvantage }).natural;
+}
+
+/**
+ * Play report 5 #8a: the sense an observer sees a DARKNESS room with. The
+ * sheet's senses first (truesight and blindsight see the dark as it is;
+ * darkvision sees it as dim light); then a legacy 'Darkvision' condition in
+ * any case (sheets written before the field), read as 60 ft. Tremorsense
+ * feels movement but does not show a room, so it does not count here.
+ */
+function darknessSense(observer: { senses?: { darkvisionFt?: number; blindsightFt?: number; truesightFt?: number } | null; conditions?: Array<{ name?: string }> | null }):
+  { label: string; kind: 'darkvision' | 'blindsight' | 'truesight'; dim: boolean } | undefined {
+  const s = observer.senses ?? {};
+  if ((s.truesightFt ?? 0) > 0) return { label: `truesight ${s.truesightFt} ft`, kind: 'truesight', dim: false };
+  if ((s.blindsightFt ?? 0) > 0) return { label: `blindsight ${s.blindsightFt} ft`, kind: 'blindsight', dim: false };
+  if ((s.darkvisionFt ?? 0) > 0) return { label: `darkvision ${s.darkvisionFt} ft`, kind: 'darkvision', dim: true };
+  if ((observer.conditions ?? []).some((c) => /^darkvision\b/i.test(c.name ?? ''))) return { label: 'darkvision 60 ft (condition)', kind: 'darkvision', dim: true };
+  return undefined;
 }
 
 export async function handleLookAtSurroundings(
@@ -388,14 +406,16 @@ export async function handleLookAtSurroundings(
     mechanics: lightMechanics,
   } : null;
 
-  // Check for darkness
+  // Check for darkness. Play report 5 #8a: a sense on the sheet sees through
+  // it (darkvision as dim light); a legacy Darkvision condition still counts.
   const isInDarkness = currentRoom.atmospherics.includes("DARKNESS");
   const hasLight =
     observer.conditions?.some((c) => c.name === "HAS_LIGHT") ||
-    observer.conditions?.some((c) => c.name === "DARKVISION") ||
     Boolean(activeLight);
+  const sense = darknessSense(observer as Parameters<typeof darknessSense>[0]);
+  const seenInDark = isInDarkness && !hasLight ? sense : undefined;
 
-  if (isInDarkness && !hasLight) {
+  if (isInDarkness && !hasLight && !sense) {
     // FINDINGS #67: DARKNESS used to return entities: [] — indistinguishable
     // from an empty room (banner-lies family, live-caught by the GM in the
     // Flooded Run). Darkness withholds IDENTITY, not PRESENCE: you can hear
@@ -445,8 +465,9 @@ export async function handleLookAtSurroundings(
     if (exit.type === "LOCKED") return false; // Locked exits are not visible
 
     if (exit.type === "HIDDEN") {
-      // Perception check: 1d20 + WIS modifier vs DC
-      const perceptionRoll = rollPerceptionD20(observer.id) + perceptionModifier;
+      // Perception check: 1d20 + WIS modifier vs DC; at disadvantage when the
+      // room is seen as dim light (darkvision in darkness).
+      const perceptionRoll = rollPerceptionD20(observer.id, seenInDark?.dim === true) + perceptionModifier;
       return perceptionRoll >= (exit.dc || 15);
     }
 
@@ -481,6 +502,13 @@ export async function handleLookAtSurroundings(
             entities: currentRoom.entityIds,
             atmospherics: currentRoom.atmospherics,
             lightSource,
+            // Play report 5 #8a: how a DARKNESS room was seen, and what that costs.
+            ...(seenInDark ? {
+              seenWith: seenInDark.label,
+              visionNote: seenInDark.dim
+                ? 'darkness seen as dim light: no colour, and sight-based Perception at disadvantage (the HIDDEN-exit check rolled 2d20 keep lowest)'
+                : `${seenInDark.kind}: the darkness does not hinder it`
+            } : {}),
             biomeContext: currentRoom.biomeContext,
             visitedCount: currentRoom.visitedCount,
           },

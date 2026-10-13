@@ -22,7 +22,9 @@ import { skillModifier, type SkillSource } from '../skill-modifier.js';
 
 export interface OpposedRollResult {
     // Speaker (trying to be stealthy)
-    speakerRoll: number;           // Raw d20 roll
+    speakerRoll: number;           // The d20 kept (the lower of two at disadvantage)
+    speakerRolls: number[];        // Every speaker die rolled (two at disadvantage)
+    speakerDisadvantage?: string;  // Play report 5 #7: why the speaker rolled at disadvantage (worn armour)
     speakerModifier: number;       // The sheet's stealth modifier (computed or override)
     speakerSource: SkillSource;
     speakerTotal: number;          // Roll + modifier
@@ -43,6 +45,8 @@ export interface OpposedRollOptions {
     profBonus?: (level: number) => number;
     /** The d20 for each side, tagged with its purpose and the roller's id. The caller logs it (roll_log). */
     roll: (purpose: 'stealth' | 'perception', forId: string) => number;
+    /** Play report 5 #7: the worn armour that puts the speaker's Stealth at disadvantage ('Scale mail (stealth disadvantage)'); two dice, the lower kept. */
+    speakerDisadvantage?: string;
 }
 
 /**
@@ -77,7 +81,10 @@ export function rollStealthVsPerception(
 
     // Speaker's Stealth check: the same number roll_skill_check rolls.
     const stealth = skillModifier(speaker, 'stealth', 'dex', profBonus(speaker.level));
-    const speakerRoll = opts.roll('stealth', speaker.id);
+    // Play report 5 #7: armour with stealthDisadvantage rolls two dice, lower kept.
+    const speakerRolls = [opts.roll('stealth', speaker.id)];
+    if (opts.speakerDisadvantage) speakerRolls.push(opts.roll('stealth', speaker.id));
+    const speakerRoll = Math.min(...speakerRolls);
     const speakerModifier = stealth.value;
     const speakerTotal = speakerRoll + speakerModifier;
 
@@ -93,6 +100,8 @@ export function rollStealthVsPerception(
 
     return {
         speakerRoll,
+        speakerRolls,
+        ...(opts.speakerDisadvantage ? { speakerDisadvantage: opts.speakerDisadvantage } : {}),
         speakerModifier,
         speakerSource: stealth.source,
         speakerTotal,

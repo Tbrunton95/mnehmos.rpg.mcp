@@ -18,7 +18,9 @@ import { parseAbility } from '../../engine/combat/conditions.js';
 import { resolveNamedSources, loadEffectNames, jsonIfString, sourcesField } from '../../engine/advantage-sources.js';
 import { resolveWorldId, worldSkillAbility } from '../../engine/table-rules.js';
 import { worldProgression } from '../../engine/progression.js';
-import { skillModifier, overrideColumn, signed, type SkillSheet, type ShortAbility } from '../../engine/skill-modifier.js';
+import { skillModifier, overrideColumn, signed, normSkill, type SkillSheet, type ShortAbility } from '../../engine/skill-modifier.js';
+import { armourStealthDisadvantage } from '../../engine/armor.js';
+import { matchSkillAdvantage, denialFor, sceneSensesFor, parseWind, windCall, tokenPosition, passivePerception, sensePassives, normTag, type SkillAdvantageTrait, type WindCall, type SensePassive } from '../../engine/senses.js';
 import * as pda from '../../render/pda.js';
 import { ExportEngine } from '../../math/export.js';
 import { CalculationRepository, StoredCalculation } from '../../storage/repos/calculation.repo.js';
@@ -82,6 +84,10 @@ const abilityKey = (v: unknown) => {
 };
 const abilityField = () => z.preprocess(abilityKey, z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']));
 
+// Play report 5 #8c: the tags on a check ('scent'); one tag may come as a bare string.
+const contextField = () => z.preprocess(v => typeof v === 'string' ? [v] : v, z.array(z.string().min(1))).optional()
+    .describe("Play report 5 #8c: tags on this check (['scent', 'hearing', 'stonework']). A skillAdvantage trait on the sheet whose `when` matches a tag grants advantage by itself and the log names it (adv: Keen Smell (scent)); an untagged check gets none and is told the tag; a scene senseDenial for the tag removes it and quotes the reason");
+
 const CheckBaseFields = {
     characterId: z.string().describe('Character making the roll'),
     dc: z.number().int().optional().describe('Difficulty class — success/failure reported when provided'),
@@ -91,13 +97,16 @@ const CheckBaseFields = {
     declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('FINDINGS #34 T4.18: labeled declared modifiers — VALUES ARE APPLIED to the total and each prints in the breakdown by name'),
     declaredEffects: z.preprocess(jsonIfString, z.array(DeclaredEffectRefSchema)).optional().describe('FINDINGS #60 RESOLVER v2: GM declares WHICH conditional trait fires (name + lane for multi-lane traits); the ENGINE reads the row and computes the value — including tier-from-hidden-pool (valueFromPool). Missing names and ambiguous lanes report loudly and apply nothing.'),
     advantageSources: sourcesField('advantage'),
-    disadvantageSources: sourcesField('disadvantage')
+    disadvantageSources: sourcesField('disadvantage'),
+    context: contextField(),
+    seed: z.string().optional().describe('Replay seed for the d20 (exact replays and tests only); omit for crypto dice')
 };
 
 const RollSkillCheckSchema = z.object({
     action: z.literal('roll_skill_check'),
     skill: z.string().describe('Skill name (perception, stealth, persuasion... or any theme skill)'),
     ability: abilityField().optional().describe('Governing ability — overrides the 5e default map; REQUIRED in practice for non-5e skill lists'),
+    against: z.string().optional().describe("Play report 5 #8c, stealth only: the observer being hidden from or sneaked past. The total is compared to their passive Perception and to every sense passive (passive Perception (scent) 16) the scene does not deny; the reply says who noticed and by what"),
     ...CheckBaseFields
 });
 const RollAbilityCheckSchema = z.object({
@@ -126,7 +135,9 @@ const OpposedSchema = z.object({
     targetAdvantage: z.boolean().optional(), targetDisadvantage: z.boolean().optional(),
     modifier: z.number().int().optional().describe('Initiator situational modifier'),
     declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional(),
-    declaredEffects: z.preprocess(jsonIfString, z.array(DeclaredEffectRefSchema)).optional().describe('Initiator declaredEffects — engine computes')
+    declaredEffects: z.preprocess(jsonIfString, z.array(DeclaredEffectRefSchema)).optional().describe('Initiator declaredEffects — engine computes'),
+    context: contextField(),
+    targetContext: z.preprocess(v => typeof v === 'string' ? [v] : v, z.array(z.string().min(1))).optional().describe("Play report 5 #8c: the defender's tags (['scent']): a skillAdvantage trait on the defender fires on them; in a fight with a scene wind the engine places the initiator upwind or downwind of the defender")
 });
 
 // d20() and logRoll() live in math/logged-d20.ts so combat and
@@ -134,9 +145,12 @@ const OpposedSchema = z.object({
 
 function abilityMod(score: number): number { return Math.floor((score - 10) / 2); }
 
+/** Play report 5 #8c: the other party of a scent contest, for the wind call (the defender's sniff at an initiator). */
+type ScentOpponent = { id: string; name: string };
+
 async function handleCharacterRoll(
     kind: 'skill' | 'ability' | 'save',
-    args: { characterId: string; skill?: string; ability?: string; dc?: number; advantage?: boolean; disadvantage?: boolean; modifier?: number; advantageSources?: string[]; disadvantageSources?: string[] }
+    args: { characterId: string; skill?: string; ability?: string; dc?: number; advantage?: boolean; disadvantage?: boolean; modifier?: number; advantageSources?: string[]; disadvantageSources?: string[]; context?: string[]; against?: string; seed?: string; scentOpponent?: ScentOpponent }
 ): Promise<object> {
     const db = getDb();
     const charRepo = new CharacterRepository(db);
@@ -285,6 +299,58 @@ async function handleCharacterRoll(
         autoAdvantage(mechs, kind, domain, auto);
         advFrom.push(...auto.adv.map(label => ({ label, lane: 'ENGINE' })));
         disFrom.push(...auto.dis.map(label => ({ label, lane: 'ENGINE' })));
+        // Play report 5 #7: worn armour with stealthDisadvantage puts every
+        // Stealth check at disadvantage (SHEET lane: it is the gear on the sheet).
+        if (kind === 'skill' && domain === 'stealth') {
+            const worn = armourStealthDisadvantage(db, charId);
+            if (worn) disFrom.push({ label: `${worn.name} (stealth disadvantage)`, lane: 'SHEET' });
+        }
+    }
+    // Play report 5 #8c: conditional traits as data (sheet skillAdvantage). A
+    // tag on the check that matches a trait's `when` fires it; the scene's
+    // senseDenial (per target, then scene-wide) or, for scent in a fight with
+    // a wind and a known opponent, the wind, switches it off with the reason.
+    // Read at roll time only: a later denial never touches this roll.
+    let traitAdvantage: string[] | undefined;
+    let deniedAdvantage: Array<{ trait: string; when: string; reason: string }> | undefined;
+    let conditionalAdvantage: string[] | undefined;
+    let windResult: WindCall | undefined;
+    const context = args.context ?? [];
+    if (kind === 'skill') {
+        const skillKey = (args.skill || '').toLowerCase().replace(/ /g, '_');
+        const matched = matchSkillAdvantage((char as { skillAdvantage?: SkillAdvantageTrait[] }).skillAdvantage, skillKey, context);
+        if (matched.applied.length) {
+            const senses = sceneSensesFor(db, charId, worldId);
+            const wind = senses.wind ? parseWind(senses.wind) : undefined;
+            for (const t of matched.applied) {
+                let reason = denialFor(senses.senseDenial, charId, t.when);
+                if (!reason && wind && args.scentOpponent && normTag(t.when) === 'scent') {
+                    const call = windCall(wind, { id: charId, name: char.name, position: tokenPosition(db, charId) }, { ...args.scentOpponent, position: tokenPosition(db, args.scentOpponent.id) });
+                    windResult = { from: call.from, relation: call.relation, note: call.note };
+                    reason = call.denied;
+                }
+                if (reason) {
+                    (deniedAdvantage ??= []).push({ trait: t.name, when: t.when, reason });
+                    breakdown.push(`⚠ ${t.label} denied: ${reason}`);
+                } else {
+                    advFrom.push({ label: t.label, lane: 'SHEET' });
+                    (traitAdvantage ??= []).push(t.label);
+                }
+            }
+        }
+        if (matched.gated.length && !context.length) {
+            conditionalAdvantage = matched.gated.map(g => `${g.label}: pass context: ['${g.when}'] when the check is ${g.when}-based`);
+            for (const c of conditionalAdvantage) breakdown.push(`conditional: ${c}`);
+        }
+    }
+    // A tag or an observer on a check it cannot apply to is said, never swallowed.
+    if (context.length && kind !== 'skill') {
+        const note = `context [${context.join(', ')}] applies to skill checks only (skillAdvantage traits are per skill); not applied to this ${kind === 'save' ? 'save' : 'ability check'}`;
+        resolverProblems.push(note); breakdown.push(`⚠ ${note}`);
+    }
+    if (args.against && !(kind === 'skill' && normSkill(args.skill ?? '') === 'stealth')) {
+        const note = `against applies to Stealth only (a hide or sneak past the observer named); not applied to this ${kind === 'skill' ? `${args.skill} check` : kind === 'save' ? 'save' : 'ability check'}`;
+        resolverProblems.push(note); breakdown.push(`⚠ ${note}`);
     }
     if (args.advantageSources?.length || args.disadvantageSources?.length) {
         // Shared with grapple (src/engine/advantage-sources.ts): a miss or an
@@ -311,9 +377,40 @@ async function handleCharacterRoll(
     const why = [advantageSources.length ? `adv: ${advantageSources.join(', ')}` : '', disadvantageSources.length ? `dis: ${disadvantageSources.join(', ')}` : ''].filter(Boolean).join('; ');
     const expression = advantage && !disadvantage ? '2d20kh1' : disadvantage && !advantage ? '2d20kl1' : '1d20';
 
-    const roll = d20(advantage, disadvantage);
+    const roll = d20(advantage, disadvantage, args.seed);
     const total = roll.natural + bonus;
     const success = args.dc !== undefined ? total >= args.dc : undefined;
+
+    // Play report 5 #8c: a hide or sneak against a named observer. The total
+    // is compared to their passive Perception and to every sense passive the
+    // scene does not deny (wind decides scent when both have token positions).
+    let against: Record<string, unknown> | undefined;
+    let againstNote = '';
+    if (kind === 'skill' && args.against && normSkill(args.skill ?? '') === 'stealth') {
+        const observer = charRepo.findById(args.against);
+        if (!observer) {
+            resolverProblems.push(`against: character ${args.against} not found; the total was compared to nothing`);
+            breakdown.push(`⚠ against: character ${args.against} not found`);
+        } else {
+            const oProf = profBonus(observer.level);
+            const sheet = observer as unknown as Parameters<typeof sensePassives>[0];
+            const pp = passivePerception(sheet, oProf);
+            const senses = sceneSensesFor(db, observer.id, worldId);
+            const wind = senses.wind ? parseWind(senses.wind) : undefined;
+            const denied: Array<{ when: string; reason: string }> = [];
+            const live: SensePassive[] = [];
+            for (const p of sensePassives(sheet, oProf)) {
+                let reason = denialFor(senses.senseDenial, observer.id, p.when);
+                if (!reason && wind && normTag(p.when) === 'scent') reason = windCall(wind, { id: observer.id, name: observer.name, position: tokenPosition(db, observer.id) }, { id: charId, name: char.name, position: tokenPosition(db, charId) }).denied;
+                if (reason) denied.push({ when: p.when, reason }); else live.push(p);
+            }
+            const by = total < pp ? `passive Perception ${pp}` : live.find(p => total < p.value)?.label;
+            against = { observerId: observer.id, observerName: observer.name, passivePerception: pp, passives: live, ...(denied.length ? { denied } : {}), noticed: !!by, ...(by ? { by } : {}) };
+            againstNote = by
+                ? ` — noticed by ${observer.name}'s ${by}`
+                : ` — not noticed by ${observer.name} (passive Perception ${pp}${live.map(p => `, ${p.label}`).join('')}${denied.length ? `; denied: ${denied.map(d => `${d.when} — ${d.reason}`).join('; ')}` : ''})`;
+        }
+    }
     // Wishlist item 10: a failed save by a creature with legendary
     // resistances left says so. Reported only — the GM decides to spend one.
     const lrLeft = (char as { legendaryResistancesRemaining?: number }).legendaryResistancesRemaining ?? 0;
@@ -360,10 +457,17 @@ async function handleCharacterRoll(
         resolverProblems: resolverProblems.length ? resolverProblems : undefined,
         advantageSources: advantageSources.length ? advantageSources : undefined,
         disadvantageSources: disadvantageSources.length ? disadvantageSources : undefined,
+        // Play report 5 #8c: the traits that fired, the ones a denial stopped, the tag an untagged check would need, the wind call, the observer compared against.
+        ...(context.length ? { context } : {}),
+        ...(traitAdvantage ? { traitAdvantage } : {}),
+        ...(deniedAdvantage ? { deniedAdvantage } : {}),
+        ...(conditionalAdvantage ? { conditionalAdvantage } : {}),
+        ...(windResult ? { wind: windResult } : {}),
+        ...(against ? { against } : {}),
         legendaryResistanceAvailable,
         dc: args.dc,
         outcome: success === undefined ? 'no DC set' : success ? 'SUCCESS' : 'FAILURE',
-        message: `${char.name} ${kind === 'save' ? `${args.ability!.toUpperCase()} save` : (args.skill || args.ability)}${why ? ` (${why})` : ''}: d20(${roll.rolls.join(',')})=${roll.natural} + ${bonus} = ${total}${args.dc !== undefined ? ` vs DC ${args.dc} — ${success ? 'SUCCESS' : 'FAILURE'}` : ''}${legendaryResistanceAvailable ? ` — ${legendaryResistanceAvailable} legendary resistance${legendaryResistanceAvailable === 1 ? '' : 's'} left: the GM may spend one to succeed` : ''}`
+        message: `${char.name} ${kind === 'save' ? `${args.ability!.toUpperCase()} save` : (args.skill || args.ability)}${why ? ` (${why})` : ''}: d20(${roll.rolls.join(',')})=${roll.natural} + ${bonus} = ${total}${args.dc !== undefined ? ` vs DC ${args.dc} — ${success ? 'SUCCESS' : 'FAILURE'}` : ''}${legendaryResistanceAvailable ? ` — ${legendaryResistanceAvailable} legendary resistance${legendaryResistanceAvailable === 1 ? '' : 's'} left: the GM may spend one to succeed` : ''}${deniedAdvantage ? ` — ${deniedAdvantage.map(d => `${d.trait} (${d.when}) denied: ${d.reason}`).join('; ')}` : ''}${againstNote}`
     };
 }
 
@@ -418,26 +522,67 @@ const ProjectileSchema = z.object({
 // (SHEET + ENGINE traits + EFFECT declaredEffects + SITUATIONAL + all guard
 // lanes), then one verdict. No dc on either side — the other roll IS the dc.
 async function handleOpposed(args: z.infer<typeof OpposedSchema>): Promise<object> {
+    // Play report 5 #8c: each side is the other's scent opponent for the wind
+    // call; the names are read once so a missing row refuses before any roll.
+    const db = getDb();
+    const charRepo = new CharacterRepository(db);
+    const iRow = charRepo.findById(args.characterId);
+    const dRow = charRepo.findById(args.targetId);
+    if (!iRow) return { error: true, message: `Character ${args.characterId} not found` };
+    if (!dRow) return { error: true, message: `Character ${args.targetId} not found` };
+
     const iKind = args.skill ? 'skill' : 'ability';
     const initiator = await handleCharacterRoll(iKind, {
         characterId: args.characterId, skill: args.skill, ability: args.ability ?? (args.skill ? undefined : 'str'),
         advantage: args.advantage, disadvantage: args.disadvantage,
         modifier: args.modifier,
-        declaredModifiers: args.declaredModifiers as never, declaredEffects: args.declaredEffects as never
+        declaredModifiers: args.declaredModifiers as never, declaredEffects: args.declaredEffects as never,
+        context: args.context, scentOpponent: { id: dRow.id, name: dRow.name }
     } as Parameters<typeof handleCharacterRoll>[1]);
     if ((initiator as { error?: boolean }).error) return initiator;
 
     const tKind = args.targetSkill ? 'skill' : 'ability';
     const defender = await handleCharacterRoll(tKind, {
         characterId: args.targetId, skill: args.targetSkill, ability: args.targetAbility ?? (args.targetSkill ? undefined : 'str'),
-        advantage: args.targetAdvantage, disadvantage: args.targetDisadvantage
+        advantage: args.targetAdvantage, disadvantage: args.targetDisadvantage,
+        context: args.targetContext, scentOpponent: { id: iRow.id, name: iRow.name }
     } as Parameters<typeof handleCharacterRoll>[1]);
     if ((defender as { error?: boolean }).error) return defender;
 
-    const i = initiator as { total?: number; characterName?: string };
-    const d = defender as { total?: number; characterName?: string };
+    const i = initiator as { total?: number; characterName?: string; wind?: WindCall };
+    const d = defender as { total?: number; characterName?: string; wind?: WindCall };
     const margin = (i.total ?? 0) - (d.total ?? 0);
-    const winner = margin > 0 ? 'initiator' : margin < 0 ? 'defender' : 'tie';
+    let winner: 'initiator' | 'defender' | 'tie' = margin > 0 ? 'initiator' : margin < 0 ? 'defender' : 'tie';
+
+    // Play report 5 #8c: a sneak, hide or ambush against a character with a
+    // sense trait is compared to that sense's passive (passive Perception
+    // (scent) 16) unless the scene or the wind denies it. The passive is a
+    // floor under the defender's active roll: a Stealth total below it is
+    // noticed whatever the dice said.
+    let passiveCheck: Record<string, unknown> | undefined;
+    let decidedBy: string | undefined;
+    if (normSkill(args.skill ?? '') === 'stealth' && (!args.targetSkill || normSkill(args.targetSkill) === 'perception')) {
+        const worldId = resolveWorldId(db, { characterIds: [dRow.id] });
+        const prof = worldProgression(db, worldId).profBonus(dRow.level);
+        const passives = sensePassives(dRow as unknown as Parameters<typeof sensePassives>[0], prof);
+        if (passives.length) {
+            const senses = sceneSensesFor(db, dRow.id, worldId);
+            const wind = senses.wind ? parseWind(senses.wind) : undefined;
+            const checks = passives.map(p => {
+                let reason = denialFor(senses.senseDenial, dRow.id, p.when);
+                if (!reason && wind && normTag(p.when) === 'scent') reason = windCall(wind, { id: dRow.id, name: dRow.name, position: tokenPosition(db, dRow.id) }, { id: iRow.id, name: iRow.name, position: tokenPosition(db, iRow.id) }).denied;
+                return { p, reason };
+            });
+            const noticing = checks.find(c => !c.reason && (i.total ?? 0) < c.p.value);
+            const first = noticing ?? checks[0];
+            passiveCheck = first.reason
+                ? { sense: first.p.when, trait: first.p.trait, denied: first.reason }
+                : { sense: first.p.when, trait: first.p.trait, passive: first.p.value, vs: i.total, noticed: !!noticing };
+            if (noticing) { winner = 'defender'; decidedBy = noticing.p.label; }
+        }
+    }
+    const wind = d.wind ?? i.wind;
+
     return {
         success: true,
         actionType: 'opposed',
@@ -447,9 +592,16 @@ async function handleOpposed(args: z.infer<typeof OpposedSchema>): Promise<objec
         winnerName: winner === 'initiator' ? i.characterName : winner === 'defender' ? d.characterName : null,
         margin: Math.abs(margin),
         statusQuoHolds: winner !== 'initiator',
-        message: winner === 'tie'
-            ? `OPPOSED: ${i.characterName} ${i.total} vs ${d.characterName} ${d.total} — TIE, status quo holds`
-            : `OPPOSED: ${winner === 'initiator' ? i.characterName : d.characterName} wins by ${Math.abs(margin)} (${i.total} vs ${d.total})`
+        ...(passiveCheck ? { passiveCheck } : {}),
+        ...(decidedBy ? { decidedBy } : {}),
+        ...(wind ? { wind } : {}),
+        message: (decidedBy
+            ? `OPPOSED: ${d.characterName} notices ${i.characterName} by ${decidedBy} (Stealth ${i.total}); the active roll was ${i.total} vs ${d.total}`
+            : winner === 'tie'
+                ? `OPPOSED: ${i.characterName} ${i.total} vs ${d.characterName} ${d.total} — TIE, status quo holds`
+                : `OPPOSED: ${winner === 'initiator' ? i.characterName : d.characterName} wins by ${Math.abs(margin)} (${i.total} vs ${d.total})`)
+            + (passiveCheck && 'denied' in passiveCheck ? ` — passive Perception (${passiveCheck.sense}) not compared: ${passiveCheck.denied}` : '')
+            + (passiveCheck && !decidedBy && 'passive' in passiveCheck ? ` — Stealth ${i.total} clears passive Perception (${passiveCheck.sense}) ${passiveCheck.passive}` : '')
     };
 }
 
@@ -929,6 +1081,7 @@ export const MathManageTool = {
 🛡️ SAVES AND CHECKS (roll_saving_throw, roll_skill_check, roll_ability_check, opposed) — actions of this tool, not separate tools:
 - math_manage { action: "roll_saving_throw", characterId, ability: "wis" | "Wisdom", dc } reads the sheet: ability mod, save proficiency, autoApply traits
 - advantage / disadvantage: true, or advantageSources / disadvantageSources: ["VAUREK"] — each names one of the character's conditions or active effects (a miss or an ambiguous name is refused). The roll log records why: "wis save (adv: VAUREK)"
+- context: ['scent'] (play report 5 #8c): a skillAdvantage trait on the sheet ({name: 'Keen Smell', skills: ['perception', 'survival'], when: 'scent'}) whose when matches a tag grants advantage by itself and is named (adv: Keen Smell (scent)); an untagged check gets none and conditionalAdvantage tells the tag. A scene_manage senseDenial for the tag removes it and the reply quotes the reason (deniedAdvantage); a denial set after a roll never touches it. opposed takes context (initiator) and targetContext (defender); with a scene wind and token positions the engine places the initiator upwind or downwind of a scent-tagged defender (wind). opposed stealth vs perception also compares the Stealth total to the defender's passive Perception (scent) unless denied: a total below it is noticed (passiveCheck, decidedBy). roll_skill_check stealth {against: observerId} does the same against a named observer (against). seed replays the d20 (tests and exact replays only)
 - declaredEffects: [{name}] applies a conditional trait's bonus, or its advantage_on
 - A failed save by a creature with legendary resistances left reports legendaryResistanceAvailable
 - Skill checks take the same fields: math_manage { action: "roll_skill_check", characterId, skill, dc }
@@ -1001,6 +1154,10 @@ Actions: roll, probability, solve, simplify, projectile, roll_skill_check, roll_
         // Wishlist item 10 mirror law: named advantage sources.
         advantageSources: sourcesField('advantage'),
         disadvantageSources: sourcesField('disadvantage'),
+        // Play report 5 #8c (mirror): tags on a check, the defender's tags, the observer a hide is made against.
+        context: contextField(),
+        targetContext: z.preprocess(v => typeof v === 'string' ? [v] : v, z.array(z.string().min(1))).optional().describe("opposed: the defender's tags (['scent']); their skillAdvantage traits fire on them; with a scene wind and token positions the initiator is placed upwind or downwind"),
+        against: z.string().optional().describe('roll_skill_check stealth: the observer hidden from or sneaked past; the total is compared to their passive Perception and sense passives unless the scene denies the sense'),
         // #67 mirror law: opposed-check params.
         targetId: z.string().optional().describe('opposed: defender characterId'),
         targetSkill: z.string().optional().describe('opposed: defender skill'),

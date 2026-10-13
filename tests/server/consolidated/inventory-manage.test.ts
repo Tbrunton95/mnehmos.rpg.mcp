@@ -823,6 +823,126 @@ describe('inventory_manage consolidated tool', () => {
     // the refusal was a bare throw with no fix. The refusal now names the real
     // id, the slot that was tried, the allowed slots, and the exact item_manage
     // call that makes the item equippable; nothing is written.
+    // Play report 5 #7: custom armour. The GM's mail shirt {baseAc: 13,
+    // maxDexBonus: 2} derived 10 + DEX (11) with no warning because the base
+    // was read under exactly two spellings. One armour reader now (src/engine/
+    // armor.ts): aliases, category-inferred DEX caps, loud unreadable rows.
+    describe('custom armour (play report 5 #7)', () => {
+        const sheet = () => new CharacterRepository(getDb(':memory:')).findById(testCharId)! as { ac: number; acSource?: string; stats: Record<string, number> };
+        const makeItem = async (name: string, type: string, properties: Record<string, unknown>) => {
+            const created = parseItemResult(await handleItemManage({ action: 'create', name, type, weight: 1, value: 1, properties }, ctx));
+            await handleInventoryManage({ action: 'give', characterId: testCharId, itemId: created.item.id, quantity: 1 }, ctx);
+            return created.item.id as string;
+        };
+        const equip = async (itemId: string, slot: string, extra: Record<string, unknown> = {}) =>
+            parseResult(await handleInventoryManage({ action: 'equip', characterId: testCharId, itemId, slot, ...extra }, ctx));
+
+        it("the mail shirt {baseAc: 13, maxDexBonus: 2} equips at 14 on DEX 12 (item_manage stored it as baseAC)", async () => {
+            const shirt = await makeItem('Mail shirt', 'armor', { baseAc: 13, maxDexBonus: 2 });
+            const worn = await equip(shirt, 'armor');
+            expect(worn.success).toBe(true);
+            expect(worn.ac).toMatchObject({ before: 11, after: 14, source: 'derived' });
+            expect(worn.ac.parts[0]).toBe('Mail shirt base 13 + DEX(max 2)');
+            expect(worn.armor).toMatchObject({ item: 'Mail shirt', baseAC: 13, dexApplied: 1, dexCap: 2, aliased: {} });
+            expect(worn.warnings).toBeUndefined();
+            expect(sheet().ac).toBe(14);
+        });
+
+        it("Varek's shirt as stored before the fix (baseAc on the row) derives 14 too, and the reply names the alias", async () => {
+            const { ItemRepository } = await import('../../../src/storage/repos/item.repo.js');
+            const now = new Date().toISOString();
+            const legacy = randomUUID();
+            new ItemRepository(getDb(':memory:')).create({ id: legacy, name: 'Mail shirt', type: 'armor', weight: 20, value: 50, properties: { baseAc: 13, maxDexBonus: 2 }, createdAt: now, updatedAt: now } as any);
+            await handleInventoryManage({ action: 'give', characterId: testCharId, itemId: legacy, quantity: 1 }, ctx);
+            const worn = await equip(legacy, 'armor');
+            expect(worn.ac).toMatchObject({ before: 11, after: 14, source: 'derived' });
+            expect(worn.armor).toMatchObject({ item: 'Mail shirt', baseAC: 13, aliased: { baseAc: 'baseAC' } });
+        });
+
+        it('base_ac, ac and armorClass are read as the base too', async () => {
+            for (const [key, props] of Object.entries({ base_ac: { base_ac: 13 }, ac: { ac: 13 }, armorClass: { armorClass: 13 } })) {
+                const id = await makeItem(`Coat ${key}`, 'armor', props);
+                const worn = await equip(id, 'armor');
+                expect(worn.ac.after, key).toBe(14);
+                await handleInventoryManage({ action: 'unequip', characterId: testCharId, itemId: id }, ctx);
+            }
+        });
+
+        it('heavy with no cap adds no DEX; medium with no cap caps at 2; light takes it all', async () => {
+            new CharacterRepository(getDb(':memory:')).update(testCharId, { stats: { str: 14, dex: 16, con: 13, int: 10, wis: 11, cha: 10 } } as any);
+            // The sheet stayed at 11 while DEX moved to 16: a derived AC follows gear.
+            await handleCharacterManage({ action: 'update', characterId: testCharId, acSource: 'derived' }, ctx);
+            const heavy = await makeItem('Plate', 'armor', { baseAC: 18, armorCategory: 'heavy' });
+            expect((await equip(heavy, 'armor')).ac.after).toBe(18);
+            const medium = await makeItem('Breastplate', 'armor', { baseAC: 14, armorCategory: 'medium' });
+            expect((await equip(medium, 'armor')).ac.after).toBe(16);
+            const light = await makeItem('Leather', 'armor', { baseAC: 11, armorCategory: 'light' });
+            const worn = await equip(light, 'armor');
+            expect(worn.ac.after).toBe(14);
+            expect(worn.armor.category).toBe('light');
+        });
+
+        it('an armour-slot item with no readable base warns, names the fix, and never falls back in silence', async () => {
+            const shirt = await makeItem('Mail shirt', 'armor', { weightClass: 'medium' });
+            const worn = await equip(shirt, 'armor');
+            expect(worn.success).toBe(true);
+            expect(worn.ac.after).toBe(11);
+            expect(worn.warnings).toHaveLength(1);
+            expect(worn.warnings[0]).toContain('Mail shirt is worn in the armor slot but has no readable baseAC');
+            expect(worn.warnings[0]).toContain(`item_manage update {itemId: '${shirt}', properties: {baseAC: <n>}, mergeProperties: true}`);
+            expect(worn.message).toContain('no readable baseAC');
+            expect(worn.armor).toBeUndefined();
+        });
+
+        it('a STR below the requirement notes the 5e speed penalty and does not apply it', async () => {
+            const mail = await makeItem('Chain mail', 'armor', { baseAC: 16, armorCategory: 'heavy', strengthRequired: 15 });
+            const worn = await equip(mail, 'armor');
+            expect(worn.ac.after).toBe(16);
+            expect(worn.armor).toMatchObject({ strengthRequired: 15, meetsStrength: false });
+            expect(worn.warnings).toEqual(['STR 14 is below the 15 Chain mail requires: speed -10 ft (5e; not applied)']);
+            expect(worn.message).toContain('speed -10 ft');
+        });
+
+        it('custom magic armour {baseAC, acBonus} with no equipSlots defaults to the armor slot, a shield category to the offhand', async () => {
+            const magic = await makeItem('Mail +1', 'armor', { baseAC: 13, maxDexBonus: 2, acBonus: 1 });
+            const worn = await equip(magic, 'armor');
+            expect(worn.success).toBe(true);
+            expect(worn.ac.after).toBe(15);
+            const shield = await makeItem('Tower shield', 'armor', { armorCategory: 'shield', acBonus: 2 });
+            const held = await equip(shield, 'offhand');
+            expect(held.success).toBe(true);
+            expect(held.ac.after).toBe(17);
+            expect(held.ac.parts).toEqual(['Mail +1 base 13 + DEX(max 2)', 'Mail +1 +1', 'Tower shield +2']);
+            const wrong = await equip(shield, 'armor');
+            expect(wrong.error).toBe(true);
+            expect(wrong.allowedSlots).toEqual(['offhand']);
+        });
+
+        it("Varek: a hand-set 14 survives the shirt that now derives 14, flags the match, and recomputeAc hands it to the gear", async () => {
+            await handleCharacterManage({ action: 'update', characterId: testCharId, ac: 14 }, ctx);
+            const shirt = await makeItem('Mail shirt', 'armor', { baseAc: 13, maxDexBonus: 2 });
+            const worn = await equip(shirt, 'armor');
+            expect(worn.ac).toMatchObject({ before: 14, after: 14, source: 'manual', derived: 14 });
+            expect(worn.acMatchesDerived).toBe(true);
+            expect(worn.acChange).toContain('AC 14 is hand-set and the gear now derives 14 too; pass recomputeAc: true');
+            expect(sheet()).toMatchObject({ ac: 14, acSource: 'manual' });
+            await handleInventoryManage({ action: 'unequip', characterId: testCharId, itemId: shirt }, ctx);
+            const taken = await equip(shirt, 'armor', { recomputeAc: true });
+            expect(taken.ac).toMatchObject({ after: 14, source: 'derived' });
+            expect(sheet()).toMatchObject({ ac: 14, acSource: 'derived' });
+        });
+
+        it('unequip reports the armour that remains and its warnings too', async () => {
+            const shirt = await makeItem('Mail shirt', 'armor', { baseAc: 13, maxDexBonus: 2 });
+            const ring = await makeItem('Ring', 'misc', { acBonus: 1, equipSlots: ['accessory'] });
+            await equip(shirt, 'armor');
+            await equip(ring, 'accessory');
+            const doffed = parseResult(await handleInventoryManage({ action: 'unequip', characterId: testCharId, itemId: ring }, ctx));
+            expect(doffed.ac).toMatchObject({ before: 15, after: 14 });
+            expect(doffed.armor).toMatchObject({ item: 'Mail shirt', baseAC: 13 });
+        });
+    });
+
     describe('equippable custom items (play report 4 #3)', () => {
         const owned = async (name: string, type: string, properties?: Record<string, unknown>) => {
             const created = parseItemResult(await handleItemManage({ action: 'create', name, type, weight: 1, value: 1, ...(properties ? { properties } : {}) }, ctx));

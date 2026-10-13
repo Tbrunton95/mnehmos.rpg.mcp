@@ -10,6 +10,7 @@ import { ItemRepository } from '../../storage/repos/item.repo.js';
 import { getDb } from '../../storage/index.js';
 import { EQUIP_SLOTS, equipSlotSchema } from '../../schema/inventory.js';
 import { similarity } from '../../utils/fuzzy-enum.js';
+import { canonicalArmorProps, hasArmorProps, readArmorProps, ARMOR_CATEGORIES } from '../../engine/armor.js';
 import { journalSnapshot } from '../utils/write-journal.js';
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
@@ -92,6 +93,29 @@ function withEquipSlots(base: Record<string, unknown> | undefined, slots: string
     else delete out.equipSlots;
     return out;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ARMOUR PROPERTIES (play report 5 #7)
+// ═══════════════════════════════════════════════════════════════════════════
+// An armour template's keys are checked and canonicalised on every write: the
+// GM's baseAc / base_ac / maxDex / armorType land as baseAC / maxDexBonus /
+// armorCategory (the alias named in the reply), a category typo is refused
+// with the nearest name, and a base that is not a non-negative integer is
+// refused. Nothing is written on a refusal. Applies to type 'armor' and to
+// any template carrying a definite armour key (a ring with acBonus is left alone).
+
+/** The stored properties after canonicalisation, with the aliases rewritten and the armour props as read; refuses on a problem. */
+function checkArmorProps(type: string | undefined, properties: Record<string, unknown> | undefined): { properties: Record<string, unknown>; aliased: Record<string, string>; armorProps: ReturnType<typeof readArmorProps> } | undefined {
+    if (!properties) return undefined;
+    if (type !== 'armor' && !hasArmorProps(properties)) return undefined;
+    const r = canonicalArmorProps(properties);
+    if (r.problems.length) refuse(`Armour properties: ${r.problems.join('; ')}. Canonical keys: baseAC, armorCategory (${ARMOR_CATEGORIES.join(' | ')}), maxDexBonus, strengthRequired, stealthDisadvantage, acBonus. NOTHING was written.`);
+    const { aliased: _a, ...armorProps } = readArmorProps(r.properties);
+    return { properties: r.properties, aliased: r.aliased, armorProps: { ...armorProps, aliased: {} } };
+}
+
+/** 'baseAc → baseAC, maxDex → maxDexBonus' for the message. */
+const aliasNote = (aliased: Record<string, string>) => Object.entries(aliased).map(([from, to]) => `${from} → ${to}`).join(', ');
 
 const equipSlotsField = (what: string) => z.array(equipSlotSchema()).optional().describe(what);
 const TYPE_DEFAULTS = 'the type defaults return (weapon: mainhand/offhand; armor: armor, or offhand with acBonus; anything else: not equippable)';
@@ -204,6 +228,9 @@ const definitions: Record<ItemAction, ActionDefinition> = {
 
             // Play report 4 #3: validated before the write; refusals carry writes: 'none'.
             const slots = resolveEquipSlots(params.equipSlots, params.properties);
+            // Play report 5 #7: armour keys canonicalised and checked before the write.
+            const armour = checkArmorProps(params.type, params.properties);
+            const baseProps = armour?.properties ?? params.properties;
 
             const now = new Date().toISOString();
             const item = {
@@ -212,7 +239,7 @@ const definitions: Record<ItemAction, ActionDefinition> = {
                 description: params.description,
                 weight: params.weight ?? 0,
                 value: params.value ?? 0,
-                properties: slots !== undefined ? withEquipSlots(params.properties, slots) : params.properties,
+                properties: slots !== undefined ? withEquipSlots(baseProps, slots) : baseProps,
                 ...(params.worldId ? { worldId: params.worldId } : {}),
                 id: randomUUID(),
                 createdAt: now,
@@ -221,11 +248,14 @@ const definitions: Record<ItemAction, ActionDefinition> = {
 
             itemRepo.create(item);
 
+            const aliased = armour && Object.keys(armour.aliased).length ? armour.aliased : undefined;
             return {
                 success: true,
                 item,
                 ...(slots !== undefined ? { equipSlots: slots } : {}),
-                message: `Item template "${item.name}" created (id at item.id; in a sequence reference it as {{<stepId>.item.id}})${slots?.length ? `; equippable in ${slots.join(', ')}` : ''}`
+                ...(armour ? { armorProps: armour.armorProps } : {}),
+                ...(aliased ? { aliased } : {}),
+                message: `Item template "${item.name}" created (id at item.id; in a sequence reference it as {{<stepId>.item.id}})${slots?.length ? `; equippable in ${slots.join(', ')}` : ''}${aliased ? `; armour keys canonicalised: ${aliasNote(aliased)}` : ''}`
             };
         },
         aliases: ['new', 'add', 'template']
@@ -387,6 +417,12 @@ const definitions: Record<ItemAction, ActionDefinition> = {
                 updates.properties = withEquipSlots(updates.properties ?? (target.properties as Record<string, unknown> | undefined), slots);
             }
 
+            // Play report 5 #7: the properties the write would leave (merged or
+            // wholesale) are canonicalised and checked before the journal write.
+            const armour = checkArmorProps(updates.type ?? target.type, updates.properties);
+            if (armour) updates.properties = armour.properties;
+            const aliased = armour && Object.keys(armour.aliased).length ? armour.aliased : undefined;
+
             // FINDINGS #87: preview lane — the diff, no write.
             if (preview) {
                 const proposed: Record<string, { from: unknown; to: unknown }> = {};
@@ -421,7 +457,9 @@ const definitions: Record<ItemAction, ActionDefinition> = {
                 journalId,
                 ...(mergedFrom && { propertyMerge: { preservedKeys: mergedFrom, mode: 'shallow-merge' } }),
                 ...(slots !== undefined ? { equipSlots: slots } : {}),
-                message: `Item "${item.name}" updated${mergedFrom ? ' (properties merged, not replaced)' : ''}${slotNote} — revertable: session_manage revert {writeId:${journalId}}`
+                ...(armour ? { armorProps: armour.armorProps } : {}),
+                ...(aliased ? { aliased } : {}),
+                message: `Item "${item.name}" updated${mergedFrom ? ' (properties merged, not replaced)' : ''}${slotNote}${aliased ? `; armour keys canonicalised: ${aliasNote(aliased)}` : ''} — revertable: session_manage revert {writeId:${journalId}}`
             };
         },
         aliases: ['modify', 'edit', 'patch']
@@ -549,15 +587,14 @@ export const ItemManageTool = {
 
 🗡️ ITEM TYPES:
 - weapon: Attack bonuses, damage dice in properties
-- armor: AC bonuses, baseAC for armor class calculation
+- armor: baseAC, armorCategory and the DEX cap for armor class calculation (see ARMOR PROPERTIES)
 - consumable: One-use items (potions, scrolls)
 - quest/misc: Story items and general goods
 
 ⚔️ WEAPON PROPERTIES EXAMPLE:
 { attackBonus: 1, damageDice: "1d8", damageType: "slashing" }
 
-🛡️ ARMOR PROPERTIES EXAMPLE:
-{ baseAC: 14, maxDexBonus: 2 }
+🛡️ ARMOR PROPERTIES: { baseAC: 13, armorCategory: 'medium', maxDexBonus: 2, strengthRequired?: 13, stealthDisadvantage?: true }; a shield is { armorCategory: 'shield', acBonus: 2 } (equips in the offhand). DEX cap: maxDexBonus when written, else from the category (heavy: no DEX; medium: cap 2; light: full DEX). Aliases are rewritten to these keys on create/update and named in the reply's aliased: baseAc, base_ac, ac, armorClass → baseAC; maxDex, dexCap → maxDexBonus; category, armorType → armorCategory; strReq → strengthRequired; stealth_disadvantage → stealthDisadvantage. A typo in armorCategory is refused with the nearest name, a base that is not a non-negative integer is refused, two spellings that disagree are refused — nothing written. Any equipped item's acBonus adds to AC (magic armour, rings). stealthDisadvantage puts the wearer's Stealth checks at disadvantage (math_manage, eavesdropping); a strengthRequired above the wearer's STR is reported on equip (5e speed -10 ft, not applied). character_manage naturalArmor {base, addDex} is the floor worn armour must beat
 
 🧷 EQUIP SLOTS: ${EQUIP_SLOTS.join(', ')}. By type a weapon equips in mainhand/offhand and armor in armor (offhand with acBonus); anything else (misc, consumable, quest, scroll), or a different slot, needs properties.equipSlots. Pass equipSlots: ['accessory'] on create or update — update merges it into the stored properties (other keys kept, no mergeProperties needed); equipSlots: [] removes the key so the type defaults return. properties: {equipSlots: [...]} works too and is validated the same way: an unknown slot is refused with the nearest slot and nothing written. An inventory_manage equip refusal prints the exact update call to run.
 

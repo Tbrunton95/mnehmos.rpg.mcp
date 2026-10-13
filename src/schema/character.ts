@@ -1,5 +1,7 @@
-import { PartSchema, SizeCategorySchema, AttackProfileSchema, AbilitySchema, VesselProfileSchema, FightingStyleSchema } from './token-extras.js';
+import { PartSchema, SizeCategorySchema, AttackProfileSchema, AbilitySchema, VesselProfileSchema, FightingStyleSchema, sensesSchema, naturalArmorSchema, skillAdvantageTraitSchema } from './token-extras.js';
+import { ignoreCoverSchema } from './cover.js';
 import { z } from 'zod';
+import { deathSaveModeSchema } from '../engine/combat/dying.js';
 import { CharacterTypeSchema } from './party.js';
 import {
     SubclassSchema,
@@ -138,17 +140,29 @@ export const CharacterSchema = z.object({
     /** Swim speed in feet: the movement budget underwater (else half speed). */
     swimSpeed: z.number().int().min(0).optional(),
     flySpeed: z.number().int().min(0).optional(),
+    /** Play report 5 #8a: senses in feet; spatial look, the status block and tokens read them. */
+    senses: sensesSchema().optional(),
+    /** Play report 5 #8b: natural armour {base, addDex, maxDex?}, the AC floor worn armour must beat. */
+    naturalArmor: naturalArmorSchema().optional(),
+    /** Play report 5 #8c: conditional skill traits [{name, skills, when, passiveBonus?, note?}]; a tagged check fires them. */
+    skillAdvantage: z.array(skillAdvantageTraitSchema()).optional(),
     attacksPerAction: z.number().int().min(1).optional(),
     attacks: z.array(AttackProfileSchema).optional(),
     abilities: z.array(AbilitySchema).optional(),
     /** Item 17: the fighting style the engine applies on this character's attacks (defense: on attacks against it). */
     fightingStyle: FightingStyleSchema.optional(),
+    /** Play report 5 #1: a feature that ignores cover (Sharpshooter, Spell Sniper), scoped to ranged / melee / spells; a bare value covers all three. */
+    ignoreCover: ignoreCoverSchema().optional(),
     /** Item 16: the Battle Master's superiority die; the dice themselves are resourcePools.superiority (refresh short). */
     superiorityDie: z.enum(['1d6', '1d8', '1d10', '1d12']).optional(),
     /** Item 16: the ability behind manoeuvre save DCs (8 + proficiency + its modifier); default the higher of STR and DEX. */
     maneuverAbility: z.enum(['str', 'dex']).optional(),
     cr: z.number().min(0).optional(),
     autoLegendaryResistance: z.boolean().optional(),
+    /** Play report 5 #5: tracks death saves at 0 HP. Default by characterType (pc/npc yes; enemy/neutral no); stored in combat_profile. */
+    deathSaves: z.boolean().optional(),
+    /** Play report 5 #5: auto (the engine rolls the save on advance) | prompt (DEATH SAVE DUE; advance refused until rolled). Unset = the world's environment.deathSaveMode, else auto. */
+    deathSaveMode: deathSaveModeSchema().optional(),
     /** Request 5: the row is a vessel (character_manage create_vessel); tokens made from it run the void-combat lane. */
     vessel: VesselProfileSchema.optional(),
     /** The form a character has taken (character_manage set_form): its name and the sheet's own values to go back to. */

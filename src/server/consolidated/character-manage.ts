@@ -17,13 +17,19 @@ import { worldProgression, levelCapProblem } from '../../engine/progression.js';
 import { computedSkillModifier } from '../../engine/skill-modifier.js';
 import { FORM_KEYS, sheetFromCreature, snapshotBase, nextHp, hpModeSchema, type HpMode } from '../../engine/forms.js';
 import { pushSheetToLiveTokens, pushAbilityStateToLiveTokens } from '../handlers/combat-handlers.js';
+import { deathSaveModeSchema, dyingStatus, dyingLabel, counters as deathCounters, stripDyingRowConditions, isDyingRowCondition, rowTracksDeathSaves, type RowCondition } from '../../engine/combat/dying.js';
+import { liveEncounterFor } from '../handlers/combat-handlers.js';
+import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { findAbility } from '../../engine/combat/abilities.js';
 import { readWorldClock, readWorldConditions, dayClock, SET_CLOCK_HINT, scheduleInWorldSql, scheduleLiveSql } from '../../engine/world-clock.js';
 import { scheduledWriteOpSchema, applyScheduledOps, type ScheduledWriteOp } from '../../engine/scheduled-ops.js';
 import { exposureThresholdSchema, exposureCap, exposureSummary, ensureExposureColumn, readExposure, writeExposure, type ExposureEntry } from '../../engine/exposure.js';
 import { applyFamilyDelta, familyMember, type FamilyMove } from '../../engine/pool-family.js';
 import { z } from 'zod';
-import { ParticipantExtrasShape, SizeCategorySchema, FightingStyleSchema } from '../../schema/token-extras.js';
+import { ParticipantExtrasShape, SizeCategorySchema, FightingStyleSchema, sensesSchema, naturalArmorSchema, skillAdvantageTraitSchema } from '../../schema/token-extras.js';
+import { composeArmorClass, deriveArmorClass } from '../../engine/armor.js';
+import { passivePerception, sensePassives } from '../../engine/senses.js';
+import { ignoreCoverSchema, IGNORE_COVER_DESCRIBE } from '../../schema/cover.js';
 import { SUPERIORITY_DICE } from '../../engine/combat/maneuvers.js';
 import { randomUUID } from 'crypto';
 import { SessionContext } from '../types.js';
@@ -50,6 +56,7 @@ import { SceneRepository } from '../../storage/repos/scene.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { RichFormatter } from '../utils/formatter.js';
 import { applyGrowth } from '../growth.js';
+import { wakeRowFromKnockout } from '../../engine/combat/nonlethal.js';
 import { recordAward, listAwards, pendingTotal, postPending } from '../../storage/xp-awards.js';
 import {
     CharacterOptionCategory,
@@ -128,13 +135,66 @@ export function mergeConditions(current: SheetCondition[], add: SheetCondition[]
     return out;
 }
 
+/** A condition's text for a refusal line: conditions run to kilobytes. */
+function clip(s: string, n = 60): string {
+    return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
+/**
+ * Refuse an update before any write: the Error carries writes: 'none', which
+ * the action router copies onto the reply so the renderer prints NO WRITE.
+ * A function declaration (not a const) so TypeScript treats the call as
+ * never returning and narrows what follows it.
+ */
+function refuseUpdate(message: string): never {
+    const e = new Error(message);
+    (e as Error & { writes?: string }).writes = 'none';
+    throw e;
+}
+
+/**
+ * Play report 5 #10: why an editConditions replace / replaceSource find
+ * missed, and the call that would hit. Pure. The condition is as it stands
+ * when this edit runs: earlier edits in the same call are already applied to
+ * it, so a second edit's miss describes the first edit's result.
+ *  1. find sits in the other field: print the other verb's call, reusing the
+ *     caller's own match and with, so it pastes back as is.
+ *  2. a case-insensitive hit (either field): say find is case-sensitive and
+ *     show the casing that is there.
+ *  3. neither: list what the condition holds (name, source, legacy note), clipped.
+ * Never switches field by itself: the engine refuses loudly and suggests.
+ */
+export function editTextMiss(c: { name: string; source?: string; note?: string }, match: string, field: 'name' | 'source', find: string, withText: string): string {
+    const other: 'name' | 'source' = field === 'name' ? 'source' : 'name';
+    const verbOf = (f: 'name' | 'source') => f === 'name' ? 'replace' : 'replaceSource';
+    const text: Record<'name' | 'source', string> = { name: c.name, source: c.source ?? '' };
+    const call = (f: 'name' | 'source', findText: string) =>
+        `Use ${verbOf(f)}: editConditions: [{match: ${JSON.stringify(match)}, ${verbOf(f)}: {find: ${JSON.stringify(findText)}, with: ${JSON.stringify(withText)}}}]`;
+    const head = `editConditions: '${clip(find)}' is not in the ${field} of '${clip(c.name)}'`;
+    if (text[other].includes(find)) {
+        return `${head} but is in its ${other}. ${call(other, find)}. Nothing was written.`;
+    }
+    const lower = find.toLowerCase();
+    const same = text[field].toLowerCase().indexOf(lower);
+    if (same >= 0) {
+        return `${head} as written; '${clip(text[field].slice(same, same + find.length))}' is (find is case-sensitive). Nothing was written.`;
+    }
+    const across = text[other].toLowerCase().indexOf(lower);
+    if (across >= 0) {
+        const actual = text[other].slice(across, across + find.length);
+        return `${head}; its ${other} has '${clip(actual)}' (find is case-sensitive). ${call(other, actual)}. Nothing was written.`;
+    }
+    const note = c.note ? `; note '${clip(c.note, 200)}'` : '';
+    return `${head} nor in its ${other}. It holds: name '${clip(c.name, 200)}'; source '${c.source ? clip(c.source, 200) : '(none)'}'${note}. Nothing was written.`;
+}
+
 /**
  * Combat profile on the sheet: what a token made from this character starts
  * with (combat create and add_participant read it when the caller omits it).
  * The legendary counters and lair flag are older columns exposed here too.
  */
-const COMBAT_PROFILE_FIELDS = ['size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'attacksPerAction', 'attacks', 'abilities', 'fightingStyle', 'superiorityDie', 'maneuverAbility', 'cr', 'autoLegendaryResistance',
-    'legendaryActions', 'legendaryResistances', 'legendaryResistancesRemaining', 'hasLairActions', 'acSource'] as const;
+const COMBAT_PROFILE_FIELDS = ['size', 'reach', 'speed', 'swimSpeed', 'flySpeed', 'senses', 'naturalArmor', 'skillAdvantage', 'attacksPerAction', 'attacks', 'abilities', 'fightingStyle', 'ignoreCover', 'superiorityDie', 'maneuverAbility', 'cr', 'autoLegendaryResistance',
+    'legendaryActions', 'legendaryResistances', 'legendaryResistancesRemaining', 'hasLairActions', 'acSource', 'deathSaves', 'deathSaveMode'] as const;
 const CombatProfileShape = {
     // Play report 3 #2: update {ac} sets manual by itself; pass acSource:
     // 'derived' alone to hand the AC back to the gear without touching it.
@@ -144,14 +204,20 @@ const CombatProfileShape = {
     speed: z.number().int().min(0).optional().describe("Walking speed in feet (the token's movementSpeed; a species rule sets it at create)"),
     swimSpeed: ParticipantExtrasShape.swimSpeed,
     flySpeed: ParticipantExtrasShape.flySpeed,
+    senses: sensesSchema().optional().describe('Play report 5 #8a: senses in feet {darkvisionFt, blindsightFt, tremorsenseFt, truesightFt}. spatial_manage look sees a DARKNESS room with one (darkvision: dim light, sight Perception at disadvantage); the status block shows DV 60; tokens carry it. A species rule sets it at create; an SRD species with Darkvision gets 60 ft'),
+    naturalArmor: naturalArmorSchema().optional().describe("Play report 5 #8b: natural armour {base, addDex: true, maxDex?}: the AC floor worn armour must beat (unarmoured AC is the higher of 10 + DEX and base + DEX; shields and other acBonus add on top). update recomputes a gear-derived AC at once and says what a hand-set AC would become"),
+    skillAdvantage: z.array(skillAdvantageTraitSchema()).optional().describe("Play report 5 #8c: conditional skill traits as data, [{name: 'Keen Smell', skills: ['perception', 'survival'], when: 'scent', passiveBonus: 5, note?}]. math_manage roll_skill_check/opposed and improvisation_manage montage with context: ['scent'] apply advantage by themselves and log the trait; untagged checks get none. The passive for the sense (passive Perception (scent) 16) shows on get and the status block and catches sneaks in opposed. scene_manage set {senseDenial} switches a sense off with a reason"),
     attacksPerAction: ParticipantExtrasShape.attacksPerAction,
     attacks: ParticipantExtrasShape.attacks,
     abilities: ParticipantExtrasShape.abilities,
     fightingStyle: ParticipantExtrasShape.fightingStyle,
+    ignoreCover: ignoreCoverSchema().optional().describe(IGNORE_COVER_DESCRIBE),
     superiorityDie: z.enum(SUPERIORITY_DICE).optional().describe("Item 16: the Battle Master's superiority die (1d6 | 1d8 | 1d10 | 1d12); the dice are adjust_pool {pool: 'superiority', value: 4, max: 4, refresh: 'short'}"),
     maneuverAbility: z.enum(['str', 'dex']).optional().describe('Item 16: the ability behind manoeuvre save DCs, 8 + proficiency + its modifier (default: the higher of STR and DEX)'),
     cr: ParticipantExtrasShape.cr,
     autoLegendaryResistance: ParticipantExtrasShape.autoLegendaryResistance,
+    deathSaves: ParticipantExtrasShape.deathSaves,
+    deathSaveMode: ParticipantExtrasShape.deathSaveMode,
     legendaryActions: ParticipantExtrasShape.legendaryActions,
     legendaryResistances: ParticipantExtrasShape.legendaryResistances,
     legendaryResistancesRemaining: ParticipantExtrasShape.legendaryResistancesRemaining,
@@ -244,7 +310,7 @@ const UpdateSchema = z.object({
     worldId: z.string().optional().describe('FINDINGS #94: claim this character to a world — the per-row path that makes list {worldId} strict filtering usable on legacy rows'),
     race: z.string().optional(),
     class: z.string().optional(),
-    hp: z.number().int().min(0).optional(),
+    hp: z.number().int().min(0).optional().describe("Current HP. Play report 5 #5: a value above 0 on a sheet at 0 wakes it — the dying rules' conditions (Unconscious/Prone sourced 'dying', Stable) come off, also from a list addConditions/removeConditions/editConditions built in the same call; conditions set whole is kept as given"),
     maxHp: z.number().int().min(1).optional(),
     ac: z.number().int().min(0).optional(),
     level: z.number().int().min(1).optional()
@@ -265,12 +331,12 @@ const UpdateSchema = z.object({
     editConditions: z.array(z.object({
         match: z.string().min(1).describe('Case-insensitive text found in exactly one condition name'),
         name: z.string().optional().describe('Replace the whole name'),
-        replace: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the name'),
-        replaceSource: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the source'),
+        replace: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the name (find is case-sensitive); text in the source needs replaceSource. A miss says which field holds the text and prints the call that hits'),
+        replaceSource: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the source (find is case-sensitive); text in the name needs replace'),
         duration: z.number().int().optional(),
         source: z.string().optional(),
         pinned: z.boolean().optional().describe('Pin it: shown first in the tiny status block and the boot digest')
-    })).optional().describe('Edit one condition in place without resending its text. Nothing is written if a match finds zero or several conditions'),
+    })).optional().describe('Edit one condition in place without resending its text. match reads condition names only. Nothing is written if a match finds zero or several conditions, or a find misses; the refusal names what the condition holds'),
     background: z.string().nullable().optional().describe('Background name; null clears it (play report 2 #9)'),
     alignment: z.string().optional(),
     origin: CharacterOriginSchema.optional(),
@@ -555,6 +621,9 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
         };
     }
 
+    // Play report 5 #5: the dying track, from the live token or the sheet.
+    const dyingBlock = dyingStatusBlock(db, args.characterId, char as { hp?: number; conditions?: RowCondition[] });
+
     // Item 15: shown counters on the full block too; rads and composure keep
     // their own rows.
     const fullCounters = shownCounters(pools as Parameters<typeof shownCounters>[0])
@@ -588,9 +657,38 @@ async function handleGetStatusBlock(args: z.infer<typeof GetStatusBlockSchema>):
         ...((exposureFooter.length || owed) ? { footer: [...exposureFooter, ...(owed ? [owed] : [])] } : {}),
         ...(exposureFooter.length ? { exposure: exposureEntries.map(e => ({ name: e.name, pool: e.pool, perHour: e.perHour, current: pools[e.pool]?.current ?? 0, cap: exposureCap(e, pools[e.pool]) })) } : {}),
         ...speedLine(char as { speed?: number; swimSpeed?: number; flySpeed?: number }),
+        ...((char as { senses?: Record<string, number> }).senses ? { senses: (char as { senses?: Record<string, number> }).senses } : {}),
+        // Play report 5 #8c: passive Perception, and one passive per sense trait (passive Perception (scent) 16).
+        passive: passiveBlock(db, worldId, char as Parameters<typeof passivePerception>[0]),
         ...activeEncounterEnvironment(db, args.characterId),
-        message: `${char.name}: HP ${char.hp}/${char.maxHp}`
+        ...(dyingBlock ? { dying: dyingBlock } : {}),
+        message: `${char.name}: HP ${char.hp}/${char.maxHp}${dyingBlock ? ` — ${dyingBlock.label}` : ''}`
     };
+}
+
+/**
+ * Play report 5 #5: the dying track for the status block. The live token
+ * (counters, stable, dead) when the character is in a fight; otherwise the
+ * sheet's own dying conditions (DYING, or STABLE after a stabilise outside a
+ * fight). Absent above 0 HP.
+ */
+function dyingStatusBlock(db: ReturnType<typeof getDb>, characterId: string, char: { hp?: number; conditions?: RowCondition[]; characterType?: string; deathSaves?: boolean }): { status: 'dying' | 'stable' | 'dead'; successes: number; failures: number; label: string; from: 'token' | 'sheet' } | undefined {
+    try {
+        const enc = liveEncounterFor(db, characterId);
+        const tok = enc ? new EncounterRepository(db).loadState(enc)?.participants.find((p: { id: string }) => p.id === characterId) : undefined;
+        if (tok) {
+            // The token's flag is hydrated on its next combat call; until then the row's default stands in.
+            const view = { ...tok, deathSaves: tok.deathSaves ?? rowTracksDeathSaves(char as { characterType?: string; deathSaves?: boolean }) };
+            const status = dyingStatus(view);
+            if (!status) return undefined;
+            return { status, ...deathCounters(view), label: dyingLabel(view) ?? status.toUpperCase(), from: 'token' };
+        }
+    } catch { /* no encounters table: the sheet decides */ }
+    if ((char.hp ?? 1) > 0) return undefined;
+    const own = (char.conditions ?? []).filter(isDyingRowCondition);
+    if (!own.length) return undefined;
+    const stable = own.some(c => c.name.toLowerCase() === 'stable');
+    return { status: stable ? 'stable' : 'dying', successes: 0, failures: 0, label: stable ? 'STABLE' : 'DYING (no fight: stabilise or heal)', from: 'sheet' };
 }
 
 /** The name of the room a character is seated in, when there is one. */
@@ -605,6 +703,12 @@ function roomNameFor(db: ReturnType<typeof getDb>, char: { currentRoomId?: strin
 function clipStatus(s: string | undefined, n: number): string | undefined {
     if (s === undefined) return undefined;
     return s.length > n ? `${s.slice(0, n).trimEnd()}…` : s;
+}
+
+/** Play report 5 #8c: passive Perception (10 + the one perception number) and the sense passives, on the world's proficiency curve. */
+function passiveBlock(db: ReturnType<typeof getDb>, worldId: string | null | undefined, char: Parameters<typeof passivePerception>[0] & { level: number }): { perception: number; senses: ReturnType<typeof sensePassives> } {
+    const prof = worldProgression(db, worldId).profBonus(char.level);
+    return { perception: passivePerception(char, prof), senses: sensePassives(char, prof) };
 }
 
 /** The sheet's speeds, only when one is set (a block without them reads as before). */
@@ -888,18 +992,26 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
     const maxHp = args.maxHp ?? Math.max(hp, derivedMaxHp);
     const characterId = randomUUID();
 
-    const supportedSpeciesMechanics = new Set(['max_hp_per_level']);
+    // Play report 5 #8a/#8b: senses and natural armour from the species. A
+    // world species rule names them; an SRD species with the Darkvision
+    // feature sees 60 ft. The caller's own values win.
+    const srdSenses = speciesSource?.featureNames.includes('Darkvision') ? { darkvisionFt: 60 } : undefined;
+    const speciesSenses = args.senses === undefined ? (worldSpecies?.senses ?? srdSenses) : undefined;
+    const speciesNaturalArmor = args.naturalArmor === undefined ? worldSpecies?.naturalArmor : undefined;
+    const speciesSkillAdvantage = args.skillAdvantage === undefined ? worldSpecies?.skillAdvantage : undefined;
+    const supportedSpeciesMechanics = new Set(['max_hp_per_level', 'senses']);
     const appliedSpeciesMechanics = [
         ...(speciesAbilityBonusesApplied ? ['ability_score_increases'] : []),
         ...(speciesSource?.languages.length ? ['fixed_languages'] : []),
-        ...(speciesMaxHpBonus > 0 && args.maxHp === undefined ? ['max_hp_per_level'] : [])
+        ...(speciesMaxHpBonus > 0 && args.maxHp === undefined ? ['max_hp_per_level'] : []),
+        ...(srdSenses && args.senses === undefined ? ['senses'] : [])
     ];
     const deferredSpeciesMechanics = [
         ...(!speciesAbilityBonusesApplied && speciesHasBonuses ? ['ability_score_increases'] : []),
         ...(speciesMaxHpBonus > 0 && args.maxHp !== undefined ? ['max_hp_per_level:maxHp_override'] : [])
     ];
     const unsupportedSpeciesFeatures = (speciesSource?.featureNames ?? [])
-        .filter((featureName) => !supportedSpeciesMechanics.has(featureName === 'Dwarven Toughness' ? 'max_hp_per_level' : featureName));
+        .filter((featureName) => !supportedSpeciesMechanics.has(featureName === 'Dwarven Toughness' ? 'max_hp_per_level' : featureName === 'Darkvision' ? 'senses' : featureName));
 
     // Build the base character record from args. The character row MUST be
     // inserted before provisioning runs, otherwise inventory_items.character_id
@@ -915,7 +1027,9 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         stats,
         hp,
         maxHp,
-        ac: args.ac ?? 10 + Math.floor((stats.dex - 10) / 2),
+        // Play report 5 #8b: the default AC is unarmoured 10 + DEX, or the
+        // natural armour when the sheet or its species has one and it is higher.
+        ac: args.ac ?? composeArmorClass({ dexMod: Math.floor((stats.dex - 10) / 2), naturalArmor: args.naturalArmor ?? speciesNaturalArmor }, []).ac,
         level,
         characterType: args.characterType ?? 'pc',
         factionId: args.factionId,
@@ -952,6 +1066,11 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
         ...(args.speed === undefined && worldSpecies?.speed !== undefined ? { speed: worldSpecies.speed } : {}),
         ...(args.swimSpeed === undefined && worldSpecies?.swimSpeed !== undefined ? { swimSpeed: worldSpecies.swimSpeed } : {}),
         ...(args.flySpeed === undefined && worldSpecies?.flySpeed !== undefined ? { flySpeed: worldSpecies.flySpeed } : {}),
+        // Play report 5 #8a/#8b: the species' senses (world rule, or SRD
+        // Darkvision 60 ft) and natural armour, when the caller set none.
+        ...(speciesSenses ? { senses: speciesSenses } : {}),
+        ...(speciesNaturalArmor ? { naturalArmor: speciesNaturalArmor } : {}),
+        ...(speciesSkillAdvantage?.length ? { skillAdvantage: speciesSkillAdvantage } : {}),
         // FINDINGS #93: resourcePools was accepted by BOTH schemas and never
         // read by the payload — the #33/#59/#90 anatomy on the worst possible
         // verb: a create whose banner said it worked. Honored now.
@@ -1081,12 +1200,16 @@ export async function handleCreate(args: z.infer<typeof CreateSchema>): Promise<
                 appliedMechanics: appliedSpeciesMechanics,
                 deferredMechanics: deferredSpeciesMechanics,
                 unsupportedFeatureNames: unsupportedSpeciesFeatures,
-                maxHpBonus: speciesMaxHpBonus
+                maxHpBonus: speciesMaxHpBonus,
+                ...(srdSenses ? { senses: srdSenses } : {})
             } : worldSpecies ? {
                 world: true,
                 name: raceName,
                 size: worldSpecies.size,
                 speed: worldSpecies.speed,
+                ...(worldSpecies.senses ? { senses: worldSpecies.senses } : {}),
+                ...(worldSpecies.naturalArmor ? { naturalArmor: worldSpecies.naturalArmor } : {}),
+                ...(worldSpecies.skillAdvantage?.length ? { skillAdvantage: worldSpecies.skillAdvantage } : {}),
                 traits: worldSpecies.traits,
                 abilityBonuses: worldSpecies.abilityBonuses ?? {},
                 abilityBonusesApplied: speciesAbilityBonusesApplied,
@@ -1199,13 +1322,16 @@ async function handleGet(args: z.infer<typeof GetSchema>): Promise<object> {
         }).filter(Boolean) as Array<Record<string, unknown>>;
         if (found.length) liveEncounters = found;
     } catch { /* no encounters table */ }
-    const currencyLabel = worldLexicon(db, resolveWorldId(db, { characterIds: [args.characterId] })).currency;
+    const sheetWorldId = resolveWorldId(db, { characterIds: [args.characterId] });
+    const currencyLabel = worldLexicon(db, sheetWorldId).currency;
     // The names alone: fields:['conditionNames'] is the condition index
     // without the kilobytes of source text.
     const conditionNames = ((character as any).conditions ?? []).map((c: { name: string }) => c.name);
     // Request 10: exposure timers ride the sheet read beside the pools they feed.
     const exposure = readExposure(db, args.characterId);
-    return { ...character, conditionNames, worldId, currency, currencyLabel, currencyNote: currency ? `${currencyLabel} ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec, ...(exposure.length ? { exposure } : {}), ...(liveEncounters ? { liveEncounters } : {}) };
+    // Play report 5 #8c: the passives, so the sheet shows passive Perception 11 and passive Perception (scent) 16.
+    const passive = passiveBlock(db, sheetWorldId, character as Parameters<typeof passiveBlock>[2]);
+    return { ...character, conditionNames, worldId, currency, currencyLabel, currencyNote: currency ? `${currencyLabel} ${currency.gold ?? 0}` : undefined, lastWrites, composureSpec, passive, ...(exposure.length ? { exposure } : {}), ...(liveEncounters ? { liveEncounters } : {}) };
 }
 
 async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object> {
@@ -1234,6 +1360,10 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
         args.knownSpells ?? character.knownSpells,
         args.preparedSpells ?? character.preparedSpells,
     );
+
+    // Play report 5 #8b: the gear-derived AC before natural armour changes,
+    // so a legacy row (no acSource) is read right: stored == derived → follows.
+    const derivedBefore = args.naturalArmor !== undefined ? deriveArmorClass(getDb(), character.id).ac : undefined;
 
     const updateData: Record<string, unknown> = {};
 
@@ -1279,6 +1409,68 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
     }
     if (args.resourcePools !== undefined) updateData.resourcePools = args.resourcePools;
 
+    // Handle conditions. Play report 5 #10: resolved HERE, before the
+    // preview return and the raw-SQL lanes below (worldId, startingGold,
+    // composureSpec), so an editConditions refusal's "Nothing was written"
+    // is true, the Error carries writes: 'none' for the renderer, and a
+    // preview shows the resulting list and refuses a bad edit the way the
+    // write would. Pure: nothing here writes. Nothing between here and the
+    // repo update reads the sheet's conditions.
+    if (args.conditions !== undefined) {
+        updateData.conditions = args.conditions;
+    } else if (args.addConditions !== undefined || args.removeConditions !== undefined || args.editConditions !== undefined) {
+        let currentConditions: Array<{ name: string; duration?: number; source?: string; pinned?: boolean; note?: string }> =
+            (character as any).conditions || [];
+
+        if (args.removeConditions?.length) {
+            const toRemove = new Set(args.removeConditions.map(n => n.toLowerCase()));
+            currentConditions = currentConditions.filter(c => !toRemove.has(c.name.toLowerCase()));
+        }
+
+        // Edit in place: each match must find exactly one condition, or the
+        // whole update is refused before anything is written. Edits apply in
+        // order to a copy, so a later edit (and its miss message) sees the
+        // condition as the earlier edit left it.
+        if (args.editConditions?.length) {
+            currentConditions = currentConditions.map(c => ({ ...c }));
+            for (const edit of args.editConditions) {
+                const needle = edit.match.toLowerCase();
+                const hits = currentConditions.filter(c => c.name.toLowerCase().includes(needle));
+                if (hits.length > 1) {
+                    refuseUpdate(`editConditions: '${edit.match}' matches ${hits.length} conditions: ${hits.map(h => `'${clip(h.name)}'`).join(', ')}; use more of the text. Nothing was written.`);
+                }
+                if (hits.length === 0) {
+                    // Play report 5 #10: match reads names only; the text may sit in one source.
+                    const inSource = currentConditions.filter(c => c.source?.toLowerCase().includes(needle));
+                    if (inSource.length) {
+                        const names = inSource.map(c => `'${clip(c.name)}'`).join(', ');
+                        refuseUpdate(`editConditions: '${edit.match}' matches no condition name, but it is in the source of ${inSource.length === 1 ? names : `${inSource.length} conditions: ${names}`}; match on the name instead, e.g. {match: ${JSON.stringify(inSource[0].name.slice(0, 40))}}. Nothing was written.`);
+                    }
+                    refuseUpdate(`editConditions: '${edit.match}' matches no condition. Nothing was written.`);
+                }
+                const c = hits[0];
+                if (edit.name !== undefined) c.name = edit.name;
+                if (edit.replace) {
+                    if (!c.name.includes(edit.replace.find)) refuseUpdate(editTextMiss(c, edit.match, 'name', edit.replace.find, edit.replace.with));
+                    c.name = c.name.split(edit.replace.find).join(edit.replace.with);
+                }
+                if (edit.replaceSource) {
+                    if (!c.source?.includes(edit.replaceSource.find)) refuseUpdate(editTextMiss(c, edit.match, 'source', edit.replaceSource.find, edit.replaceSource.with));
+                    c.source = c.source!.split(edit.replaceSource.find).join(edit.replaceSource.with);
+                }
+                if (edit.duration !== undefined) c.duration = edit.duration;
+                if (edit.source !== undefined) c.source = edit.source;
+                if (edit.pinned !== undefined) c.pinned = edit.pinned;
+            }
+        }
+
+        if (args.addConditions?.length) {
+            currentConditions = mergeConditions(currentConditions, args.addConditions);
+        }
+
+        updateData.conditions = currentConditions;
+    }
+
     // FINDINGS #88: preview lane — the diff of mapped fields, zero writes.
     // Runs before column sync and the raw-SQL lanes (startingGold,
     // composureSpec) so NOTHING below this line executes on a preview.
@@ -1288,7 +1480,6 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
         for (const [k, v] of Object.entries(updateData)) wouldChange[k] = { from: current?.[k], to: v };
         if (args.startingGold !== undefined) wouldChange.currency = { from: current?.currency, to: { gold: args.startingGold } };
         if (args.composureSpec !== undefined) wouldChange.composureSpec = { from: '(stored)', to: args.composureSpec };
-        if (args.conditions !== undefined || args.addConditions !== undefined || args.removeConditions !== undefined || args.editConditions !== undefined) wouldChange.conditions = { from: current?.conditions, to: '(per conditions/addConditions/removeConditions/editConditions rules)' };
         return {
             success: true,
             preview: true,
@@ -1367,56 +1558,59 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
             .run(JSON.stringify(args.composureSpec), args.characterId);
     }
 
-    // Handle conditions
-    if (args.conditions !== undefined) {
-        updateData.conditions = args.conditions;
-    } else if (args.addConditions !== undefined || args.removeConditions !== undefined || args.editConditions !== undefined) {
-        let currentConditions: Array<{ name: string; duration?: number; source?: string; pinned?: boolean }> =
-            (character as any).conditions || [];
-
-        if (args.removeConditions?.length) {
-            const toRemove = new Set(args.removeConditions.map(n => n.toLowerCase()));
-            currentConditions = currentConditions.filter(c => !toRemove.has(c.name.toLowerCase()));
+    // Play report 5 #5: a sheet healed above 0 by hand (update {hp}) wakes:
+    // the dying rules' conditions (Unconscious/Prone sourced 'dying', Stable)
+    // come off (docs/table-rules/dying.md: any healing above 0). They come
+    // off the list addConditions / removeConditions / editConditions built
+    // above as well, so the edit lands and the dying marks still go; only
+    // conditions set whole is kept as given, the caller owning that list.
+    let wokeFrom: string[] = [];
+    if (args.hp !== undefined && args.hp > 0 && character.hp <= 0 && args.conditions === undefined) {
+        const stripped = stripDyingRowConditions((updateData.conditions as RowCondition[] | undefined) ?? (character as { conditions?: RowCondition[] }).conditions);
+        if (stripped.removed.length) {
+            updateData.conditions = stripped.conditions;
+            wokeFrom = stripped.removed;
         }
-
-        // Edit in place: each match must find exactly one condition, or the
-        // whole update is refused before anything is written.
-        if (args.editConditions?.length) {
-            currentConditions = currentConditions.map(c => ({ ...c }));
-            for (const edit of args.editConditions) {
-                const needle = edit.match.toLowerCase();
-                const hits = currentConditions.filter(c => c.name.toLowerCase().includes(needle));
-                if (hits.length !== 1) {
-                    throw new Error(hits.length === 0
-                        ? `editConditions: '${edit.match}' matches no condition. Nothing was written.`
-                        : `editConditions: '${edit.match}' matches ${hits.length} conditions: ${hits.map(h => `'${h.name.length > 60 ? h.name.slice(0, 59) + '…' : h.name}'`).join(', ')}; use more of the text. Nothing was written.`);
-                }
-                const c = hits[0];
-                if (edit.name !== undefined) c.name = edit.name;
-                if (edit.replace) {
-                    if (!c.name.includes(edit.replace.find)) throw new Error(`editConditions: '${edit.replace.find}' is not in the matched condition. Nothing was written.`);
-                    c.name = c.name.split(edit.replace.find).join(edit.replace.with);
-                }
-                if (edit.replaceSource) {
-                    if (!c.source?.includes(edit.replaceSource.find)) throw new Error(`editConditions: '${edit.replaceSource.find}' is not in the matched condition's source. Nothing was written.`);
-                    c.source = c.source.split(edit.replaceSource.find).join(edit.replaceSource.with);
-                }
-                if (edit.duration !== undefined) c.duration = edit.duration;
-                if (edit.source !== undefined) c.source = edit.source;
-                if (edit.pinned !== undefined) c.pinned = edit.pinned;
-            }
-        }
-
-        if (args.addConditions?.length) {
-            currentConditions = mergeConditions(currentConditions, args.addConditions);
-        }
-
-        updateData.conditions = currentConditions;
     }
 
-    const updated = characterRepo.update(args.characterId, updateData);
+    // Play report 5 #4: a knocked-out sheet lifted above 0 comes round too: the
+    // knockout's Unconscious (source 'nonlethal: …') leaves, everything else
+    // stays. An explicit `conditions` list on the same call is the GM's and wins.
+    let wokeKo: ReturnType<typeof wakeRowFromKnockout>;
+    if (args.hp !== undefined && args.conditions === undefined) {
+        const working = (updateData.conditions ?? (character as { conditions?: Array<{ name: string; source?: string }> }).conditions) as Array<{ name: string; source?: string }> | undefined;
+        wokeKo = wakeRowFromKnockout((character as { hp?: number }).hp ?? 0, args.hp, working);
+        if (wokeKo) updateData.conditions = wokeKo.conditions;
+    }
+    // One woke for the reply: the dying marks that came off and the knockout's Unconscious.
+    const woke = (wokeFrom.length || wokeKo) ? { conditionsRemoved: [...wokeFrom, ...(wokeKo?.removed ?? [])] } : undefined;
+
+    let updated = characterRepo.update(args.characterId, updateData);
     if (!updated) {
         throw new Error(`Failed to update character: ${args.characterId}`);
+    }
+
+    // Play report 5 #8b: natural armour changed, so the derived AC moves with
+    // it. A sheet that follows its gear (acSource 'derived', or a legacy row
+    // whose AC equalled its gear) takes the new number now; a hand-set AC is
+    // kept and told what the gear gives (the inventory_manage equip rule).
+    let armorClass: { derived: number; parts: string[]; applied: boolean } | undefined;
+    let armorNote = '';
+    if (args.naturalArmor !== undefined && derivedBefore !== undefined) {
+        const derived = deriveArmorClass(getDb(), updated.id);
+        const source = (updated as { acSource?: string }).acSource;
+        const follows = args.ac === undefined && (source === 'derived' || (source === undefined && updated.ac === derivedBefore));
+        if (follows) {
+            const before = updated.ac;
+            if (derived.ac !== updated.ac || source !== 'derived') characterRepo.update(updated.id, { ac: derived.ac, acSource: 'derived' } as never);
+            updated = { ...updated, ac: derived.ac, acSource: 'derived' } as typeof updated;
+            armorClass = { derived: derived.ac, parts: derived.parts, applied: true };
+            armorNote = ` — natural armour: AC ${before} → ${derived.ac} (${derived.parts.join(' + ')})`;
+        } else {
+            if (source === undefined) characterRepo.update(updated.id, { acSource: 'manual' } as never);
+            armorClass = { derived: derived.ac, parts: derived.parts, applied: false };
+            armorNote = ` — AC ${updated.ac} is hand-set${source === undefined ? ' (marked so from here)' : ''}; the gear gives ${derived.ac} (${derived.parts.join(' + ')}): update {ac: ${derived.ac}} to take it, or update {acSource: 'derived'} and an equip to let gear drive it`;
+        }
     }
 
     // Play report 2 #5: an explicit override write is the GM's decision on a
@@ -1444,7 +1638,9 @@ async function handleUpdate(args: z.infer<typeof UpdateSchema>): Promise<object>
         changed: Object.keys(updateData).filter(k => k !== 'updatedAt'),
         ...(columnSync && { columnSync }),
         ...(ledgerAcknowledged.length && { ledgerAcknowledged }),
-        message: `Character updated successfully${columnSync ? ` — column sync: ${Object.entries(columnSync).map(([k, v]) => `${k} ${v.from}→${v.to} (offset ${v.offset >= 0 ? '+' : ''}${v.offset} preserved)`).join(', ')}` : ''}${ledgerAcknowledged.length ? ` — the skill_override_migrated finding for ${ledgerAcknowledged.join('/')} is acknowledged` : ''}${acNote}`
+        ...(woke ? { woke } : {}),
+        ...(armorClass ? { armorClass } : {}),
+        message: `Character updated successfully${columnSync ? ` — column sync: ${Object.entries(columnSync).map(([k, v]) => `${k} ${v.from}→${v.to} (offset ${v.offset >= 0 ? '+' : ''}${v.offset} preserved)`).join(', ')}` : ''}${ledgerAcknowledged.length ? ` — the skill_override_migrated finding for ${ledgerAcknowledged.join('/')} is acknowledged` : ''}${acNote}${armorNote}${wokeFrom.length ? ` — healed above 0: ${wokeFrom.join(', ')} (dying) came off` : ''}${wokeKo ? ` — ${updated.name} comes round (${wokeKo.removed.join(', ')} cleared; HP ${updated.hp})` : ''}`
     };
 }
 
@@ -3188,7 +3384,7 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         alignment: z.string().optional(),
         origin: CharacterOriginSchema.optional(),
         stats: StatsSchema.optional().describe('create: given = final (species bonuses not added unless applySpeciesAbilityBonuses: true); omitted = 10 baseline + species bonuses'),
-        hp: z.number().int().optional(),
+        hp: z.number().int().optional().describe("create/update: current HP. update above 0 on a sheet at 0 wakes it: the dying conditions (Unconscious/Prone sourced 'dying', Stable) come off, also beside addConditions/removeConditions/editConditions in the same call"),
         maxHp: z.number().int().optional(),
         ac: z.number().int().optional(),
         level: z.number().int().min(1).optional().describe("Character level, 1 to the world's max (20 unless a table_rules progression rule sets maxLevel; null = no cap)"),
@@ -3262,11 +3458,17 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
         speed: z.number().int().min(0).optional().describe("create/update: walking speed in feet (the token's movementSpeed; a species rule sets it at create)"),
         swimSpeed: z.number().int().min(0).optional().describe('create/update: swim speed in feet, the movement budget underwater (else half speed)'),
         flySpeed: z.number().int().min(0).optional().describe('create/update: fly speed in feet'),
+        senses: sensesSchema().optional().describe('create/update (mirror, play report 5 #8a): senses in feet {darkvisionFt, blindsightFt, tremorsenseFt, truesightFt}; spatial look sees DARKNESS with one, the status block shows DV 60, tokens carry it; a species rule or SRD Darkvision sets it at create'),
+        naturalArmor: naturalArmorSchema().optional().describe('create/update (mirror, play report 5 #8b): natural armour {base, addDex: true, maxDex?}, the AC floor worn armour must beat; update recomputes a gear-derived AC and says what a hand-set one would become'),
+        skillAdvantage: z.array(skillAdvantageTraitSchema()).optional().describe("create/update (mirror, play report 5 #8c): conditional skill traits [{name, skills: [...], when: '<tag>', passiveBonus?: 5, note?}]; a check with context: ['<tag>'] gets advantage by itself; the sense passive shows on the status block"),
         attacksPerAction: z.number().int().min(1).optional().describe('create/update: multiattack, attacks one Attack action allows'),
         attacks: z.array(z.any()).optional().describe('create/update: named attack profiles [{name, attackBonus, damage, damageType?, part?, item?, reachFt?, ranged?, twoHanded?, default?, note?}] — item names the inventory item it swings, so world_manage reconcile can flag a profile whose weapon is gone; ranged and twoHanded decide which fighting style applies'),
         fightingStyle: FightingStyleSchema.optional().describe('create/update: great_weapon | dueling | archery | defense, applied by the engine on this character\'s attacks (defense: +1 AC against it while armour is worn, when its AC is derived; do not set it if the sheet\'s ac already counts it)'),
+        ignoreCover: ignoreCoverSchema().optional().describe(`create/update (mirror): ${IGNORE_COVER_DESCRIBE}`),
         superiorityDie: z.enum(SUPERIORITY_DICE).optional().describe("create/update (mirror): the superiority die for combat_action attack {maneuver}; the dice are adjust_pool {pool: 'superiority', value, max, refresh: 'short'}"),
         maneuverAbility: z.enum(['str', 'dex']).optional().describe('create/update (mirror): the ability behind manoeuvre save DCs (default the higher of STR and DEX)'),
+        deathSaves: z.boolean().optional().describe('create/update (mirror): play report 5 #5 — this character tracks death saves at 0 HP (default: pc and npc rows yes, enemy and neutral no; false opts a named PC out, true opts a villain in)'),
+        deathSaveMode: deathSaveModeSchema().optional().describe("create/update (mirror): auto (the engine rolls the save on advance) | prompt (DEATH SAVE DUE, advance refused until death_save is rolled or posted). Unset = the world's environment.deathSaveMode, else auto"),
         abilities: z.array(z.any()).optional().describe('create/update: limited abilities [{name, recharge?, perRest?: short | long, grantsAction?, actionCost?, ready?, note?}]; perRest ones are spent on use and readied by rest_manage'),
         cr: z.number().min(0).optional().describe('create/update: challenge rating'),
         autoLegendaryResistance: z.boolean().optional().describe('create/update: spend a legendary resistance on a failed save automatically'),
@@ -3290,12 +3492,12 @@ Aliases: new/add/spawn->create, fetch/find->get, modify/edit->update`,
     editConditions: z.array(z.object({
         match: z.string().min(1).describe('Case-insensitive text found in exactly one condition name'),
         name: z.string().optional().describe('Replace the whole name'),
-        replace: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the name'),
-        replaceSource: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the source'),
+        replace: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the name (find is case-sensitive); text in the source needs replaceSource. A miss says which field holds the text and prints the call that hits'),
+        replaceSource: z.object({ find: z.string().min(1), with: z.string() }).optional().describe('Replace text inside the source (find is case-sensitive); text in the name needs replace'),
         duration: z.number().int().optional(),
         source: z.string().optional(),
         pinned: z.boolean().optional().describe('Pin it: shown first in the tiny status block and the boot digest')
-    })).optional().describe('Edit one condition in place without resending its text. Nothing is written if a match finds zero or several conditions'),
+    })).optional().describe('Edit one condition in place without resending its text. match reads condition names only. Nothing is written if a match finds zero or several conditions, or a find misses; the refusal names what the condition holds'),
         // Add XP field
         amount: z.number().int().optional(),
         // FINDINGS #60 (mirror law): MEND CLOCK params — absent here means

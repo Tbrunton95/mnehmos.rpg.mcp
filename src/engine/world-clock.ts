@@ -33,6 +33,11 @@ export interface WorldConditions {
 }
 
 /** The normalised environment of a world, or null when the world or its JSON is missing or broken. */
+/** The world's canonical environment (every key, normalised), or null without a world or a readable row. */
+export function readWorldEnvironment(db: Database.Database, worldId: string | null | undefined): ReturnType<typeof normalizeWorldEnvironment> | null {
+    return readEnvironment(db, worldId);
+}
+
 function readEnvironment(db: Database.Database, worldId: string | null | undefined): ReturnType<typeof normalizeWorldEnvironment> | null {
     if (!worldId) return null;
     try {
