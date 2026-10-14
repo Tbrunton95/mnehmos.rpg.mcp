@@ -13,7 +13,7 @@
  * triggers — 5e: forced movement never provokes.
  */
 import type { CombatParticipant, CombatState } from './engine.js';
-import { footprintCells, SIZE_TABLE } from '../../schema/encounter.js';
+import { footprintCells, SIZE_TABLE, DEFAULT_GRID_BOUNDS } from '../../schema/encounter.js';
 
 export interface ForcedMoveResult {
     from: { x: number; y: number };
@@ -56,9 +56,13 @@ export function forcedMove(state: Grid, mover: CombatParticipant, awayFrom: Comb
     const occupied = new Map<string, string>();
     for (const p of state.participants) {
         if (p.id === mover.id) continue;
+        // Play report 7 #10: a rider and its mount share squares; neither blocks the other.
+        if (p.id === mover.riderId || p.id === mover.mountedOn) continue;
         for (const cell of footprintCells(p)) occupied.set(`${cell.x},${cell.y}`, p.name);
     }
-    const bounds = state.gridBounds;
+    // A fight made in this process has no gridBounds; a reloaded one has the
+    // default. Read the default either way so a push lands on the same square.
+    const bounds = state.gridBounds ?? DEFAULT_GRID_BOUNDS;
     const blockedAt = (anchor: { x: number; y: number }): string | undefined => {
         for (const cell of footprintCells(mover, anchor)) {
             const key = `${cell.x},${cell.y}`;

@@ -22,6 +22,9 @@ import { SessionContext } from '../types.js';
 import { validateSpellCast, consumeSpellSlot, calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { resolveSpell } from '../../engine/magic/spell-resolver.js';
 import { PartSchema, UnitSchema, ParticipantExtrasShape, attackRequiresSchema, type Part, type ReadiedAttack, type Ability } from '../../schema/token-extras.js';
+import { READIED_ATTACK_KEYS } from '../../schema/token-extras.js';
+import { describeNestedIgnored } from '../../utils/action-router.js';
+import { modelsInAreaSchema, MODELS_IN_AREA_DESCRIBE, AREA_DESCRIBE } from '../../schema/token-extras.js';
 import { evaluateAttackTrigger, type AttackTriggerFacts } from '../../engine/combat/attack-triggers.js';
 import { isKnockedOut, nonlethalSource, stripNonlethalRowConditions, clearNonlethalUnconscious } from '../../engine/combat/nonlethal.js';
 import { findActionGrantAcross, patchRowAbility, setAbilityReady } from '../../engine/combat/abilities.js';
@@ -31,18 +34,29 @@ import { castWorldSpell, sheetSpecies } from './world-spell.js';
 import { creditKill, growthLine, growthConditionsOnToken } from '../growth.js';
 import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
 import { volleyTier, describeUnit, breakTestDue, moraleModifiers, type BreakTest } from '../../engine/combat/units.js';
+import { rollUnitArea, unitsNeedingCount, areaCountRefusal, unitCapFor, unitCapLine, unitSavesLine, unitSummaryLine, modelsKilledBetween, liveModels, type ModelsInArea, type UnitAreaReport } from '../../engine/combat/unit-area.js';
 import { upsertPart, findPart, resolveAttackSource, holdingPart } from '../../engine/combat/parts.js';
 import { compareBands } from '../../engine/table-rules.js';
+import { bandAssumedTag, bandsUnranked, setBandCall } from '../../engine/combat/band-default.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { CombatActionLogRepository } from '../../storage/repos/combat-action-log.repo.js';
 import { startConcentration, checkConcentration, breakConcentration, concentrationAfterDamage } from '../../engine/magic/concentration.js';
-import { rollParticipantSave, toLongAbility, type ParticipantSaveResult } from '../../engine/combat/saves.js';
+import { rollParticipantSave, toLongAbility, saveSidesNote, saveSourcesRow, ENGINE_SAVE_DESCRIBE, type ParticipantSaveResult, type SaveSourcesRow } from '../../engine/combat/saves.js';
+import { fightConcentrationDie, concentrationLabelled, concentrationLine, concentrationOutcome, concentrationSourcesRow, engineSaverSides, saveDieLabels, type ConcentrationOutcome } from '../../engine/combat/saves.js';
 import type { Character } from '../../schema/character.js';
 import { getPatternGenerator, PATTERN_DESCRIPTIONS } from '../terrain-patterns.js';
 import { hydrateExtras, matchPreset, type ExtrasRow } from '../../engine/combat/participant-extras.js';
 import { rowTracksDeathSaves, wakeFromDying, isDying, dyingLabel, dyingStatus, counters as deathCounters, deathSaveCall, normalizeDeathSaveOutcome, dyingTail, withDyingRowConditions, stripDyingRowConditions, tracksDeathSaves, applyDyingConditions, type DeathSaveMode, type DyingUpdate, type RowCondition } from '../../engine/combat/dying.js';
 import { readWorldEnvironment } from '../../engine/world-clock.js';
+import { turnUntouched, turnNotTakenMessage, turnPassedLine, confirmAdvanceCall, onActiveTurn } from '../../engine/combat/turn-guard.js';
+import { AgentRepository } from '../../storage/repos/agent.repo.js';
+import { readiedSubdueFor, heldReadiedError, heldReadied, onSubdueAnswer, onSubdueAnswerText, readiedSubdueTag, readiedRanged, readiedLaneTag, type ReadiedRangedOverride } from '../../engine/combat/subdue.js';
+import { rolledReactionLine, heldFireLine, notStruckDownLine, offeredReactionLine, skippedReactionLine, readiedFlaggedLine, readiedProblemLine, type ReactionTarget } from '../../engine/combat/reaction-lines.js';
+import { mountOf, riderOf, nearestMountCell, controlledMountActionRefusal } from '../../engine/combat/mounts.js';
+import { resolveAdvantageSources, loadEffectDeclarations, sourcesField, situationalField, tagsField, type DeclaringOwner } from '../../engine/advantage-sources.js';
+import { declaredOnRoll, mergeSides, hasSides, ATTACK_SOURCE_NOTE, ATTACK_CONTEXT_DESCRIBE, INITIATIVE_CONTEXT_DESCRIBE, type AttackLane, type DeclaredSides, type InitiativeDeclared, type RollDeclarations } from '../../engine/attack-advantage.js';
+import { normTag } from '../../engine/senses.js';
 
 // Global combat state (in-memory for MVP)
 let pubsub: PubSub | null = null;
@@ -249,6 +263,19 @@ export async function settleAttackDying(result: Pick<CombatActionResult, 'dying'
         lines.push(`🩸 ${target.name} drops: ${dyingLabel(target)} — unconscious and prone; death saves on its turns (or stabilize it: combat_action stabilize {actorId, targetId: '${target.id}'})`);
     }
     return { killed, lines };
+}
+
+/**
+ * Play report 7 #5: what a knockout from an automatic swing (an opportunity
+ * attack, a readied attack, trigger_readied) owes the sheet and the reply:
+ * the knockout's Unconscious (sourced 'nonlethal: <actor>', the key every
+ * wake-up lane reads) mirrored to the target's row, and the 💤 line. Nothing
+ * when the blow did not knock out. No kill and no corpse follow a knockout.
+ */
+export function settleKnockout(result: Pick<CombatActionResult, 'knockedOut'>, target: { id: string; name: string }, actor: { id: string; name: string }): string[] {
+    if (!result.knockedOut) return [];
+    mirrorConditionToRow(target.id, 'add', 'Unconscious', undefined, nonlethalSource(actor.id));
+    return [`💤 ${target.name} knocked out by ${actor.name} (stable; no death saves, no kill, no corpse). Healing above 0 wakes them`];
 }
 
 function unitView(p: CombatParticipant) {
@@ -459,7 +486,7 @@ export function liveEncounterFor(db: ReturnType<typeof getDb>, id: string): stri
 /**
  * Build a machine-readable state object for frontend sync
  */
-function buildStateJson(state: CombatState, encounterId: string, sessionId?: string) {
+export function buildStateJson(state: CombatState, encounterId: string, sessionId?: string) {
     const currentParticipant = state.participants.find(
         (p) => p.id === state.turnOrder[state.currentTurnIndex]
     );
@@ -510,6 +537,7 @@ function buildStateJson(state: CombatState, encounterId: string, sessionId?: str
             ...(p.legendaryResistances ? { legendaryResistances: p.legendaryResistances, legendaryResistancesRemaining: p.legendaryResistancesRemaining ?? 0 } : {}),
             // Table state the GM reads each round
             ...(p.band ? { band: p.band } : {}),
+            ...(p.band && p.bandAssumed ? { bandAssumed: true } : {}),
             ...(p.regeneration ? { regeneration: p.regeneration } : {}),
             ...(p.cr !== undefined ? { cr: p.cr } : {}),
             ...(p.species ? { species: p.species } : {}),
@@ -519,6 +547,11 @@ function buildStateJson(state: CombatState, encounterId: string, sessionId?: str
             ...(p.unit ? { unit: { ...p.unit, ...unitView(p) } } : {}),
             ...(p.intent ? { intent: p.intent } : {}),
             ...(p.readied ? { readied: p.readied } : {}),
+            // Play report 7 #5: the standing order 'take them alive'.
+            ...(p.subdue ? { subdue: true } : {}),
+            // Play report 7 #10: rider and mount.
+            ...(p.mountedOn ? { mountedOn: p.mountedOn } : {}),
+            ...(p.riderId ? { riderId: p.riderId, controlled: p.controlledBy === p.riderId } : {}),
             // Play report 5 #1: standing cover and who this token could hide from (a report, never a roll).
             ...(p.cover ? { cover: p.cover, ...(p.coverBrokenRound === state.round ? { coverBrokenRound: p.coverBrokenRound } : {}) } : {}),
             ...((hide => hide.length ? { canHide: hide } : {})(canHideReport(state, p))),
@@ -541,6 +574,68 @@ function buildStateJson(state: CombatState, encounterId: string, sessionId?: str
         props: state.props ?? [],
         gridBounds: state.gridBounds ?? null
     };
+}
+
+/** Play report 7 #9: one turn-order slot as the create reply lists it. */
+export interface InitiativeRow {
+    id: string;
+    name: string;
+    roll: number;
+    modifier?: number;
+    /** The d20 (roll - modifier); absent when the initiative was given. */
+    natural?: number;
+    given?: true;
+    surprised?: true;
+    lair?: true;
+    /** Play report 7 #7 (lane F): the declared sources this roll took, and both d20s when two were rolled (natural is the kept one). */
+    advantage?: string[];
+    disadvantage?: string[];
+    rolls?: number[];
+}
+
+/**
+ * Play report 7 #9: the order the fight runs in, one row per slot (LAIR at
+ * 20). given marks a caller's pre-rolled initiative (no natural die); a
+ * surprised slot is marked even after its first turn has passed.
+ */
+export function initiativeRows(state: CombatState, opts: { given?: Set<string>; surprised?: Set<string>; ids?: string[]; declared?: Map<string, InitiativeDeclared> } = {}): InitiativeRow[] {
+    const slots = opts.ids ?? state.turnOrder;
+    return slots.map(id => {
+        if (id === 'LAIR') return { id: 'LAIR', name: 'LAIR', roll: 20, lair: true as const };
+        const p = state.participants.find(x => x.id === id);
+        const roll = p?.initiative ?? 0;
+        const modifier = p?.initiativeBonus ?? 0;
+        const given = opts.given?.has(id);
+        const declared = given ? undefined : opts.declared?.get(id);
+        return {
+            id, name: p?.name ?? id, roll, modifier,
+            ...(given ? { given: true as const } : { natural: roll - modifier }),
+            ...(opts.surprised?.has(id) ? { surprised: true as const } : {}),
+            ...(declared?.advantage?.length ? { advantage: declared.advantage } : {}),
+            ...(declared?.disadvantage?.length ? { disadvantage: declared.disadvantage } : {}),
+            ...(declared?.rolls?.length ? { rolls: declared.rolls } : {})
+        };
+    });
+}
+
+/** Play report 7 #9: who acts first, after any surprised skip. */
+export function firstUpOf(state: CombatState): { id: string; name: string; roll: number } | null {
+    const id = state.turnOrder[state.currentTurnIndex];
+    if (!id) return null;
+    if (id === 'LAIR') return { id: 'LAIR', name: 'LAIR', roll: 20 };
+    const p = state.participants.find(x => x.id === id);
+    return p ? { id: p.id, name: p.name, roll: p.initiative ?? 0 } : null;
+}
+
+/** Play report 7 #9: the banner line the GM reads the order from. */
+export function initiativeBannerLine(rows: InitiativeRow[], firstUp: { name: string } | null): string {
+    const tag = (r: InitiativeRow) => {
+        // Play report 7 #7 (lane F): a declared source on the roll (the row names it).
+        const declared = r.advantage?.length && r.disadvantage?.length ? 'advantage and disadvantage cancel' : r.advantage?.length ? 'advantage' : r.disadvantage?.length ? 'disadvantage' : '';
+        const marks = [r.given ? 'given' : '', r.surprised ? 'surprised' : '', declared].filter(Boolean);
+        return marks.length ? ` (${marks.join(', ')})` : '';
+    };
+    return `🎲 Initiative: ${rows.map(r => `${r.name} ${r.roll}${tag(r)}`).join(' · ')}${firstUp ? ` — FIRST UP: ${firstUp.name}` : ''}. Tell the table the order before resolving the first turn.`;
 }
 
 /**
@@ -591,6 +686,8 @@ function formatCombatStateText(state: CombatState, encounterId?: string): string
         // Include ID for LLM targeting
         output += `${marker} ${icon} ${p.name.padEnd(18)} ${hpBar} ${p.hp}/${p.maxHp} HP  [Init: ${p.initiative}] ID: ${p.id} ${status}\n`;
         if (p.unit) output += `      🪖 ${describeUnit(p)}\n`;
+        // Play report 7 #3: an assumed band shows until someone sets it.
+        if (p.band && p.bandAssumed) output += `      🏷 band ${p.band} (assumed): combat_manage set_band if it is stronger\n`;
         const counters = [
             p.legendaryActions ? `LA ${p.legendaryActionsRemaining ?? 0}/${p.legendaryActions}` : '',
             p.legendaryResistances ? `LR ${p.legendaryResistancesRemaining ?? 0}/${p.legendaryResistances}` : '',
@@ -606,7 +703,15 @@ function formatCombatStateText(state: CombatState, encounterId?: string): string
         const armour = (pt: Part) => `${pt.ac !== undefined ? ` AC ${pt.ac}` : ''}${pt.hp !== undefined ? ` ${pt.hp}/${pt.maxHp ?? pt.hp} HP` : ''}${pt.breakAt !== undefined ? ` breaks at ${pt.breakAt}` : ''}`;
         if (hurt.length) output += `      🦴 ${hurt.map(pt => `${pt.name}: ${pt.state}${pt.latchedTo ? `→${state.participants.find(o => o.id === pt.latchedTo!.participantId)?.name ?? pt.latchedTo.participantId}${pt.latchedTo.part ? ` ${pt.latchedTo.part}` : ''}` : ''}${armour(pt)}`).join(' · ')}\n`;
         if (p.intent) output += `      ⚑ intent: ${p.intent}\n`;
-        if (p.readied) output += `      ⏳ readied: ${p.readied.action} when ${p.readied.trigger}\n`;
+        // Play report 7 #5: the subdue order, and what it does to the readied attack.
+        if (p.subdue) output += `      🤲 subdue (take alive): opportunity attacks and readied melee swings knock out; a readied ranged shot follows its onSubdue\n`;
+        if (p.readied) output += `      ⏳ readied: ${p.readied.action} when ${p.readied.trigger}${readiedLaneTag(p)}${readiedSubdueTag(p)}\n`;
+        // Play report 7 #10: rider and mount.
+        if (p.mountedOn) {
+            const steed = state.participants.find(o => o.id === p.mountedOn);
+            output += `      🐎 riding ${steed?.name ?? p.mountedOn} (${steed?.controlledBy === p.id ? 'controlled' : 'independent'})${steed?.controlledBy === p.id ? ': its move moves the mount' : ': the mount moves itself'}\n`;
+        }
+        if (p.riderId) output += `      🐎 ridden by ${state.participants.find(o => o.id === p.riderId)?.name ?? p.riderId}${p.controlledBy === p.riderId ? ' (controlled: moves on its rider\'s turn; Dash, Disengage or Dodge only)' : ' (independent)'}\n`;
         if (p.cover) output += `      🛡 cover: ${p.cover.level}${Array.isArray(p.cover.against) && p.cover.against.length ? ` against ${p.cover.against.join(', ')}` : ''}${p.cover.direction ? ` to the ${p.cover.direction}` : ''}${p.cover.reason ? ` (${p.cover.reason})` : ''}${p.coverBrokenRound === state.round ? ' [broken this round]' : ''}\n`;
         const hide = canHideReport(state, p);
         if (hide.length) output += `      🫥 can hide from ${hide.map(h => `${h.from} (${h.reason})`).join(', ')}\n`;
@@ -831,6 +936,94 @@ function isPlayerReactor(p: CombatParticipant): boolean {
     return !!row && (row.characterType ?? 'pc') === 'pc';
 }
 
+/** Play report 7 #6: an active agent with auto_on_turn plays this token's turns (agent_manage), not a player at the table. */
+function agentDrivesTurn(id: string): boolean {
+    try {
+        const agent = new AgentRepository(getDb()).findByCharacterId(id);
+        return !!agent && agent.autoOnTurn && agent.status === 'active';
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Play report 7 #6: the slot that is up belongs to a living player character
+ * (a pc row on the heroes' side) who can act, whose turn is untouched, and
+ * whose turns no agent plays. advance refuses to pass it unless the GM
+ * confirms. LAIR, HP 0, incapacitated, surprised, enemies, npc rows and
+ * sheetless tokens are never held.
+ */
+function pcTurnNotTaken(engine: CombatEngine, p: CombatParticipant): boolean {
+    if (p.hp <= 0 || p.isDead || p.surprised) return false;
+    if (!engine.canTakeActions(p.id)) return false;
+    if (!turnUntouched(p)) return false;
+    try { if (!isPlayerReactor(p)) return false; } catch { return false; }
+    return !agentDrivesTurn(p.id);
+}
+
+/**
+ * Play report 7 #7 (lane F): an attacker's declared advantage on attack rolls,
+ * for each lane: untagged attack / attack:melee / attack:ranged mechanics on
+ * its active effects, and tagged ones whose tag `context` asserts. Effects are
+ * read by the token's id (a sheet-backed token's id is its character id;
+ * custom_effects target_id). A fight with no store in scope reads none.
+ */
+export function attackDeclarations(attackerId: string, context: readonly string[] = []): Record<AttackLane, RollDeclarations> & { effects: ReturnType<typeof loadEffectDeclarations> } {
+    let effects: ReturnType<typeof loadEffectDeclarations> = [];
+    try { effects = loadEffectDeclarations(getDb(), attackerId); } catch { effects = []; }
+    return {
+        effects,
+        melee: declaredOnRoll(effects, { kind: 'attack', range: 'melee' }, context),
+        ranged: declaredOnRoll(effects, { kind: 'attack', range: 'ranged' }, context)
+    };
+}
+
+/**
+ * Lane F: the per-lane sides an automatic attack (an opportunity attack, a
+ * readied attack, a volley's) passes to executeAttack: untagged mechanics
+ * only, since no context is asserted. Undefined when nothing fires.
+ */
+export function automaticDeclared(attackerId: string): Partial<Record<AttackLane, DeclaredSides>> | undefined {
+    const d = attackDeclarations(attackerId);
+    const out: Partial<Record<AttackLane, DeclaredSides>> = {};
+    if (hasSides(d.melee)) out.melee = mergeSides(d.melee);
+    if (hasSides(d.ranged)) out.ranged = mergeSides(d.ranged);
+    return out.melee || out.ranged ? out : undefined;
+}
+
+/** Lane F: an attack's lane as cover and fighting style read it — the ranged flag, else the grid distance against reach, else melee. */
+export function attackLaneOf(actor: CombatParticipant, target: CombatParticipant, opts: { ranged?: boolean; reachFt?: number }): AttackLane {
+    return (opts.ranged ?? (actor.position && target.position
+        ? edgeDistanceSquares(actor, target) * 5 > effectiveReachFt(actor, opts.reachFt !== undefined ? { reachFt: opts.reachFt } : undefined)
+        : false)) ? 'ranged' : 'melee';
+}
+
+/**
+ * Lane F: the initiative sides of the tokens about to roll it (a given
+ * initiative rolls nothing, so it reads nothing): untagged `initiative` and
+ * `check:dex` mechanics, and tagged ones the token's context asserts. Each
+ * context tag that fired nothing comes back as a warning naming the token.
+ */
+export function initiativeDeclarations(tokens: Array<{ id: string; name?: string; initiative?: number; context?: readonly string[] }>): { sources: Record<string, DeclaredSides>; warnings: string[] } {
+    const sources: Record<string, DeclaredSides> = {};
+    const warnings: string[] = [];
+    let db: Database.Database | undefined;
+    try { db = getDb(); } catch { db = undefined; }
+    for (const t of tokens) {
+        const context = (t.context ?? []).map(c => String(c).trim()).filter(Boolean);
+        if (t.initiative !== undefined) {
+            if (context.length) warnings.push(`${t.name ?? t.id}: context [${context.join(', ')}] ignored: its initiative was given, nothing was rolled`);
+            continue;
+        }
+        const effects = db ? loadEffectDeclarations(db, t.id) : [];
+        const d = declaredOnRoll(effects, { kind: 'initiative' }, context);
+        if (hasSides(d)) sources[t.id] = mergeSides(d);
+        const unfired = context.filter(c => !d.firedTags.includes(normTag(c)));
+        if (unfired.length) warnings.push(`${t.name ?? t.id}: context [${unfired.join(', ')}] fired nothing on initiative: no tagged initiative or check:dex mechanic on ${t.name ?? t.id} declares it`);
+    }
+    return { sources, warnings };
+}
+
 /**
  * Item 11: resolve a stored attack spec (a readied action's attack) as a
  * reaction on the encounter's dice. Omitted fields come from the named
@@ -852,7 +1045,9 @@ export function resolveReadiedAttack(engine: CombatEngine, reactor: CombatPartic
     // else the sheet's for this lane (Sharpshooter on the row rides onto the
     // token; the row itself for a fight created before it was set), lifts
     // what it names, as it does on an ordinary attack.
-    const lane: 'ranged' | 'melee' = (profile?.ranged ?? (reactor.position && target.position
+    // Lane G2: the readied attack's own ranged flag first, then the profile's, then the grid.
+    const flagged = readiedRanged(spec, profile);
+    const lane: 'ranged' | 'melee' = (flagged.ranged ?? (reactor.position && target.position
         ? edgeDistanceSquares(reactor, target) * 5 > effectiveReachFt(reactor, profile?.reachFt !== undefined ? { reachFt: profile.reachFt } : undefined)
         : false)) ? 'ranged' : 'melee';
     // The row is read only when the token carries no scope; a bare engine
@@ -861,11 +1056,124 @@ export function resolveReadiedAttack(engine: CombatEngine, reactor: CombatPartic
         try { return (new CharacterRepository(getDb()).findById(reactor.id) as { ignoreCover?: IgnoreCoverScopes } | null)?.ignoreCover; } catch { return undefined; }
     })();
     const ignoreCover = profile?.ignoreCover ?? ignoreCoverFor(sheetIgnore, lane);
+    // Play report 7 #5: a standing subdue order. A melee swing is non-lethal;
+    // a ranged shot follows the onSubdue settled when it was readied ('hold'
+    // or an unanswered order: no shot, nothing spent — thrown as a held
+    // refusal the callers report); 'fire' shoots to kill and says so. A
+    // target already down is not struck; a unit is not subdued.
+    const subdue = readiedSubdueFor(reactor, target, spec, lane);
+    if (subdue && (subdue.mode === 'hold' || subdue.mode === 'downed')) throw heldReadiedError(subdue);
     const cover = opts.cover !== undefined ? resolveCover(engine.getState()!, reactor, target, { explicit: opts.cover, ignoreCover }) : undefined;
+    // Play report 7 #7 (lane F): the reactor's untagged attack mechanics fire;
+    // a readied attack carries no context, so a tagged one never does.
+    const declared = automaticDeclared(reactor.id);
     const result = engine.executeAttack(reactor.id, target.id, attackBonus, ac, damage, damageType,
-        false, false, undefined, undefined, undefined, undefined, { withPart, ranged: profile?.ranged, twoHanded: spec.twoHanded ?? profile?.twoHanded, reachFt: profile?.reachFt, ...(cover ? { cover } : {}), ...(ignoreCover ? { ignoreCover } : {}) });
+        false, false, undefined, undefined, undefined, undefined, { withPart, ranged: flagged.ranged, twoHanded: spec.twoHanded ?? profile?.twoHanded, reachFt: profile?.reachFt, ...(cover ? { cover } : {}), ...(ignoreCover ? { ignoreCover } : {}), ...(subdue?.mode === 'non-lethal' ? { nonlethal: true } : {}), ...(declared ? { declared } : {}) });
     engine.commitAction(reactor.id, 'reaction');
+    // Lane G2: a flag that disagrees with its profile wins, and the shot says so.
+    if (flagged.override) {
+        result.situational = [...(result.situational ?? []), flagged.override.note];
+        result.detailedBreakdown = `(${flagged.override.note})\n${result.detailedBreakdown}`;
+    }
+    if (subdue) {
+        result.subdue = subdue;
+        result.situational = [...(result.situational ?? []), subdue.note];
+        result.detailedBreakdown = `(${subdue.note})\n${result.detailedBreakdown}`;
+    }
     return result;
+}
+
+/**
+ * Play report 7 #5: the profile a readied attack would fire with, picked as
+ * resolveReadiedAttack picks it (using / withPart over the token's profiles,
+ * else the sheet's). Undefined when it names none or names one that does not
+ * exist (the shot then fails, or reads its lane from the grid, when it fires).
+ */
+export function readiedShotProfile(reactor: CombatParticipant, spec: ReadiedAttack) {
+    let profiles = reactor.attacks ?? [];
+    if (!profiles.length) {
+        try { profiles = new CharacterRepository(getDb()).findById(reactor.id)?.attacks ?? []; } catch { profiles = []; }
+    }
+    try { return resolveAttackSource({ parts: reactor.parts, attacks: profiles }, { using: spec.using, withPart: spec.withPart }).profile; } catch { return undefined; }
+}
+
+/**
+ * Lane G2: whether a readied attack is ranged as the ready reads it (its own
+ * `ranged` flag, else its named profile's), and the note when the flag
+ * overrides the profile.
+ */
+export function readiedRangedFor(reactor: CombatParticipant, spec: ReadiedAttack | undefined): ReturnType<typeof readiedRanged> {
+    return spec ? readiedRanged(spec, readiedShotProfile(reactor, spec)) : {};
+}
+
+/** Lane G2: the reply field and message tail for a readied attack whose ranged flag overrides its profile. */
+export function readiedRangedNote(reactor: CombatParticipant, spec: ReadiedAttack | undefined): ReadiedRangedOverride | undefined {
+    return spec?.ranged === undefined ? undefined : readiedRangedFor(reactor, spec).override;
+}
+
+/** Lane G2 review: the short form of a flag's override, for a reaction line. */
+export function readiedOverrideTail(o: ReadiedRangedOverride | undefined): string | undefined {
+    return o ? `attack.ranged: ${o.ranged} overrides the ${o.profile} profile` : undefined;
+}
+
+/**
+ * Lane G2 review: a readied attack as the call that restates it, with the
+ * onSubdue answer to choose — every key the call gave (its own ranged flag
+ * and numbers included), so the pasted call readies the same shot.
+ * 'attack: {onSubdue: …}' alone readied a bare swing that was no longer ranged.
+ */
+export function readiedAttackPaste(spec: Record<string, unknown> | undefined): string {
+    const parts = Object.entries(spec ?? {})
+        .filter(([k, v]) => k !== 'onSubdue' && v !== undefined)
+        .map(([k, v]) => `${k}: ${typeof v === 'string' ? `'${v.replace(/'/g, "\\'")}'` : String(v)}`);
+    return `{${[...parts, "onSubdue: 'hold' | 'fire'"].join(', ')}}`;
+}
+
+/**
+ * Lane G2 review: a readied attack as a call passed it (readiedAttackInputSchema
+ * keeps unknown keys) split into what it takes and the keys it does not,
+ * each named at `path` ('attack.rnaged') for ignoredParams. Only the clean
+ * attack is ever read or stored.
+ */
+export function splitReadiedAttack(attack: Record<string, unknown> | undefined, path: string): { attack: ReadiedAttack | undefined; ignored: Array<{ path: string; key: string }>; note?: string } {
+    if (!attack) return { attack: undefined, ignored: [] };
+    const clean: Record<string, unknown> = {};
+    const ignored: Array<{ path: string; key: string }> = [];
+    for (const [k, v] of Object.entries(attack)) {
+        if (READIED_ATTACK_KEYS.includes(k)) clean[k] = v;
+        else ignored.push({ path: `${path}.${k}`, key: k });
+    }
+    return { attack: clean as ReadiedAttack, ignored, ...(ignored.length ? { note: describeNestedIgnored('readied attack', ignored, READIED_ATTACK_KEYS) } : {}) };
+}
+
+/** Lane G2 review: a success reply naming the readied attack's keys it did not take (ignoredParams and a message line). */
+export function withReadiedIgnored<T extends Record<string, unknown>>(reply: T, split: { ignored: Array<{ path: string }>; note?: string }): T {
+    if (!split.ignored.length || !split.note) return reply;
+    const prior = typeof reply.message === 'string' ? reply.message : '';
+    return { ...reply, ignoredParams: split.ignored.map(e => e.path), message: prior ? `${prior.replace(/\.?\s*$/, '')}. ${split.note}` : split.note };
+}
+
+/**
+ * Play report 7 #5 (owner's answer): readying a RANGED attack on a token
+ * under a subdue order is refused unless the call says onSubdue. The text
+ * names both values and why; `call` is the exact call to make instead.
+ * Undefined when nothing needs settling (no order, no attack, onSubdue
+ * given, or an attack that is not ranged). Lane G2: the readied attack's own
+ * `ranged` flag counts first, then its profile's.
+ */
+export function readiedSubdueRefusal(reactor: CombatParticipant, spec: ReadiedAttack | undefined, call: string): string | undefined {
+    if (!reactor.subdue || !spec || spec.onSubdue) return undefined;
+    const lane = readiedRangedFor(reactor, spec);
+    if (lane.ranged !== true) return undefined;
+    return `${reactor.name} is under a subdue order (take them alive), and this readied attack is ranged (${lane.source}): a shot can't be non-lethal (5e: non-lethal blows are melee only). Settle it now, before anyone commits: say what ${reactor.name} does when the trigger comes up — attack.onSubdue: 'hold' (the order wins: ${reactor.name} holds fire; the reaction is not spent and the shot stays readied) or attack.onSubdue: 'fire' (the shot wins: it fires as an ordinary lethal attack, logged 'subdue order overridden'). For a player's token, the player chooses. ${call} Nothing was written.`;
+}
+
+/** Play report 7 #5: a token under the order holding a ranged readied shot whose onSubdue is unanswered (the order came after the ready). */
+export function readiedNeedsOnSubdue(p: CombatParticipant): { profile: string } | undefined {
+    const spec = p.readied?.attack;
+    if (!p.subdue || !spec || spec.onSubdue) return undefined;
+    const lane = readiedRangedFor(p, spec);
+    return lane.ranged === true ? { profile: lane.source ?? 'attack.ranged: true' } : undefined;
 }
 
 /** The JSON for one rolled reaction attack: every number the prose shows. */
@@ -880,7 +1188,13 @@ export function reactionAttackData(r: CombatActionResult) {
         damage: r.damage ?? 0,
         damageType: (r as { damageType?: string }).damageType,
         targetHpAfter: r.target?.hpAfter,
+        // Play report 7 #5: a subdue order knocked the target out (no kill, no corpse), and how the order shaped the swing.
+        ...(r.knockedOut ? { knockedOut: r.knockedOut } : {}),
+        ...(r.subdue ? { subdue: r.subdue } : {}),
         ...(r.cover ? { cover: r.cover } : {}),
+        // Play report 7 #7 (lane F): the declared sources this reaction's roll took.
+        ...(r.advantageSources?.length ? { advantageSources: r.advantageSources } : {}),
+        ...(r.disadvantageSources?.length ? { disadvantageSources: r.disadvantageSources } : {}),
         ...(r.situational?.length ? { situational: r.situational } : {})
     };
 }
@@ -1036,7 +1350,7 @@ function calculateAoE(
     shape: 'circle' | 'cone' | 'line',
     origin: { x: number; y: number },
     params: { radius?: number; direction?: { x: number; y: number }; length?: number; angle?: number; width?: number }
-): { tiles: { x: number; y: number }[]; affectedParticipants: { id: string; name: string; position: { x: number; y: number } }[] } {
+): { tiles: { x: number; y: number }[]; affectedParticipants: AoeParticipant[]; modelsInArea?: Record<string, number> } {
     const spatial = new SpatialEngine();
     let tiles: { x: number; y: number }[] = [];
 
@@ -1051,13 +1365,39 @@ function calculateAoE(
         tiles = spatial.getLineTiles(origin, { x: endX, y: endY });
     }
 
-    // Find participants in affected tiles
+    // Find participants in affected tiles. Play report 7 #1: every square of
+    // a token's footprint counts (a large token was missed when the area
+    // touched its side but not its top-left square), and a unit reports the
+    // squares covered with a modelsInArea hint the GM can pass on.
     const tileSet = new Set(tiles.map(t => `${t.x},${t.y}`));
-    const affectedParticipants = state.participants
-        .filter(p => p.position && tileSet.has(`${p.position.x},${p.position.y}`) && p.hp > 0)
-        .map(p => ({ id: p.id, name: p.name, position: p.position! }));
+    const affectedParticipants: AoeParticipant[] = [];
+    const modelsInArea: Record<string, number> = {};
+    for (const p of state.participants) {
+        if (!p.position || p.hp <= 0) continue;
+        const cells = footprintCells(p);
+        const cellsInside = cells.filter(c => tileSet.has(`${c.x},${c.y}`)).length;
+        if (!cellsInside) continue;
+        const entry: AoeParticipant = { id: p.id, name: p.name, position: p.position, cellsInside, footprint: cells.length };
+        if (p.unit) {
+            const live = liveModels(p);
+            const hint = p.unit.packed ? live : Math.min(live, Math.max(1, Math.round(live * cellsInside / cells.length)));
+            entry.unit = { packed: !!p.unit.packed, liveModels: live, modelsInArea: hint };
+            modelsInArea[p.id] = hint;
+        }
+        affectedParticipants.push(entry);
+    }
 
-    return { tiles, affectedParticipants };
+    return { tiles, affectedParticipants, ...(Object.keys(modelsInArea).length ? { modelsInArea } : {}) };
+}
+
+/** A token an area touches: the squares of its footprint inside, and for a unit the modelsInArea hint. */
+interface AoeParticipant {
+    id: string;
+    name: string;
+    position: { x: number; y: number };
+    cellsInside: number;
+    footprint: number;
+    unit?: { packed: boolean; liveModels: number; modelsInArea: number };
 }
 
 // Tool definitions (internal schemas, not exported)
@@ -1124,6 +1464,8 @@ Example (use real UUID from context for player character!):
                 name: z.string(),
                 initiativeBonus: z.number().int().default(0),
                 initiative: z.number().int().optional().describe('Optional pre-rolled initiative; otherwise the engine rolls it'),
+                // Play report 7 #7 (lane F): the tags this token's initiative asserts; read at create, never stored on the token.
+                context: tagsField(INITIATIVE_CONTEXT_DESCRIBE),
                 hp: z.number().int().nonnegative(), // Allow 0 HP for dying characters
                 maxHp: z.number().int().positive(),
                 isEnemy: z.boolean().optional().describe('Whether this is an enemy (auto-detected if not set)'),
@@ -1142,6 +1484,7 @@ Example (use real UUID from context for player character!):
                 immunities: z.array(z.string()).optional()
                     .describe('Damage types that deal no damage'),
                 band: z.string().optional().describe("Table rules: power band (defaults from the character row)"),
+                bandAssumed: z.boolean().optional().describe("Play report 7 #3 (set by combat_manage create, not a caller): band is the world's lowest, assumed"),
                 regeneration: z.number().int().min(0).optional().describe('Table rules: HP healed at the start of each of its rounds (defaults from the character row)'),
                 parts: z.array(PartSchema).optional().describe('Named parts with states (defaults from the character row)'),
                 unit: UnitSchema.optional().describe('A mortal unit as one token: models, hpPerModel, packed, attackBonus, tiers'),
@@ -1243,9 +1586,16 @@ Examples:
             requires: attackRequiresSchema().optional().describe('Play report 5: the trigger the swing needs {dashed?, movedAtLeast?, hitThisTurn?}; refused naming what is missing. Default from the profile'),
             movedFt: z.number().int().min(0).optional().describe('Play report 5: feet moved this turn, declared for a token without a position'),
             nonlethal: z.boolean().optional().describe('Play report 5: a non-lethal blow (melee only): a target it drops is knocked out — 0 HP, Unconscious, stable — not killed'),
+            // Play report 7 #7 (lane F): declared advantage on the attack roll.
+            context: tagsField(ATTACK_CONTEXT_DESCRIBE),
+            advantageSources: sourcesField('advantage', ATTACK_SOURCE_NOTE),
+            disadvantageSources: sourcesField('disadvantage', ATTACK_SOURCE_NOTE),
+            situationalAdvantage: situationalField('advantage'),
+            situationalDisadvantage: situationalField('disadvantage'),
             volley: z.object({ dice: z.string(), reason: z.string() }).optional().describe('Internal: set by combat_action volley'),
             cover: coverEnum().optional().describe("Play report 5 #1: the target's cover as the GM states it: none | half (+2 AC) | three-quarters (+5) | total (refused, nothing spent). Unset: standing cover on the token (set_cover), else computed from the map (props with a cover rating, creatures on the line of fire). Printed as AC 12 +5 (three-quarters, boulder) = 17; never fold it into dc as well"),
             coverByTarget: coverByTargetSchema().optional().describe(`cast_spell (several targets): ${COVER_BY_TARGET_DESCRIBE}`),
+            modelsInArea: modelsInAreaSchema().optional().describe(`cast_spell: ${MODELS_IN_AREA_DESCRIBE}`),
             breaksCover: z.boolean().optional().describe("The attacker leaves its own standing cover to swing: set_cover is off for it until the next round (a profile's breaksCover does the same)"),
             bandScale: z.boolean().optional().describe("Request 11: false skips the band rule's damageScale for this swing (execute sets it). Default: applied when the world's band rule has damageScale and both bands are set"),
             declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit trail: printed in output, never re-applied'),
@@ -1272,7 +1622,10 @@ Examples:
         name: 'advance_turn',
         description: 'Advance to the next combatant\'s turn.',
         inputSchema: z.object({
-            encounterId: z.string().describe('The ID of the encounter')
+            encounterId: z.string().describe('The ID of the encounter'),
+            // Play report 7 #6: pass a player character's untouched turn (TURN NOT TAKEN).
+            confirm: z.boolean().optional().describe("Pass the turn of a player character who has used no action, bonus action or movement (the player passes or holds); without it advance refuses with TURN NOT TAKEN"),
+            skipTurn: z.boolean().optional().describe('Alias of confirm')
         })
     },
     END_ENCOUNTER: {
@@ -1313,9 +1666,11 @@ Examples:
                 dc: z.number().int().min(1).max(30),
                 onFail: areaSaveRiderSchema().optional().describe('Play report 5 #6: conditions for a target that fails'),
                 onSuccess: areaSaveRiderSchema().optional().describe('Play report 5 #6: conditions for a target that saves')
-            }).optional().describe('Saving throw required to avoid/reduce effect'),
+            }).optional().describe(`Saving throw required to avoid/reduce effect. ${ENGINE_SAVE_DESCRIBE}`),
             halfDamageOnSave: z.boolean().default(true).describe('Whether successful save halves damage'),
-            cover: coverByTargetSchema().optional().describe(COVER_BY_TARGET_DESCRIBE)
+            cover: coverByTargetSchema().optional().describe(COVER_BY_TARGET_DESCRIBE),
+            area: z.boolean().optional().describe(`${AREA_DESCRIBE}. A lair action is an area unless area: false`),
+            modelsInArea: modelsInAreaSchema().optional().describe(MODELS_IN_AREA_DESCRIBE)
         })
     },
     // ============================================================
@@ -1699,6 +2054,8 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
             ...(p.intent ? { intent: p.intent } : {}),
             ...(p.abilityScores ? { abilityScores: p.abilityScores } : {}),
             ...extras,
+            // Play report 7 #3: an assumed band stays marked until set_band.
+            ...(p.bandAssumed && extras.band ? { bandAssumed: true } : {}),
             hasLairActions: extras.hasLairActions ?? false,
             // Size and speed live on the participant itself, not only on the token.
             size: extras.size ?? 'medium',
@@ -1718,8 +2075,14 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
         for (const p of participants) if (parsed.surprised.includes(p.id)) p.surprised = true;
     }
 
+    // Play report 7 #7 (lane F): declared initiative. Untagged initiative /
+    // check:dex mechanics on a token's effects (and tagged ones its
+    // participants[].context asserts) roll two d20s; a given initiative rolls
+    // nothing. Read here, never stored on the token.
+    const declaredInit = initiativeDeclarations(parsed.participants.map((p, i) => ({ id: participants[i].id, name: p.name, initiative: p.initiative, context: p.context })));
+
     // Start encounter
-    const state = engine.startEncounter(participants);
+    const state = engine.startEncounter(participants, { initiativeSources: declaredInit.sources, saverSides: engineSaverSides(() => getDb()) });
 
     // CRIT-003: Add terrain to state if provided
     if (parsed.terrain && state) {
@@ -1795,12 +2158,26 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
     // Build response with BOTH text and JSON
     // Include sessionId in state JSON so frontend knows which session to query
     // dice: 'crypto' or 'seeded:<seed>' — which dice this fight rolls.
-    const stateJson = { ...buildStateJson(state, encounterId, ctx.sessionId), dice: engine.describeDice() };
+    // Play report 7 #9: the order and who is first up, as fields and one line.
+    const initiative = initiativeRows(state, {
+        given: new Set(parsed.participants.filter(p => p.initiative !== undefined).map(p => p.id)),
+        surprised: new Set(parsed.surprised ?? []),
+        declared: engine.initiativeDeclared
+    });
+    const firstUp = firstUpOf(state);
+    const stateJson = {
+        ...buildStateJson(state, encounterId, ctx.sessionId), dice: engine.describeDice(), initiative, firstUp,
+        // Play report 7 #7 (lane F): a context tag that fired nothing on a token's initiative.
+        ...(declaredInit.warnings.length ? { warnings: declaredInit.warnings } : {}),
+        // Lane H review: a surprised first slot's save_ends saves, as advance reports them (output_mode summary keeps them).
+        ...(engine.endOfTurnSaves.length ? { endOfTurnSaves: engine.endOfTurnSaves } : {})
+    };
     const formattedText = formatCombatStateText(state, encounterId);
 
     let output = `⚔️ COMBAT STARTED\n`;
     output += `Encounter ID: ${encounterId}\n`;
     output += `Dice: ${engine.describeDice()}\n`;
+    output += `${initiativeBannerLine(initiative, firstUp)}\n`;
     // A surprised first actor's slot already passed (and ticked) at start.
     for (const note of engine.turnStartNotes) output += `${note}\n`;
     output += formattedText;
@@ -1900,6 +2277,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
     // some legitimate flows could be disrupted. A stricter mode can be
     // layered on top later.
     let turnWarning: string | undefined;
+    // Play report 7 #6: the same off-turn fact as data (the warning sits after
+    // the STATE_JSON, and output_mode summary cuts it).
+    let offTurn: { actorId: string; activeId: string; activeName: string } | undefined;
     {
         const liveState = engine.getState();
         if (liveState) {
@@ -1907,6 +2287,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             if (
                 activeId &&
                 parsed.actorId !== activeId &&
+                // Play report 7 #10: a controlled mount acts on its rider's turn.
+                !onActiveTurn(liveState, parsed.actorId) &&
                 // Ignore if the supplied actorId isn't a real participant —
                 // the action handler will produce a clearer error downstream.
                 liveState.participants.some((p) => p.id === parsed.actorId)
@@ -1918,7 +2300,20 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     ? 'LAIR action'
                     : (liveState.participants.find((p) => p.id === activeId)?.name ?? activeId);
                 turnWarning = `off_turn_action: ${parsed.actorId} acting during ${activeLabel}'s turn`;
+                offTurn = { actorId: parsed.actorId, activeId, activeName: activeLabel };
             }
+        }
+    }
+
+    // Play report 7 #10: a controlled mount may only Dash, Disengage or Dodge
+    // (and move); attack, cast_spell, heal are refused before anything is spent.
+    {
+        const liveState = engine.getState();
+        const steedRefusal = liveState ? controlledMountActionRefusal(liveState, parsed.actorId, parsed.action, { reaction: !!parsed.reaction }) : undefined;
+        if (steedRefusal) {
+            const refusal = new Error(steedRefusal) as Error & { writes?: string };
+            refusal.writes = 'none';
+            throw refusal;
         }
     }
 
@@ -1950,6 +2345,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             actorId: parsed.actorId, targetIds, unbinderId: parsed.unbinderId, damage: parsed.damage, boost: parsed.boost
         });
         output = cast.output;
+        // Play report 7 #1: a world spell carries no area flag, so a count given for a unit is not used.
+        if (parsed.modelsInArea !== undefined) output += `\n(modelsInArea ignored: ${worldSpell.rule.name} is a world spell with no area flag, so its damage comes off a unit's pool as one number. For an area on a unit, combat_manage apply_damage {area: true, modelsInArea})\n`;
         result = cast.result;
         // Play report 5 #5: a world spell's damage follows the dying track to
         // the sheets: a drop mirrors Unconscious + Prone, a death runs the kill.
@@ -2146,6 +2543,72 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             if (coverRes.kind === 'total') throw totalCoverRefusal(coverRes, actor.name, target.name);
         }
 
+        // Play report 7 #7 (lane F): declared advantage on this attack, in its
+        // own lane (the lane cover and fighting style read). Untagged attack /
+        // attack:<lane> mechanics on the attacker's effects fire by themselves;
+        // tagged ones on `context` or when named. A named source grants only
+        // what declares it for this attack (lane E's resolver); anything else
+        // refuses the attack here, before any roll or spend (writes: none,
+        // sourceProblems). situationalAdvantage is the GM's one-off ('GM:
+        // downhill'); advantage: true is 'GM'. A posted outcome rolls nothing,
+        // so names are not checked (the engine notes the sources as ignored).
+        const attackCtx = (parsed.context ?? []).map(t => t.trim()).filter(Boolean);
+        const sitAdv = parsed.situationalAdvantage?.trim() || undefined;
+        const sitDis = parsed.situationalDisadvantage?.trim() || undefined;
+        // Lane F review: a volley is the unit's fire (it cannot be non-lethal,
+        // and a unit in melee volleys a step down), so it reads the ranged side
+        // whatever the grid says, theatre of mind included.
+        const attackLane: AttackLane = parsed.volley ? 'ranged'
+            : actor && target ? attackLaneOf(actor, target, { ranged, reachFt: profile?.reachFt }) : (ranged ? 'ranged' : 'melee');
+        const attackDecl = attackDeclarations(parsed.actorId, attackCtx);
+        const namedSides: DeclaredSides = { advantage: [], disadvantage: [] };
+        const namedEffects = new Set<string>();
+        const advTexts = parsed.advantageSources ?? [], disTexts = parsed.disadvantageSources ?? [];
+        if (!outcome && (advTexts.length || disTexts.length)) {
+            const sheetConditions = ((actorRow as { conditions?: Array<{ name?: unknown; source?: unknown }> } | null)?.conditions ?? [])
+                .filter(c => c && typeof c.name === 'string')
+                .map(c => ({ name: String(c.name), source: typeof c.source === 'string' ? c.source : undefined, on: 'sheet' as const }));
+            const owner: DeclaringOwner = {
+                ownerId: parsed.actorId, ownerName: actor?.name ?? actorRow?.name ?? parsed.actorId,
+                effects: attackDecl.effects,
+                traits: (actorRow as { skillAdvantage?: DeclaringOwner['traits'] } | null)?.skillAdvantage ?? [],
+                conditions: [
+                    ...(actor?.conditions ?? []).map(c => ({ name: String(c.type), source: c.sourceId, level: typeof c.metadata?.level === 'number' ? c.metadata.level : undefined, on: 'token' as const })),
+                    ...sheetConditions
+                ]
+            };
+            const roll = { kind: 'attack' as const, range: attackLane };
+            const adv = resolveAdvantageSources(advTexts, 'advantage', owner, roll, attackCtx);
+            const dis = resolveAdvantageSources(disTexts, 'disadvantage', owner, roll, attackCtx);
+            const problems = [...adv.problems, ...dis.problems];
+            if (problems.length) {
+                const refusal = new Error(`${owner.ownerName} cannot attack with these sources: ${problems.join(' | ')} Name what declares it for this ${attackLane} attack (an effect with an advantage_on / disadvantage_on mechanic scoped attack or attack:${attackLane}, a standard condition's 5e rule), or pass situationalAdvantage: '<reason>' for your own ruling. Nothing was rolled or spent.`) as Error & { writes?: string; sourceProblems?: string[] };
+                refusal.writes = 'none';
+                refusal.sourceProblems = problems;
+                throw refusal;
+            }
+            // A named untagged mechanic fires by itself anyway (labelled with its
+            // scope); a tagged one named reads '(tag, named)', a condition its name.
+            for (const g of [...adv.granted, ...dis.granted]) if (g.via === 'effect') namedEffects.add(g.name.toLowerCase());
+            const added = (g: { via: string; lane: string }) => !(g.via === 'effect' && g.lane === 'ENGINE');
+            namedSides.advantage.push(...adv.granted.filter(added).map(g => g.label));
+            namedSides.disadvantage.push(...dis.granted.filter(added).map(g => g.label));
+        }
+        const gmSides: DeclaredSides = {
+            advantage: [...(parsed.advantage ? ['GM'] : []), ...(sitAdv ? [`GM: ${sitAdv}`] : [])],
+            disadvantage: [...(parsed.disadvantage ? ['GM'] : []), ...(sitDis ? [`GM: ${sitDis}`] : [])]
+        };
+        const attackDeclared: Partial<Record<AttackLane, DeclaredSides>> = {
+            melee: mergeSides(gmSides, attackDecl[parsed.volley ? 'ranged' : 'melee'], namedSides),
+            ranged: mergeSides(gmSides, attackDecl.ranged, namedSides)
+        };
+        // A tagged mechanic nobody asserted is told its tag and its name; a tag that fired nothing is said.
+        const laneDecl = attackDecl[attackLane];
+        const tagHint = (which: 'advantage' | 'disadvantage') => (g: { effect: string; tag: string }) => `${g.effect} (${g.tag}): pass context: ['${g.tag}'] or ${which}Sources: ['${g.effect}'] when it holds`;
+        const conditionalAdvantage = attackCtx.length || outcome ? [] : laneDecl.gated.filter(g => g.which === 'advantage' && !namedEffects.has(g.effect.toLowerCase())).map(tagHint('advantage'));
+        const conditionalDisadvantage = attackCtx.length || outcome ? [] : laneDecl.gated.filter(g => g.which === 'disadvantage' && !namedEffects.has(g.effect.toLowerCase())).map(tagHint('disadvantage'));
+        const unfiredTags = attackCtx.filter(t => !laneDecl.firedTags.includes(normTag(t)));
+
         // 3. Damage - auto-calculate from multiple sources
         if (!outcome && (damage === undefined || damage === 0)) {
             // First: try preset on participant
@@ -2301,7 +2764,12 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             strikeRule = loadRule(rulesDb, ruleWorld, 'called_strike');
             if (!strikeRule) throw new Error(`calledStrike needs an enabled called_strike rule in this encounter's world${ruleWorld ? '' : ' (the encounter has no world: create it with worldId)'}`);
             if (actor && target) {
-                const problem = calledStrikeProblem(strikeRule, ruleBands, actor, target, parsed.calledStrike, parsed.atPart);
+                const problem = calledStrikeProblem(strikeRule, ruleBands, actor, target, parsed.calledStrike, parsed.atPart, {
+                    // Play report 7 #3: the band refusal names the call that fixes it, and an assumed band says so.
+                    // Review: across two ladders, the order shown is the other side's ladder.
+                    fix: (move, other) => `Set it: ${setBandCall(parsed.encounterId, move.id)} (order: ${(other.band ? bandOrderFor(rulesDb, ruleWorld, [other.band]) : ruleBands).join(' < ')})`,
+                    tag: bandAssumedTag(actor, target)
+                });
                 if (problem) throw new Error(problem);
             }
         }
@@ -2309,8 +2777,14 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             if (!target?.unit) throw new Error(`Cleave goes through packed lower-band units; ${target?.name ?? parsed.targetId} is not a unit`);
             if (!target.unit.packed) throw new Error(`${target.name} is spaced: spacing prevents cleave`);
             const cmp = actor ? compareBands(ruleBands, actor.band, target.band) : null;
-            if (cmp === null) throw new Error(`Cleave needs both bands set (unset for ${!actor?.band ? actor?.name ?? parsed.actorId : target.name})`);
-            if (cmp <= 0) throw new Error(`Never cleave peers: ${target.name} (${target.band}) is not below ${actor!.name} (${actor!.band})`);
+            if (cmp === null) {
+                // Review of play report 7 #3: two bands on different ladders are
+                // not "unset"; the fix names the ladder of the other side's band.
+                const unranked = actor ? bandsUnranked('Cleave', actor, target) : undefined;
+                const ladder = unranked?.other.band ? bandOrderFor(rulesDb, ruleWorld, [unranked.other.band]) : ruleBands;
+                throw new Error(`${unranked?.problem ?? `Cleave needs both bands set (unset for ${parsed.actorId})`}. Set it: ${setBandCall(parsed.encounterId, unranked?.move.id ?? parsed.actorId)} (order: ${ladder.join(' < ')})`);
+            }
+            if (cmp <= 0) throw new Error(`Never cleave peers: ${target.name} (${target.band}) is not below ${actor!.name} (${actor!.band})${bandAssumedTag(actor, target)}`);
         }
         if (parsed.preparedAsset) {
             preparedRule = loadRule(rulesDb, ruleWorld, 'prepared_asset', parsed.preparedAsset);
@@ -2384,6 +2858,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 reachFt: profile?.reachFt,
                 // Play report 5 #1: the cover resolved above (the engine resolves it itself when unset).
                 ...(coverRes ? { cover: coverRes } : {}),
+                // Play report 7 #7 (lane F): the declared sources per lane; the engine reads this attack's.
+                declared: attackDeclared,
                 // Item 16: the superiority die, into the damage or (precision) the attack.
                 ...(plan && plan.def.dieTo === 'damage' ? { extraDamageDice: [{ dice: plan.die, label: `superiority die (${plan.name})` }] } : {}),
                 ...(plan && plan.name === 'precision' ? { attackBonusDie: { dice: plan.die, label: 'superiority die (precision)', onlyIfMiss: true, maxMissBy: dieMax(plan.die) } } : {})
@@ -2416,6 +2892,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             if (shielded) persistShieldsToDb(shielded);
         }
 
+        // Play report 7 (lane H): the concentration save's sources, for the reply below (only when it took one).
+        let attackConcentration: (ConcentrationOutcome & { targetId: string; name: string }) | undefined;
         // Check concentration if target took damage and is concentrating
         if (result.success && result.damage && result.damage > 0) {
             const db = getDb();
@@ -2423,12 +2901,19 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             const charRepo = new CharacterRepository(db);
             const targetChar = charRepo.findById(parsed.targetId);
 
-            if (targetChar && concentrationRepo.isConcentrating(parsed.targetId)) {
+            // Lane H review: a blow that drops the target to 0 HP ends its spell
+            // outright (below), with no CON save: a save there printed '✓ held'
+            // over a spell that had just ended.
+            if (targetChar && concentrationRepo.isConcentrating(parsed.targetId) && !result.defeated) {
                 // RESOLVER v1: autoApply saving_throw_bonus (con-filtered) feeds the hold.
                 const conMechs = loadAutoMechanics(getDb(), parsed.targetId);
                 const conBonus = conMechs.filter(m => m.type === 'saving_throw_bonus' && (!m.condition || 'constitution'.includes(m.condition.toLowerCase()) || m.condition.toLowerCase().includes('con'))).reduce((s, m) => s + m.value, 0);
+                // Play report 7 (lane H): the target's declared save:con sides and conditions, on the fight's dice.
                 const concentrationCheck = checkConcentration(targetChar, result.damage, concentrationRepo, conBonus,
-                    () => engine.rollD20({ purpose: 'concentration', forId: parsed.targetId }));
+                    fightConcentrationDie(engine, db, parsed.targetId));
+                if (concentrationLabelled(concentrationCheck)) {
+                    attackConcentration = { targetId: parsed.targetId, name: targetChar.name, ...concentrationOutcome(concentrationCheck) };
+                }
                 if (concentrationCheck.broken) {
                     // Break concentration
                     breakConcentration(
@@ -2493,6 +2978,21 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // GM names the flavour.
         const ruleLines: string[] = [];
         const resultRec = result as unknown as Record<string, unknown>;
+        // Play report 7 #7 (lane F): the GM's one-offs and the tags as given, a
+        // tag that fired nothing, and the tag a tagged mechanic waits for.
+        if (sitAdv) resultRec.situationalAdvantage = sitAdv;
+        if (sitDis) resultRec.situationalDisadvantage = sitDis;
+        if (attackCtx.length) resultRec.context = attackCtx;
+        if (unfiredTags.length && !outcome) result.situational = [...(result.situational ?? []), `context [${unfiredTags.join(', ')}] fired nothing on this ${attackLane} attack: no tagged attack or attack:${attackLane} mechanic on ${actor?.name ?? parsed.actorId} declares it`];
+        // Lane F review: a posted outcome rolls nothing, so the names were not
+        // checked; say which, rather than dropping them without a word.
+        if (outcome && (advTexts.length || disTexts.length)) {
+            const unchecked = [advTexts.length ? `adv: ${advTexts.join(', ')}` : '', disTexts.length ? `dis: ${disTexts.join(', ')}` : ''].filter(Boolean).join('; ');
+            result.situational = [...(result.situational ?? []), `named sources not checked: posted outcome, no roll (${unchecked})`];
+        }
+        if (conditionalAdvantage.length) resultRec.conditionalAdvantage = conditionalAdvantage;
+        if (conditionalDisadvantage.length) resultRec.conditionalDisadvantage = conditionalDisadvantage;
+        for (const c of [...conditionalAdvantage, ...conditionalDisadvantage]) result.situational = [...(result.situational ?? []), `conditional: ${c}`];
         const afterState = engine.getState();
         const actorNow = afterState?.participants.find(p => p.id === parsed.actorId);
         const targetNow = afterState?.participants.find(p => p.id === parsed.targetId);
@@ -2519,7 +3019,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 engine.refreshVessel(targetNow);
                 if (charRepoFor(targetNow.id)) new CharacterRepository(getDb()).update(targetNow.id, { parts: targetNow.parts } as never);
                 resultRec.calledStrike = { rule: strikeRule.name, limb, crippled: true, part: part.name, notes: part.note };
-                ruleLines.push(`RULE ${strikeRule.name}: ${targetNow.name}'s ${part.name} crippled until repaired${part.note ? ` (${part.note})` : ''}`);
+                // Play report 7 #3: the peer check read an assumed band.
+                const assumed = (strikeRule.spec as { requirePeer?: boolean }).requirePeer ? bandAssumedTag(actorNow, targetNow) : '';
+                ruleLines.push(`RULE ${strikeRule.name}: ${targetNow.name}'s ${part.name} crippled until repaired${part.note ? ` (${part.note})` : ''}${assumed}`);
             } else {
                 resultRec.calledStrike = { rule: strikeRule.name, limb, crippled: false };
                 ruleLines.push(`RULE ${strikeRule.name}: called strike at the ${limb} missed`);
@@ -2533,7 +3035,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 if ('skipped' in due) { ruleLines.push(`RULE skipped: ${due.skipped}`); continue; }
                 const setPart = `combat_manage set_part {encounterId: '${parsed.encounterId}', participantId: '${targetNow.id}', part: '${parsed.atPart ?? '<part>'}', state: 'crippled' | 'dead' | 'breached'}`;
                 resultRec.consequenceDue = { ...due, setPart };
-                ruleLines.push(`CONSEQUENCE DUE (${due.rule}${due.direction === 'down' ? ', from above' : ''}): ${due.reason}. GM names it: ${due.options.join(' / ')}; record it with ${setPart} (or add_condition)`);
+                ruleLines.push(`CONSEQUENCE DUE (${due.rule}${due.direction === 'down' ? ', from above' : ''}): ${due.reason}${bandAssumedTag(actorNow, targetNow)}. GM names it: ${due.options.join(' / ')}; record it with ${setPart} (or add_condition)`);
             }
         }
         if (preparedRule) {
@@ -2591,12 +3093,22 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 } else {
                     const save = rollParticipantSave(engine, getDb(), targetNow, plan.def.save, plan.dc, { purpose: `${plan.name} save vs ${actorNow.name}` });
                     maneuver.dc = plan.dc;
-                    maneuver.save = { ability: save.ability, dc: plan.dc, natural: save.natural, total: save.total, saved: save.saved, ...(save.legendaryResisted ? { legendaryResisted: true } : {}) };
+                    maneuver.save = {
+                        ability: save.ability, dc: plan.dc, natural: save.natural, total: save.total, saved: save.saved, ...(save.legendaryResisted ? { legendaryResisted: true } : {}),
+                        // Play report 7 (lane G1): the target's declared save sides and conditions, both dice.
+                        ...(save.rolls.length > 1 ? { rolls: save.rolls } : {}),
+                        ...(save.advantageSources ? { advantageSources: save.advantageSources } : {}),
+                        ...(save.disadvantageSources ? { disadvantageSources: save.disadvantageSources } : {}),
+                        ...(save.conditionalAdvantage ? { conditionalAdvantage: save.conditionalAdvantage } : {}),
+                        ...(save.conditionalDisadvantage ? { conditionalDisadvantage: save.conditionalDisadvantage } : {})
+                    };
+                    const row = saveSourcesRow({ id: targetNow.id, name: targetNow.name }, save);
+                    if (row) resultRec.saveSources = [row];
                     if (!save.saved) maneuver.applied = applyManeuverEffect(engine, plan.def, actorNow, targetNow, parsed.maneuverItem);
                 }
             }
             resultRec.maneuver = maneuver;
-            const save = maneuver.save as { ability: string; total: number; saved: boolean } | undefined;
+            const save = maneuver.save as { ability: string; natural: number; total: number; saved: boolean; rolls?: number[]; advantageSources?: string[]; disadvantageSources?: string[] } | undefined;
             const applied = maneuver.applied as { condition?: string; dropped?: string | null; part?: string; note?: string } | undefined;
             const appliedLine = !applied ? ''
                 : applied.condition === 'prone' ? `; ${targetNow.name} is prone`
@@ -2605,7 +3117,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 : `; ${applied.note}`;
             ruleLines.push(`RULE maneuver ${plan.name}: ${used
                 ? `superiority die ${plan.die} = ${maneuver.roll} on the ${plan.def.dieTo} (${plan.poolBefore} → ${plan.poolBefore - 1} left)`
-                : `not spent (${maneuver.note ?? 'the attack missed'}; ${plan.poolBefore} left)`}${save ? `; ${save.ability.slice(0, 3).toUpperCase()} save ${save.total} vs DC ${plan.dc} ${save.saved ? 'saved' : 'FAILED'}` : ''}${appliedLine}`);
+                : `not spent (${maneuver.note ?? 'the attack missed'}; ${plan.poolBefore} left)`}${save ? `; ${save.ability.slice(0, 3).toUpperCase()} save ${save.total} vs DC ${plan.dc} ${save.saved ? 'saved' : 'FAILED'}${saveSidesNote({ ...save, rolls: save.rolls ?? [save.natural] })}` : ''}${appliedLine}`);
         }
         for (const note of source.notes) ruleLines.push(`⚖️ ${note}`);
         for (const note of (result.situational ?? []).slice().reverse()) ruleLines.unshift(`⚖️ ${note}`);
@@ -2619,7 +3131,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         }
         if (result.bandScale && bandRule) {
             const bs = result.bandScale;
-            ruleLines.push(`RULE ${bandRule.name}: ${actorNow?.band ?? actor?.band} ${bs.steps > 0 ? `${bs.steps} above` : `${-bs.steps} below`} ${targetNow?.band ?? target?.band}: damage ×${bs.multiplier} (${bs.before} → ${bs.after})`);
+            ruleLines.push(`RULE ${bandRule.name}: ${actorNow?.band ?? actor?.band} ${bs.steps > 0 ? `${bs.steps} above` : `${-bs.steps} below`} ${targetNow?.band ?? target?.band}: damage ×${bs.multiplier} (${bs.before} → ${bs.after})${bandAssumedTag(actorNow ?? actor, targetNow ?? target)}`);
+        }
+        // Play report 7 #3: a cleave goes through a lower band; an assumed one says so.
+        if (parsed.cleave && targetNow?.unit && bandAssumedTag(actorNow ?? actor, targetNow)) {
+            ruleLines.push(`RULE cleave: through ${targetNow.name} (${targetNow.band}) below ${(actorNow ?? actor)?.name} (${(actorNow ?? actor)?.band})${bandAssumedTag(actorNow ?? actor, targetNow)}`);
         }
         if (targetNow?.unit) {
             const t = volleyTier(targetNow);
@@ -2640,8 +3156,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // Growth tracks: a kill feeds the killer's growth pool (more for a
         // victim of its band or above). The next form is offered, never taken.
         // The same hook apply_damage and sheet execute use (creditKill).
-        if (result.target && result.target.hpBefore > 0 && targetNow && targetNow.hp <= 0 && actorNow && !result.knockedOut) {
-            const credit = await creditKill(rulesDb, ruleWorld, parsed.actorId, { id: targetNow.id, name: targetNow.name, band: targetNow.band }, actorNow.band);
+        // Play report 7 #1: a unit credits each model the blow killed, wiped or not.
+        const unitKills = targetNow?.unit && result.target ? modelsKilledBetween(targetNow.unit, result.target.hpBefore, targetNow.hp) : undefined;
+        const killCredited = unitKills !== undefined ? unitKills > 0 : !!(result.target && result.target.hpBefore > 0 && targetNow && targetNow.hp <= 0);
+        if (killCredited && targetNow && actorNow && !result.knockedOut) {
+            const credit = await creditKill(rulesDb, ruleWorld, parsed.actorId, { id: targetNow.id, name: targetNow.name, band: targetNow.band, ...(targetNow.bandAssumed ? { bandAssumed: true } : {}) }, actorNow.band, unitKills ?? 1);
             if (credit) {
                 resultRec.growth = credit;
                 ruleLines.push(growthLine(credit));
@@ -2684,6 +3203,15 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 resultRec.multiattack = swing;
                 ruleLines.push(`⚔ attack ${swing.made}/${swing.of}${swing.made < swing.of ? '' : ' (Attack action spent)'}`);
             }
+        }
+
+        // Play report 7 (lane H): a concentration save that took a source (or
+        // left a tagged one waiting) says so; with none the reply is as before.
+        if (attackConcentration) {
+            resultRec.concentrationSaves = [attackConcentration];
+            const row = concentrationSourcesRow({ id: attackConcentration.targetId, name: attackConcentration.name }, attackConcentration);
+            if (row) resultRec.saveSources = [...((resultRec.saveSources as SaveSourcesRow[] | undefined) ?? []), row];
+            ruleLines.push(`🧠 ${attackConcentration.name}: ${concentrationLine(attackConcentration)}`);
         }
 
         output = formatAttackResult(result);
@@ -2797,16 +3325,30 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             throw new Error('No combat state');
         }
 
-        const actor = currentState.participants.find(p => p.id === parsed.actorId);
-        if (!actor) {
+        const named = currentState.participants.find(p => p.id === parsed.actorId);
+        if (!named) {
             throw new Error(`Actor ${parsed.actorId} not found`);
         }
+        // Play report 7 #10: a rider on a controlled mount moves the MOUNT (the
+        // mount's budget; the rider moves free and follows, credited the feet);
+        // a rider on an independent mount cannot move it. A moving mount
+        // carries its rider.
+        const steed = mountOf(currentState, named);
+        if (steed && steed.riderId === named.id && steed.controlledBy !== named.id) {
+            const refusal = new Error(`${named.name} rides ${steed.name} (independent): it moves when ${steed.name} moves (move {actorId: '${steed.id}'}); dismount first (combat_manage dismount {encounterId: '${parsed.encounterId}', riderId: '${named.id}'}) to move on foot. Nothing was spent.`) as Error & { writes?: string };
+            refusal.writes = 'none';
+            throw refusal;
+        }
+        const actor = steed && steed.riderId === named.id ? steed : named;
+        const carried = riderOf(currentState, actor);
+        const rider = carried && carried.mountedOn === actor.id ? carried : undefined;
 
         // Get actor's current position
         const actorPos = (actor as any).position;
         if (!actorPos) {
             // No position set - just set the target position directly
             (actor as any).position = parsed.targetPosition;
+            if (rider) rider.position = { x: parsed.targetPosition.x, y: parsed.targetPosition.y };
             output = formatMoveResult(actor.name, undefined, parsed.targetPosition, true, null);
         } else {
             // Item 11: the move is validated first (blocked destination, no
@@ -2818,7 +3360,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             // Every square another participant fills is an obstacle (a
             // large token fills 2x2 from its position, item 6).
             for (const p of currentState.participants) {
-                if (p.id === parsed.actorId) continue;
+                // Play report 7 #10: a mount's own rider shares its squares and never blocks it.
+                if (p.id === actor.id || p.id === rider?.id) continue;
                 for (const cell of footprintCells(p)) obstacles.add(`${cell.x},${cell.y}`);
             }
 
@@ -2837,6 +3380,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             // Play report 5 #1: reactors with no shot (total cover between them and the mover).
             const opportunityAttacksSkipped: Array<Record<string, unknown>> = [];
             const readiedTriggered: Array<Record<string, unknown>> = [];
+            // Play report 7 (lane G2): one line per reaction, kept whole by output_mode 'summary'.
+            const reactionLines: string[] = [];
+            const lineTarget = (who: CombatParticipant): ReactionTarget => rider && who === rider ? { name: rider.name, riding: actor.name } : rider && who === actor ? { name: actor.name, carrying: rider.name } : { name: who.name };
             let moved = false;
 
             // The mover's whole footprint at the destination must be clear.
@@ -2865,12 +3411,21 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 // Reactions along the path, in step order. At one step a
                 // readied action goes before the opportunity attack: the
                 // reactor chose it, and it spends the same reaction.
+                // Play report 7 #10: readied triggers are checked for the mount and
+                // its rider (each strikes the one it watched; a reactor fires once);
+                // opportunity attacks come from the mount's path, once per reactor.
                 type Reaction =
-                    | { kind: 'readied'; reactor: CombatParticipant; stepIndex: number; readied: NonNullable<CombatParticipant['readied']> }
+                    | { kind: 'readied'; reactor: CombatParticipant; stepIndex: number; readied: NonNullable<CombatParticipant['readied']>; target: CombatParticipant }
                     | { kind: 'oa'; reactor: CombatParticipant; stepIndex: number };
+                const readiedOnce = new Set<string>();
+                const readiedHits = [
+                    // The rider first: at one step an 'enemy' watch strikes the rider, as an opportunity attack does.
+                    ...(rider ? engine.getReadiedTriggers(actor.id, path, { watched: rider.id }).map(t => ({ kind: 'readied' as const, ...t, target: rider })) : []),
+                    ...engine.getReadiedTriggers(actor.id, path).map(t => ({ kind: 'readied' as const, ...t, target: actor }))
+                ].sort((a, b) => a.stepIndex - b.stepIndex).filter(t => !readiedOnce.has(t.reactor.id) && !!readiedOnce.add(t.reactor.id));
                 const reactions: Reaction[] = [
-                    ...engine.getReadiedTriggers(parsed.actorId, path).map(t => ({ kind: 'readied' as const, ...t })),
-                    ...engine.getOpportunityAttackers(parsed.actorId, path).map(h => ({ kind: 'oa' as const, reactor: h.attacker, stepIndex: h.stepIndex }))
+                    ...readiedHits,
+                    ...engine.getOpportunityAttackers(actor.id, path).map(h => ({ kind: 'oa' as const, reactor: h.attacker, stepIndex: h.stepIndex }))
                 ].sort((a, b) => a.stepIndex - b.stepIndex || (a.kind === b.kind ? 0 : a.kind === 'readied' ? -1 : 1));
 
                 const hpBefore = actor.hp;
@@ -2884,92 +3439,145 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     // The mover stands where the reaction happens (conditions
                     // within 5 ft and the grid read this square).
                     actor.position = at;
+                    // Play report 7 #10: the rider shares the mount's space, so it is
+                    // struck from the mount square nearest the reactor. An opportunity
+                    // attack takes the rider by default (5e lets the attacker choose).
+                    if (rider) rider.position = (reactor.position ? nearestMountCell(actor, reactor.position, at) : undefined) ?? at;
+                    // Review: the rider when the reactor is hostile to it; a reactor hostile to the
+                    // mount alone (a captured warhorse under a friend) strikes the mount.
+                    const struck = reaction.kind === 'readied' ? reaction.target : (rider && !!reactor.isEnemy !== !!rider.isEnemy ? rider : actor);
+                    const strikesRider = !!rider && struck === rider;
                     if (reaction.kind === 'readied') {
                         const { readied } = reaction;
                         if (!readied.attack) {
                             // Not an attack: the GM resolves it with trigger_readied.
                             readiedTriggered.push({ participantId: reactor.id, name: reactor.name, stepIndex, at, readied, fired: false });
                             reactionOutput += `\n⏳ READIED: ${reactor.name} — ${readied.action} (${readied.trigger}) at (${at.x}, ${at.y}): call combat_manage trigger_readied {encounterId: '${parsed.encounterId}', participantId: '${reactor.id}'}\n`;
+                            reactionLines.push(readiedFlaggedLine(reactor.name, readied.action, `combat_manage trigger_readied {encounterId: '${parsed.encounterId}', participantId: '${reactor.id}'}`));
                             continue;
                         }
                         let fired: CombatActionResult;
                         try {
-                            fired = resolveReadiedAttack(engine, reactor, actor, readied.attack);
+                            fired = resolveReadiedAttack(engine, reactor, struck, readied.attack);
                         } catch (err) {
+                            // Play report 7 #5: held under a subdue order (a ranged shot, or a
+                            // target already down): no shot, the reaction is not spent and the
+                            // readied attack stays armed. An unanswered onSubdue names the answer.
+                            const held = heldReadied(err);
+                            if (held) {
+                                const awaiting = held.mode === 'hold' && held.awaitingOnSubdue;
+                                readiedTriggered.push({ participantId: reactor.id, name: reactor.name, stepIndex, at, readied, fired: false, held: true, reason: held.note, ...(awaiting ? { awaitingOnSubdue: true, answer: onSubdueAnswer(parsed.encounterId, reactor.id) } : {}) });
+                                reactionOutput += `\n⏳ READIED: ${reactor.name} — ${readied.action} (${readied.trigger}) at (${at.x}, ${at.y}): ${held.note}. The reaction is not spent and the readied attack stays armed${awaiting ? `. Answer: ${onSubdueAnswerText(parsed.encounterId, reactor.id)}` : ''}\n`;
+                                reactionLines.push(held.mode === 'downed' ? notStruckDownLine(reactor.name, lineTarget(struck)) : heldFireLine(reactor.name, awaiting ? onSubdueAnswerText(parsed.encounterId, reactor.id) : undefined));
+                                continue;
+                            }
                             // A dead part or unknown profile: flagged, nothing spent.
                             const problem = err instanceof Error ? err.message : String(err);
                             readiedTriggered.push({ participantId: reactor.id, name: reactor.name, stepIndex, at, readied, fired: false, problem });
                             reactionOutput += `\n⏳ READIED: ${reactor.name} — ${readied.action}: could not fire (${problem}); resolve with trigger_readied\n`;
+                            reactionLines.push(readiedProblemLine(reactor.name, problem));
                             continue;
                         }
                         reactor.readied = undefined;
-                        readiedTriggered.push({ participantId: reactor.id, name: reactor.name, stepIndex, at, readied, fired: true, attack: reactionAttackData(fired) });
+                        readiedTriggered.push({ participantId: reactor.id, name: reactor.name, stepIndex, at, readied, fired: true, ...(rider ? { targetId: struck.id } : {}), attack: reactionAttackData(fired) });
                         reactionOutput += `\n⏳ READIED fires: ${reactor.name} — ${readied.action} (${readied.trigger}) at (${at.x}, ${at.y})\n${fired.detailedBreakdown}\n↩ reaction spent\n`;
-                        const readiedDying = await settleAttackDying(fired, actor, reactor.name, parsed.encounterId);
+                        const readiedDying = await settleAttackDying(fired, struck, reactor.name, parsed.encounterId);
                         if (readiedDying.killed) reactionKilled = readiedDying.killed;
+                        reactionLines.push(rolledReactionLine('readied', reactor.name, lineTarget(struck), reactionAttackData(fired), { killed: !!readiedDying.killed, override: readiedOverrideTail(readiedRangedFor(reactor, readied.attack).override) }));
                         if (readiedDying.lines.length) reactionOutput += `${readiedDying.lines.join('\n')}\n`;
+                        // Play report 7 #5: a knockout under the subdue order reaches the sheet.
+                        const readiedKo = settleKnockout(fired, struck, reactor);
+                        if (readiedKo.length) reactionOutput += `${readiedKo.join('\n')}\n`;
                         new CombatActionLogRepository(getDb()).log({
                             encounterId: parsed.encounterId, round: currentState.round, turnIndex: currentState.currentTurnIndex,
-                            actorId: reactor.id, actorName: reactor.name, actionType: 'trigger_readied', targetIds: [actor.id],
-                            resultSummary: `${reactor.name}'s readied action fires: ${readied.action} (${readied.trigger}) — ${fired.message}`,
+                            actorId: reactor.id, actorName: reactor.name, actionType: 'trigger_readied', targetIds: [struck.id],
+                            resultSummary: `${reactor.name}'s readied action fires: ${readied.action} (${readied.trigger}) — ${fired.message}${fired.subdue ? ` (${fired.subdue.note})` : ''}`,
                             resultDetail: fired.detailedBreakdown, damageDealt: fired.damage
                         });
+                    } else if (reactor.subdue && struck.hp <= 0 && !struck.unit) {
+                        // Play report 7 #5: under the subdue order a reactor does not strike a mover already down.
+                        const reason = `subdue: ${struck.name} is already down; ${reactor.name} does not strike (reaction kept)`;
+                        opportunityAttacksSkipped.push({ attackerId: reactor.id, attackerName: reactor.name, stepIndex, at, reason });
+                        reactionOutput += `\n⚡ OPPORTUNITY ATTACK skipped: ${reason}\n`;
+                        reactionLines.push(notStruckDownLine(reactor.name, lineTarget(struck)));
+                        continue;
                     } else if (isPlayerReactor(reactor)) {
                         // A PC's reaction is the player's choice: offer the exact call.
-                        const call = { tool: 'combat_action', action: 'attack', encounterId: parsed.encounterId, actorId: reactor.id, targetId: actor.id, reaction: true };
-                        opportunityAttacksAvailable.push({ attackerId: reactor.id, attackerName: reactor.name, stepIndex, at, call });
-                        reactionOutput += `\n⚡ OPPORTUNITY ATTACK AVAILABLE: ${reactor.name} may strike ${actor.name} leaving reach at (${at.x}, ${at.y}); the player decides. combat_action attack {encounterId: '${parsed.encounterId}', actorId: '${reactor.id}', targetId: '${actor.id}', reaction: true}\n`;
+                        // Play report 7 #5: under a subdue order the offered swing is non-lethal.
+                        const takeAlive = !!reactor.subdue && !struck.unit;
+                        // The swing happened in melee where the mover left reach (ranged: false), so the
+                        // non-lethal call stays good after the mover has walked on.
+                        const call = { tool: 'combat_action', action: 'attack', encounterId: parsed.encounterId, actorId: reactor.id, targetId: struck.id, reaction: true, ...(takeAlive ? { nonlethal: true, ranged: false } : {}) };
+                        opportunityAttacksAvailable.push({ attackerId: reactor.id, attackerName: reactor.name, stepIndex, at, call, ...(strikesRider ? { couldTarget: actor.id } : {}) });
+                        reactionOutput += `\n⚡ OPPORTUNITY ATTACK AVAILABLE: ${reactor.name} may strike ${struck.name} leaving reach at (${at.x}, ${at.y}); the player decides${takeAlive ? ' (subdue order: non-lethal, take them alive)' : ''}. combat_action attack {encounterId: '${parsed.encounterId}', actorId: '${reactor.id}', targetId: '${struck.id}', reaction: true${takeAlive ? ', nonlethal: true, ranged: false' : ''}}${strikesRider ? ` (or the mount: targetId '${actor.id}')` : ''}\n`;
+                        reactionLines.push(offeredReactionLine(reactor.name, lineTarget(struck), `combat_action attack {encounterId: '${parsed.encounterId}', actorId: '${reactor.id}', targetId: '${struck.id}', reaction: true${takeAlive ? ', nonlethal: true, ranged: false' : ''}}`, { nonlethal: takeAlive, ...(strikesRider ? { orMount: actor.id } : {}) }));
                         continue;
                     } else {
                         let oaResult: CombatActionResult;
                         try {
-                            oaResult = engine.executeOpportunityAttack(reactor.id, parsed.actorId);
+                            // Play report 7 #7 (lane F): untagged attack mechanics fire on the swing (no context here).
+                            const oaDeclared = automaticDeclared(reactor.id);
+                            oaResult = engine.executeOpportunityAttack(reactor.id, struck.id, oaDeclared ? { declared: oaDeclared } : {});
                         } catch (err) {
                             // Play report 5 #1: total cover between them: no shot, no reaction spent, the move goes on.
                             if (!(err instanceof Error && (err as { writes?: string }).writes === 'none')) throw err;
                             opportunityAttacksSkipped.push({ attackerId: reactor.id, attackerName: reactor.name, stepIndex, at, reason: err.message });
                             reactionOutput += `\n⚡ OPPORTUNITY ATTACK skipped: ${reactor.name} has no shot at (${at.x}, ${at.y}) — ${err.message}\n`;
+                            reactionLines.push(skippedReactionLine(reactor.name, lineTarget(struck), err.message));
                             continue;
                         }
-                        opportunityAttacks.push({ attackerId: reactor.id, attackerName: reactor.name, stepIndex, at, ...reactionAttackData(oaResult) });
+                        opportunityAttacks.push({ attackerId: reactor.id, attackerName: reactor.name, stepIndex, at, ...(rider ? { targetId: struck.id, ...(strikesRider ? { couldTarget: actor.id } : {}) } : {}), ...reactionAttackData(oaResult) });
                         reactionOutput += formatOpportunityAttackResult(oaResult) + '\n';
-                        const oaDying = await settleAttackDying(oaResult, actor, reactor.name, parsed.encounterId);
+                        if (strikesRider) reactionOutput += `🐎 ${reactor.name} struck ${rider.name}, the rider, by default: 5e lets an attacker provoked by a mount choose, and it could target the ${actor.name} instead (move the damage with adjust_hp if the table says so)\n`;
+                        const oaDying = await settleAttackDying(oaResult, struck, reactor.name, parsed.encounterId);
                         if (oaDying.killed) reactionKilled = oaDying.killed;
+                        reactionLines.push(rolledReactionLine('OA', reactor.name, { ...lineTarget(struck), ...(strikesRider ? { couldStrikeMount: true } : {}) }, reactionAttackData(oaResult), { killed: !!oaDying.killed }));
                         if (oaDying.lines.length) reactionOutput += `${oaDying.lines.join('\n')}\n`;
+                        // Play report 7 #5: a knockout under the subdue order reaches the sheet.
+                        const oaKo = settleKnockout(oaResult, struck, reactor);
+                        if (oaKo.length) reactionOutput += `${oaKo.join('\n')}\n`;
                     }
-                    // A mover who drops stops where it fell.
-                    if (actor.hp <= 0) { fellAt = stepIndex; break; }
+                    // A mover who drops stops where it fell (a mount stops when its rider drops).
+                    if (actor.hp <= 0 || (rider && rider.hp <= 0)) { fellAt = stepIndex; break; }
                 }
 
                 // Play report 5: the feet actually walked feed the trigger counters.
+                // Play report 7 #10: a carried rider is credited the mount's feet
+                // (mounted charges, trigger-tied attacks) without spending its own.
                 const addMoved = (feet: number) => {
-                    actor.movedThisTurn = (actor.movedThisTurn ?? 0) + feet;
-                    actor.movedSinceDash = (actor.movedSinceDash ?? 0) + feet;
+                    for (const who of rider ? [actor, rider] : [actor]) {
+                        who.movedThisTurn = (who.movedThisTurn ?? 0) + feet;
+                        who.movedSinceDash = (who.movedSinceDash ?? 0) + feet;
+                    }
                 };
+                const rideLine = (feet: number) => rider ? `\n🐎 ${rider.name} rides ${actor.name}: it moves free, and the ${feet} ft count toward its own movement this turn (${rider.movedThisTurn ?? 0} ft, for mounted charges)` : '';
                 if (fellAt !== undefined) {
                     const fell = { x: path[fellAt].x, y: path[fellAt].y };
                     actor.position = fell;
+                    if (rider) rider.position = { ...fell };
                     (actor as any).movementRemaining = currentMovement - fellAt * 5;
                     addMoved(fellAt * 5);
+                    const downed = actor.hp <= 0 || !rider ? actor : rider;
                     output = reactionOutput
                         + (fellAt > 0 ? formatMoveResult(actor.name, actorPos, fell, true, null, fellAt) : '')
-                        + `\n${actor.name} ${dyingLabel(actor) ? `is ${dyingLabel(actor)}` : 'was defeated'} while attempting to move and cannot complete the movement!`;
+                        + `\n${downed.name} ${isKnockedOut(downed) ? 'is knocked out' : dyingLabel(downed) ? `is ${dyingLabel(downed)}` : 'was defeated'} while ${downed === actor ? 'attempting to move' : `riding ${actor.name}`} and ${downed === actor ? 'cannot complete the movement' : `the ${actor.name} stops there`}!`;
                     result = {
                         type: 'attack',
                         success: false,
                         actor: { id: actor.id, name: actor.name },
-                        target: { id: actor.id, name: actor.name, hpBefore, hpAfter: actor.hp, maxHp: actor.maxHp },
+                        target: { id: downed.id, name: downed.name, hpBefore: downed === actor ? hpBefore : downed.hp, hpAfter: downed.hp, maxHp: downed.maxHp },
                         defeated: true,
-                        message: `${actor.name} ${dyingLabel(actor) ?? 'defeated'} by a reaction while moving`,
+                        message: `${downed.name} ${isKnockedOut(downed) ? 'knocked out' : dyingLabel(downed) ?? 'defeated'} by a reaction while moving`,
                         detailedBreakdown: output
                     };
                 } else {
                     // Move successful - update position and remaining movement
                     actor.position = parsed.targetPosition;
+                    if (rider) rider.position = { x: parsed.targetPosition.x, y: parsed.targetPosition.y };
                     (actor as any).movementRemaining = currentMovement - moveCost;
                     addMoved(moveCost);
                     moved = true;
-                    output = reactionOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, true, null, path.length - 1);
+                    output = reactionOutput + formatMoveResult(actor.name, actorPos, parsed.targetPosition, true, null, path.length - 1) + rideLine(moveCost);
                 }
             }
 
@@ -2983,7 +3591,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 message: moved ? `${actor.name} moved` : `${actor.name} could not move`,
                 detailedBreakdown: output
             };
-            Object.assign(result as unknown as Record<string, unknown>, { opportunityAttacks, opportunityAttacksAvailable, readiedTriggered, ...(opportunityAttacksSkipped.length ? { opportunityAttacksSkipped } : {}), ...(reactionKilled ? { killed: reactionKilled } : {}) });
+            Object.assign(result as unknown as Record<string, unknown>, { opportunityAttacks, opportunityAttacksAvailable, readiedTriggered, ...(opportunityAttacksSkipped.length ? { opportunityAttacksSkipped } : {}), ...(reactionKilled ? { killed: reactionKilled } : {}),
+                // Play report 7 (lane G2): one line per reaction; the embed lifts it to the top level.
+                ...(reactionLines.length ? { reactionLines } : {}),
+                // Play report 7 #10: who carried whom.
+                ...(rider ? { mounted: { riderId: rider.id, mountId: actor.id, controlled: actor.controlledBy === rider.id, movedBy: 'mount', mountMovementRemaining: actor.movementRemaining ?? null, riderMovementRemaining: rider.movementRemaining ?? null } } : {}) });
         }
 
         // Create dummy result if not set (for the case where no position was set initially)
@@ -3066,6 +3678,15 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // Spell is valid - resolve effects
         const spell = validation.spell!;
         const effectiveSlotLevel = validation.effectiveSlotLevel || spell.level;
+        // Play report 7 #1: an area spell (areaOfEffect) on a unit token goes
+        // model by model; a spaced unit needs modelsInArea before the slot,
+        // the action or any die is spent. Any other spell takes one model.
+        const spellArea = !!spell.areaOfEffect;
+        if (spellArea && spell.effects.some(e => e.type === 'damage')) {
+            const named = parsed.targetIds?.length ? parsed.targetIds : parsed.targetId ? parsed.targetId.split(',').map((t: string) => t.trim()).filter(Boolean) : [];
+            const needs = unitsNeedingCount(currentState.participants, named, parsed.modelsInArea as ModelsInArea | undefined);
+            if (needs.length) throw areaCountRefusal(needs);
+        }
 
         // ACTION ECONOMY VALIDATION
         const actionType = parseCastingTime(spell.castingTime);
@@ -3162,6 +3783,19 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 }
             }
         }
+        // Play report 7 #7 (lane F): a spell attack reads the caster's untagged
+        // attack / attack:<lane> mechanics. The spell's own kind decides the
+        // lane when it states one (5e: Spiritual Weapon is a melee spell attack
+        // at range 60); else a touch or self spell (or one that reaches only
+        // 5 ft) makes a melee spell attack, any other a ranged one. A direct
+        // handler caller's ranged: true | false decides it instead.
+        const spellRange = (spell as { range?: unknown }).range;
+        const spellKind = (spell as { spellAttack?: AttackLane }).spellAttack;
+        const spellLane: AttackLane = parsed.ranged === true ? 'ranged' : parsed.ranged === false ? 'melee'
+            : spellKind ? spellKind
+            : spellRange === 'touch' || spellRange === 'self' || (typeof spellRange === 'number' && spellRange <= 5) ? 'melee' : 'ranged';
+        const spellDeclared = spellMakesAttack ? automaticDeclared(parsed.actorId)?.[spellLane] : undefined;
+        let spellAttackSources: { advantageSources?: string[]; disadvantageSources?: string[] } = {};
         const resolution = resolveSpell(spell, casterChar, effectiveSlotLevel, {
             targetAC,
             perTargetSaves: true,
@@ -3177,8 +3811,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                         if (!!advantage !== !!disadvantage) rolls.push(engine.rollD20({ purpose: 'spell attack', forId: parsed.actorId }));
                         return { natural: advantage && !disadvantage ? Math.max(...rolls) : disadvantage && !advantage ? Math.min(...rolls) : rolls[0], rolls };
                     }
-                    const r = engine.rollSpellAttackD20(parsed.actorId, attackTargetId, { ranged: parsed.ranged, advantage, disadvantage });
+                    const r = engine.rollSpellAttackD20(parsed.actorId, attackTargetId, { ranged: parsed.ranged, advantage, disadvantage, ...(spellDeclared ? { declared: spellDeclared } : {}) });
                     spellAttackSituational = r.situational;
+                    spellAttackSources = { ...(r.advantageSources ? { advantageSources: r.advantageSources } : {}), ...(r.disadvantageSources ? { disadvantageSources: r.disadvantageSources } : {}) };
                     return r;
                 },
                 roll: (notation, tag) => engine.rollDice(notation, { purpose: tag, forId: parsed.actorId, ...(attackTargetId ? { targetId: attackTargetId } : {}) })
@@ -3215,8 +3850,16 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             damageModifier?: 'immune' | 'resistant' | 'vulnerable' | 'normal';
             save?: ParticipantSaveResult;
             cover?: { kind: string; source: string; via: string; saveBonus: number };
+            /** Play report 7 #1: an area spell on a unit, model by model. */
+            unitArea?: UnitAreaReport;
+            /** Play report 7 #1: a spell that is not an area took one model at most. */
+            unitCap?: { before: number; after: number };
         }[] = [];
         const damageType = resolution.damageType || 'force';
+        // Play report 7 (lane G1): what each target's save took (declared mechanics, conditions), for saveSources.
+        const spellSaveSources: SaveSourcesRow[] = [];
+        // Play report 7 (lane H): concentration saves that took a declared source or left a tagged one waiting.
+        const spellConcentration: Array<ConcentrationOutcome & { targetId: string; name: string }> = [];
 
         // Get spell's save info
         const damageEffect = spell.effects.find(e => e.type === 'damage');
@@ -3258,10 +3901,20 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 let saveTotal: number | undefined;
                 let saved = false;
                 let targetSave: ParticipantSaveResult | undefined;
+                // Play report 7 #1: an area spell on a unit: one save per model inside.
+                const unitRoll = targetParticipant.unit && spellArea
+                    ? rollUnitArea(engine, db, targetParticipant, {
+                        damage: baseDamage, halfOnSave: saveEffect === 'half',
+                        savingThrow: requiresSave ? { ability: saveType!, dc: spellSaveDC } : undefined,
+                        damageType, coverBonus: tcBonus, purpose: spell.name,
+                        modelsInArea: parsed.modelsInArea as ModelsInArea | undefined, shape: spell.areaOfEffect!.shape
+                    })
+                    : undefined;
+                if (unitRoll) saved = unitRoll.majoritySaved;
 
                 // Roll saving throw if spell requires it: the sheet's ability
                 // modifier and save proficiency, on the encounter's seeded stream.
-                if (requiresSave) {
+                if (requiresSave && !unitRoll) {
                     targetSave = rollParticipantSave(engine, db, targetParticipant, saveType!, spellSaveDC, {
                         purpose: `${toLongAbility(saveType!) ?? 'dexterity'} save vs ${spell.name}${tcBonus ? ` (cover +${tcBonus})` : ''}`,
                         ...(tcBonus ? { extraBonus: tcBonus } : {})
@@ -3280,10 +3933,14 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     }
                 }
 
-                // Resistance, immunity and vulnerability apply after the save.
-                const typed = engine.calculateDamageWithModifiers(damageDealt, damageType, targetParticipant);
-                damageDealt = typed.finalDamage;
-                const damageModifier = typed.modifier;
+                // Resistance, immunity and vulnerability apply after the save
+                // (per model for a unit in an area: rollUnitArea did it).
+                const typed = unitRoll ? undefined : engine.calculateDamageWithModifiers(damageDealt, damageType, targetParticipant);
+                damageDealt = unitRoll ? unitRoll.hpLost : typed!.finalDamage;
+                const damageModifier = unitRoll ? unitRoll.damageModifier : typed!.modifier;
+                // Play report 7 #1: a spell that is not an area takes one model of a unit at most.
+                const spellCap = targetParticipant.unit && !unitRoll ? unitCapFor(targetParticipant, damageDealt) : undefined;
+                if (spellCap) damageDealt = spellCap.damage;
 
                 // Apply damage via engine's applyDamage (direct HP reduction).
                 // Play report 5 #5: a tracked target dropped to 0 is dying (its
@@ -3323,14 +3980,30 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     damageModifier,
                     save: targetSave,
                     ...(tc && (tc.kind !== 'none' || tc.ignored) ? { cover: { kind: tc.kind, source: tc.source, via: tc.via, saveBonus: tcBonus } } : {}),
+                    ...(unitRoll ? { unitArea: unitRoll.report } : {}),
+                    ...(spellCap?.cap ? { unitCap: spellCap.cap } : {}),
                     ...(dying ? { dying } : {})
                 });
+                {
+                    const row = targetSave
+                        ? saveSourcesRow({ id: tid, name: targetParticipant.name }, targetSave)
+                        : unitRoll?.report.saveBonus ? saveSourcesRow({ id: tid, name: targetParticipant.name }, { ability: unitRoll.report.saveBonus.ability, ...unitRoll.report }, { models: unitRoll.report.saves?.length ?? 0 }) : undefined;
+                    if (row) spellSaveSources.push(row);
+                }
 
                 // Check concentration if target is concentrating
                 const targetChar = charRepo.findById(tid);
-                if (targetChar && concentrationRepo.isConcentrating(tid) && damageDealt > 0) {
+                // Lane H review: 0 HP ends the spell outright (below), with no CON save.
+                if (targetChar && concentrationRepo.isConcentrating(tid) && damageDealt > 0 && !defeated) {
+                    // Play report 7 (lane H): the target's declared save:con sides and conditions, on the fight's dice.
                     const concentrationCheck = checkConcentration(targetChar, damageDealt, concentrationRepo, 0,
-                        () => engine.rollD20({ purpose: 'concentration', forId: tid }));
+                        fightConcentrationDie(engine, db, tid));
+                    if (concentrationLabelled(concentrationCheck)) {
+                        const c = concentrationOutcome(concentrationCheck);
+                        spellConcentration.push({ targetId: tid, name: targetParticipant.name, ...c });
+                        const row = concentrationSourcesRow({ id: tid, name: targetParticipant.name }, c);
+                        if (row) spellSaveSources.push(row);
+                    }
                     if (concentrationCheck.broken) {
                         breakConcentration(
                             { characterId: tid, reason: 'damage', damageAmount: damageDealt },
@@ -3383,8 +4056,12 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                         purpose: `${toLongAbility(effect.saveType!) ?? effect.saveType} save vs ${spell.name}${dBonus ? ` (cover +${dBonus})` : ''}`,
                         ...(dBonus ? { extraBonus: dBonus } : {})
                     });
-                    const line = `🎲 ${tp.name} ${save.ability.toUpperCase()} save: d20(${save.rolls.join(',')}) ${save.modifier >= 0 ? '+' : '-'} ${Math.abs(save.modifier)} = ${save.total} vs DC ${spellSaveDC} [${save.saved ? 'PASS' : 'FAIL'}]`;
+                    const line = `🎲 ${tp.name} ${save.ability.toUpperCase()} save: d20(${save.rolls.join(',')}) ${save.modifier >= 0 ? '+' : '-'} ${Math.abs(save.modifier)} = ${save.total} vs DC ${spellSaveDC} [${save.saved ? 'PASS' : 'FAIL'}]${saveSidesNote(save)}`;
                     conditionLines.push(line);
+                    // Play report 7 (lane G1): a tagged mechanic the save did not fire, and the row for saveSources.
+                    for (const c of [...(save.conditionalAdvantage ?? []), ...(save.conditionalDisadvantage ?? [])]) conditionLines.push(`   conditional: ${c}`);
+                    const row = saveSourcesRow({ id: tp.id, name: tp.name }, save);
+                    if (row) spellSaveSources.push(row);
                     if (save.legendaryResisted) conditionLines.push(`⭐ Legendary resistance spent: the failed save becomes a success`);
                     if (save.saved) continue;
                 }
@@ -3473,7 +4150,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 const defeatIcon = dr.defeated ? (dr.dying && drAfter ? dyingTail(drAfter, dr.dying) : ' 💀 DEFEATED') : '';
                 if (dr.saveRoll !== undefined) {
                     const saveResult = dr.saved ? '✓ PASS' : '✗ FAIL';
-                    output += `  • ${dr.name}: d20(${dr.saveRoll}) + ${(dr.saveTotal || 0) - dr.saveRoll} = ${dr.saveTotal} [${saveResult}]\n`;
+                    output += `  • ${dr.name}: d20(${dr.saveRoll}) + ${(dr.saveTotal || 0) - dr.saveRoll} = ${dr.saveTotal} [${saveResult}]${dr.save ? saveSidesNote(dr.save) : ''}\n`;
+                    for (const c of [...(dr.save?.conditionalAdvantage ?? []), ...(dr.save?.conditionalDisadvantage ?? [])]) output += `    conditional: ${c}\n`;
                     if (dr.save?.legendaryResisted) output += `    ⭐ Legendary resistance spent: the failed save becomes a success\n`;
                     else if (dr.save?.legendaryResistanceAvailable) output += `    ⭐ Failed with ${dr.save.legendaryResistanceAvailable} legendary resistance(s) left: the GM may spend one\n`;
                     output += `    → ${dr.damageDealt} dmg${modTag(dr.damageModifier)} | ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
@@ -3485,7 +4163,10 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             // Show the target's own save and the damage it actually took,
             // not the resolver's single unmodified save.
             const only = damageResults[0];
-            const shown = requiresSave
+            // Play report 7 #1: a unit in an area shows the roll; its per-model line follows.
+            const shown = only.unitArea
+                ? { ...resolution, damage: baseDamage, saveResult: undefined }
+                : requiresSave
                 ? { ...resolution, damage: only.damageDealt ?? baseDamage, saveResult: (only.saved ? 'passed' : 'failed') as 'passed' | 'failed', saveDC: spellSaveDC }
                 : { ...resolution, damage: only.damageDealt ?? resolution.damage };
             const onlyAfter = only.dying ? engine.getState()?.participants.find(p => p.id === only.id) : undefined;
@@ -3499,7 +4180,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 output += `\n🛡️ ${only.name} is ${only.damageModifier} to ${damageType}\n`;
             }
             if (only.save) {
-                output += `\n🎲 ${only.name} ${only.save.ability.toUpperCase()} save: d20(${only.save.rolls.join(',')}) ${only.save.modifier >= 0 ? '+' : '-'} ${Math.abs(only.save.modifier)} = ${only.save.total} vs DC ${spellSaveDC} [${only.save.parts.join(', ')}]\n`;
+                output += `\n🎲 ${only.name} ${only.save.ability.toUpperCase()} save: d20(${only.save.rolls.join(',')}) ${only.save.modifier >= 0 ? '+' : '-'} ${Math.abs(only.save.modifier)} = ${only.save.total} vs DC ${spellSaveDC} [${only.save.parts.join(', ')}]${saveSidesNote(only.save)}\n`;
+                for (const c of [...(only.save.conditionalAdvantage ?? []), ...(only.save.conditionalDisadvantage ?? [])]) output += `   conditional: ${c}\n`;
                 if (only.save.legendaryResisted) output += `⭐ Legendary resistance spent: the failed save becomes a success\n`;
                 else if (only.save.legendaryResistanceAvailable) output += `⭐ Failed with ${only.save.legendaryResistanceAvailable} legendary resistance(s) left: the GM may spend one\n`;
             }
@@ -3519,7 +4201,17 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             : (requiresSave ? baseDamage : (resolution.damage || 0));
         if (spellAttackSituational.length) output += `\n(${spellAttackSituational.join('; ')})\n`;
         if (spellCoverLines.length) output += `\n${spellCoverLines.join('\n')}\n`;
+        // Play report 7 #1: what the spell did to each unit, model by model (or the one-model cap).
+        for (const dr of damageResults) {
+            if (dr.unitArea) {
+                const sl = unitSavesLine(dr.unitArea);
+                output += `\n🎯 ${dr.name} — ${dr.unitArea.line}${sl ? `\n   ${sl}` : ''}\n`;
+            } else if (dr.unitCap) output += `\n🎯 ${dr.name}: ${unitCapLine(dr.unitCap)}\n`;
+        }
+        if (!spellArea && parsed.modelsInArea !== undefined) output += `\n(modelsInArea ignored: ${spell.name} is not an area spell)\n`;
         if (conditionLines.length) output += `\n${conditionLines.join('\n')}\n`;
+        // Play report 7 (lane H): a concentration save that took a source (or left a tagged one waiting).
+        for (const c of spellConcentration) output += `\n🧠 ${c.name}: ${concentrationLine(c)}\n`;
         if (spellKilled.length) output += `\n${killedLines(spellKilled).join('\n')}\n`;
         for (const due of breakTests) output += `\n▌ ${due.line}\n`;
         output += `\n[SPELL: ${spell.name}, SLOT: ${effectiveSlotLevel > 0 ? effectiveSlotLevel : 'cantrip'}, DMG: ${reportedDamage}, HEAL: ${resolution.healing || 0}]`;
@@ -3554,7 +4246,20 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         if (coverSkipped.length) (result as { coverSkipped?: unknown }).coverSkipped = coverSkipped;
         if (conditionsApplied.length) (result as { conditionsApplied?: unknown }).conditionsApplied = conditionsApplied;
         if (breakTests.length) (result as { breakTests?: unknown }).breakTests = breakTests;
+        // Play report 7 #1: per-unit area reports and one-model caps.
+        const unitAreas = damageResults.filter(dr => dr.unitArea).map(dr => ({ targetId: dr.id, name: dr.name, ...dr.unitArea! }));
+        if (unitAreas.length) (result as { unitAreas?: unknown }).unitAreas = unitAreas;
+        // The owner's line per unit, lifted to the reply's top level so output_mode 'summary' keeps it.
+        if (unitAreas.length) (result as { unitLines?: string[] }).unitLines = unitAreas.map(u => unitSummaryLine(u.name, u, breakTests.find(b => b.participantId === u.targetId)));
+        const unitCaps = damageResults.filter(dr => dr.unitCap).map(dr => ({ targetId: dr.id, name: dr.name, ...dr.unitCap! }));
+        if (unitCaps.length) (result as { unitCaps?: unknown }).unitCaps = unitCaps;
+        // Play report 7 (lane G1): what each save took, lifted to the reply's top level below so output_mode 'summary' keeps it.
+        if (spellSaveSources.length) (result as { saveSources?: SaveSourcesRow[] }).saveSources = spellSaveSources;
+        if (spellConcentration.length) (result as { concentrationSaves?: unknown }).concentrationSaves = spellConcentration;
         if (spellAttackSituational.length) result.situational = spellAttackSituational;
+        // Play report 7 #7 (lane F): the declared sources the spell attack roll took.
+        if (spellAttackSources.advantageSources) result.advantageSources = spellAttackSources.advantageSources;
+        if (spellAttackSources.disadvantageSources) result.disadvantageSources = spellAttackSources.disadvantageSources;
         // Play report 5: the knockout a healing spell woke (token and sheet).
         if (spellWoke) (result as unknown as Record<string, unknown>).woke = spellWoke;
         // Play report 5 #5: the first target's dying track and the kills this spell ran (a list, as the area paths report).
@@ -3563,6 +4268,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
     } else {
         throw new Error(`Unknown action: ${parsed.action}`);
     }
+
+    // Play report 7 #6: the actor took a combat action this turn (a move that
+    // only placed it, a heal, a spell: the PC turn guard reads it). A move
+    // refused before a step (blocked, no path, not enough movement) is not one.
+    if (!(parsed.action === 'move' && result?.success === false)) engine.markActed(parsed.actorId);
 
     // Save state
     const state = engine.getState();
@@ -3660,6 +4370,15 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             shieldsAbsorbed: r.shieldsAbsorbed,
             shields: r.shields,
             situational: r.situational,
+            // Play report 7 #7 (lane F): the declared sources the attack roll took, the GM's
+            // one-offs and tags as given, and the tag a tagged mechanic waits for.
+            advantageSources: r.advantageSources,
+            disadvantageSources: r.disadvantageSources,
+            situationalAdvantage: (r as { situationalAdvantage?: unknown }).situationalAdvantage,
+            situationalDisadvantage: (r as { situationalDisadvantage?: unknown }).situationalDisadvantage,
+            context: (r as { context?: unknown }).context,
+            conditionalAdvantage: (r as { conditionalAdvantage?: unknown }).conditionalAdvantage,
+            conditionalDisadvantage: (r as { conditionalDisadvantage?: unknown }).conditionalDisadvantage,
             targetUnit: (r as { targetUnit?: unknown }).targetUnit,
             preparedEffectDue: (r as { preparedEffectDue?: unknown }).preparedEffectDue,
             multiattack: (r as { multiattack?: unknown }).multiattack,
@@ -3683,19 +4402,36 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             // Item 16: the manoeuvre on this swing: die, spend, save and effect.
             maneuver: (r as { maneuver?: unknown }).maneuver,
             saves: (r as { saves?: unknown }).saves,
+            // Play report 7 (lane G1): what each save the engine rolled took (declared mechanics, conditions) or waits for.
+            saveSources: (r as { saveSources?: unknown }).saveSources,
+            // Play report 7 (lane H): concentration saves that took a declared source (Steady Mind, exhaustion 3) or a tagged one's hint.
+            concentrationSaves: (r as { concentrationSaves?: unknown }).concentrationSaves,
             conditionsApplied: (r as { conditionsApplied?: unknown }).conditionsApplied,
             worldSpell: (r as { worldSpell?: unknown }).worldSpell,
             breakTests: (r as { breakTests?: unknown }).breakTests,
+            // Play report 7 #1: an area spell on units, model by model; a single-target spell's one-model cap.
+            unitAreas: (r as { unitAreas?: unknown }).unitAreas,
+            unitCaps: (r as { unitCaps?: unknown }).unitCaps,
             growth: (r as { growth?: unknown }).growth,
             // Item 11: reactions a move set off, each at the step it happened.
             opportunityAttacks: (r as { opportunityAttacks?: unknown }).opportunityAttacks,
             opportunityAttacksAvailable: (r as { opportunityAttacksAvailable?: unknown }).opportunityAttacksAvailable,
             readiedTriggered: (r as { readiedTriggered?: unknown }).readiedTriggered,
+            // Play report 7 #5: reactors that held their swing (total cover, or a subdue order at a mover already down).
+            opportunityAttacksSkipped: (r as { opportunityAttacksSkipped?: unknown }).opportunityAttacksSkipped,
+            // Play report 7 #10: a mount that carried its rider on this move.
+            mounted: (r as { mounted?: unknown }).mounted,
             // Play report 5 #5: the target's dying track after this blow, and the kill it ran.
             dying: r.dying,
             killed: (r as { killed?: unknown }).killed
         } : undefined;
-        output += `\n\n<!-- STATE_JSON\n${JSON.stringify({ ...stateJson, actionResult })}\nSTATE_JSON -->`;
+        // Play report 7 #1: each unit's area line at the top level, where output_mode 'summary' keeps it whole.
+        const unitLines = (r as { unitLines?: string[] } | undefined)?.unitLines;
+        // Play report 7 (lane G1): what each save took, at the top level too, for the same reason.
+        const saveSources = (r as { saveSources?: unknown[] } | undefined)?.saveSources;
+        // Play report 7 (lane G2): each reaction's line (a move's opportunity and readied attacks), kept whole the same way.
+        const reactionLines = (r as { reactionLines?: string[] } | undefined)?.reactionLines;
+        output += `\n\n<!-- STATE_JSON\n${JSON.stringify({ ...stateJson, actionResult, ...(turnWarning && offTurn ? { offTurn } : {}), ...(unitLines?.length ? { unitLines } : {}), ...(saveSources?.length ? { saveSources } : {}), ...(reactionLines?.length ? { reactionLines } : {}) })}\nSTATE_JSON -->`;
     }
 
     if (turnWarning) {
@@ -3743,10 +4479,38 @@ export async function handleAdvanceTurn(args: unknown, ctx: SessionContext) {
         refusal.writes = 'none';
         throw refusal;
     }
+    const worldEnv = readWorldEnvironment(getDb(), resolveWorldId(getDb(), { encounterId: parsed.encounterId }));
+    // Play report 7 #6: the PC turn guard. A living player character whose
+    // turn is untouched is not passed silently: TURN NOT TAKEN, nothing
+    // written, unless the GM confirms (confirm / skipTurn). A world opts out
+    // with environment.pcTurnGuard: 'off'.
+    let skippedTurn: { participantId: string; name: string; round: number } | undefined;
+    const skippedAt = preTurnState ? { round: preTurnState.round, turnIndex: preTurnState.currentTurnIndex } : undefined;
+    if (previousParticipant && worldEnv?.pcTurnGuard !== 'off' && pcTurnNotTaken(engine, previousParticipant)) {
+        if (!parsed.confirm && !parsed.skipTurn) {
+            const refusal = new Error(turnNotTakenMessage(previousParticipant.name, parsed.encounterId)) as Error & { writes?: string; turnNotTaken?: unknown; confirmCall?: string };
+            refusal.writes = 'none';
+            // As data too: output_mode summary cuts a long message, and the call must survive it.
+            refusal.turnNotTaken = { participantId: previousParticipant.id, name: previousParticipant.name, round: skippedAt?.round ?? 1 };
+            refusal.confirmCall = confirmAdvanceCall(parsed.encounterId);
+            throw refusal;
+        }
+        skippedTurn = { participantId: previousParticipant.id, name: previousParticipant.name, round: skippedAt?.round ?? 1 };
+    }
     // The world's default death-save mode; a token's own deathSaveMode wins.
-    const worldMode = readWorldEnvironment(getDb(), resolveWorldId(getDb(), { encounterId: parsed.encounterId }))?.deathSaveMode as DeathSaveMode | undefined;
-    engine.nextTurnWithConditions({ deathSaveMode: worldMode, encounterId: parsed.encounterId });
+    const worldMode = worldEnv?.deathSaveMode as DeathSaveMode | undefined;
+    // Play report 7 (lane H): the end-of-turn save of a save_ends condition reads the
+    // saver's declared sides and sheet modifier through this provider (passed on every
+    // advance, so a fight rehydrated in a new process reads it too).
+    engine.nextTurnWithConditions({ deathSaveMode: worldMode, encounterId: parsed.encounterId, saverSides: engineSaverSides(() => getDb()) });
     const state = engine.getState();
+    if (skippedTurn) {
+        new CombatActionLogRepository(getDb()).log({
+            encounterId: parsed.encounterId, round: skippedTurn.round, turnIndex: skippedAt?.turnIndex ?? 0,
+            actorId: 'GM', actorName: 'GM', actionType: 'skip_turn', targetIds: [skippedTurn.participantId],
+            resultSummary: `${skippedTurn.name}'s turn passed untaken (GM confirmed)`
+        });
+    }
 
     // Play report 5 #5: a third failed death save on the way in runs the kill
     // on the sheet (cause, corpse) and is printed plainly.
@@ -3773,6 +4537,7 @@ export async function handleAdvanceTurn(args: unknown, ctx: SessionContext) {
     }
 
     let output = `\n⏭️ TURN ENDED: ${previousParticipant?.name}\n`;
+    if (skippedTurn) output += `${turnPassedLine(skippedTurn.name)}\n`;
     for (const note of engine.turnStartNotes) output += `♻️ ${note}\n`;
     for (const line of killedLines(killed)) output += `${line}\n`;
     output += state ? formatCombatStateText(state, parsed.encounterId) : 'No combat state';
@@ -3786,9 +4551,12 @@ export async function handleAdvanceTurn(args: unknown, ctx: SessionContext) {
         const stateJson = {
             ...buildStateJson(state, parsed.encounterId),
             turnStartNotes: engine.turnStartNotes,
+            // Play report 7 (lane H): each save_ends end-of-turn save (output_mode summary keeps the rows whole).
+            ...(engine.endOfTurnSaves.length ? { endOfTurnSaves: engine.endOfTurnSaves } : {}),
             ...(engine.deathSaveEvents.length ? { deathSaves: engine.deathSaveEvents } : {}),
             ...(killed.length ? { killed } : {}),
-            ...(due ? { deathSaveDue: due } : {})
+            ...(due ? { deathSaveDue: due } : {}),
+            ...(skippedTurn ? { skippedTurn } : {})
         };
         output += `\n\n<!-- STATE_JSON\n${JSON.stringify(stateJson)}\nSTATE_JSON -->`;
     }
@@ -4020,11 +4788,18 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
     }
 
     // Roll the death save, or apply the posted result.
+    const answersDue = !!participant.deathSaveDue;
     const result = posted ? engine.postDeathSave(id, posted) : engine.rollDeathSave(id);
 
     if (!result) {
         throw new Error('Failed to roll death save');
     }
+    // Play report 7 #6: a natural 20 answering DEATH SAVE DUE means the slot
+    // that is up takes its turn. The advance stopped on it at 0 HP and ran no
+    // turn start, so the economy left from the turn it dropped would refuse
+    // its first swing: start the turn now (action, movement, reaction reset).
+    const turnStarted = result.regainedHp && answersDue && state.turnOrder[state.currentTurnIndex] === id;
+    const turnStartNotes = turnStarted ? engine.beginTurn(id) : [];
     // Play report 5 #5: the sheet follows. A natural 20 writes 1 HP (the next
     // sync used to revert it) and wakes the row; three failures run the kill.
     const charRepo = new CharacterRepository(getDb());
@@ -4052,6 +4827,7 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
     } as Parameters<typeof pda.renderDeath>[0]);
     if (posted) output += `\n(posted: ${posted} — no die rolled)`;
     if (result.regainedHp) output += `\n${participant.name} is back at 1 HP, conscious (the sheet says so too)${participant.conditions.some(c => String(c.type) === 'prone') ? '; prone until they stand' : ''}.`;
+    if (turnStarted) output += `\n${participant.name} takes this turn: action, bonus action, movement and reaction are fresh.${turnStartNotes.map(n => `\n♻️ ${n}`).join('')}`;
     if (result.isStabilized) output += `\n${participant.name} is STABLE: unconscious, no more saves; 1 HP returns after 1d4 hours, or any healing wakes them.`;
     if (killed) output += `\n${killedLines([killed]).join('\n')}`;
     else if (result.isDead) output += `\n☠ ${participant.name} is dead (third failed death save).`;
@@ -4061,7 +4837,7 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
     const repo = new EncounterRepository(db);
     saveEncounterState(repo, parsed.encounterId, engine.getState()!);
 
-    output += `\n<!-- STATE_JSON\n${JSON.stringify({ deathSave: { participantId: id, characterId: id, characterName: participant.name, ...(result.roll !== undefined ? { roll: result.roll } : {}), ...(posted ? { posted } : {}), isNat20: result.isNat20, isNat1: result.isNat1, success: result.success, successes: result.successes, failures: result.failures, stabilized: result.isStabilized, isStabilized: result.isStabilized, dead: result.isDead, isDead: result.isDead, regainedHp: result.regainedHp, hp: participant.hp, sheetHp: row ? participant.hp : undefined }, ...(killed ? { killed } : {}) })}\nSTATE_JSON -->`;
+    output += `\n<!-- STATE_JSON\n${JSON.stringify({ deathSave: { participantId: id, characterId: id, characterName: participant.name, ...(result.roll !== undefined ? { roll: result.roll } : {}), ...(posted ? { posted } : {}), isNat20: result.isNat20, isNat1: result.isNat1, success: result.success, successes: result.successes, failures: result.failures, stabilized: result.isStabilized, isStabilized: result.isStabilized, dead: result.isDead, isDead: result.isDead, regainedHp: result.regainedHp, hp: participant.hp, sheetHp: row ? participant.hp : undefined, ...(turnStarted ? { turnStarted: true } : {}) }, ...(killed ? { killed } : {}), ...(turnStartNotes.length ? { turnStartNotes } : {}) })}\nSTATE_JSON -->`;
 
     return {
         content: [{
@@ -4098,6 +4874,12 @@ export interface AreaSaveOptions {
     damagePurpose?: string;
     /** Request 11: the band rule's multiplier for this target (apply_damage with an actor). */
     bandScaleFor?: (target: CombatParticipant) => BandDamageScale | null;
+    /** Play report 7 #1: the effect is an area: a unit target resolves model by model. Unset: a unit takes one model at most. */
+    area?: boolean;
+    /** Play report 7 #1: models of a unit inside the area ({targetId: n}, '*' for all); required for a spaced unit. */
+    modelsInArea?: ModelsInArea | number;
+    /** Play report 7 #1: the template's shape for the unit line ('cone'); default 'area'. */
+    areaShape?: string;
 }
 
 export interface AreaSaveTarget {
@@ -4114,8 +4896,8 @@ export interface AreaSaveTarget {
     hpBefore?: number;
     /** Set when a resistance, immunity or vulnerability changed the damage. */
     damageModifier?: 'immune' | 'resistant' | 'vulnerable';
-    /** A concentrating sheet's CON save (or 0 HP) after the damage. */
-    concentration?: { spell: string; broken: boolean; reason: string; saveRoll?: number; saveTotal?: number; saveDC?: number };
+    /** A concentrating sheet's CON save (or 0 HP) after the damage; play report 7 (lane H): with the sources it took. */
+    concentration?: ConcentrationOutcome;
     /** Request 5: a vessel's shields soaked this much before the hull. */
     shieldsAbsorbed?: number;
     /** Request 5: the vessel's shields after the hit. */
@@ -4130,6 +4912,48 @@ export interface AreaSaveTarget {
     conditionsApplied?: string[];
     /** Play report 5 #5: what this damage did to a tracked target at or into 0 HP. */
     dying?: DyingUpdate;
+    /** Play report 7 #1: an area on a unit token, model by model (damageTaken is the HP off the pool). */
+    unitArea?: UnitAreaReport;
+    /** Play report 7 #1: damage that is not an area took one model of a unit at most. */
+    unitCap?: { before: number; after: number };
+    /**
+     * Play report 7 (lane G1): what put the save at advantage or disadvantage
+     * (the target's untagged save:<ability> mechanics, its standard
+     * conditions' 5e rules; a unit's, once for every model), both dice when
+     * two were rolled, and the tag a tagged mechanic waits for.
+     */
+    advantageSources?: string[];
+    disadvantageSources?: string[];
+    saveRolls?: number[];
+    conditionalAdvantage?: string[];
+    conditionalDisadvantage?: string[];
+}
+
+/** Play report 7 (lane G1): a save's labels as a target record carries them (a unit report's too). */
+export function saveLabelsOf(s: Pick<ParticipantSaveResult, 'advantageSources' | 'disadvantageSources' | 'conditionalAdvantage' | 'conditionalDisadvantage'> & { rolls?: number[] }): Pick<AreaSaveTarget, 'advantageSources' | 'disadvantageSources' | 'saveRolls' | 'conditionalAdvantage' | 'conditionalDisadvantage'> {
+    return saveDieLabels(s);
+}
+
+/**
+ * Play report 7 (lane G1): the reply's top-level saveSources, one row per
+ * target whose save took a source or left a tagged mechanic unfired (a unit:
+ * its models count), which output_mode 'summary' keeps whole. Empty: none.
+ */
+export function saveSourcesOf(targets: ReadonlyArray<{ targetId: string; targetName: string; unitArea?: UnitAreaReport } & Pick<AreaSaveTarget, 'advantageSources' | 'disadvantageSources' | 'saveRolls' | 'saveRoll' | 'conditionalAdvantage' | 'conditionalDisadvantage' | 'concentration'>>, ability?: string): { saveSources?: SaveSourcesRow[] } {
+    const rows: SaveSourcesRow[] = [];
+    for (const t of targets) {
+        const row = saveSourcesRow({ id: t.targetId, name: t.targetName }, {
+            ability: t.unitArea?.saveBonus?.ability ?? toLongAbility(ability ?? '') ?? 'dexterity',
+            rolls: t.saveRolls ?? (t.saveRoll !== undefined ? [t.saveRoll] : undefined),
+            advantageSources: t.advantageSources, disadvantageSources: t.disadvantageSources,
+            conditionalAdvantage: t.conditionalAdvantage, conditionalDisadvantage: t.conditionalDisadvantage
+        }, t.unitArea ? { models: t.unitArea.saves?.length ?? 0 } : {});
+        if (row) rows.push(row);
+        // Play report 7 (lane H): the target's concentration save, a row of its own when it took a source.
+        const conc = t.concentration ? concentrationSourcesRow({ id: t.targetId, name: t.targetName }, t.concentration) : undefined;
+        if (conc) rows.push(conc);
+    }
+    return rows.length ? { saveSources: rows } : {};
 }
 
 /**
@@ -4146,6 +4970,12 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
     const missing: string[] = [];
     let damageRolled: number | undefined;
     let damageRolls: number[] | undefined;
+    // Play report 7 #1: a spaced unit in an area needs its count before any
+    // die is rolled (the handlers ask first; this is the backstop).
+    if (opts.area && (opts.damage !== undefined || opts.savingThrow)) {
+        const needs = unitsNeedingCount(state.participants, opts.targetIds, opts.modelsInArea);
+        if (needs.length) throw areaCountRefusal(needs);
+    }
     if (typeof opts.damage === 'string') {
         const rolled = engine.rollDice(opts.damage, { purpose: opts.damagePurpose ?? `${purpose} damage` });
         damageRolled = Math.max(0, rolled.total);
@@ -4181,6 +5011,14 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
         }
         const dexSave = !!opts.savingThrow && (toLongAbility(opts.savingThrow.ability) ?? 'dexterity') === 'dexterity';
         const saveBonus = cover && dexSave ? cover.acBonus : 0;
+        // Play report 7 #1: an area on a unit token goes model by model.
+        if (target.unit && opts.area) {
+            const u = resolveUnitAreaTarget(engine, target, opts, purpose, { damage: damageRolled ?? 0, halfOnSave, coverBonus: saveBonus, cover, dexSave });
+            targets.push(u.target);
+            lines.push(u.line);
+            if (u.breakTest) breakTests.push(u.breakTest);
+            continue;
+        }
         let saved = false;
         let save: ParticipantSaveResult | undefined;
         if (opts.savingThrow) {
@@ -4202,6 +5040,10 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
             bandScale = { ...scale, before: damageTaken, after: scaled };
             damageTaken = scaled;
         }
+        // Play report 7 #1: damage that is not an area takes one model of a unit at most.
+        const capped = target.unit && !opts.area ? unitCapFor(target, damageTaken) : undefined;
+        const unitCap = capped?.cap;
+        if (capped) damageTaken = capped.damage;
         const shieldsBefore = (target as { shields?: { current: number; max: number } }).shields?.current;
         // Play report 5 #5: a tracked target dropped to 0 goes unconscious and
         // prone (mirrored to its sheet); one already down takes a failed save.
@@ -4211,9 +5053,10 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
         const defeated = after ? after.hp <= 0 : false;
         // Request 5: what the shields took before the hull.
         const shieldsAbsorbed = shieldsBefore !== undefined && after?.shields ? Math.max(0, shieldsBefore - after.shields.current) : 0;
-        // Concentration on the encounter's d20; 0 HP ends it outright.
+        // Concentration on the encounter's d20; 0 HP ends it outright. Play
+        // report 7 (lane H): the target's declared save:con sides and conditions.
         const concentration = damageTaken > 0
-            ? concentrationAfterDamage(targetId, damageTaken, defeated && hpBefore > 0, () => engine.rollD20({ purpose: 'concentration', forId: targetId }), concentrationRepo, charRepo)
+            ? concentrationAfterDamage(targetId, damageTaken, defeated && hpBefore > 0, fightConcentrationDie(engine, db, targetId), concentrationRepo, charRepo)
             : undefined;
         // Item 12: a unit carried through its breakAt owes a break test.
         const breakTest = after?.unit && damageTaken > 0
@@ -4247,10 +5090,13 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
             ...(conditionsApplied.length ? { conditionsApplied } : {}),
             ...(mod.modifier !== 'normal' ? { damageModifier: mod.modifier } : {}),
             ...(bandScale ? { bandScale } : {}),
+            ...(unitCap ? { unitCap } : {}),
             ...(shieldsAbsorbed ? { shieldsAbsorbed } : {}),
             ...(after?.shields ? { shields: { current: after.shields.current, max: after.shields.max } } : {}),
             ...(save?.legendaryResisted ? { legendaryResisted: true } : {}),
             ...(save?.legendaryResistanceAvailable ? { legendaryResistanceAvailable: save.legendaryResistanceAvailable } : {}),
+            // Play report 7 (lane G1): the sources the save took, both dice, a tagged mechanic's hint.
+            ...(save ? saveLabelsOf(save) : {}),
             ...(concentration ? { concentration } : {}),
             ...(breakTest ? { breakTest } : {}),
             ...(dying ? { dying } : {})
@@ -4264,17 +5110,83 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
             line += saved ? ' ✓ SAVED' : ' ✗ FAILED';
             line += save.legendaryResisted ? ' (legendary resistance)'
                 : save.legendaryResistanceAvailable ? ` (${save.legendaryResistanceAvailable} legendary resistance(s) left)` : '';
+            line += saveSidesNote(save);
+            for (const c of [...(save.conditionalAdvantage ?? []), ...(save.conditionalDisadvantage ?? [])]) line += `\n   conditional: ${c}`;
         }
-        line += `\n   Damage: ${damageTaken}${opts.damageType ? ` ${opts.damageType}` : ''}${mod.modifier !== 'normal' ? ` (${mod.modifier})` : ''}${bandScale ? ` ×${bandScale.multiplier} band (${bandScale.before} → ${bandScale.after})` : ''}`;
+        line += `\n   Damage: ${damageTaken}${opts.damageType ? ` ${opts.damageType}` : ''}${mod.modifier !== 'normal' ? ` (${mod.modifier})` : ''}${bandScale ? ` ×${bandScale.multiplier} band (${bandScale.before} → ${bandScale.after})${bandAssumedTag(target, state.participants.find(o => o.id === opts.originId))}` : ''}`;
+        if (unitCap) line += `\n   ${unitCapLine(unitCap)}`;
         if (shieldsAbsorbed && after?.shields) line += `\n   Shields: −${shieldsAbsorbed}, ${after.shields.current}/${after.shields.max} left`;
         if (after) line += `\n   HP: ${after.hp}/${after.maxHp}${after.hp <= 0 ? dyingTail(after, dying) : ''}`;
         if (dying?.failuresAdded) line += `\n   🩸 hit while down: +${dying.failuresAdded} failed death save${dying.failuresAdded > 1 ? 's' : ''}`;
-        if (concentration) line += `\n   Concentration on ${concentration.spell}: ${concentration.reason === 'death' ? 'ends at 0 HP' : `CON save ${concentration.saveTotal} vs DC ${concentration.saveDC} ${concentration.broken ? '✗ BROKEN' : '✓ held'}`}`;
+        if (concentration) line += `\n   ${concentrationLine(concentration)}`;
         if (breakTest) line += `\n   ${breakTest.line}`;
         if (conditionsApplied.length) line += `\n   Conditions: ${conditionsApplied.join(', ')}`;
         lines.push(line);
     }
     return { targets, damageRolled, damageRolls, lines, missing, breakTests };
+}
+
+/**
+ * Play report 7 #1: one unit target of an area, model by model. Each model
+ * inside saves on the fight's dice (rollUnitArea); the pool loses the dead
+ * models' HP; the break test reads the new count. The save's riders follow
+ * the result most of the models still standing inside got (ties: failed),
+ * since a unit is one token; an area that left none of them standing lays none.
+ */
+function resolveUnitAreaTarget(
+    engine: CombatEngine, target: CombatParticipant, opts: AreaSaveOptions, purpose: string,
+    ctx: { damage: number; halfOnSave: boolean; coverBonus: number; cover?: CoverResolution; dexSave: boolean }
+): { target: AreaSaveTarget; line: string; breakTest: BreakTest | null } {
+    const db = getDb();
+    const hpBefore = target.hp;
+    const roll = rollUnitArea(engine, db, target, {
+        damage: ctx.damage, halfOnSave: ctx.halfOnSave, savingThrow: opts.savingThrow, damageType: opts.damageType,
+        coverBonus: ctx.coverBonus, purpose, modelsInArea: opts.modelsInArea, shape: opts.areaShape, bandScaleFor: opts.bandScaleFor
+    });
+    const dying = roll.hpLost > 0 ? engine.applyDamage(target.id, roll.hpLost) : undefined;
+    if (dying?.dropped) markRowDying(target.id);
+    const after = engine.getState()!.participants.find(p => p.id === target.id);
+    const breakTest = after?.unit && roll.hpLost > 0
+        ? breakTestDue(after, hpBefore, { moraleBonus: moraleModifiers(after, engine.getState()!.participants, sheetSpecies(db)) })
+        : null;
+    const conditionsApplied: string[] = [];
+    const rider = opts.savingThrow && roll.riderResult ? (roll.riderResult === 'saved' ? opts.onSuccess : opts.onFail) : undefined;
+    for (const entry of rider?.conditions ?? []) {
+        const label = typeof entry === 'string' ? entry : String(entry.type || entry.name || '');
+        const norm = normalizeCondition(entry, target.id);
+        if (!norm) continue;
+        const { id: _riderId, ...rest } = norm;
+        if (rest.sourceId === undefined) rest.sourceId = `${purpose} (${roll.riderResult === 'saved' ? 'saved' : 'failed save'})`;
+        engine.removeConditionsByType(target.id, rest.type);
+        engine.applyCondition(target.id, rest);
+        conditionsApplied.push(label);
+        if (rider!.mirrorToCharacter) mirrorConditionToRow(target.id, 'add', label, rest.duration, rest.sourceId);
+    }
+    const cover = ctx.cover;
+    const rec: AreaSaveTarget = {
+        targetId: target.id, targetName: target.name,
+        saved: roll.majoritySaved, damageTaken: roll.hpLost,
+        hpBefore, hpAfter: after?.hp, defeated: after ? after.hp <= 0 : undefined,
+        unitArea: roll.report,
+        // Play report 7 (lane G1): the sources every model's save took, as on any target.
+        ...saveLabelsOf(roll.report),
+        ...(cover && (cover.kind !== 'none' || cover.ignored) ? { cover: { kind: cover.kind, source: cover.source, via: cover.via, saveBonus: ctx.coverBonus, ...(opts.savingThrow && !ctx.dexSave && cover.kind !== 'none' ? { note: 'cover adds to DEX saves only' } : {}) } } : {}),
+        ...(conditionsApplied.length ? { conditionsApplied } : {}),
+        ...(roll.damageModifier !== 'normal' ? { damageModifier: roll.damageModifier } : {}),
+        ...(roll.bandScale ? { bandScale: roll.bandScale } : {}),
+        ...(breakTest ? { breakTest } : {}),
+        ...(dying ? { dying } : {})
+    };
+    let line = `🎯 ${target.name} — ${roll.report.line}`;
+    const savesLine = unitSavesLine(roll.report);
+    if (savesLine) line += `\n   ${savesLine}`;
+    // Play report 7 #3: a band-scaled area on a unit whose band was assumed says so.
+    const bandTag = roll.bandScale ? bandAssumedTag(target, engine.getState()!.participants.find(o => o.id === opts.originId)) : '';
+    line += `\n   Damage: ${roll.hpLost}${opts.damageType ? ` ${opts.damageType}` : ''} off the pool (${roll.report.modelsKilled} model${roll.report.modelsKilled === 1 ? '' : 's'})${roll.damageModifier !== 'normal' ? ` (${roll.damageModifier})` : ''}${roll.bandScale ? ` ×${roll.bandScale.multiplier} band per model (${roll.bandScale.before} → ${roll.bandScale.after})${bandTag}` : ''}`;
+    if (after) line += `\n   HP: ${after.hp}/${after.maxHp}`;
+    if (breakTest) line += `\n   ${breakTest.line}`;
+    if (conditionsApplied.length) line += `\n   Conditions (${roll.riderResult === 'saved' ? 'most still standing saved' : 'most still standing failed'}): ${conditionsApplied.join(', ')}`;
+    return { target: rec, line, breakTest };
 }
 
 /**
@@ -4310,16 +5222,32 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
     output += `└─────────────────────────────────────────┘\n\n`;
     output += `${parsed.actionDescription}\n\n`;
 
+    // Play report 7 #1: a lair action is an area unless area: false; a spaced
+    // unit in it needs its count before anything is rolled.
+    const lairArea = parsed.area ?? true;
+    const lairHarms = (parsed.damage !== undefined && parsed.damage !== 0) || !!parsed.savingThrow;
+    if (lairArea && lairHarms && parsed.targetIds?.length) {
+        const needs = unitsNeedingCount(state.participants, parsed.targetIds, parsed.modelsInArea);
+        if (needs.length) throw areaCountRefusal(needs);
+    }
+
+    // Play report 7 #1: each unit's area line, for the reply's unitLines (output_mode summary keeps it whole).
+    const unitLines: string[] = [];
+    // Play report 7 (lane G1): what each save took, for the reply's saveSources (summary keeps it whole too).
+    let saveSources: SaveSourcesRow[] | undefined;
     // Apply damage to targets if specified
     if (parsed.targetIds && parsed.targetIds.length > 0 && ((parsed.damage !== undefined && parsed.damage !== 0) || parsed.savingThrow)) {
         const area = resolveAreaSave(engine, {
             targetIds: parsed.targetIds, damage: parsed.damage, damageType: parsed.damageType,
             savingThrow: parsed.savingThrow, halfDamageOnSave: parsed.halfDamageOnSave,
             // Play report 5: cover per target (no origin token for a lair), riders on the save.
-            cover: parsed.cover as Record<string, unknown> | undefined, onFail: parsed.savingThrow?.onFail, onSuccess: parsed.savingThrow?.onSuccess
+            cover: parsed.cover as Record<string, unknown> | undefined, onFail: parsed.savingThrow?.onFail, onSuccess: parsed.savingThrow?.onSuccess,
+            area: lairArea, modelsInArea: parsed.modelsInArea
         }, 'lair');
         if (typeof parsed.damage === 'string') output += `🎲 ${parsed.damage}: ${area.damageRolled}\n`;
         output += area.lines.join('\n') + '\n';
+        for (const t of area.targets) if (t.unitArea) unitLines.push(unitSummaryLine(t.targetName, t.unitArea, t.breakTest));
+        saveSources = saveSourcesOf(area.targets, parsed.savingThrow?.ability).saveSources;
         // Play report 5 #5: a tracked token the lair killed is killed on its sheet too.
         const killed = await settleAreaDeaths(parsed.encounterId, state, area.targets, 'lair action');
         for (const line of killedLines(killed)) output += `${line}\n`;
@@ -4339,7 +5267,9 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
         content: [{
             type: 'text' as const,
             text: output
-        }]
+        }],
+        ...(unitLines.length ? { unitLines } : {}),
+        ...(saveSources ? { saveSources } : {})
     };
 }
 
@@ -4437,7 +5367,12 @@ export async function handleCalculateAoe(args: unknown, ctx: SessionContext) {
     if (result.affectedParticipants.length > 0) {
         output += `\n⚠️ AFFECTED CREATURES:\n`;
         for (const p of result.affectedParticipants) {
-            output += `  • ${p.name} at (${p.position.x}, ${p.position.y})\n`;
+            output += `  • ${p.name} at (${p.position.x}, ${p.position.y})${p.footprint > 1 ? ` — ${p.cellsInside}/${p.footprint} squares` : ''}`
+                + `${p.unit ? `; unit ${p.unit.packed ? 'packed: every live model' : 'spaced'}, ${p.unit.modelsInArea} of ${p.unit.liveModels} models inside` : ''}\n`;
+        }
+        // Play report 7 #1: the count to pass to the damage call (a hint from the squares; the GM decides).
+        if (result.modelsInArea) {
+            output += `\nmodelsInArea: {${Object.entries(result.modelsInArea).map(([id, n]) => `'${id}': ${n}`).join(', ')}} (pass it on apply_damage / use_ability / lair_action / cast_spell; a hint from the squares covered, the GM decides)\n`;
         }
     } else {
         output += `\n✓ No creatures in area of effect\n`;

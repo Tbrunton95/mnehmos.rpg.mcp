@@ -50,6 +50,17 @@ describe('forcedMove (pure)', () => {
         expect(rd.to).toEqual({ x: 0, y: 4 });
     });
 
+    it('a fight with no gridBounds stops at the default board edge, as the same fight does after a reload', () => {
+        // A fight made in this process has gridBounds null; a reloaded one gets
+        // the 0..100 default. The push must land on the same square either way.
+        const warm = state([{ id: 'a', name: 'A', position: { x: 1, y: 2 } }, { id: 'b', name: 'B', position: { x: 0, y: 2 } }]);
+        const r = forcedMove(warm, warm.participants[1], warm.participants[0], 10);
+        expect(r).toMatchObject({ to: { x: 0, y: 2 }, feet: 0 });
+        expect(r.stoppedBy).toMatch(/edge of the grid/);
+        const reloaded = state([{ id: 'a', name: 'A', position: { x: 1, y: 2 } }, { id: 'b', name: 'B', position: { x: 0, y: 2 } }], { gridBounds: { minX: 0, maxX: 100, minY: 0, maxY: 100 } });
+        expect(forcedMove(reloaded, reloaded.participants[1], reloaded.participants[0], 10).to).toEqual(r.to);
+    });
+
     it('stops at the first blocked step: a terrain obstacle, another creature, or the edge of the grid', () => {
         const wall = state([{ id: 'a', name: 'A', position: { x: 2, y: 2 } }, { id: 'b', name: 'B', position: { x: 3, y: 2 } }], { terrain: { obstacles: ['5,2'] } });
         const r1 = forcedMove(wall, wall.participants[1], wall.participants[0], 10);
@@ -198,10 +209,9 @@ describe('grapple shove', () => {
     });
 
     it('a sheetless token sets the default DC from its CR and ability scores', async () => {
+        // Play report 7 #2: combat_manage create carries the marine's abilityScores onto the token.
         await fight([{ ...marine, cr: 5 }, cultist]);
-        // combat_manage create does not carry abilityScores onto a token; a bestiary spawn does. Set them on the live token.
-        const live = getOrLoadEngine(ctx as any, encounterId)!.getState()!.participants.find(p => p.id === 'marine')!;
-        live.abilityScores = { strength: 16, dexterity: 12, constitution: 14, intelligence: 10, wisdom: 10, charisma: 10 };
+        expect(getOrLoadEngine(ctx as any, encounterId)!.getState()!.participants.find(p => p.id === 'marine')!.abilityScores?.strength).toBe(16);
         dice(3);
         const res = await act({ action: 'grapple', move: 'shove', save: { ability: 'str' }, encounterId, actorId: 'marine', targetId: 'cultist' });
         // CR 5 → proficiency 3; STR 16 → +3; 8 + 3 + 3 = 14.

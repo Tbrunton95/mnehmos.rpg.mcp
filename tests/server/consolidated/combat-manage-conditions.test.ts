@@ -75,7 +75,7 @@ describe('combat_manage add_condition / remove_condition', () => {
     it('lets a round-based condition added mid-fight count down', async () => {
         await call({ action: 'add_condition', encounterId, participantId: 'token-scion', condition: { name: 'blinded', duration: 1 } });
         expect(tokenConditions(encounterId, 'token-scion').map(c => c.type)).toEqual(['blinded']);
-        for (let i = 0; i < 4; i++) await call({ action: 'advance', encounterId });
+        for (let i = 0; i < 4; i++) await call({ action: 'advance', encounterId, confirm: true });
         expect(tokenConditions(encounterId, 'token-scion')).toEqual([]);
     });
 

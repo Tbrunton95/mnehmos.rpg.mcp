@@ -105,7 +105,7 @@ describe('dying over the MCP boundary (play report 5 #5)', () => {
             { id: 'hero', name: 'Hero', hp: 0, maxHp: 20, initiative: 10, position: { x: 1, y: 0 } }
         ] });
         const enc = created.encounterId as string;
-        const due = await call('combat_manage', { action: 'advance', encounterId: enc });
+        const due = await call('combat_manage', { action: 'advance', encounterId: enc, confirm: true });
         expect(due.deathSaveDue).toMatchObject({ participantId: 'hero' });
         const refused = await call('combat_manage', { action: 'advance', encounterId: enc });
         expect(refused.error).toBe(true);
@@ -153,7 +153,7 @@ describe('dying over the MCP boundary (play report 5 #5)', () => {
         const enc = created.encounterId as string;
         const brute = new EncounterRepository(getDb()).loadState(enc)!.participants.find(p => p.id === 'brute') as any;
         expect(brute).toMatchObject({ deathSaves: true, deathSaveMode: 'prompt' });
-        const due = await call('combat_manage', { action: 'advance', encounterId: enc });
+        const due = await call('combat_manage', { action: 'advance', encounterId: enc, confirm: true });
         expect(due.deathSaveDue).toMatchObject({ participantId: 'brute' });
         expect(due.rawText ?? JSON.stringify(due)).not.toMatch(/<encounterId>/);
     });

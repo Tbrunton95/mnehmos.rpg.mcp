@@ -12,7 +12,7 @@ import { sameName } from './abilities.js';
 type ExtrasKey = 'size' | 'reach' | 'movementSpeed' | 'attackBonus' | 'attackDamage' | 'attackDamageType' |
     'attacksPerAction' | 'attacks' | 'abilities' | 'legendaryActions' | 'legendaryResistances' |
     'legendaryResistancesRemaining' | 'autoLegendaryResistance' | 'hasLairActions' | 'cr' |
-    'band' | 'regeneration' | 'parts' | 'ac' | 'species' | 'tags' | 'swimSpeed' | 'flySpeed' | 'senses' | 'vessel' | 'shields' | 'fightingStyle' | 'ignoreCover' | 'deathSaves' | 'deathSaveMode';
+    'band' | 'regeneration' | 'parts' | 'ac' | 'species' | 'tags' | 'swimSpeed' | 'flySpeed' | 'senses' | 'vessel' | 'shields' | 'fightingStyle' | 'ignoreCover' | 'deathSaves' | 'deathSaveMode' | 'subdue';
 
 /** What hydrateExtras hands the token: every ability carries a boolean ready. */
 export type ExtrasOutput = Partial<Pick<CombatParticipant, ExtrasKey>>;
@@ -31,7 +31,9 @@ const ROW_KEYS = [
     'size', 'reach', 'movementSpeed', 'swimSpeed', 'flySpeed', 'senses', 'attackBonus', 'attackDamage', 'attackDamageType',
     'attacksPerAction', 'attacks', 'abilities', 'legendaryActions', 'legendaryResistances',
     'legendaryResistancesRemaining', 'autoLegendaryResistance', 'hasLairActions', 'cr',
-    'species', 'tags', 'vessel', 'fightingStyle', 'ignoreCover', 'deathSaves', 'deathSaveMode'
+    'species', 'tags', 'vessel', 'fightingStyle', 'ignoreCover', 'deathSaves', 'deathSaveMode',
+    // Play report 7 #5: the standing subdue order (a shape-only key is parsed and then dropped at create).
+    'subdue'
 ] as const;
 
 /** The preset side: CreaturePreset names its fields differently. */

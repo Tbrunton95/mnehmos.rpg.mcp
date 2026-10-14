@@ -44,7 +44,7 @@ describe('parts', () => {
         const set = await manage({ action: 'set_part', participantId: 'karanak', part: 'middle head', state: 'latched', latchedTo: { participantId: 'luciel', part: 'forearm' } });
         expect(set).toMatch(/middle head intact → latched → luciel forearm/);
         // Luciel is held: speed 0 from his next turn.
-        await manage({ action: 'advance' }); await manage({ action: 'advance' });
+        await manage({ action: 'advance', confirm: true }); await manage({ action: 'advance', confirm: true });
         expect(tok('luciel').movementRemaining).toBe(0);
         // Luciel attacks Karanak with advantage.
         const hit = await act({ action: 'attack', actorId: 'luciel', targetId: 'karanak', attackBonus: 5, damage: 1 });
@@ -78,7 +78,7 @@ describe('parts', () => {
         await setup();
         await manage({ action: 'set_part', participantId: 'luciel', part: 'left wing', kind: 'wing', state: 'crippled', mirrorToCharacter: true });
         expect(new CharacterRepository(getDb()).findById('luciel')!.parts).toEqual([expect.objectContaining({ name: 'left wing', state: 'crippled' })]);
-        await manage({ action: 'advance' }); await manage({ action: 'advance' });
+        await manage({ action: 'advance', confirm: true }); await manage({ action: 'advance', confirm: true });
         expect(tok('luciel').movementRemaining).toBe(15);
         expect(await manage({ action: 'get' })).toMatch(/🦴 left wing: crippled/);
         await manage({ action: 'remove_part', participantId: 'luciel', part: 'left wing', mirrorToCharacter: true });
@@ -113,7 +113,7 @@ describe('called strikes on parts, and the arm that swings', () => {
         await setup();
         await manage({ action: 'set_part', participantId: 'karanak', part: 'left arm', kind: 'arm', state: 'intact', holds: ['whip'] });
         await manage({ action: 'set_part', participantId: 'karanak', part: 'right arm', kind: 'arm', state: 'crippled', holds: ['axe'] });
-        await manage({ action: 'advance' });
+        await manage({ action: 'advance', confirm: true });
         const whip = await act({ action: 'attack', actorId: 'karanak', targetId: 'luciel', weapon: 'whip', attackBonus: 5, damage: 1 });
         expect(whip.r.roll.allRolls).toHaveLength(1);
         freshAction('karanak');
@@ -176,7 +176,7 @@ describe('intent and readied actions', () => {
         await setup();
         await manage({ action: 'set_intent', participantId: 'karanak', intent: 'charges the wing, then breaks the relay', readied: { action: 'melta the lane', trigger: 'Knight D crosses the open cross' } });
         expect(await manage({ action: 'get' })).toMatch(/⚑ intent: charges the wing/);
-        await manage({ action: 'advance' }); // Luciel -> Karanak
+        await manage({ action: 'advance', confirm: true }); // Luciel -> Karanak
         expect(tok('karanak').intent).toBe('charges the wing, then breaks the relay');
         await manage({ action: 'advance' }); // Karanak's turn ends
         expect(tok('karanak').intent).toBeUndefined();

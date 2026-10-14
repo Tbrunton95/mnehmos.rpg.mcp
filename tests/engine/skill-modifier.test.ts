@@ -1,4 +1,4 @@
-import { abilityModifier, computedSkillModifier, hasSkill, normSkill, skillModifier, skillOverride, overrideColumn, signed } from '../../src/engine/skill-modifier.js';
+import { abilityModifier, computedSkillModifier, hasSkill, normSkill, skillModifier, skillOverride, overrideColumn, signed, SRD_SKILL_ABILITY, skillKey, srdSkillAbility, resolveSkillAbility, unmappedSkillWarning } from '../../src/engine/skill-modifier.js';
 
 /**
  * Play report 2 #5: one skill number per character. A stealth/perception
@@ -49,5 +49,48 @@ describe('skill-modifier', () => {
         expect(overrideColumn('Stealth')).toBe('stealth_bonus');
         expect(overrideColumn('perception')).toBe('perception_bonus');
         expect(overrideColumn('athletics')).toBeNull();
+    });
+});
+
+/**
+ * Play report 7 #11: 'sleight-of-hand' rolled WIS. roll_skill_check folded
+ * spaces only, missed the SRD map and fell back to WIS without a word. One
+ * map and one fold now serve roll_skill_check, opposed, stunts and the montage.
+ */
+describe('skill names (play report 7 #11)', () => {
+    it('the 18 SRD skills map to their abilities under snake_case keys', () => {
+        expect(Object.keys(SRD_SKILL_ABILITY)).toHaveLength(18);
+        expect(SRD_SKILL_ABILITY.sleight_of_hand).toBe('dex');
+        expect(SRD_SKILL_ABILITY.animal_handling).toBe('wis');
+        expect(SRD_SKILL_ABILITY.athletics).toBe('str');
+        expect(Object.isFrozen(SRD_SKILL_ABILITY)).toBe(true);
+    });
+
+    it('skillKey folds every spelling of an SRD skill to its key, and other names to lower snake case', () => {
+        for (const s of ['Sleight of Hand', 'sleight-of-hand', 'sleight_of_hand', 'SleightOfHand', ' SLEIGHT OF HAND ']) expect(skillKey(s)).toBe('sleight_of_hand');
+        expect(skillKey('Animal-Handling')).toBe('animal_handling');
+        expect(skillKey('Waaagh Lore')).toBe('waaagh_lore');
+        expect(skillKey('basket-weaving')).toBe('basket_weaving');
+    });
+
+    it('srdSkillAbility reads any spelling; an unknown skill gives undefined', () => {
+        expect(srdSkillAbility('sleight-of-hand')).toBe('dex');
+        expect(srdSkillAbility('SleightOfHand')).toBe('dex');
+        expect(srdSkillAbility('Animal-Handling')).toBe('wis');
+        expect(srdSkillAbility('haggling')).toBeUndefined();
+        expect(srdSkillAbility('')).toBeUndefined();
+    });
+
+    it('resolveSkillAbility: given beats world beats SRD; none says so', () => {
+        expect(resolveSkillAbility('athletics', { given: 'dex', world: 'int' })).toEqual({ ability: 'dex', source: 'given' });
+        expect(resolveSkillAbility('athletics', { given: 'Dexterity' })).toEqual({ ability: 'dex', source: 'given' });
+        expect(resolveSkillAbility('athletics', { world: 'int' })).toEqual({ ability: 'int', source: 'world' });
+        expect(resolveSkillAbility('sleight-of-hand', {})).toEqual({ ability: 'dex', source: 'srd' });
+        expect(resolveSkillAbility('haggling', {})).toEqual({ source: 'none' });
+        expect(resolveSkillAbility('haggling', { given: null, world: null })).toEqual({ source: 'none' });
+    });
+
+    it("the unmapped warning is the montage's words", () => {
+        expect(unmappedSkillWarning('haggling')).toBe("skill 'haggling' names no ability (not an SRD skill or a world skill): rolled with no skill modifier (no ability, no proficiency) — pass ability, or define it with table_rules {kind: 'skill', name: 'haggling', spec: {ability}}");
     });
 });

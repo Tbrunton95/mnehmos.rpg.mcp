@@ -8,13 +8,17 @@ import { z } from 'zod';
 import { createActionRouter, ActionDefinition, McpResponse, ignoredParamsOf, describeIgnoredParams } from '../../utils/action-router.js';
 import { MANEUVER_NAMES, maneuverSaveDC } from '../../engine/combat/maneuvers.js';
 import { forcedMove } from '../../engine/combat/forced-move.js';
-import { rollParticipantSave, rollCharacterSave, proficiencyByLevel, toLongAbility, type ParticipantSaveResult } from '../../engine/combat/saves.js';
+import { rollParticipantSave, rollCharacterSave, proficiencyByLevel, toLongAbility, saveSidesNote, saveSourcesRow, type ParticipantSaveResult } from '../../engine/combat/saves.js';
+import { sheetConcentrationDie, concentrationSidesNote, concentrationSourcesRow, type ConcentrationOutcome } from '../../engine/combat/saves.js';
 import { SessionContext } from '../types.js';
 import { RichFormatter } from '../utils/formatter.js';
 import * as pda from '../../render/pda.js';
 import { handleExecuteCombatAction, getOrLoadEngine, liveEncounterFor, syncParticipantHpFromDb, saveEncounterState } from '../handlers/combat-handlers.js';
+import { readiedSubdueRefusal, readiedRangedNote, readiedAttackPaste, splitReadiedAttack, withReadiedIgnored } from '../handlers/combat-handlers.js';
+import { afterForcedMove, settleMountsAfter, foldSettleIntoReply, type MountEvent } from '../handlers/mounts.js';
+import { controlledMountActionRefusal } from '../../engine/combat/mounts.js';
 import { dyingLabel, counters as deathCounters, withDyingRowConditions, STABLE_CONDITION, type RowCondition } from '../../engine/combat/dying.js';
-import { skillModifier, type SkillSheet } from '../../engine/skill-modifier.js';
+import { skillModifier, normSkill, type SkillSheet } from '../../engine/skill-modifier.js';
 import { edgeDistanceSquares } from '../../schema/encounter.js';
 import { readWorldClock, dayClock } from '../../engine/world-clock.js';
 import { mintInstance } from './inventory-manage.js';
@@ -35,12 +39,17 @@ import { CombatEngine } from '../../engine/combat/engine.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import type { CombatParticipant } from '../../engine/combat/engine.js';
 import { bandOrderFor, bandRuleFor, bandDamageMultiplier, compareBands, resolveWorldId, type TableRule } from '../../engine/table-rules.js';
+import { bandAssumedTag, bandsUnranked, setBandCall } from '../../engine/combat/band-default.js';
 import { sizeRank } from '../../schema/encounter.js';
-import { READIED_TRIGGERS, ReadiedAttackSchema, attackRequiresSchema, type Ability } from '../../schema/token-extras.js';
+import { READIED_TRIGGERS, readiedAttackInputSchema, attackRequiresSchema, type Ability } from '../../schema/token-extras.js';
 import { findActionGrantAcross, patchRowAbility } from '../../engine/combat/abilities.js';
 import { loggedD20, loggedDice, loggedRoll } from '../../math/logged-d20.js';
-import { resolveNamedSources, loadEffectNames, jsonIfString, sourcesField } from '../../engine/advantage-sources.js';
+import { resolveAdvantageSources, loadEffectDeclarations, jsonIfString, sourcesField, situationalField, tagsField, type DeclaringOwner, type GrantedSource } from '../../engine/advantage-sources.js';
+import { ATTACK_SOURCE_NOTE, ATTACK_CONTEXT_DESCRIBE } from '../../engine/attack-advantage.js';
+import { scopedAdvantage, type RollScope } from '../../engine/advantage-scope.js';
+import { sceneSensesFor, denialFor, normTag, type SkillAdvantageTrait } from '../../engine/senses.js';
 import { coverEnum, coverByTargetSchema, COVER_BY_TARGET_DESCRIBE } from '../../schema/cover.js';
+import { modelsInAreaSchema, MODELS_IN_AREA_DESCRIBE } from '../../schema/token-extras.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -104,7 +113,13 @@ const AttackSchema = z.object({
     bonusAction: z.boolean().optional().describe("Play report 5: a bonus-action attack (Goring Rush, an off-hand strike): spends the bonus action, not the Attack action, so an open multiattack is untouched; the actor's own turn only; never with reaction, legendaryCost or actionSurge. Default from the profile's bonusAction"),
     requires: attackRequiresSchema().optional().describe("Play report 5: the trigger this swing needs — {dashed?: true, movedAtLeast?: 20, hitThisTurn?: true}; refused before anything is spent (writes: none) naming what is missing ('needs a Dash this turn and 20 ft moved after it: dashed yes, moved 15 ft'). Default from the profile's requires"),
     movedFt: z.number().int().min(0).optional().describe('Play report 5, theatre of the mind: feet the attacker moved this turn, read for requires.movedAtLeast only when the token has no position (the reply marks it declared)'),
-    nonlethal: z.boolean().optional().describe("Play report 5: a non-lethal blow (melee only — refused with writes: none on ranged, volley, cleave or a unit). A target it drops to 0 is KNOCKED OUT: hp 0, Unconscious sourced 'nonlethal: <actor>', stable (no death saves), no kill credit, no corpse; the sheet shows the Unconscious. Healing above 0 (heal, adjust_hp) wakes them")
+    nonlethal: z.boolean().optional().describe("Play report 5: a non-lethal blow (melee only — refused with writes: none on ranged, volley, cleave or a unit). A target it drops to 0 is KNOCKED OUT: hp 0, Unconscious sourced 'nonlethal: <actor>', stable (no death saves), no kill credit, no corpse; the sheet shows the Unconscious. Healing above 0 (heal, adjust_hp) wakes them"),
+    // Play report 7 #7 (lane F): declared advantage on the attack roll.
+    context: tagsField(ATTACK_CONTEXT_DESCRIBE),
+    advantageSources: sourcesField('advantage', ATTACK_SOURCE_NOTE),
+    disadvantageSources: sourcesField('disadvantage', ATTACK_SOURCE_NOTE),
+    situationalAdvantage: situationalField('advantage'),
+    situationalDisadvantage: situationalField('disadvantage')
 });
 
 const HealSchema = z.object({
@@ -148,7 +163,8 @@ const CastSpellSchema = z.object({
     unbinderId: z.string().optional().describe("A world spell with contestedBy: 'unbind': this participant rolls the casting dice; a higher total stops it"),
     boost: spellBoostSchema().optional().describe('World spell: spend a pool for +modifier and/or extraDice on the casting roll; sideEffect pools move too (growth-checked). Refused if the pool cannot pay'),
     cover: coverEnum().optional().describe("Play report 5 #1: the target's cover (targetId or targetIds; with several targets it is every target's default and coverByTarget overrides one): a spell attack rolls against AC +2 / +5, a DEX save takes the same bonus, total refuses a spell that chooses its creatures (Fire Bolt, Hold Person) before the slot is spent, and an area spell skips that target. Unset: standing cover, else the map. Spell Sniper (the sheet's ignoreCover.spells) lifts it by itself"),
-    coverByTarget: coverByTargetSchema().optional().describe(`Play report 5 #1 (several targets): ${COVER_BY_TARGET_DESCRIBE}. An area target behind total cover is unaffected unless given 'none'`)
+    coverByTarget: coverByTargetSchema().optional().describe(`Play report 5 #1 (several targets): ${COVER_BY_TARGET_DESCRIBE}. An area target behind total cover is unaffected unless given 'none'`),
+    modelsInArea: modelsInAreaSchema().optional().describe(`${MODELS_IN_AREA_DESCRIBE}. An area spell (areaOfEffect: Burning Hands, Fireball) on a unit goes model by model, each model saving on the fight's dice; any other spell takes one model at most`)
 });
 
 const VolleySchema = z.object({
@@ -165,7 +181,22 @@ const VolleySchema = z.object({
     cover: coverEnum().optional().describe("Play report 5 #1: the target's cover: none | half (+2 AC) | three-quarters (+5) | total (refused). Unset: standing cover, else the map")
 });
 
-const GRAPPLE_SOURCE_NOTE = "grapple: a miss or an ambiguous name REFUSES the move before any roll or spend (writes: none) — a grapple spends the attack and writes conditions, so nothing is guessed. Logged in the roll's purpose.";
+const GRAPPLE_SOURCE_NOTE = "grapple: a miss, an ambiguous name or a source that declares nothing for this grapple REFUSES the move before any roll or spend (writes: none) — a grapple spends the attack and writes conditions, so nothing is guessed. Logged in the roll's purpose.";
+
+/**
+ * Play report 7 #7: the tags a grapple asserts (['head-on']). A factory:
+ * GrappleSchema and the outer mirror each hold their own instance. A bare
+ * string is one tag; a JSON string of an array is read as the array.
+ */
+const GRAPPLE_CONTEXT_DESCRIBE = "grapple (play report 7): tags this grapple asserts (['head-on']). An effect mechanic {type: 'advantage_on', value: 'grapple' | 'grapple:<move>' | 'check:athletics', condition: 'head-on'} on the grappler fires on its tag (or when named in advantageSources); a skillAdvantage trait listing Athletics fires on its `when`. Untagged mechanics fire without it";
+const grappleContextField = () => z.preprocess(v => { const p = jsonIfString(v); return typeof p === 'string' ? [p] : p; }, z.array(z.string().min(1))).optional()
+    .describe(GRAPPLE_CONTEXT_DESCRIBE);
+
+/** Play report 7 #7 (lane F): the outer mirror's situational reasons, said for attack and grapple. A fresh instance each call. */
+const mirrorSituationalField = (which: 'advantage' | 'disadvantage') => {
+    const f = situationalField(which);
+    return f.describe(`attack / grapple (mirror): ${f.description ?? ''}`);
+};
 
 /** Play report 5, item 2: the shove's save. A fresh instance each call: the outer mirror must not hold one zod object twice. */
 const shoveSaveSchema = () => z.object({
@@ -200,7 +231,10 @@ const GrappleSchema = z.object({
     advantage: z.boolean().optional().describe('The actor rolls 2d20 keep highest (the GM\'s ruling; cancels against any disadvantage to one die)'),
     disadvantage: z.boolean().optional().describe('The actor rolls 2d20 keep lowest; the lower band or smaller size is automatic and never stacks'),
     advantageSources: sourcesField('advantage', GRAPPLE_SOURCE_NOTE),
-    disadvantageSources: sourcesField('disadvantage', GRAPPLE_SOURCE_NOTE)
+    disadvantageSources: sourcesField('disadvantage', GRAPPLE_SOURCE_NOTE),
+    situationalAdvantage: situationalField('advantage'),
+    situationalDisadvantage: situationalField('disadvantage'),
+    context: grappleContextField()
 });
 
 const DashSchema = z.object({
@@ -231,7 +265,8 @@ const ReadySchema = z.object({
     trigger: z.string().describe('Trigger condition for the readied action'),
     on: z.enum(READIED_TRIGGERS).optional().describe('enters_reach | leaves_reach: the engine watches moves and fires it. Unset = fired by hand with combat_manage trigger_readied'),
     watch: z.string().optional().describe("Who sets it off: a participant id or name, 'enemy' (default) or 'any'"),
-    attack: ReadiedAttackSchema.optional().describe('{using?, attackBonus?, damage?, damageType?, withPart?}: the attack it makes; with on set it fires itself as a reaction')
+    // Lane G2 review: unknown keys inside attack are kept so the handler names them (ignoredParams), never stored.
+    attack: readiedAttackInputSchema().optional().describe("{using?, attackBonus?, damage?, damageType?, withPart?, ranged?, onSubdue?}: the attack it makes; with on set it fires itself as a reaction. ranged: true | false is the attack's own lane, read before the profile's flag and the grid (a flag that disagrees with the profile wins; the reply's rangedOverride says so). Play report 7 #5: under a subdue order a ranged attack needs onSubdue 'hold' | 'fire' (refused without it). A key it does not take comes back in ignoredParams (attack.<key>) and is not stored")
 });
 
 /**
@@ -310,7 +345,11 @@ const definitions: Record<CombatAction, ActionDefinition> = {
             const declaredModifiers = coatingRead
                 ? [...(params.declaredModifiers ?? []), { label: `🧪 ${coatingRead.label} (coating, ${coatingRead.remainingHits} left)`, value: coatingRead.bonus }]
                 : params.declaredModifiers;
-            const result = await handleExecuteCombatAction({
+            // Play report 7 #7 (lane F): a named source that declares nothing for
+            // this attack is refused before anything is rolled or spent; the
+            // refusal carries each problem as data (sourceProblems).
+            let result: Awaited<ReturnType<typeof handleExecuteCombatAction>>;
+            try { result = await handleExecuteCombatAction({
                 encounterId: params.encounterId,
                 action: 'attack',
                 actorId: params.actorId,
@@ -347,8 +386,17 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                 bonusAction: params.bonusAction,
                 requires: params.requires,
                 movedFt: params.movedFt,
-                nonlethal: params.nonlethal
-            }, ctx);
+                nonlethal: params.nonlethal,
+                context: params.context,
+                advantageSources: params.advantageSources,
+                disadvantageSources: params.disadvantageSources,
+                situationalAdvantage: params.situationalAdvantage,
+                situationalDisadvantage: params.situationalDisadvantage
+            }, ctx); } catch (err) {
+                const sourceProblems = (err as { sourceProblems?: string[] } | undefined)?.sourceProblems;
+                if (!sourceProblems) throw err;
+                return { error: true, writes: 'none', actionType: 'attack', actorId: params.actorId, targetId: params.targetId, sourceProblems, message: (err as Error).message };
+            }
             const data = extractResultData(result, 'attack');
             // FINDINGS #96-C (BUG A, second pass — fixed against the OBSERVED payload):
             // the attack result nests everything under actionResult — the flag lives
@@ -459,7 +507,8 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                 unbinderId: params.unbinderId,
                 boost: params.boost,
                 cover: params.cover,
-                coverByTarget: params.coverByTarget
+                coverByTarget: params.coverByTarget,
+                modelsInArea: params.modelsInArea
             }, ctx);
             return extractResultData(result, 'cast_spell');
         },
@@ -545,6 +594,20 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                 };
             }
             const dasher = engine.getState()?.participants.find(p => p.id === params.actorId);
+            // Play report 7 #10 (review): a mounted rider's moves spend the mount's
+            // movement (or the mount moves itself), so a rider's Dash never widens
+            // them. With a square to reach, refuse before the action is spent and
+            // name the mount's Dash; a plain Dash stands (the rider may dismount
+            // and walk) with a note.
+            const ridden = dasher?.mountedOn ? engine.getState()?.participants.find(p => p.id === dasher.mountedOn && p.riderId === dasher.id) : undefined;
+            if (ridden && params.targetPosition) {
+                const steerable = ridden.controlledBy === dasher!.id;
+                return {
+                    error: true, actionType: 'dash', actorId: params.actorId, writes: 'none',
+                    message: `${dasher!.name} rides ${ridden.name}: a move spends ${ridden.name}'s movement, so the Dash that widens it is the mount's: combat_action dash {encounterId: '${params.encounterId}', actorId: '${ridden.id}', targetPosition: {x: ${params.targetPosition.x}, y: ${params.targetPosition.y}}}${steerable ? '' : ` on ${ridden.name}'s own turn (an independent mount)`}. ${dasher!.name}'s own Dash counts only once it dismounts. Nothing was spent.`
+                };
+            }
+            const rideNote = ridden ? ` 🐎 ${dasher!.name} rides ${ridden.name}: its moves spend the ${ridden.name}'s movement, which this Dash does not widen (the mount's own Dash does: dash {actorId: '${ridden.id}'}); ${dasher!.name}'s doubled movement counts once it dismounts.` : '';
             // A banked extra action (Action Surge) pays for a second Dash; say so.
             const extrasBefore = dasher?.extraActions ?? 0;
             const result = engine.applyDash(params.actorId);
@@ -559,6 +622,7 @@ const definitions: Record<CombatAction, ActionDefinition> = {
             const dashes = dasher?.dashes ?? 1;
             const extraActionSpent = extrasBefore > 0 && (dasher?.extraActions ?? 0) < extrasBefore;
             // Save it: a reload used to lose the doubled movement and the spent action.
+            engine.markActed(params.actorId);
             const dashState = engine.getState();
             if (dashState) getDomainServices().encounter.saveState(params.encounterId, dashState);
 
@@ -568,6 +632,8 @@ const definitions: Record<CombatAction, ActionDefinition> = {
             // reactions, movedSinceDash), so one call dashes to a square. A
             // refused move leaves the Dash spent and says why.
             let moveInfo: Record<string, unknown> | undefined;
+            // Play report 7 (lane G2): the move's reaction lines ride at the top of the dash reply (summary keeps them).
+            let reactionLines: string[] | undefined;
             if (params.targetPosition) {
                 const from = dasher?.position ? { x: dasher.position.x, y: dasher.position.y } : undefined;
                 try {
@@ -580,6 +646,7 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                     const feet = from && to ? Math.max(Math.abs(to.x - from.x), Math.abs(to.y - from.y)) * 5 : undefined;
                     const summary = typeof data.rawText === 'string' ? data.rawText.replace(/\s+/g, ' ').trim().slice(0, 300) : undefined;
                     const list = (k: string) => Array.isArray(ar[k]) && (ar[k] as unknown[]).length ? { [k]: ar[k] } : {};
+                    if (Array.isArray(data.reactionLines) && data.reactionLines.length) reactionLines = data.reactionLines as string[];
                     moveInfo = {
                         success: ok, requested: params.targetPosition, ...(from ? { from } : {}), to: to ?? null,
                         ...(ok && feet !== undefined ? { feet } : {}),
@@ -603,10 +670,11 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                 dashes,
                 ...(extraActionSpent ? { extraActionSpent: true } : {}),
                 ...(moveInfo ? { move: moveInfo } : {}),
+                ...(reactionLines ? { reactionLines } : {}),
                 effect: dashes > 1
                     ? `Dash ${dashes}: one more speed allotment this turn (budget now ${result.movementRemaining}ft)`
                     : `Movement speed doubled for this turn (budget now ${result.movementRemaining}ft)`,
-                message: `${params.actorId} takes the Dash action${dashes > 1 ? ` again (dash ${dashes})` : ''}. Movement ${dashes > 1 ? 'extended' : 'doubled'}; ${result.movementRemaining}ft remaining.${extraActionSpent ? ` ⚡ The extra action (Action Surge) paid for it; ${dasher?.extraActions ?? 0} left.` : ''}${moveLine}`
+                message: `${params.actorId} takes the Dash action${dashes > 1 ? ` again (dash ${dashes})` : ''}. Movement ${dashes > 1 ? 'extended' : 'doubled'}; ${result.movementRemaining}ft remaining.${extraActionSpent ? ` ⚡ The extra action (Action Surge) paid for it; ${dasher?.extraActions ?? 0} left.` : ''}${moveLine}${rideNote}`
             };
         },
         aliases: ['sprint', 'run', 'hustle']
@@ -620,6 +688,7 @@ const definitions: Record<CombatAction, ActionDefinition> = {
             if (!engine) return { error: true, actionType: 'dodge', message: `Encounter ${params.encounterId} not found.` };
             const applied = engine.applyDodge(params.actorId);
             if (!applied.ok) return { error: true, actionType: 'dodge', actorId: params.actorId, message: applied.error };
+            engine.markActed(params.actorId);
             const dodgeState = engine.getState();
             if (dodgeState) new EncounterRepository(getDb()).saveState(params.encounterId, dodgeState);
             // Attack disadvantage is applied by the engine; the DEX-save
@@ -641,8 +710,12 @@ const definitions: Record<CombatAction, ActionDefinition> = {
             if (!ctx) throw new Error('No session context');
             const engine = getOrLoadEngine(ctx, params.encounterId);
             if (!engine) return { error: true, actionType: 'help', message: `Encounter ${params.encounterId} not found.` };
+            // Play report 7 #10: a controlled mount may only Dash, Disengage or Dodge.
+            const steedRefusal = controlledMountActionRefusal(engine.getState()!, params.actorId, 'help');
+            if (steedRefusal) return { error: true, actionType: 'help', actorId: params.actorId, writes: 'none', message: steedRefusal };
             const applied = engine.applyHelp(params.actorId, params.targetId);
             if (!applied.ok) return { error: true, actionType: 'help', actorId: params.actorId, message: applied.error };
+            engine.markActed(params.actorId);
             const helpState = engine.getState();
             if (helpState) new EncounterRepository(getDb()).saveState(params.encounterId, helpState);
             // The engine applies the advantage to the ally's next attack; an
@@ -671,6 +744,16 @@ const definitions: Record<CombatAction, ActionDefinition> = {
             if (!engine || !state) return { error: true, actionType: 'ready', message: `Encounter ${params.encounterId} not found.` };
             const p = state.participants.find(x => x.id === params.actorId);
             if (!p) return { error: true, actionType: 'ready', actorId: params.actorId, message: `Participant ${params.actorId} not in this encounter` };
+            // Lane G2 review: a key the readied attack does not take is named, never stored.
+            const split = splitReadiedAttack(params.attack, 'attack');
+            const attack = split.attack;
+            // Play report 7 #10: a controlled mount may only Dash, Disengage or Dodge.
+            const steedRefusal = controlledMountActionRefusal(state, p.id, 'ready');
+            if (steedRefusal) return { error: true, actionType: 'ready', actorId: params.actorId, writes: 'none', message: steedRefusal };
+            // Play report 7 #5: a ranged shot under a subdue order is settled now (onSubdue), never when the trigger fires.
+            // Lane G2 review: the call to paste restates the whole attack (its own ranged flag included).
+            const subdueRefusal = readiedSubdueRefusal(p, attack, `Ready it again with the answer: combat_action ready {encounterId: '${params.encounterId}', actorId: '${p.id}', readiedAction, trigger, …, attack: ${readiedAttackPaste(attack)}}.`);
+            if (subdueRefusal) return { error: true, actionType: 'ready', actorId: params.actorId, writes: 'none', onSubdue: ['hold', 'fire'], message: subdueRefusal };
             const economy = engine.validateActionEconomy(p.id, 'action');
             // A banked extra action (Action Surge) pays for the Ready; say so.
             const extrasBefore = p.extraActions ?? 0;
@@ -681,13 +764,16 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                 trigger: params.trigger,
                 ...(params.on ? { on: params.on } : {}),
                 ...(params.watch ? { watch: params.watch } : {}),
-                ...(params.attack ? { attack: params.attack } : {})
+                ...(attack ? { attack } : {})
             };
+            engine.markActed(p.id);
             new EncounterRepository(getDb()).saveState(params.encounterId, state);
             const fires = params.on
-                ? ` It fires itself when ${params.watch ?? 'an enemy'} ${params.on === 'enters_reach' ? 'enters' : 'leaves'} ${p.name}'s reach${params.attack ? ' (attack rolled as a reaction)' : ' (flagged for trigger_readied)'}.`
+                ? ` It fires itself when ${params.watch ?? 'an enemy'} ${params.on === 'enters_reach' ? 'enters' : 'leaves'} ${p.name}'s reach${attack ? ' (attack rolled as a reaction)' : ' (flagged for trigger_readied)'}.`
                 : ' Fire it with combat_manage trigger_readied.';
-            return {
+            // Lane G2: an explicit ranged flag that disagrees with the named profile wins; say so.
+            const rangedOverride = readiedRangedNote(p, attack);
+            return withReadiedIgnored({
                 success: true,
                 actionType: 'ready',
                 actorId: params.actorId,
@@ -696,9 +782,10 @@ const definitions: Record<CombatAction, ActionDefinition> = {
                 readied: p.readied,
                 ...(economy.valid ? {} : { warning: `${economy.error}; readied anyway` }),
                 ...(extraActionSpent ? { extraActionSpent: true } : {}),
+                ...(rangedOverride ? { rangedOverride } : {}),
                 effect: `Readied action: "${params.readiedAction}" when "${params.trigger}".${fires}`,
-                message: `${p.name} readies an action.${extraActionSpent ? ` ⚡ The extra action (Action Surge) paid for it; ${p.extraActions ?? 0} left.` : ''}`
-            };
+                message: `${p.name} readies an action.${extraActionSpent ? ` ⚡ The extra action (Action Surge) paid for it; ${p.extraActions ?? 0} left.` : ''}${rangedOverride ? ` ${rangedOverride.note}.` : ''}`
+            }, split);
         },
         aliases: ['prepare', 'hold', 'wait']
     },
@@ -707,6 +794,10 @@ const definitions: Record<CombatAction, ActionDefinition> = {
         schema: StabilizeSchema,
         handler: async (params: z.infer<typeof StabilizeSchema>, ctx?: SessionContext) => {
             if (!ctx) throw new Error('No session context');
+            // Play report 7 #10: a controlled mount may only Dash, Disengage or Dodge.
+            const steedState = params.encounterId ? getOrLoadEngine(ctx, params.encounterId)?.getState() : undefined;
+            const steedRefusal = steedState ? controlledMountActionRefusal(steedState, params.actorId, 'stabilize') : undefined;
+            if (steedRefusal) return { error: true, actionType: 'stabilize', actorId: params.actorId, writes: 'none', message: steedRefusal };
             return stabilizeAction(params, ctx);
         },
         aliases: ['stabilise', 'first_aid', 'spare_the_dying'],
@@ -999,13 +1090,15 @@ DO NOT use math_manage for combat rolls - use this tool instead!
 Everything else auto-calculated. Returns: roll result, damage dealt, HP change. When the world's band rule carries damageScale and both bands are set, damage is scaled by the band gap (result bandScale {steps, multiplier, before, after}; bandScale: false skips it for one swing). Spells, heals and execute are never band-scaled.
 ⚡ actionSurge: true | 'Action Surge' (attack and grapple): when the action is already spent, spends a ready ability with grantsAction (token first, then the sheet) for one extra action and swings; the spend is mirrored to the sheet. While the action is still free it is a no-op (actionSurge.spent: false). To bank the action without swinging, combat_manage use_ability.
 ⚡ BONUS-ACTION ATTACKS (play report 5): a profile with bonusAction: true (or attack {bonusAction: true}) spends the bonus action, not the Attack action — an open multiattack is untouched (result bonusAction {spent, trigger?}). Own turn only; refused (writes: none) off-turn, when the bonus action is spent, or with reaction / legendaryCost / actionSurge. A profile's requires {dashed?, movedAtLeast?, hitThisTurn?} (or the call's) ties the swing to a trigger: the engine counts movedThisTurn and movedSinceDash (the move handler adds the feet walked; Dash resets movedSinceDash; both reset at turn start) and refuses with the exact gap ('Goring Rush needs a Dash this turn and 20 ft moved after it: dashed yes, moved 15 ft'). Tokens without positions declare movedFt (reported as declared). Goring Rush: profile {name: 'Goring Rush', attackBonus, damage, bonusAction: true, requires: {dashed: true, movedAtLeast: 20}}, then dash {targetPosition} and attack {using: 'Goring Rush'}.
+🎯 DECLARED ADVANTAGE ON ATTACKS (play report 7): a condition stays prose; what changes an attack roll is an effect mechanic {type: 'advantage_on' | 'disadvantage_on', value: 'attack' | 'attack:melee' | 'attack:ranged', condition?: '<when-tag>'} on the attacker (improvisation_manage apply_effect, or feature_from_condition to convert a condition). Untagged, it fires by itself on every attack in its lane — this call, opportunity attacks, readied attacks (on a move or trigger_readied), volleys and spell attacks (a touch spell or Spiritual Weapon is a melee spell attack; a volley always reads the ranged side and an opportunity attack the melee side). The lane is the attack's own: ranged: true|false, else the profile's ranged flag, else the grid distance against reach. Tagged ('charging'), it fires on context: ['charging'] or when named in advantageSources (the GM asserting it: 'Horn Charge (charging, named)'); opportunity and readied attacks carry no context, so a tagged one never fires there. advantageSources / disadvantageSources grant only what declares it for this attack's lane (such a mechanic, or a standard condition's 5e rule); a name that matches nothing, two things or declares nothing REFUSES the attack before any roll or spend (writes: none, sourceProblems: "'Gor Hunter' grants no advantage on melee attacks. To grant one, improvisation_manage feature_from_condition {…}; for a one-off, use situationalAdvantage: '<reason>'."). situationalAdvantage / situationalDisadvantage: '<reason>' is the GM's one-off, logged 'GM: downhill'; advantage: true is logged 'GM'. Everything cancels as usual with conditions (prone, invisible, poisoned…), Dodge and Help. The breakdown prints 'advantage ← Bloodlust (attack:melee)', the reply carries advantageSources / disadvantageSources (and conditionalAdvantage naming the tag a tagged mechanic waits for), the roll log purpose reads 'attack (adv: Bloodlust (attack:melee))'. The older form (value: 1 with skill / save / autoApply) never touches an attack.
+🛡 SAVES THE ENGINE ROLLS (play report 7): a spell's save (cast_spell, a world spell, the debuff loop), a manoeuvre's save, shove's save and the DC 10 stay-mounted save read the saver's own untagged {advantage_on | disadvantage_on, value: 'save:<ability>'} mechanics (Danger Sense: save:dex) and restrained on a DEX save (exhaustion 3+ on every save), cancelling as usual; a tagged one never fires there and is named in conditionalAdvantage. saves[], saveSources and the roll log ('dexterity save vs Fireball (adv: Danger Sense (save:dex))') name every source.
 💤 NON-LETHAL (play report 5): attack {nonlethal: true} is a melee blow meant to subdue — refused with writes: none when the attack is ranged (an explicit flag, or the grid says the target is beyond reach), a volley, a cleave or against a unit. A blow that drops the target leaves it at 0 HP, Unconscious (sourced 'nonlethal: <actor>') and STABLE: no death saves, no kill credit, no corpse; the breakdown reads [KNOCKED OUT — stable] (result knockedOut {by, stable}) and the state view shows 💤 KNOCKED OUT (stable). The sheet carries the Unconscious too. Healing above 0 — the heal action, a spell, combat_manage adjust_hp — removes that Unconscious on token and sheet (result woke {conditionsRemoved}); an Unconscious from another source (a sleep spell) is left alone. A blow that does not drop the target is an ordinary hit.
 🗡 FIGHTING STYLES (sheet fightingStyle; token inherits): archery +2 to hit when ranged; great_weapon rerolls weapon dice of 1-2 once on a two-handed melee hit (twoHanded on the profile or the call; crit dice too, never added dice); dueling +2 damage on a one-handed melee hit; defense +1 to the target's derived AC while it wears equipped armour (pass dc, or leave defense unset, if the sheet's ac already counts it). Result fightingStyle {style, applied, ...}. A posted outcome takes none.
 🎲 MANOEUVRES (maneuver: trip | precision | riposte | menacing | disarming): the sheet needs superiorityDie ('1d8') and a superiority pool (character_manage adjust_pool {pool: 'superiority', value: 4, max: 4, refresh: 'short'}); a missing die or pool, a posted outcome, a volley or cleave are refused before any roll (writes: none). trip / menacing / disarming add the die to a hit's damage (doubled on a crit, never rerolled) and the target saves STR / WIS / STR against 8 + proficiency + STR or DEX (maneuverAbility): a failed save means prone (not above Large) / frightened of you until the end of your next turn / the held item (maneuverItem, else the first in the part's holds) falls as a prop. precision rolls the die only on a miss it could make up (never a natural 1) and folds it into roll.bonus / roll.total. riposte needs reaction: true and a melee miss by the target against you this round. The die is spent only when it was rolled (result maneuver {name, die, roll, spent, pool: {before, after}, dc?, save?, applied?, turnedHit?}); the pool's history carries the reason.
 
 🔮 CAST_SPELL (minimal call):
 { action: "cast_spell", encounterId, actorId, spellName, targetId }
-Validates spell, rolls damage, applies effects, handles saves - all automatic. A world spell (table_rules kind spell) takes boost {pool, delta, modifier?, extraDice?, sideEffect?: [{pool, delta}]}: spend a pool (warpstone -1) for +modifier / +extraDice on the casting roll, with side-effect pools (taint +1); refused if the pool cannot pay. Spell costs, boosts and side effects all run the growth check (growth_track rungs fire or are offered; result worldSpell.boost / growthApplied / growthReady).
+Validates spell, rolls damage, applies effects, handles saves - all automatic. An area spell (areaOfEffect: Burning Hands, Fireball) on a unit token goes model by model, each model saving on the fight's dice (result unitAreas; a spaced unit needs modelsInArea: {id: n}, refused before the slot is spent without it); any other spell takes one model of a unit at most (unitCaps). A world spell (table_rules kind spell) takes boost {pool, delta, modifier?, extraDice?, sideEffect?: [{pool, delta}]}: spend a pool (warpstone -1) for +modifier / +extraDice on the casting roll, with side-effect pools (taint +1); refused if the pool cannot pay. Spell costs, boosts and side effects all run the growth check (growth_track rungs fire or are offered; result worldSpell.boost / growthApplied / growthReady).
 
 💚 SUPPORT:
 - heal - Restore HP to a target
@@ -1015,11 +1108,12 @@ Validates spell, rolls damage, applies effects, handles saves - all automatic. A
 - move - Move to a position (use available movement)
 - dash - Double movement speed for the turn; with targetPosition it also moves there in the same call (the move runs through the move handler: path, budget, reactions; result move {success, from, to, feet})
 - disengage - Move without provoking opportunity attacks
-  (a move provokes along its whole path, after it is validated; NPC reactors roll, a PC reactor is offered in opportunityAttacksAvailable with the exact attack {reaction: true} call)
+  (a move provokes along its whole path, after it is validated; NPC reactors roll, a PC reactor is offered in opportunityAttacksAvailable with the exact attack {reaction: true} call; the reply's reactionLines says what each reaction did in one line, a PC's offered call included, and output_mode 'summary' keeps them whole)
 
 🛡️ DEFENSIVE:
 - dodge - Attacks against you roll at disadvantage until your next turn (engine-applied; DEX-save advantage is on the GM)
-- ready - Prepare an action with a trigger (spends the action). on: enters_reach | leaves_reach + watch + attack {…} makes the engine fire it as a reaction during a move; without attack it is flagged for combat_manage trigger_readied
+- ready - Prepare an action with a trigger (spends the action). on: enters_reach | leaves_reach + watch + attack {…} makes the engine fire it as a reaction during a move; without attack it is flagged for combat_manage trigger_readied. Under a subdue order (combat_manage set_subdue) a readied melee swing is non-lethal, and a ranged attack needs attack.onSubdue: 'hold' (holds fire, reaction kept) | 'fire' (lethal, 'subdue order overridden') or the ready is refused (writes: none). attack.ranged: true | false is the readied attack's own lane, read at ready and when it fires, before the profile's flag and the grid (attack {attackBonus, damage, ranged: true} is a shot with no profile; a flag that disagrees with its profile wins and rangedOverride says so)
+- A controlled mount (combat_manage mount) may only Dash, Disengage or Dodge; its rider's move {actorId: rider} moves it
 
 Aliases: hit/strike→attack, cast/spell→cast_spell, sprint→dash, evade→dodge.
 
@@ -1028,9 +1122,9 @@ Aliases: hit/strike→attack, cast/spell→cast_spell, sprint→dash, evade→do
 The healer must be adjacent (within 5 ft) and spends the action; a Wisdom (Medicine) check DC 10 is rolled on the fight's dice (the sheet's WIS + proficiency, or medicineBonus). A healer's kit in the actor's inventory (properties.healersKit, or a name like "Healer's Kit") makes it automatic and spends one use (useKit: false keeps it); Spare the Dying (a cantrip, known spell or ability) is automatic too. Success: the target is STABLE — unconscious, no more death saves, counters cleared — and regains 1 HP after 1d4 hours, rolled now and filed as a scheduled change on the world clock (world_manage advance {fireScheduled: true} fires it). A failed check still spends the action. Refused before anything is spent (writes: none): not adjacent, action spent, target above 0 HP, dead or already stable. Without encounterId it runs on the character sheets (logged dice; Stable written to the row). The dying rules themselves: a participant with a character row (pc/npc) tracks death saves at 0 HP (combat_profile.deathSaves overrides; mooks die at 0); combat_manage advance rolls the save on its turn (deathSaveMode prompt holds the slot with DEATH SAVE DUE); a hit while down is a failed save (two on a crit or from 5 ft); massive damage kills outright; any healing above 0 clears the counters.
 
 🤼 GRAPPLE (FINDINGS #99 — unarmed vocabulary):
-{ action: "grapple", encounterId?, actorId, targetId, move: clinch|takedown|throw|slam|control|break|execute|shove, surface?, control?, outcome?: win|lose, damage?, modifier?, advantage?, disadvantage?, advantageSources?, disadvantageSources?, push?, prone?, save?, bonusAction? }
+{ action: "grapple", encounterId?, actorId, targetId, move: clinch|takedown|throw|slam|control|break|execute|shove, surface?, control?, outcome?: win|lose, damage?, modifier?, advantage?, disadvantage?, advantageSources?, disadvantageSources?, situationalAdvantage?, situationalDisadvantage?, context?, push?, prone?, save?, bonusAction? }
 🦬 SHOVE (play report 5): { action: 'grapple', move: 'shove', actorId, targetId, push?: 5 | 10, prone?: true, save?: {ability: 'str', dc?}, bonusAction?: true }. Push (default 5 ft; 10 is a house extension and the reply says so) OR prone, never both (refused, writes: none). The contest is the grapple contest unless save is given: then the TARGET rolls the save (dc as given, else 8 + proficiency + the shover's STR; legendary resistance honoured; result save {ability, dc, dcSource, natural, total, saved}) and a failed save is the shove. The push is FORCED MOVEMENT: one square per 5 ft directly away from the shover, the target's whole footprint checked against terrain obstacles, other tokens and the grid bounds; it stops at the first blocked square (pushed {feet, requested, from, to, stoppedBy?}), spends no movement and provokes nothing — no opportunity attacks, no readied triggers (forcedMovement). Unplaced tokens or the sheet path report pushed {feet, narrative: true} for the GM to place. A hold the shover had on the target stays (holdNote); a shove never ends a grapple by itself. bonusAction: true spends the bonus action instead of an attack (Shield Master, Tavern Brawler): the actor's own turn only, refused with writes: none when off-turn or already used; never with actionSurge; break is always the action. Hammering Horns in one call: {action: 'grapple', move: 'shove', push: 10, save: {ability: 'str'}, bonusAction: true}.
-Internal opposed check (Athletics vs better of Athletics/Acrobatics) on the fight's logged dice; with encounterId it spends one attack (break spends the action; actionSurge: true reopens a spent action from a grantsAction ability), and tokens without a sheet can grapple. Grapple is the ONE action that works without encounterId: two live tokens in one fight are routed there (routedToEncounter); one side in a fight, or two fights, is refused; neither in a fight runs on the character sheets with logged dice, the world's proficiency curve and expertise. execute on sheets kills through character_manage kill (HP 0, concentration ended, a corpse row; writesTo 'sheet'); in a fight it only drops the token to 0 HP. An execute with no damage is a coup de grâce (its HP, defences bypassed); posted or dice damage respects resistances. The lower band or smaller size rolls at disadvantage automatically (reasons in situational). ADVANTAGE (play report 4): the ACTOR's roll mode is the GM's advantage/disadvantage flag plus named sources — advantageSources / disadvantageSources name what is on the actor (its token conditions, sheet conditions or active effects; math_manage's rule: exact beats prefix beats substring, one hit) — plus the automatic band/size rule; advantage and disadvantage together cancel to one die (rollMode {actor, defender}; situational prints 'Marine: advantage (GM; Bulwark)' or the cancel line; the roll_log purpose reads 'grapple (adv: GM, Bulwark; dis: lower band)' and stays 'grapple' with no reasons). The defender keeps only its automatic disadvantage. A source that matches nothing or two things is REFUSED before any roll or spend (writes: none) — a grapple writes, so nothing is guessed; posted outcomes and helpless targets roll no contest, so flags and sources are noted as ignored there. Keys grapple does not use come back in ignoredParams. A target more than one size larger is refused, and throw/slam of anything larger. A helpless target — unconscious, asleep, incapacitated, paralysed, stunned, petrified or at 0 HP, read from its token when it has one, else its sheet — is held without a contest (house ruling; autoWin.reason says why; a break against a helpless holder succeeds the same way); a helpless ACTOR is refused on the sheets as the engine refuses it in a fight. outcome: win|lose posts a result the table already resolved: no d20, the attack is still spent (lose writes nothing); with a win, damage is the throw/slam surface damage (a number as posted, dice rolled on the fight's dice), still band-scaled. Win writes conditions to the character row, and to the live encounter tokens when encounterId is given (clinch→Clinched, takedown/slam→Prone+Grappled, throw→Prone, control→Restrained, break→clears the ACTOR's holds from targetId: holds sourced 'grapple: <holder>' or 'pinned by <holder>' go with their extras; holds sourced to the holder's bare id or name clear only Clinched/Grappled/Restrained/Pinned). control: true pins (Grappled + Restrained, no damage). execute: a pinned lower-band foe takes a posted crit of damage (default its HP); pinned = Restrained or Pinned, or Grappled + Prone, sourced to this actor by id, name, or any 'grapple:'/'pinned by' form — read from the token first, then the sheet (pinFrom); combat_manage add_condition {fromGrapple} writes that source. throw/slam ROLL surface damage (earth d4 / concrete-wall-table d6 / edge-glass d8, margin ≥5 adds a die) and RETURN it — apply via your damage lane; the encounter sheet owns mid-combat HP.`,
+Internal opposed check (Athletics vs better of Athletics/Acrobatics) on the fight's logged dice; with encounterId it spends one attack (break spends the action; actionSurge: true reopens a spent action from a grantsAction ability), and tokens without a sheet can grapple. Grapple is the ONE action that works without encounterId: two live tokens in one fight are routed there (routedToEncounter); one side in a fight, or two fights, is refused; neither in a fight runs on the character sheets with logged dice, the world's proficiency curve and expertise. execute on sheets kills through character_manage kill (HP 0, concentration ended, a corpse row; writesTo 'sheet'); in a fight it only drops the token to 0 HP. An execute with no damage is a coup de grâce (its HP, defences bypassed); posted or dice damage respects resistances. The lower band or smaller size rolls at disadvantage automatically (reasons in situational). ADVANTAGE (play report 4; declared, play report 7): the ACTOR's roll mode is the GM's advantage/disadvantage flag, situationalAdvantage / situationalDisadvantage: '<reason>' (the GM's one-off, logged 'GM: downhill'), the actor's declared mechanics and named sources, plus the automatic band/size rule. A condition stays prose: what changes the roll is an effect mechanic {type: 'advantage_on', value: 'grapple' | 'grapple:<move>' | 'check:athletics' | 'check:str', condition?: '<when-tag>'} — untagged it fires on every grapple by itself; tagged ('head-on') it fires on context: ['head-on'] or when named in advantageSources (the GM asserting it; logged 'Horn-Lock (head-on, named)'). advantageSources / disadvantageSources name what is on the actor (its token conditions, sheet conditions, active effects or skillAdvantage traits; math_manage's rule: exact beats prefix beats substring, one hit) and grant only what DECLARES it for this grapple: such a mechanic (or the older {value: 1, skill: 'athletics'} form), a standard condition's 5e rule (poisoned, frightened: disadvantage on the check), a skillAdvantage trait listing Athletics (Acrobatics on a break; the scene's sense denial still applies). The defender's own untagged check:athletics / check:acrobatics mechanics fire on its roll (defenderAdvantageSources). Convert a prose condition once: improvisation_manage feature_from_condition {characterId, match: 'Horn-Lock', mechanics: [{type: 'advantage_on', value: 'grapple', condition: 'head-on'}]}; advantage and disadvantage together cancel to one die (rollMode {actor, defender}; situational prints 'Marine: advantage (GM; Bulwark)' or the cancel line; the roll_log purpose reads 'grapple (adv: GM, Bulwark; dis: lower band)' and stays 'grapple' with no reasons). The defender keeps only its automatic disadvantage. A source that matches nothing, two things, or declares nothing for this grapple is REFUSED before any roll or spend (writes: none, sourceProblems with the call that would declare it) — a grapple writes, so nothing is guessed; posted outcomes and helpless targets roll no contest, so flags and sources are noted as ignored there. Keys grapple does not use come back in ignoredParams. A target more than one size larger is refused, and throw/slam of anything larger. A helpless target — unconscious, asleep, incapacitated, paralysed, stunned, petrified or at 0 HP, read from its token when it has one, else its sheet — is held without a contest (house ruling; autoWin.reason says why; a break against a helpless holder succeeds the same way); a helpless ACTOR is refused on the sheets as the engine refuses it in a fight. outcome: win|lose posts a result the table already resolved: no d20, the attack is still spent (lose writes nothing); with a win, damage is the throw/slam surface damage (a number as posted, dice rolled on the fight's dice), still band-scaled. Win writes conditions to the character row, and to the live encounter tokens when encounterId is given (clinch→Clinched, takedown/slam→Prone+Grappled, throw→Prone, control→Restrained, break→clears the ACTOR's holds from targetId: holds sourced 'grapple: <holder>' or 'pinned by <holder>' go with their extras; holds sourced to the holder's bare id or name clear only Clinched/Grappled/Restrained/Pinned). control: true pins (Grappled + Restrained, no damage). execute: a pinned lower-band foe takes a posted crit of damage (default its HP); pinned = Restrained or Pinned, or Grappled + Prone, sourced to this actor by id, name, or any 'grapple:'/'pinned by' form — read from the token first, then the sheet (pinFrom); combat_manage add_condition {fromGrapple} writes that source. throw/slam ROLL surface damage (earth d4 / concrete-wall-table d6 / edge-glass d8, margin ≥5 adds a die) and RETURN it — apply via your damage lane; the encounter sheet owns mid-combat HP.`,
     // Grapple is intercepted before the router: its contract joins the router's
     // here so the mirror audit, search_tools and ignored-param checks see it.
     actionSchemas: {
@@ -1070,6 +1164,7 @@ Internal opposed check (Athletics vs better of Athletics/Acrobatics) on the figh
         ammoCount: z.number().optional().describe('FINDINGS #58 (mirror): magazines expended (default 1)'),
         cover: coverEnum().optional().describe("attack / volley / cast_spell (mirror): the target's cover: none | half (+2 AC, +2 DEX save) | three-quarters (+5) | total (refused, nothing spent). Unset: standing cover (combat_manage set_cover), else the map; the single best source, never a sum. Printed as AC 12 +5 (three-quarters, boulder) = 17; do not fold it into dc too"),
         coverByTarget: coverByTargetSchema().optional().describe(`cast_spell (mirror): ${COVER_BY_TARGET_DESCRIBE}`),
+        modelsInArea: modelsInAreaSchema().optional().describe(`cast_spell (mirror): ${MODELS_IN_AREA_DESCRIBE}`),
         breaksCover: z.boolean().optional().describe("attack (mirror): the attacker leaves its own standing cover for the round"),
         advantage: z.boolean().optional().describe('attack / volley / grapple: 2d20 keep highest (mirror of inner schema, Findings #32). On a grapple it is the actor\'s roll and cancels against any disadvantage'),
         declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional().describe('Register-B audit: declared modifiers already in attackBonus, printed in the breakdown'),
@@ -1077,8 +1172,12 @@ Internal opposed check (Athletics vs better of Athletics/Acrobatics) on the figh
         // trait; engine computes and APPLIES the value (incl. valueFromPool).
         declaredEffects: z.array(z.object({ name: z.string(), lane: z.string().optional() })).optional().describe('RESOLVER v2: [{name, lane?}] — engine-computed conditional trait values; do NOT also fold into attackBonus'),
         disadvantage: z.boolean().optional().describe('attack / volley / grapple: 2d20 keep lowest. On a grapple the lower band or smaller size is automatic and never stacks'),
-        advantageSources: sourcesField('advantage', GRAPPLE_SOURCE_NOTE),
-        disadvantageSources: sourcesField('disadvantage', GRAPPLE_SOURCE_NOTE),
+        // Play report 7 #7: attack (lane F) and grapple (lane E) share these keys.
+        advantageSources: sourcesField('advantage', `${ATTACK_SOURCE_NOTE} ${GRAPPLE_SOURCE_NOTE}`),
+        disadvantageSources: sourcesField('disadvantage', `${ATTACK_SOURCE_NOTE} ${GRAPPLE_SOURCE_NOTE}`),
+        situationalAdvantage: mirrorSituationalField('advantage'),
+        situationalDisadvantage: mirrorSituationalField('disadvantage'),
+        context: tagsField(`${ATTACK_CONTEXT_DESCRIBE}. ${GRAPPLE_CONTEXT_DESCRIBE}`),
         dc: z.number().optional().describe('DC for the attack'),
         damage: z.union([z.number(), z.string()]).optional().describe('Damage amount or dice'),
         damageType: z.string().optional().describe('Damage type (fire, slashing, etc.)'),
@@ -1091,7 +1190,7 @@ Internal opposed check (Athletics vs better of Athletics/Acrobatics) on the figh
         trigger: z.string().optional().describe('Trigger for readied action'),
         on: z.enum(['enters_reach', 'leaves_reach']).optional().describe('ready (mirror): enters_reach | leaves_reach, the engine fires it on a move'),
         watch: z.string().optional().describe("ready (mirror): who sets it off: participant id or name, 'enemy' (default) or 'any'"),
-        attack: z.any().optional().describe('ready (mirror): {using?, attackBonus?, damage?, damageType?, withPart?}, the attack it makes as a reaction'),
+        attack: z.any().optional().describe("ready (mirror): {using?, attackBonus?, damage?, damageType?, withPart?, ranged?: boolean, onSubdue?: 'hold' | 'fire'}, the attack it makes as a reaction (ranged: the attack's own lane, over the profile's flag and the grid; onSubdue is required for a ranged attack on a token under a subdue order)"),
         move: z.enum(GRAPPLE_MOVES).optional().describe("FINDINGS #99 grapple: the move. clinch→Clinched · takedown/slam→Prone+Grappled · throw→Prone · control→Restrained · break→clears the ACTOR's holds from targetId · execute→a posted crit on a lower-band foe this actor pinned: damage as given (defences apply), else a coup de grâce taking its HP (defences bypassed); without an encounter the sheet is written and the kill makes a corpse · shove→pushes 5 ft (push: 10 house extension) directly away or knocks prone (prone: true), forced movement that never provokes"),
         push: z.number().optional().describe('grapple shove (mirror): feet pushed directly away — 5 (5e RAW) or 10 (house extension, labelled); default 5 unless prone is set'),
         prone: z.boolean().optional().describe('grapple shove (mirror): knock the target prone instead of pushing it (push or prone, never both)'),
@@ -1164,6 +1263,8 @@ interface GrappleSide {
     row?: GrappleRow;
     tok?: CombatParticipant;
     band?: string | null;
+    /** Play report 7 #3: the token's band is the world's lowest, assumed at create. */
+    bandAssumed?: boolean;
     size: string;
     str: number;
     dex: number;
@@ -1176,6 +1277,7 @@ function grappleSide(id: string, row: GrappleRow | null, tok: CombatParticipant 
         row: row ?? undefined,
         tok,
         band: tok?.band ?? row?.band,
+        ...(tok?.band && tok.bandAssumed ? { bandAssumed: true } : {}),
         size: tok?.size ?? row?.size ?? 'medium',
         str: row?.stats?.str ?? tok?.abilityScores?.strength ?? 10,
         dex: row?.stats?.dex ?? tok?.abilityScores?.dexterity ?? 10
@@ -1311,11 +1413,21 @@ function executeCheck(args: Record<string, unknown>, g: GrappleContext): { probl
     const needPin = (found: string[]) => `execute needs ${g.target.name} pinned by ${g.actor.name}: found ${found.length ? found.join(', ') : 'nothing'}; needs Restrained/Pinned, or Grappled + Prone, sourced to ${g.actor.name} (id or name, or 'grapple: ${g.actor.id}')`;
     const bandProblem = (): string | undefined => {
         const cmp = compareBands(g.order, g.actor.band, g.target.band);
-        if (cmp === null) return `execute needs both bands set (unset for ${!g.actor.band ? g.actor.name : g.target.name})`;
-        if (cmp !== 1) return `execute is against a pinned foe of a lower band; ${g.target.name} (${g.target.band}) is not below ${g.actor.name} (${g.actor.band})`;
+        if (cmp === null) {
+            // Play report 7 #3: the refusal names the call that fixes it. Review:
+            // two bands on different ladders are not "unset"; the fix names the
+            // ladder of the other side's band.
+            const { move, other, problem } = bandsUnranked('execute', g.actor, g.target);
+            const fix = g.engine && g.encounterId && move.tok
+                ? setBandCall(g.encounterId, move.id)
+                : `character_manage update {characterId: '${move.id}', band: '<band>'}`;
+            const ladder = other.band ? bandOrderFor(g.db, g.worldId, [other.band]) : g.order;
+            return `${problem}. Set it: ${fix} (order: ${ladder.join(' < ')})`;
+        }
+        if (cmp !== 1) return `execute is against a pinned foe of a lower band; ${g.target.name} (${g.target.band}) is not below ${g.actor.name} (${g.actor.band})${bandAssumedTag(g.actor, g.target)}`;
         return undefined;
     };
-    const note = `${g.actor.name} executes ${g.target.name} (pinned; ${g.actor.band} over ${g.target.band})`;
+    const note = `${g.actor.name} executes ${g.target.name} (pinned; ${g.actor.band} over ${g.target.band})${bandAssumedTag(g.actor, g.target)}`;
 
     if (!g.engine) {
         // No encounter: both sheets, the pin read from the target's sheet.
@@ -1391,7 +1503,7 @@ async function executeOnSheets(args: Record<string, unknown>, g: GrappleContext,
     const hpAfter = Math.max(0, hpBefore - damage);
     const defeated = hpAfter <= 0;
     let killed = false; let corpseId: string | undefined;
-    let concentration: Record<string, unknown> | undefined;
+    let concentration: ConcentrationOutcome | undefined;
     if (defeated) {
         // The same death as character_manage kill: one verb for 'this thing is dead'.
         const spell = new ConcentrationRepository(db).findByCharacterId(target.id)?.activeSpell;
@@ -1400,19 +1512,21 @@ async function executeOnSheets(args: Record<string, unknown>, g: GrappleContext,
         if (k.error) return { error: true, writes: 'none', actionType: 'grapple', message: String(k.message) };
         killed = true;
         corpseId = typeof k.corpseId === 'string' ? k.corpseId : undefined;
-        if (k.concentrationBroken) concentration = { spell: spell ?? k.concentrationBroken, broken: true, reason: 'death' };
+        if (k.concentrationBroken) concentration = { spell: (spell ?? k.concentrationBroken) as string, broken: true, reason: 'death' };
     } else {
         repo.update(target.id, { hp: hpAfter });
         if (damage > 0) {
-            const c = concentrationAfterDamage(target.id, damage, false, () => loggedD20(db, { purpose: 'concentration', forId: target.id }, { tool: 'combat_action' }).natural, new ConcentrationRepository(db), repo);
+            // Play report 7 (lane H): the survivor's declared save:con sides and sheet conditions, on a logged d20.
+            const c = concentrationAfterDamage(target.id, damage, false, sheetConcentrationDie(db, target.id, 'combat_action'), new ConcentrationRepository(db), repo);
             if (c) concentration = { ...c };
         }
     }
+    const concentrationRow = concentration ? concentrationSourcesRow({ id: target.id, name: target.name }, concentration) : undefined;
     // Play report 2, item 6: the kill feeds the executioner's growth track.
     const growth = killed ? await creditKill(db, g.worldId, actor.id, { id: target.id, name: target.name, band: target.band }, actor.band) : undefined;
     let message = `${check.note}: ${damage}${damageType ? ` ${damageType}` : ''} damage (${detail}) — HP ${hpBefore} → ${hpAfter}`;
     if (killed) message += `. ${target.name} is dead${corpseId ? `; corpse ${corpseId.slice(0, 8)} on the ground` : ''}`;
-    if (concentration) message += `. Concentration on ${String(concentration.spell)}: ${concentration.reason === 'death' ? 'ends at 0 HP' : concentration.broken ? 'BROKEN' : 'held'}`;
+    if (concentration) message += `. Concentration on ${String(concentration.spell)}: ${concentration.reason === 'death' ? 'ends at 0 HP' : concentration.broken ? 'BROKEN' : 'held'}${concentration.reason === 'death' ? '' : concentrationSidesNote(concentration)}`;
     message += `. No encounter: written to the sheet${killed ? ' and the corpse ledger' : ''}.`;
     if (growth) message += `\n⬆ ${growthLine(growth)}`;
     return {
@@ -1424,6 +1538,8 @@ async function executeOnSheets(args: Record<string, unknown>, g: GrappleContext,
         hpBefore, hpAfter, defeated, killed,
         ...(corpseId ? { corpseId } : {}),
         ...(concentration ? { concentration } : {}),
+        // Play report 7 (lane H): the concentration save's sources, as every engine save reports them.
+        ...(concentrationRow ? { saveSources: [concentrationRow] } : {}),
         ...(growth ? { growth } : {}),
         writesTo: 'sheet', message
     };
@@ -1474,6 +1590,16 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
             return { error: true, writes: 'none', actionType: 'grapple', message: `${key} must be true or false, not ${JSON.stringify(v)} — nothing was rolled or spent` };
         }
     }
+    // Play report 7 #7: the GM's one-off is a reason, as text; a direct
+    // caller's `true` is refused, never read as no reason.
+    for (const key of ['situationalAdvantage', 'situationalDisadvantage'] as const) {
+        const v = args[key];
+        if (v !== undefined && v !== null && (typeof v !== 'string' || !v.trim())) {
+            return { error: true, writes: 'none', actionType: 'grapple', message: `${key} takes the reason as text ('downhill'), not ${JSON.stringify(v)} — nothing was rolled or spent` };
+        }
+    }
+    const sitAdv = typeof args.situationalAdvantage === 'string' ? args.situationalAdvantage.trim() : '';
+    const sitDis = typeof args.situationalDisadvantage === 'string' ? args.situationalDisadvantage.trim() : '';
 
     // What a side is judged by: the token when there is one (its conditions
     // and hp), else the sheet — a stale sheet condition never decides a live fight.
@@ -1510,20 +1636,89 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
     // sources are matched against the actor's token conditions, sheet
     // conditions and active effects (math_manage's resolver). A miss or an
     // ambiguous name is REFUSED here, before anything is spent — a grapple
-    // spends the attack and writes conditions, where math_manage only warns
-    // and rolls. With no contest nothing would be rolled, so nothing is checked.
+    // spends the attack and writes conditions (math_manage refuses the same
+    // way since play report 7). With no contest nothing would be rolled, so
+    // nothing is checked.
+    // Play report 7 #7 (the owner's spec): a name grants only what DECLARES
+    // it for this grapple (src/engine/advantage-sources.ts) — an effect's
+    // advantage_on mechanic whose scope covers it (grapple, grapple:<move>,
+    // check:athletics, check:str; Acrobatics/DEX on a break), a standard
+    // condition's 5e rule, a skillAdvantage trait listing Athletics (#8).
+    // Scoped mechanics also fire by themselves: untagged ones always, tagged
+    // ones on `context`. Anything else is refused before anything is spent.
     const gmAdv = args.advantage === true, gmDis = args.disadvantage === true;
     const advTexts = sourceTexts(args.advantageSources), disTexts = sourceTexts(args.disadvantageSources);
+    if (args.context !== undefined && args.context !== null && !Array.isArray(jsonIfString(args.context)) && typeof args.context !== 'string') {
+        return { error: true, writes: 'none', actionType: 'grapple', message: `context takes the roll's tags (['head-on'] or 'head-on'), not ${JSON.stringify(args.context)} — nothing was rolled or spent` };
+    }
+    const ctxTags = sourceTexts(args.context).map(t => t.trim()).filter(Boolean);
     let advLabels: string[] = [], disLabels: string[] = [];
-    if (contested && (advTexts.length || disTexts.length)) {
-        const owner = { ownerName: actor.name, conditions: [...tokConditions(actor.tok), ...rowConditions(actor.row)], effectNames: loadEffectNames(db, actor.id) };
-        const adv = resolveNamedSources(advTexts, 'advantage', owner);
-        const dis = resolveNamedSources(disTexts, 'disadvantage', owner);
-        const problems = [...adv.problems, ...dis.problems];
-        if (problems.length) {
-            return { error: true, writes: 'none', actionType: 'grapple', sourceProblems: problems, message: `${actor.name} cannot grapple with these sources: ${problems.join('; ')}. Name what is on ${actor.name}'s token, sheet or active effects (a condition's name or source, an effect's name). Nothing was rolled or spent.` };
+    let defAdvLabels: string[] = [], defDisLabels: string[] = [];
+    let deniedAdvantage: Array<{ trait: string; when: string; reason: string }> | undefined;
+    let conditionalAdvantage: string[] | undefined;
+    // Play report 7 #7 (review): a tag that fires nothing is said, never swallowed.
+    let contextUnfired: string[] | undefined;
+    if (contested) {
+        const rollSkills = isBreak ? ['athletics', 'acrobatics'] : ['athletics'];
+        const rollScope: RollScope = { kind: 'grapple', move, skills: rollSkills, abilities: isBreak ? ['str', 'dex'] : ['str'] };
+        const effects = loadEffectDeclarations(db, actor.id);
+        const traits = (actor.row as { skillAdvantage?: SkillAdvantageTrait[] } | undefined)?.skillAdvantage ?? [];
+        const autoAdv = scopedAdvantage(effects, 'advantage', rollScope, ctxTags);
+        const autoDis = scopedAdvantage(effects, 'disadvantage', rollScope, ctxTags);
+        let named: { adv: GrantedSource[]; dis: GrantedSource[] } = { adv: [], dis: [] };
+        if (advTexts.length || disTexts.length) {
+            const owner: DeclaringOwner = {
+                ownerId: actor.id, ownerName: actor.name, effects, traits,
+                conditions: [
+                    ...(actor.tok?.conditions ?? []).map(c => ({ name: String(c.type), source: c.sourceId, level: typeof c.metadata?.level === 'number' ? c.metadata.level : undefined, on: 'token' as const })),
+                    ...rowConditions(actor.row).map(c => ({ ...c, on: 'sheet' as const }))
+                ]
+            };
+            const adv = resolveAdvantageSources(advTexts, 'advantage', owner, rollScope, ctxTags);
+            const dis = resolveAdvantageSources(disTexts, 'disadvantage', owner, rollScope, ctxTags);
+            const problems = [...adv.problems, ...dis.problems];
+            if (problems.length) {
+                return { error: true, writes: 'none', actionType: 'grapple', sourceProblems: problems, message: `${actor.name} cannot grapple with these sources: ${problems.join('; ')}. Name what declares it (an effect with an advantage_on / disadvantage_on mechanic whose scope covers the grapple, a standard condition, a skillAdvantage trait listing Athletics), or pass situationalAdvantage: '<reason>' for your own ruling. Nothing was rolled or spent.` };
+            }
+            named = { adv: adv.granted, dis: dis.granted };
         }
-        advLabels = adv.labels; disLabels = dis.labels;
+        // #8: traits covering the roll's skills fire on their tag or by name,
+        // through the scene's sense denial, as on a skill check.
+        const tagSet = new Set(ctxTags.map(normTag));
+        const firingTraits = [
+            ...traits.filter(t => t && typeof t.when === 'string' && Array.isArray(t.skills) && tagSet.has(normTag(t.when)) && t.skills.some(s => rollSkills.some(r => normSkill(String(s)) === normSkill(r))))
+                .map(t => ({ name: t.name, when: t.when, label: `${t.name} (${t.when})` })),
+            ...named.adv.filter(g => g.via === 'trait').map(g => ({ name: g.name, when: g.tag ?? '', label: g.label }))
+        ].filter((t, i, all) => all.findIndex(x => x.name.toLowerCase() === t.name.toLowerCase()) === i);
+        const traitLabels: string[] = [];
+        if (firingTraits.length) {
+            const senses = sceneSensesFor(db, actor.id, g.worldId);
+            for (const t of firingTraits) {
+                const reason = denialFor(senses.senseDenial, actor.id, t.when);
+                if (reason) (deniedAdvantage ??= []).push({ trait: t.name, when: t.when, reason });
+                else traitLabels.push(t.label);
+            }
+        }
+        const once = (xs: string[]) => xs.filter((x, i) => xs.findIndex(y => y.toLowerCase() === x.toLowerCase()) === i);
+        advLabels = once([...autoAdv.fired.map(f => f.label), ...named.adv.filter(x => x.via !== 'trait').map(x => x.label), ...traitLabels]);
+        disLabels = once([...autoDis.fired.map(f => f.label), ...named.dis.map(x => x.label)]);
+        // A tagged mechanic nobody asserted is told its tag and its name.
+        const namedEffects = new Set(named.adv.filter(x => x.via === 'effect').map(x => x.name.toLowerCase()));
+        const hints = autoAdv.gated.filter(x => !namedEffects.has(x.effect.toLowerCase())).map(x => `${x.effect} (${x.tag}): pass context: ['${x.tag}'] or advantageSources: ['${x.effect}'] when it holds`);
+        if (hints.length && !ctxTags.length) conditionalAdvantage = hints;
+        const firedTags = new Set([...autoAdv.fired, ...autoDis.fired].filter(f => f.tag).map(f => normTag(f.tag!)));
+        for (const t of firingTraits) firedTags.add(normTag(t.when));
+        const unfired = ctxTags.filter(t => !firedTags.has(normTag(t)));
+        if (unfired.length) contextUnfired = unfired;
+        // The defender rolls the better of Athletics/Acrobatics (Athletics
+        // against a break): its untagged check:<skill> / check:<ability>
+        // mechanics fire on that roll. 'grapple' scopes are the grappler's.
+        const defEffects = loadEffectDeclarations(db, target.id);
+        const defRolls: RollScope[] = isBreak
+            ? [{ kind: 'check', skill: 'athletics', ability: 'str' }]
+            : [{ kind: 'check', skill: 'athletics', ability: 'str' }, { kind: 'check', skill: 'acrobatics', ability: 'dex' }];
+        defAdvLabels = once(defRolls.flatMap(r => scopedAdvantage(defEffects, 'advantage', r).fired.filter(f => !f.tag).map(f => f.label)));
+        defDisLabels = once(defRolls.flatMap(r => scopedAdvantage(defEffects, 'disadvantage', r).fired.filter(f => !f.tag).map(f => f.label)));
     }
 
     // Economy: a grapple replaces one attack of the Attack action; escaping is
@@ -1566,32 +1761,36 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
     // The lower band or the smaller size rolls at disadvantage, once (5e: never
     // stacks). Short labels go in the roll_log purpose, the detail in the line.
     const cmp = compareBands(g.order, actor.band, target.band);
-    const autoReasons = (me: GrappleSide, them: GrappleSide, lowerBand: boolean): Array<{ label: string; detail: string }> => [
-        ...(lowerBand ? [{ label: 'lower band', detail: `${me.band} vs ${them.band}` }] : []),
+    const autoReasons = (me: GrappleSide, them: GrappleSide, lowerBand: boolean): Array<{ label: string; detail: string; note?: string }> => [
+        ...(lowerBand ? [{ label: 'lower band', detail: `${me.band} vs ${them.band}`, note: bandAssumedTag(me, them).trim() || undefined }] : []),
         ...(sizeRank(me.size) < sizeRank(them.size) ? [{ label: 'smaller', detail: `${me.size} vs ${them.size}` }] : [])
     ];
-    const detailed = (r: { label: string; detail: string }) => `${r.label} (${r.detail})`;
+    const detailed = (r: { label: string; detail: string; note?: string }) => `${r.label} (${r.detail})${r.note ? ` ${r.note}` : ''}`;
     const actorAuto = contested ? autoReasons(actor, target, cmp === -1) : [];
     const defAuto = contested ? autoReasons(target, actor, cmp === 1) : [];
     // The actor's reasons in order: the GM's flag, the automatic rule, the
     // named sources. The defender has only the automatic rule.
-    const actorAdv = [...(gmAdv ? ['GM'] : []), ...advLabels];
-    const actorDis = { short: [...(gmDis ? ['GM'] : []), ...actorAuto.map(r => r.label), ...disLabels], long: [...(gmDis ? ['GM'] : []), ...actorAuto.map(detailed), ...disLabels] };
-    const defDis = { short: defAuto.map(r => r.label), long: defAuto.map(detailed) };
+    // Play report 7: the GM's one-off reads 'GM: <reason>' after the flag.
+    const gmAdvLabels = [...(gmAdv ? ['GM'] : []), ...(sitAdv ? [`GM: ${sitAdv}`] : [])];
+    const gmDisLabels = [...(gmDis ? ['GM'] : []), ...(sitDis ? [`GM: ${sitDis}`] : [])];
+    const actorAdv = [...gmAdvLabels, ...advLabels];
+    const actorDis = { short: [...gmDisLabels, ...actorAuto.map(r => r.label), ...disLabels], long: [...gmDisLabels, ...actorAuto.map(detailed), ...disLabels] };
+    const defDis = { short: [...defAuto.map(r => r.label), ...defDisLabels], long: [...defAuto.map(detailed), ...defDisLabels] };
     const modeOf = (adv: number, dis: number): GrappleRollMode => adv && dis ? 'cancelled' : adv ? 'advantage' : dis ? 'disadvantage' : 'normal';
     const actorMode = modeOf(actorAdv.length, actorDis.short.length);
-    const defMode = modeOf(0, defDis.short.length);
+    const defMode = modeOf(defAdvLabels.length, defDis.short.length);
     const sideLine = (name: string, mode: GrappleRollMode, adv: string[], dis: string[]): string | undefined =>
         mode === 'cancelled' ? `${name}: advantage and disadvantage cancel — one die (adv: ${adv.join('; ')}; dis: ${dis.join('; ')})`
         : mode === 'advantage' ? `${name}: advantage (${adv.join('; ')})`
         : mode === 'disadvantage' ? `${name}: disadvantage (${dis.join('; ')})`
         : undefined;
     const situational = contested
-        ? [sideLine(actor.name, actorMode, actorAdv, actorDis.long), sideLine(target.name, defMode, [], defDis.long)].filter((l): l is string => !!l)
+        ? [sideLine(actor.name, actorMode, actorAdv, actorDis.long), sideLine(target.name, defMode, defAdvLabels, defDis.long)].filter((l): l is string => !!l)
         : [
-            ...(gmAdv || advTexts.length ? ['advantage ignored: no contest rolled'] : []),
-            ...(gmDis || disTexts.length ? ['disadvantage ignored: no contest rolled'] : [])
+            ...(gmAdv || sitAdv || advTexts.length || ctxTags.length ? ['advantage ignored: no contest rolled'] : []),
+            ...(gmDis || sitDis || disTexts.length ? ['disadvantage ignored: no contest rolled'] : [])
         ];
+    if (contextUnfired) situational.push(`context [${contextUnfired.join(', ')}] fired nothing on this grapple: no tagged effect or skillAdvantage trait on ${actor.name} declares it here (convert a prose condition with improvisation_manage feature_from_condition)`);
     // The purpose stays exactly 'grapple' with no reasons (roll counts query it).
     const purposeOf = (adv: string[], dis: string[]) => {
         const why = [adv.length ? `adv: ${adv.join(', ')}` : '', dis.length ? `dis: ${dis.join(', ')}` : ''].filter(Boolean).join('; ');
@@ -1635,7 +1834,7 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
     const defProf = defSkill.bonus;
 
     const atk = contested ? roll(actor, target, actorMode, purposeOf(actorAdv, actorDis.short)) : undefined;
-    const def = contested ? roll(target, actor, defMode, purposeOf([], defDis.short)) : undefined;
+    const def = contested ? roll(target, actor, defMode, purposeOf(defAdvLabels, defDis.short)) : undefined;
     const atkRolls = atk?.rolls ?? [];
     const defRolls = def?.rolls ?? [];
     const atkTotal = atk ? atk.kept + atkStat + atkProf + bonus : undefined;
@@ -1666,7 +1865,7 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
     const shown = (r: { rolls: number[]; kept: number }, mode: GrappleRollMode) => r.rolls.length > 1 ? `d20(${r.rolls.join(',')} ${mode === 'advantage' ? 'adv' : 'dis'} → ${r.kept})` : `d20(${r.rolls[0]})`;
     const breakdown = atk && def
         ? `${actor.name} ${shown(atk, actorMode)}+${atkStat}stat+${atkProf}prof${atkSkill.expertise ? ' (expertise)' : ''}${bonus ? `+${bonus}situational` : ''} = ${atkTotal}  vs  ${target.name} ${shown(def, defMode)}+${defStat}stat+${defProf}prof${defSkill.expertise ? ' (expertise)' : ''} = ${defTotal}`
-        : saveResult ? `${target.name} ${saveResult.ability.slice(0, 3).toUpperCase()} save d20(${saveResult.rolls.join(',')})${saveResult.modifier >= 0 ? '+' : ''}${saveResult.modifier} = ${saveResult.total} vs DC ${saveResult.dc} (${saveResult.dcSource}) — ${saveResult.saved ? 'SAVED' : 'FAILED'}${saveResult.legendaryResisted ? ' (legendary resistance)' : ''}; no contest rolled`
+        : saveResult ? `${target.name} ${saveResult.ability.slice(0, 3).toUpperCase()} save d20(${saveResult.rolls.join(',')})${saveResult.modifier >= 0 ? '+' : ''}${saveResult.modifier} = ${saveResult.total} vs DC ${saveResult.dc} (${saveResult.dcSource}) — ${saveResult.saved ? 'SAVED' : 'FAILED'}${saveResult.legendaryResisted ? ' (legendary resistance)' : ''}${saveSidesNote(saveResult)}; no contest rolled`
         : posted ? `posted by the GM: ${posted.toUpperCase()} — no contest rolled` : `auto-win: ${auto} — no contest rolled`;
 
     let actionSpent: string | undefined;
@@ -1678,6 +1877,8 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
             actionSpent = n && n.of > 1 ? `attack ${n.made}/${n.of}` : 'action';
         }
     }
+    // Play report 7 (lane G1): what the shove's save took, for the reply's saveSources (output_mode 'summary' keeps it whole).
+    const shoveSaveRow = saveResult ? saveSourcesRow({ id: target.id, name: target.name }, saveResult) : undefined;
     const common = {
         success: true, actionType: 'grapple', move, breakdown,
         ...(g.encounterId ? { encounterId: g.encounterId } : {}),
@@ -1685,14 +1886,29 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
         ...(contested ? { margin, rolls: { actor: atkRolls, defender: defRolls }, rollMode: { actor: actorMode, defender: defMode } } : {}),
         ...(advLabels.length ? { advantageSources: advLabels } : {}),
         ...(disLabels.length ? { disadvantageSources: disLabels } : {}),
+        // Play report 7 #7/#8: the GM's one-offs, the tags given, the defender's own declared sources, a denied trait, the tag a tagged mechanic needs.
+        ...(sitAdv ? { situationalAdvantage: sitAdv } : {}),
+        ...(sitDis ? { situationalDisadvantage: sitDis } : {}),
+        ...(ctxTags.length ? { context: ctxTags } : {}),
+        ...(defAdvLabels.length ? { defenderAdvantageSources: defAdvLabels } : {}),
+        ...(defDisLabels.length ? { defenderDisadvantageSources: defDisLabels } : {}),
+        ...(deniedAdvantage ? { deniedAdvantage } : {}),
+        ...(conditionalAdvantage ? { conditionalAdvantage } : {}),
+        ...(contextUnfired ? { contextUnfired } : {}),
         ...(auto ? { autoWin: { reason: auto } } : {}),
         ...(posted ? { outcome: posted, posted: true } : {}),
         ...(saveResult ? { save: {
             ability: saveResult.ability, dc: saveResult.dc, dcSource: saveResult.dcSource, rolls: saveResult.rolls, natural: saveResult.natural,
             modifier: saveResult.modifier, total: saveResult.total, saved: saveResult.saved, parts: saveResult.parts,
             ...(saveResult.legendaryResisted ? { legendaryResisted: true } : {}),
-            ...(saveResult.legendaryResistanceAvailable ? { legendaryResistanceAvailable: saveResult.legendaryResistanceAvailable } : {})
+            ...(saveResult.legendaryResistanceAvailable ? { legendaryResistanceAvailable: saveResult.legendaryResistanceAvailable } : {}),
+            // Play report 7 (lane G1): the target's declared save sides and conditions, as on every engine save.
+            ...(saveResult.advantageSources ? { advantageSources: saveResult.advantageSources } : {}),
+            ...(saveResult.disadvantageSources ? { disadvantageSources: saveResult.disadvantageSources } : {}),
+            ...(saveResult.conditionalAdvantage ? { conditionalAdvantage: saveResult.conditionalAdvantage } : {}),
+            ...(saveResult.conditionalDisadvantage ? { conditionalDisadvantage: saveResult.conditionalDisadvantage } : {})
         } } : {}),
+        ...(shoveSaveRow ? { saveSources: [shoveSaveRow] } : {}),
         ...(isShove ? { shove: { mode: shoveProne ? 'prone' : 'push', ...(pushFeet ? { push: pushFeet } : {}), ...(pushFeet === 10 ? { houseRule: 'push 10 ft is a house extension; 5e RAW pushes 5 ft' } : {}) } } : {}),
         ...(situational.length ? { situational } : {}),
         ...(actionSpent ? { actionSpent } : {}),
@@ -1754,7 +1970,7 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
             const scaled = Math.max(1, Math.floor(surfaceDamage * scale.multiplier));
             surfaceBandScale = { ...scale, before: surfaceDamage, after: scaled };
             surfaceDamage = scaled;
-            damageDetail += ` ×${scale.multiplier} band (${surfaceBandScale.before} → ${scaled})`;
+            damageDetail += ` ×${scale.multiplier} band (${surfaceBandScale.before} → ${scaled})${bandAssumedTag(actor, target)}`;
         }
     }
 
@@ -1793,10 +2009,14 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
     // target is left in place and said so.
     let pushed: { feet: number; narrative?: true; [k: string]: unknown } | undefined;
     let holdNote: string | undefined;
+    const mountEvents: MountEvent[] = [];
     if (isShove && pushFeet > 0) {
         if (engine && actor.tok?.position && target.tok?.position) {
             const fm = forcedMove(engine.getState()!, target.tok, actor.tok, pushFeet);
             pushed = { feet: fm.feet, requested: fm.requested, squares: fm.squares, from: fm.from, to: fm.to, direction: fm.direction, ...(fm.stoppedBy ? { stoppedBy: fm.stoppedBy } : {}) };
+            // Play report 7 #10: a pushed mount carries its rider (DC 10 DEX to stay on); a pushed rider is shoved off.
+            mountEvents.push(...afterForcedMove(engine, target.tok, fm));
+            if (mountEvents.length && target.tok.position) pushed.to = { x: target.tok.position.x, y: target.tok.position.y };
         } else {
             pushed = { feet: pushFeet, narrative: true, note: engine ? 'a token without a position: the GM places it' : 'no encounter: the GM narrates the push' };
         }
@@ -1819,13 +2039,14 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
         ...(applied.length ? { conditionsApplied: applied, onto: target.name } : {}),
         ...(pushed ? { pushed, forcedMovement: { opportunityAttacks: 'none (forced movement never provokes)', readiedTriggers: 'none (forced movement)', movementSpent: 0 } } : {}),
         ...(holdNote ? { holdNote } : {}),
+        ...(mountEvents.length ? { mounts: mountEvents } : {}),
         ...(isBreak ? { conditionsRemoved: removed, from: actor.name } : {}),
         ...(tokensTouched ? { encounterTokensUpdated: true } : {}),
         ...(surfaceBandScale ? { bandScale: surfaceBandScale } : {}),
         ...(surfaceDamage !== undefined ? { surfaceDamage, damageDetail, applyNote: 'surface damage is ROLLED, not applied — post it with attack {outcome: \"hit\", damage: N} on the target (no engine d20, no crit doubling), or combat_manage adjust_hp. The encounter sheet owns mid-combat HP.' } : {}),
         message: surgeLine + (isBreak
             ? `${actor.name} breaks ${target.name}'s hold — ${removed.length ? removed.join('/') : 'nothing'} cleared. ${breakdown}`
-            : shoveLine ? `${shoveLine}. ${breakdown}`
+            : shoveLine ? `${shoveLine}. ${breakdown}${mountEvents.length ? `\n${mountEvents.map(e => e.line).join('\n')}` : ''}`
             : `${actor.name} lands the ${move} on ${target.name}${applied.length ? ` — ${applied.join(' + ')}` : ''}${control ? ' (pinned, no damage)' : ''}${surfaceDamage !== undefined ? `, ${surfaceDamage} surface damage (${damageDetail})` : ''}. ${breakdown}`)
     };
 }
@@ -1862,6 +2083,9 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
         };
         const g = grappleContext(a, ctx);
         if ('error' in g) return refuse(g.message);
+        // Play report 7 #10: a controlled mount may only Dash, Disengage or Dodge.
+        const steedRefusal = g.engine ? controlledMountActionRefusal(g.engine.getState()!, String(a.actorId), 'grapple') : undefined;
+        if (steedRefusal) return refuse(steedRefusal);
         if (move === 'execute') {
             if (postedGrappleOutcome(a.outcome) === 'lose') return refuse(`execute is not contested: outcome '${String(a.outcome)}' has no meaning here (drop it; the posted crit lands)`);
             const check = executeCheck(a, g);
@@ -1881,6 +2105,15 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
                 ...(!check.coupDeGrace && typeof a.damageType === 'string' ? { damageType: a.damageType } : {}) };
         } else {
             const result = withIgnored(grappleResolve(a, g, move));
+            // Play report 7 #10: a rider knocked prone (takedown, throw, a prone
+            // shove) rolls to stay mounted; a mount gone down drops its rider.
+            if (!result.error) {
+                const settled = settleMountsAfter(ctx, g.encounterId);
+                if (settled.events.length) {
+                    const prior = (result as { mounts?: MountEvent[] }).mounts ?? [];
+                    Object.assign(result, { mounts: [...prior, ...settled.events], message: `${String(result.message ?? '')}\n${settled.lines.join('\n')}` });
+                }
+            }
             let out = result.error ? RichFormatter.error(String(result.message)) : RichFormatter.header(`Grapple — ${String(result.move)}`, '🤼') + RichFormatter.alert(String(result.message), 'info');
             if (Array.isArray(result.situational)) out += (result.situational as string[]).map(s => `  ${s}\n`).join('');
             out += RichFormatter.embedJson(result, 'COMBAT_ACTION');
@@ -1892,6 +2125,11 @@ export async function handleCombatAction(args: unknown, ctx: SessionContext): Pr
     // Wrap response with ASCII formatting
     try {
         const parsed = JSON.parse(response.content[0].text);
+        // Play report 7 #10: after any write, a rider whose mount went down
+        // or who was knocked prone (a trip, a dying drop) is settled here.
+        if (!parsed.error && parsed.writes !== 'none') {
+            foldSettleIntoReply(parsed, settleMountsAfter(ctx, typeof parsed.encounterId === 'string' ? parsed.encounterId : (args as { encounterId?: string })?.encounterId));
+        }
         let output = '';
         if (execute && !parsed.error) {
             parsed.execute = execute.note; parsed.grappleMove = 'execute'; parsed.pinFrom = execute.pinFrom;

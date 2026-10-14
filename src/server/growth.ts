@@ -57,6 +57,8 @@ export interface GrowthCredit extends GrowthOutcome {
     from: number;
     to: number;
     reason: string;
+    /** Play report 7 #1: kills credited at once (models of a unit); unset for one. */
+    kills?: number;
 }
 
 export interface GrowthApplyOptions {
@@ -245,15 +247,17 @@ export function growthLine(c: GrowthCredit): string {
  * Play report 2, item 6: the one kill hook. Credits a kill to the killer's
  * growth track (perKill plus perBandAbove); undefined for a self-kill, when
  * no track applies, or when anything throws (no character row, no rules
- * table) — a kill credit never fails the call that made the kill.
+ * table) — a kill credit never fails the call that made the kill. Play
+ * report 7 #1: count credits that many kills at once (the models of a unit
+ * a blow or an area killed), reason 'kill: 4 × Militia'.
  */
 export async function creditKill(
     db: Database.Database, worldId: string | null | undefined, killerId: string | undefined,
-    victim: { id: string; name: string; band?: string | null }, attackerBand?: string | null
+    victim: { id: string; name: string; band?: string | null; bandAssumed?: boolean }, attackerBand?: string | null, count = 1
 ): Promise<GrowthCredit | undefined> {
-    if (!killerId || victim.id === killerId) return undefined;
+    if (!killerId || victim.id === killerId || !(count >= 1)) return undefined;
     try {
-        return await creditGrowth(db, worldId, killerId, 'kill', { victim: victim.name, victimBand: victim.band, attackerBand });
+        return await creditGrowth(db, worldId, killerId, 'kill', { victim: victim.name, victimBand: victim.band, attackerBand, ...(victim.bandAssumed ? { victimBandAssumed: true } : {}), count });
     } catch { return undefined; }
 }
 
@@ -278,8 +282,9 @@ export function growthConditionsOnToken(
  */
 export async function creditGrowth(
     db: Database.Database, worldId: string | null | undefined, characterId: string,
-    kind: 'kill' | 'victory', opts: { victim?: string; victimBand?: string | null; attackerBand?: string | null } = {}
+    kind: 'kill' | 'victory', opts: { victim?: string; victimBand?: string | null; attackerBand?: string | null; victimBandAssumed?: boolean; count?: number } = {}
 ): Promise<GrowthCredit | undefined> {
+    const count = kind === 'kill' ? Math.max(1, Math.floor(opts.count ?? 1)) : 1;
     const repo = new CharacterRepository(db);
     const char = repo.findById(characterId);
     if (!char) return undefined;
@@ -288,6 +293,7 @@ export async function creditGrowth(
         const found = findPool(pools, track.spec.pool);
         if (!found) continue;
         let delta = 0;
+        let bandNote = '';
         if (kind === 'victory') delta = track.spec.perVictory ?? 0;
         else {
             delta = track.spec.perKill ?? 0;
@@ -299,16 +305,21 @@ export async function creditGrowth(
                 const iv = order.indexOf(opts.victimBand.trim().toLowerCase());
                 const ia = order.indexOf(attackerBand.trim().toLowerCase());
                 if (iv >= 0 && ia >= 0) delta += per * Math.max(0, iv - ia + 1);
+                // Play report 7 #3: a per-band credit that read an assumed band says so,
+                // even when it added nothing (a higher real band would have paid more).
+                if (iv >= 0 && ia >= 0 && opts.victimBandAssumed) bandNote = ' (band assumed)';
             }
         }
+        // Play report 7 #1: several kills of one victim (models of a unit) at once.
+        delta *= count;
         if (!delta) continue;
-        const reason = kind === 'kill' ? `kill: ${opts.victim ?? 'a foe'}` : 'victory';
+        const reason = kind === 'kill' ? `kill: ${count > 1 ? `${count} × ` : ''}${opts.victim ?? 'a foe'}${bandNote}` : 'victory';
         const from = found.pool.current;
         const { updates } = applyScheduledOps(char, [{ op: 'adjust_pool', pool: found.key, delta }], { reason });
         repo.update(char.id, updates as never);
         const to = ((updates.resourcePools as Record<string, PoolLike>)[found.key]).current;
         const outcome = await applyGrowth(db, worldId, char.id, found.key, from, to);
-        return { track: track.name, pool: found.key, delta, from, to, reason, ...outcome };
+        return { track: track.name, pool: found.key, delta, from, to, reason, ...(count > 1 ? { kills: count } : {}), ...outcome };
     }
     return undefined;
 }

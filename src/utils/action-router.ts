@@ -120,6 +120,21 @@ export function describeIgnoredParams(action: string, ignored: string[], schema:
     return `Ignored params (not ${action} parameters; nothing was written for them): ${parts.join('; ')}.`;
 }
 
+/**
+ * Play report 7 #2: the note for keys a handler dropped inside a nested
+ * object (create's participants[]): each dotted path with its own hint, else
+ * the nearest valid key of that object, else no close match. The handler
+ * puts the paths in ignoredParams; the router merges its own after them.
+ */
+export function describeNestedIgnored(where: string, entries: Array<{ path: string; key: string; hint?: string }>, validKeys: readonly string[]): string {
+    const parts = entries.map(e => {
+        if (e.hint) return `${e.path} — ${e.hint}`;
+        const near = nearestKey(e.key, validKeys);
+        return near ? `${e.path} — nearest valid key '${near}'` : `${e.path} — no close match among ${where} keys`;
+    });
+    return `Ignored params (not ${where} keys; nothing was written for them): ${parts.join('; ')}.`;
+}
+
 export interface ActionSchemaDocumentation {
     [action: string]: {
         schema: z.ZodType<any>;
@@ -273,13 +288,20 @@ export function createActionRouter<TActions extends string>(
             // Play report 2 #10 / play report 4 #2: every action says which keys
             // it dropped — loudly, on the success reply, with the nearest valid
             // key — unless it, or its router, opted out with 'strip'.
-            const ignored = (definition.unknownKeys ?? defaultUnknownKeys) === 'warn' ? ignoredParamsOf(definition.schema, args) : [];
+            // Play report 7 #2: keys the handler reported itself (nested
+            // participant keys) stay; the router's top-level keys follow, each
+            // listed and noted once (review: a key the handler already named
+            // is not repeated).
+            const ownRaw = typeof result === 'object' && result !== null ? (result as { ignoredParams?: unknown }).ignoredParams : undefined;
+            const own = Array.isArray(ownRaw) ? ownRaw : [];
+            const ignored = ((definition.unknownKeys ?? defaultUnknownKeys) === 'warn' ? ignoredParamsOf(definition.schema, args) : [])
+                .filter(k => !own.includes(k));
             if (ignored.length && typeof result === 'object' && result !== null && !('content' in result) && !(result as { error?: unknown }).error) {
                 const note = describeIgnoredParams(action, ignored, definition.schema, definition.unknownKeyHints);
                 const prior = (result as { message?: unknown }).message;
                 return formatMcpSuccess({
                     ...(result as Record<string, unknown>),
-                    ignoredParams: ignored,
+                    ignoredParams: [...own, ...ignored],
                     message: typeof prior === 'string' && prior ? `${prior.replace(/\.?\s*$/, '')}. ${note}` : note
                 }, matchResult);
             }

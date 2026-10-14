@@ -176,6 +176,8 @@ export function coverBetween(state: StateLike, attacker: CombatParticipant, targ
         }
         for (const p of state.participants) {
             if (p.id === attacker.id || p.id === target.id || p.hp <= 0 || !p.position) continue;
+            // Play report 7 #10: a rider takes no cover from its own mount, nor a mount from its rider.
+            if (p.id === attacker.mountedOn || p.id === attacker.riderId || p.id === target.mountedOn || p.id === target.riderId) continue;
             if (footprintCells(p).some(c => c.x === cell.x && c.y === cell.y)) add({ kind: 'half', source: `${p.name} (creature)`, via: 'computed' });
         }
     }

@@ -60,7 +60,7 @@ describe('combat HP write-through', () => {
         }, mockCtx as any);
         const encounterId = created.content[0].text.match(/Encounter ID: (encounter-[^\n\s]+)/)![1];
         // Order is Hero (25) → LAIR (20) → Dragon (5); one advance reaches the lair.
-        await handleAdvanceTurn({ encounterId }, mockCtx as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, mockCtx as any);
         return encounterId;
     }
 

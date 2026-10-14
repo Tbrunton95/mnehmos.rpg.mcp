@@ -11,6 +11,8 @@
  * Every application is reported back to the caller for the table to see.
  */
 import type Database from 'better-sqlite3';
+import { scopedMechanic, longAbility, type ScopedMechanic, type RollScope } from './advantage-scope.js';
+import { skillKey } from './skill-modifier.js';
 
 export interface AutoMechanic {
     type: string;
@@ -159,7 +161,20 @@ export function applyDeclaredEffects(
         // same skill/save scope and lane filters apply; the condition stays the
         // GM's fiction gate and only labels the source.
         if (candidates.length === 0 && (wantType === 'skill_bonus' || wantType === 'saving_throw_bonus')) {
-            const advMechs = mechs.filter(m => m && ADVANTAGE_TYPES.has(m.type ?? ''));
+            // Play report 7 #7: a mechanic in the scope grammar (value
+            // 'grapple', 'check:stealth', ...) is not read here — it fires by
+            // its scope and tag (src/engine/advantage-scope.ts). The older
+            // form below keeps exactly the meaning it had.
+            const advMechs = mechs.filter(m => m && ADVANTAGE_TYPES.has(m.type ?? '') && !scopedMechanic(m));
+            const scopedOnly = advMechs.length ? [] : mechs.map(m => scopedMechanic(m)).filter((s): s is ScopedMechanic => !!s);
+            if (scopedOnly.length) {
+                const tagged = scopedOnly.filter(s => s.tag);
+                const what = scopedOnly.map(s => s.tag ? `${s.text}, when ${s.tag}` : s.text).join('; ');
+                problems.push(tagged.length
+                    ? `declared effect "${row.name}" declares its ${scopedOnly[0].which} by scope (${what}): name it in advantageSources or pass context: [${tagged.map(s => `'${s.tag}'`).join(', ')}] — nothing applied through declaredEffects`
+                    : `declared effect "${row.name}" declares its ${scopedOnly[0].which} by scope (${what}): it fires by itself on every roll in that scope — nothing applied through declaredEffects`);
+                continue;
+            }
             if (advMechs.length) {
                 const scopeKey = (m: RawMech) => wantType === 'skill_bonus' ? m.skill : m.save;
                 let scoped = domain ? advMechs.filter(m => scopeKey(m) === undefined || domainMatch(scopeKey(m), domain)) : advMechs;
@@ -226,8 +241,14 @@ export function applyDeclaredEffects(
 function domainMatch(condition: string | undefined, domain: string | undefined): boolean {
     if (!condition) return true;                       // unfiltered — applies across the domain
     if (!domain) return false;                          // filtered mechanic, unknown domain — skip
-    return domain.toLowerCase().includes(condition.toLowerCase())
-        || condition.toLowerCase().includes(domain.toLowerCase());
+    // Play report 7 #11 (review): spaces, hyphens and underscores fold, so a
+    // mechanic scoped 'Sleight of Hand' or 'sleight-of-hand' fits the roll's
+    // canonical 'sleight_of_hand' (the key every road now rolls under).
+    const fold = (s: string) => s.toLowerCase().replace(/[\s_-]+/g, '');
+    const c = fold(condition), d = fold(domain);
+    if (!c) return true;
+    if (!d) return false;
+    return d.includes(c) || c.includes(d);
 }
 
 /** Sum of autoApply attack_bonus mechanics on the actor. */
@@ -290,6 +311,40 @@ export function autoAdvantage(
         if (!domainMatch(key, domain)) continue;
         (m.type === 'advantage_on' ? out.adv : out.dis).push(m.effectName);
     }
+}
+
+/**
+ * Play report 7 #7: whether an advantage mechanic in the OLDER form (a number
+ * or prose in value, scoped by `skill` / `save`, autoApply's condition as the
+ * domain filter) declares advantage on this roll when the GM names its
+ * effect. The same scope rules autoAdvantage and applyDeclaredEffects apply:
+ * a save-scoped mechanic covers that save, a skill-scoped one that skill (a
+ * grapple's Athletics, or Acrobatics on a break), an unscoped one every save
+ * and check; the older form never covered attacks or initiative.
+ */
+export function legacyAdvantageFits(m: { skill?: unknown; save?: unknown; condition?: unknown; autoApply?: unknown }, roll: RollScope): boolean {
+    const skill = typeof m.skill === 'string' ? m.skill : undefined;
+    const save = typeof m.save === 'string' ? m.save : undefined;
+    const filter = m.autoApply === true && typeof m.condition === 'string' ? m.condition : undefined;
+    switch (roll.kind) {
+        case 'save': return skill === undefined && domainMatch(save ?? filter, longAbility(roll.ability));
+        case 'check':
+            if (save !== undefined) return false;
+            if (!roll.skill) return skill === undefined && filter === undefined;
+            return domainMatch(skill ?? filter, skillKey(roll.skill));
+        case 'grapple':
+            if (save !== undefined) return false;
+            return roll.skills.some(s => domainMatch(skill ?? filter, s));
+        default: return false;
+    }
+}
+
+/** Where an older-form advantage mechanic applies, for a refusal: 'wisdom saves', 'stealth checks', 'saves and skill checks'. */
+export function legacyScopePhrase(m: { skill?: unknown; save?: unknown; condition?: unknown; autoApply?: unknown }): string {
+    if (typeof m.save === 'string') return `${m.save} saves`;
+    if (typeof m.skill === 'string') return `${m.skill} checks`;
+    if (m.autoApply === true && typeof m.condition === 'string') return `rolls matching '${m.condition}'`;
+    return 'saves and skill checks';
 }
 
 /** Sum of autoApply skill_bonus mechanics (condition = skill filter). */

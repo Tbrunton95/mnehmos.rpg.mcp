@@ -212,9 +212,9 @@ describe('CRIT-001: HP Persistence After Combat', () => {
         }, mockCtx);
 
         // Advance turn to reset action economy for the orc
-        await handleAdvanceTurn({ encounterId }, mockCtx);
-        await handleAdvanceTurn({ encounterId }, mockCtx);
-        await handleAdvanceTurn({ encounterId }, mockCtx);
+        await handleAdvanceTurn({ encounterId, confirm: true }, mockCtx);
+        await handleAdvanceTurn({ encounterId, confirm: true }, mockCtx);
+        await handleAdvanceTurn({ encounterId, confirm: true }, mockCtx);
 
         // Attack hero2
         await handleExecuteCombatAction({
@@ -516,7 +516,7 @@ describe('PLAYTEST-FIX: HP Sync from character_manage to combat display', () => 
         charRepo.update(character.id, { hp: 22 });
 
         // Advance turn - the returned state should show synced HP
-        const advanceResult = await handleAdvanceTurn({ encounterId }, mockCtx);
+        const advanceResult = await handleAdvanceTurn({ encounterId, confirm: true }, mockCtx);
         const state = extractStateJson(advanceResult.content[0].text);
         const heroInCombat = state.participants.find((p: any) => p.id === character.id);
 

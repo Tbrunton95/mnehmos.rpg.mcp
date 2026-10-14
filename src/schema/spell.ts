@@ -155,7 +155,11 @@ export const SpellSchema = z.object({
         size: z.number().int() // Size in feet
     }).optional(),
     effects: z.array(SpellEffectSchema),
-    autoHit: z.boolean().default(false) // e.g., Magic Missile
+    autoHit: z.boolean().default(false), // e.g., Magic Missile
+    // Play report 7 #7 (lane F review): the spell attack's own kind when the
+    // range does not say it (5e: Spiritual Weapon is a melee spell attack at
+    // range 60). Unset: touch / self / 5 ft is melee, any other range ranged.
+    spellAttack: z.enum(['melee', 'ranged']).optional()
 });
 
 export type Spell = z.infer<typeof SpellSchema>;

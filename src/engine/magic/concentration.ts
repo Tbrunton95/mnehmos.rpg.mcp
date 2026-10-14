@@ -7,7 +7,7 @@ import { ConcentrationState, ConcentrationCheckResult, BreakConcentrationRequest
 import { Character, NPC } from '../../schema/character.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
-import { saveModifier } from '../combat/saves.js';
+import { saveModifier, saveDieLabels, concentrationOutcome, type SaveDie, type SaveDieLabels } from '../combat/saves.js';
 import { cryptoInt } from '../../math/crypto-dice.js';
 
 /**
@@ -33,13 +33,19 @@ export function rollConcentrationSave(constitutionModifier: number, d20: () => n
 /**
  * Check if concentration is maintained after taking damage. The CON save
  * adds save proficiency from the sheet.
+ *
+ * Play report 7 (lane H): `d20` may hand back a SaveDie (concentrationDie in
+ * saves.ts: the creature's declared save:con sides and its conditions, one
+ * die or two on the road's stream); its kept die is the roll and its labels
+ * ride the result (advantageSources, saveRolls, conditionalAdvantage …). A
+ * plain number is one die with nothing to say, as before.
  */
 export function checkConcentration(
     character: Character | NPC,
     damageAmount: number,
     concentrationRepo: ConcentrationRepository,
     extraSaveBonus: number = 0,
-    d20?: () => number
+    d20?: () => number | SaveDie
 ): ConcentrationCheckResult {
     const concentration = concentrationRepo.findByCharacterId(character.id);
 
@@ -60,7 +66,13 @@ export function checkConcentration(
     }, 'constitution');
     const constitutionModifier = con.total + extraSaveBonus;
     // Only reached with an active concentration, so no die is drawn otherwise.
-    const { roll, total } = rollConcentrationSave(constitutionModifier, d20);
+    let die: SaveDie | undefined;
+    const { roll, total } = rollConcentrationSave(constitutionModifier, d20 ? () => {
+        const drawn = d20();
+        if (typeof drawn === 'number') return drawn;
+        die = drawn;
+        return drawn.natural;
+    } : undefined);
 
     const success = total >= dc;
 
@@ -74,6 +86,7 @@ export function checkConcentration(
         saveTotal: total,
         damageAmount,
         constitutionModifier,
+        ...(die ? saveDieLabels(die) : {}),
     };
 }
 
@@ -265,17 +278,19 @@ export function checkAutomaticConcentrationBreak(
  * concentrating character that took damage rolls the CON save on the die it
  * is given (the encounter stream, or a logged d20 outside one) and loses the
  * spell on a failure; dropping to 0 HP loses it outright. Returns undefined
- * when the character was not concentrating.
+ * when the character was not concentrating. Play report 7 (lane H): with a
+ * concentrationDie the save's labels ride the result (nothing extra without
+ * a source).
  */
 export function concentrationAfterDamage(
     characterId: string,
     damage: number,
     defeated: boolean,
-    d20: () => number,
+    d20: () => number | SaveDie,
     concentrationRepo: ConcentrationRepository,
     characterRepo: CharacterRepository,
     extraSaveBonus = 0
-): { spell: string; broken: boolean; reason: 'damage' | 'failed_save' | 'death'; saveRoll?: number; saveTotal?: number; saveDC?: number } | undefined {
+): ({ spell: string; broken: boolean; reason: 'damage' | 'failed_save' | 'death'; saveRoll?: number; saveTotal?: number; saveDC?: number } & SaveDieLabels) | undefined {
     if (!concentrationRepo.isConcentrating(characterId)) return undefined;
     const character = characterRepo.findById(characterId);
     if (!character) return undefined;
@@ -287,5 +302,8 @@ export function concentrationAfterDamage(
     if (damage <= 0) return undefined;
     const check = checkConcentration(character, damage, concentrationRepo, extraSaveBonus, d20);
     if (check.broken) breakConcentration({ characterId, reason: 'damage', damageAmount: damage }, concentrationRepo, characterRepo);
-    return { spell, broken: check.broken, reason: check.broken ? 'failed_save' : 'damage', saveRoll: check.saveRoll, saveTotal: check.saveTotal, saveDC: check.saveDC };
+    return {
+        ...concentrationOutcome({ ...check, spell }),
+        reason: check.broken ? 'failed_save' : 'damage'
+    };
 }

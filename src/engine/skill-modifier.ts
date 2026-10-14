@@ -57,6 +57,68 @@ export function normSkill(skill: string): string {
     return skill.toLowerCase().replace(/[ _-]/g, '');
 }
 
+/**
+ * Play report 7 #11: the 18 SRD skills and the ability each rolls with, under
+ * snake_case keys. The one map: roll_skill_check (and opposed through it),
+ * stunts and the montage read it, so no reader can disagree on a spelling.
+ */
+export const SRD_SKILL_ABILITY: Readonly<Record<string, ShortAbility>> = Object.freeze({
+    athletics: 'str',
+    acrobatics: 'dex', sleight_of_hand: 'dex', stealth: 'dex',
+    arcana: 'int', history: 'int', investigation: 'int', nature: 'int', religion: 'int',
+    animal_handling: 'wis', insight: 'wis', medicine: 'wis', perception: 'wis', survival: 'wis',
+    deception: 'cha', intimidation: 'cha', performance: 'cha', persuasion: 'cha'
+});
+
+const SRD_BY_NORM: ReadonlyMap<string, string> = new Map(Object.keys(SRD_SKILL_ABILITY).map(k => [normSkill(k), k]));
+
+/**
+ * The key a skill is read by: the SRD key for any spelling of an SRD skill
+ * ('Sleight of Hand', 'sleight-of-hand', 'SleightOfHand' → 'sleight_of_hand'),
+ * else the name folded to lower snake case ('Waaagh Lore' → 'waaagh_lore').
+ */
+export function skillKey(skill: string): string {
+    const trimmed = String(skill ?? '').trim();
+    return SRD_BY_NORM.get(normSkill(trimmed)) ?? trimmed.toLowerCase().replace(/[\s-]+/g, '_');
+}
+
+/** The ability an SRD skill rolls with, in any spelling; undefined for any other name. */
+export function srdSkillAbility(skill: string): ShortAbility | undefined {
+    const key = SRD_BY_NORM.get(normSkill(String(skill ?? '').trim()));
+    return key ? SRD_SKILL_ABILITY[key] : undefined;
+}
+
+export type SkillAbilitySource = 'given' | 'world' | 'srd' | 'none';
+
+const SHORT_ABILITIES: readonly ShortAbility[] = ['str', 'dex', 'con', 'int', 'wis', 'cha'];
+/** 'dex', 'DEX' or 'Dexterity' → 'dex'; anything else undefined. */
+function shortAbility(v: string | null | undefined): ShortAbility | undefined {
+    if (typeof v !== 'string') return undefined;
+    const k = v.trim().toLowerCase().slice(0, 3) as ShortAbility;
+    return SHORT_ABILITIES.includes(k) ? k : undefined;
+}
+
+/**
+ * Which ability a skill check rolls with: the one the call gives, else the
+ * world's skill (table_rules skill, looked up by the caller), else the SRD
+ * map; 'none' when nothing names one. The caller decides what none means
+ * (roll_skill_check and the montage roll with no ability and warn; a stunt refuses).
+ */
+export function resolveSkillAbility(skill: string, opts: { given?: string | null; world?: string | null }): { ability?: ShortAbility; source: SkillAbilitySource } {
+    const given = shortAbility(opts.given);
+    if (given) return { ability: given, source: 'given' };
+    const world = shortAbility(opts.world);
+    if (world) return { ability: world, source: 'world' };
+    const srd = srdSkillAbility(skill);
+    if (srd) return { ability: srd, source: 'srd' };
+    return { source: 'none' };
+}
+
+/** What a skill that names no ability rolls with, said in the montage's words. */
+export function unmappedSkillWarning(skill: string): string {
+    return `skill '${skill}' names no ability (not an SRD skill or a world skill): rolled with no skill modifier (no ability, no proficiency) — pass ability, or define it with table_rules {kind: 'skill', name: '${skill}', spec: {ability}}`;
+}
+
 export function hasSkill(list: readonly string[] | undefined | null, skill: string): boolean {
     if (!list?.length) return false;
     const want = normSkill(skill);

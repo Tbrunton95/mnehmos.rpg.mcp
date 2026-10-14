@@ -8,6 +8,7 @@ import type { CombatParticipant, CombatActionResult } from './engine.js';
 import { PART_KINDS, type Part } from '../../schema/token-extras.js';
 import { compareBands, type RuleSpec, type TableRule } from '../table-rules.js';
 import { findPart } from './parts.js';
+import { bandsUnranked } from './band-default.js';
 
 export interface ConsequenceDue {
     rule: string;
@@ -57,7 +58,11 @@ export function peerConsequence(
     if (!r.isHit) return null;
     if (target.hp <= 0 || (target as { unit?: unknown }).unit) return null;
     const peer = isPeer(order, actor, target);
-    if (peer === null) return { skipped: `${rule.name}: band unset for ${!actor.band ? actor.name : target.name}` };
+    if (peer === null) {
+        // Review of play report 7 #3: both set on different ladders is not "unset".
+        if (actor.band && target.band) return { skipped: `${rule.name}: ${actor.name} (${actor.band}) and ${target.name} (${target.band}${target.bandAssumed ? ', assumed' : ''}) share no band ladder` };
+        return { skipped: `${rule.name}: band unset for ${!actor.band ? actor.name : target.name}` };
+    }
     const spec = rule.spec as RuleSpec<'peer_consequence'>;
     if (!peer && spec.direction !== 'both') return null;
     const threshold = Math.ceil(target.maxHp * spec.thresholdFraction);
@@ -126,15 +131,25 @@ export function calledStrikeProblem(
     actor: CombatParticipant,
     target: CombatParticipant,
     limb: string,
-    atPart?: string
+    atPart?: string,
+    /**
+     * Play report 7 #3: the call that sets a band (move: the token to change,
+     * other: the token whose ladder it should join), and ' (band assumed)'
+     * when one was assumed.
+     */
+    say: { fix?: (move: CombatParticipant, other: CombatParticipant) => string; tag?: string } = {}
 ): string | null {
     const spec = rule.spec as RuleSpec<'called_strike'>;
     const resolved = resolveCalledStrike(rule, target, limb, atPart);
     if ('problem' in resolved) return resolved.problem;
     if (!spec.requirePeer) return null;
     const peer = isPeer(order, actor, target);
-    if (peer === null) return `${rule.name} needs both bands set (unset for ${!actor.band ? actor.name : target.name})`;
-    if (!peer) return `${rule.name}: called strikes are against a single opponent of your band or greater; ${target.name} (${target.band}) is below ${actor.name} (${actor.band})`;
+    if (peer === null) {
+        // Review: two bands on different ladders are not "unset".
+        const { move, other, problem } = bandsUnranked(rule.name, actor, target);
+        return `${problem}${say.fix ? `. ${say.fix(move, other)}` : ''}`;
+    }
+    if (!peer) return `${rule.name}: called strikes are against a single opponent of your band or greater; ${target.name} (${target.band}) is below ${actor.name} (${actor.band})${say.tag ?? ''}`;
     return null;
 }
 

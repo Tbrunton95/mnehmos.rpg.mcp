@@ -4,6 +4,7 @@ import { clearCombatState } from '../../src/server/handlers/combat-handlers.js';
 import { CharacterRepository } from '../../src/storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../src/storage/repos/concentration.repo.js';
 import { WorldRepository } from '../../src/storage/repos/world.repo.js';
+import { CustomEffectsRepository } from '../../src/storage/repos/custom-effects.repo.js';
 import { closeDb, getDb } from '../../src/storage/index.js';
 import { DEFAULT_BAND_ORDER } from '../../src/engine/table-rules.js';
 
@@ -90,6 +91,24 @@ describe('grapple execute on character sheets', () => {
         expect(posted.damage).toBe(2);
         expect(posted.damageDetail).toMatch(/posted.*resistant/);
         expect(sheet('cultist').hp).toBe(Math.max(0, before - 2));
+    });
+
+    it("play report 7 (lane H): the survivor's concentration save reads its Steady Mind (save:con): two logged dice, the labels on the reply", async () => {
+        new CustomEffectsRepository(getDb()).apply({
+            target_id: 'cultist', target_type: 'character', name: 'Steady Mind', description: 'Steady Mind', category: 'boon', power_level: 1,
+            source: { type: 'unknown' }, mechanics: [{ type: 'advantage_on', value: 'save:con' }] as never, duration: { type: 'until_removed' as never },
+            triggers: [], removal_conditions: [{ type: 'duration_expires' as const }], stackable: false, max_stacks: 1
+        } as never);
+        const res = await act({ action: 'grapple', move: 'execute', actorId: 'luciel', targetId: 'cultist', damage: 4 });
+        expect(res.killed).toBe(false);
+        expect(res.concentration).toMatchObject({ spell: 'Bless', reason: expect.stringMatching(/damage|failed_save/), advantageSources: ['Steady Mind (save:con)'] });
+        expect(res.concentration.saveRolls).toHaveLength(2);
+        expect(res.concentration.saveRoll).toBe(Math.max(...res.concentration.saveRolls));
+        const logged = rollLog('concentration (adv: Steady Mind (save:con))');
+        expect(logged).toHaveLength(1);
+        expect(logged[0]).toMatchObject({ for_id: 'cultist', expression: '2d20kh1', result: res.concentration.saveRoll });
+        expect(res.saveSources).toEqual([{ targetId: 'cultist', name: 'Cultist', ability: 'constitution', save: 'concentration on Bless', broken: res.concentration.broken, rolls: res.concentration.saveRolls, advantage: ['Steady Mind (save:con)'] }]);
+        expect(res.message).toMatch(/Concentration on Bless: (held|BROKEN) \[d20 \d+, \d+; adv: Steady Mind \(save:con\)\]/);
     });
 
     it('refusals write nothing: missing row, peer band, unpinned target, posted lose, already down', async () => {

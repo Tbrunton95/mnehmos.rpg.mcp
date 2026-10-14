@@ -131,7 +131,10 @@ describe('break tests in play', () => {
             return orig.call(this, n, t);
         });
         vi.spyOn(CombatEngine.prototype, 'rollD20').mockReturnValue(1);
-        const r = await act({ action: 'cast_spell', actorId: 'mage', spellName: 'Fireball', targetIds: ['scions'] });
+        // Play report 7 #1: Fireball goes model by model, so 30 over a packed
+        // 10×5 unit kills all ten. Half a spaced unit in the sphere halves it.
+        await manage({ action: 'set_unit', participantId: 'scions', packed: false });
+        const r = await act({ action: 'cast_spell', actorId: 'mage', spellName: 'Fireball', targetIds: ['scions'], modelsInArea: { scions: 5 } });
         expect(r.text).toMatch(/BREAK TEST DUE: Scions/);
         expect(r.r.breakTests?.[0]).toMatchObject({ participantId: 'scions' });
     });

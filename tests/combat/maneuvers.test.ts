@@ -39,7 +39,7 @@ const sheet = (id: string) => new CharacterRepository(getDb()).findById(id)! as 
 const pool = () => sheet('brannoc').resourcePools.superiority;
 const rolls = () => queryRolls(getDb(), { encounterId: enc, limit: 50 }) as any[];
 const pin = (...values: number[]) => { const q = [...values]; vi.mocked(cryptoInt).mockImplementation((sides: number) => q.shift() ?? sides); };
-const advance = async (n = 1) => { for (let i = 0; i < n; i++) await manage({ action: 'advance', encounterId: enc }); };
+const advance = async (n = 1) => { for (let i = 0; i < n; i++) await manage({ action: 'advance', encounterId: enc, confirm: true }); };
 
 type Sheet = Record<string, unknown>;
 const FIGHTER: Sheet = {
@@ -353,7 +353,7 @@ describe('menacing attack', () => {
 
         await advance(2); // thug, then brannoc round 2: still there at the start of the attacker's next turn
         expect(tok('orc').conditions.some((c: any) => c.type === 'frightened')).toBe(true);
-        const ended = (await manage({ action: 'advance', encounterId: enc })).content[0].text; // end of brannoc's turn in round 2
+        const ended = (await manage({ action: 'advance', encounterId: enc, confirm: true })).content[0].text; // end of brannoc's turn in round 2
         expect(tok('orc').conditions.some((c: any) => c.type === 'frightened')).toBe(false);
         expect(ended).toMatch(/Orc is no longer frightened of Brannoc/);
         fear = undefined;

@@ -107,7 +107,7 @@ describe('cover over the MCP boundary', () => {
 
     it('use_ability: savingThrow.onFail and cover cross the loose outer savingThrow', async () => {
         await fight('cover-mcp-4');
-        await call('combat_manage', { action: 'advance', encounterId: enc }); // the gretchin's turn
+        await call('combat_manage', { action: 'advance', encounterId: enc, confirm: true }); // the gretchin's turn
         const spy = vi.spyOn(CombatEngine.prototype, 'rollD20').mockReturnValue(2);
         const used = await call('combat_manage', { action: 'use_ability', encounterId: enc, participantId: 'grot', ability: 'Belch', targetIds: ['wiz'], damage: 4, savingThrow: { ability: 'dex', dc: 15, onFail: { conditions: ['prone'] } }, cover: { wiz: 'half' } });
         spy.mockRestore();

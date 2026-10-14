@@ -15,10 +15,11 @@ import { PhysicsEngine } from '../../math/physics.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { loadAutoMechanics, autoSkillBonus, autoSaveBonus, autoAdvantage, applyDeclaredEffects } from '../../engine/effects-resolver.js';
 import { parseAbility } from '../../engine/combat/conditions.js';
-import { resolveNamedSources, loadEffectNames, jsonIfString, sourcesField } from '../../engine/advantage-sources.js';
+import { resolveAdvantageSources, loadEffectDeclarations, jsonIfString, sourcesField, situationalField, type DeclaringOwner, type GrantedSource } from '../../engine/advantage-sources.js';
+import { scopedAdvantage, type RollScope } from '../../engine/advantage-scope.js';
 import { resolveWorldId, worldSkillAbility } from '../../engine/table-rules.js';
 import { worldProgression } from '../../engine/progression.js';
-import { skillModifier, overrideColumn, signed, normSkill, type SkillSheet, type ShortAbility } from '../../engine/skill-modifier.js';
+import { skillModifier, overrideColumn, signed, normSkill, skillKey as canonicalSkillKey, resolveSkillAbility, unmappedSkillWarning, type SkillSheet, type ShortAbility, type SkillAbilitySource } from '../../engine/skill-modifier.js';
 import { armourStealthDisadvantage } from '../../engine/armor.js';
 import { matchSkillAdvantage, denialFor, sceneSensesFor, parseWind, windCall, tokenPosition, passivePerception, sensePassives, normTag, type SkillAdvantageTrait, type WindCall, type SensePassive } from '../../engine/senses.js';
 import * as pda from '../../render/pda.js';
@@ -63,14 +64,6 @@ function logCalculationEvent(db: Database.Database, calculationId: string, type:
 // ACTION SCHEMAS
 // ═══════════════════════════════════════════════════════════════════════════
 
-const SKILL_ABILITY: Record<string, string> = {
-    athletics: 'str',
-    acrobatics: 'dex', sleight_of_hand: 'dex', stealth: 'dex',
-    arcana: 'int', history: 'int', investigation: 'int', nature: 'int', religion: 'int',
-    animal_handling: 'wis', insight: 'wis', medicine: 'wis', perception: 'wis', survival: 'wis',
-    deception: 'cha', intimidation: 'cha', performance: 'cha', persuasion: 'cha'
-};
-
 const DeclaredEffectRefSchema = z.object({ name: z.string(), lane: z.string().optional() });
 
 // Wishlist item 10: 'Wisdom', 'WIS' and 'wisdom' all mean wis. Long names map
@@ -85,8 +78,10 @@ const abilityKey = (v: unknown) => {
 const abilityField = () => z.preprocess(abilityKey, z.enum(['str', 'dex', 'con', 'int', 'wis', 'cha']));
 
 // Play report 5 #8c: the tags on a check ('scent'); one tag may come as a bare string.
-const contextField = () => z.preprocess(v => typeof v === 'string' ? [v] : v, z.array(z.string().min(1))).optional()
-    .describe("Play report 5 #8c: tags on this check (['scent', 'hearing', 'stonework']). A skillAdvantage trait on the sheet whose `when` matches a tag grants advantage by itself and the log names it (adv: Keen Smell (scent)); an untagged check gets none and is told the tag; a scene senseDenial for the tag removes it and quotes the reason");
+// Play report 7 (review): a JSON string of an array is read as the array, as grapple's and the attack's tags are.
+const tagList = (v: unknown) => { const p = jsonIfString(v); return typeof p === 'string' ? [p] : p; };
+const contextField = () => z.preprocess(tagList, z.array(z.string().min(1))).optional()
+    .describe("Play report 5 #8c: tags on this check (['scent', 'hearing', 'stonework']). A skillAdvantage trait on the sheet whose `when` matches a tag grants advantage by itself and the log names it (adv: Keen Smell (scent)); an untagged check gets none and is told the tag; a scene senseDenial for the tag removes it and quotes the reason. Play report 7: a tag also fires an effect mechanic declared with that when-tag ({type: 'advantage_on', value: 'save:wis', condition: 'the Choir sings'}), on saves and ability checks too; a tag that fires nothing on a save or ability check is reported");
 
 const CheckBaseFields = {
     characterId: z.string().describe('Character making the roll'),
@@ -98,14 +93,16 @@ const CheckBaseFields = {
     declaredEffects: z.preprocess(jsonIfString, z.array(DeclaredEffectRefSchema)).optional().describe('FINDINGS #60 RESOLVER v2: GM declares WHICH conditional trait fires (name + lane for multi-lane traits); the ENGINE reads the row and computes the value — including tier-from-hidden-pool (valueFromPool). Missing names and ambiguous lanes report loudly and apply nothing.'),
     advantageSources: sourcesField('advantage'),
     disadvantageSources: sourcesField('disadvantage'),
+    situationalAdvantage: situationalField('advantage'),
+    situationalDisadvantage: situationalField('disadvantage'),
     context: contextField(),
     seed: z.string().optional().describe('Replay seed for the d20 (exact replays and tests only); omit for crypto dice')
 };
 
 const RollSkillCheckSchema = z.object({
     action: z.literal('roll_skill_check'),
-    skill: z.string().describe('Skill name (perception, stealth, persuasion... or any theme skill)'),
-    ability: abilityField().optional().describe('Governing ability — overrides the 5e default map; REQUIRED in practice for non-5e skill lists'),
+    skill: z.string().describe("Skill name (perception, stealth, persuasion... or any theme skill). Play report 7 #11: any spelling of an SRD skill rolls its ability ('Sleight of Hand', 'sleight-of-hand', 'SleightOfHand' all roll DEX); the reply says which (skillAbility, skillAbilitySource: given | world | srd | none)"),
+    ability: abilityField().optional().describe("Governing ability — overrides the 5e default map and a world skill's own. A skill that is neither SRD nor a world skill, with no ability given, rolls with no ability and no proficiency and warns (resolverProblems); it never falls back to WIS"),
     against: z.string().optional().describe("Play report 5 #8c, stealth only: the observer being hidden from or sneaked past. The total is compared to their passive Perception and to every sense passive (passive Perception (scent) 16) the scene does not deny; the reply says who noticed and by what"),
     ...CheckBaseFields
 });
@@ -137,7 +134,7 @@ const OpposedSchema = z.object({
     declaredModifiers: z.array(z.object({ label: z.string(), value: z.number() })).optional(),
     declaredEffects: z.preprocess(jsonIfString, z.array(DeclaredEffectRefSchema)).optional().describe('Initiator declaredEffects — engine computes'),
     context: contextField(),
-    targetContext: z.preprocess(v => typeof v === 'string' ? [v] : v, z.array(z.string().min(1))).optional().describe("Play report 5 #8c: the defender's tags (['scent']): a skillAdvantage trait on the defender fires on them; in a fight with a scene wind the engine places the initiator upwind or downwind of the defender")
+    targetContext: z.preprocess(tagList, z.array(z.string().min(1))).optional().describe("Play report 5 #8c: the defender's tags (['scent']): a skillAdvantage trait on the defender fires on them; in a fight with a scene wind the engine places the initiator upwind or downwind of the defender")
 });
 
 // d20() and logRoll() live in math/logged-d20.ts so combat and
@@ -150,7 +147,7 @@ type ScentOpponent = { id: string; name: string };
 
 async function handleCharacterRoll(
     kind: 'skill' | 'ability' | 'save',
-    args: { characterId: string; skill?: string; ability?: string; dc?: number; advantage?: boolean; disadvantage?: boolean; modifier?: number; advantageSources?: string[]; disadvantageSources?: string[]; context?: string[]; against?: string; seed?: string; scentOpponent?: ScentOpponent }
+    args: { characterId: string; skill?: string; ability?: string; dc?: number; advantage?: boolean; disadvantage?: boolean; modifier?: number; advantageSources?: string[]; disadvantageSources?: string[]; situationalAdvantage?: string; situationalDisadvantage?: string; context?: string[]; against?: string; seed?: string; scentOpponent?: ScentOpponent }
 ): Promise<object> {
     const db = getDb();
     const charRepo = new CharacterRepository(db);
@@ -187,11 +184,20 @@ async function handleCharacterRoll(
     // the lane column now states that per-path truth.
     const contributions: Array<{ label: string; value: number; lane: string; source?: string }> = [];
     let bonus = 0;
+    const resolverProblems: string[] = [];
+    // Play report 7 #11: one key for every spelling of a skill
+    // ('sleight-of-hand', 'SleightOfHand' → 'sleight_of_hand'), and the
+    // ability it rolls with: given, else the world's skill, else the SRD map.
+    const skill = kind === 'skill' ? canonicalSkillKey(args.skill || '') : '';
+    let skillAbility: ShortAbility | null | undefined;
+    let skillAbilitySource: SkillAbilitySource | undefined;
 
     if (kind === 'skill') {
-        const skill = (args.skill || '').toLowerCase().replace(/ /g, '_');
         // Item 8: a world skill (table_rules skill) names its own ability.
-        const ability = args.ability || worldSkillAbility(db, worldId, args.skill) || SKILL_ABILITY[skill] || 'wis';
+        const resolved = resolveSkillAbility(args.skill || '', { given: args.ability, world: worldSkillAbility(db, worldId, args.skill) });
+        skillAbility = resolved.ability ?? null;
+        skillAbilitySource = resolved.source;
+        const ability = resolved.ability;
         // Play report 2 #5: ONE stealth/perception number per character
         // (src/engine/skill-modifier.ts). The column is tri-state: null
         // composes ability + proficiency (+ expertise) on the world's curve;
@@ -199,8 +205,13 @@ async function handleCharacterRoll(
         // the composition — the same number stunts and the eavesdrop layer
         // roll. (#67-E made the column authoritative; the 0 every sheet was
         // born with then displaced every rogue's DEX+prof. Null fixes that.)
-        const sm = skillModifier(char as SkillSheet, skill, ability as ShortAbility, profBonus(char.level));
-        if (sm.source === 'override') {
+        // A skill that names no ability (not SRD, not the world's, none
+        // given) rolls with no ability and no proficiency, and says so — it
+        // used to fall back to WIS without a word (the montage's rule).
+        const sm = ability ? skillModifier(char as SkillSheet, skill, ability, profBonus(char.level)) : undefined;
+        if (!sm || !ability) {
+            resolverProblems.push(unmappedSkillWarning(args.skill || ''));
+        } else if (sm.source === 'override') {
             bonus += sm.value;
             breakdown.push(`${skill} override ${signed(sm.value)} (replaces computed ${ability.toUpperCase()}+prof ${signed(sm.computed)})`);
             contributions.push({ label: `${skill} override`, value: sm.value, lane: 'SHEET', source: overrideColumn(skill) ?? undefined });
@@ -237,7 +248,6 @@ async function handleCharacterRoll(
     // the conditional trait; the engine computes its value from the row
     // (fixed or pool-derived) and applies it. Problems report loudly.
     const dRefs = (args as { declaredEffects?: Array<{ name: string; lane?: string }> }).declaredEffects ?? [];
-    const resolverProblems: string[] = [];
     // Wishlist item 10: where advantage and disadvantage came from. Each
     // source prints as a zero-value contribution and in the roll_log purpose.
     const advFrom: Array<{ label: string; lane: string }> = [];
@@ -295,7 +305,7 @@ async function handleCharacterRoll(
     const longAbility: Record<string, string> = { str: 'strength', dex: 'dexterity', con: 'constitution', int: 'intelligence', wis: 'wisdom', cha: 'charisma' };
     if (kind === 'save' || kind === 'skill') {
         const auto = { adv: [] as string[], dis: [] as string[] };
-        const domain = kind === 'save' ? (longAbility[args.ability!] ?? args.ability) : (args.skill || '').toLowerCase().replace(/ /g, '_');
+        const domain = kind === 'save' ? (longAbility[args.ability!] ?? args.ability) : skill;
         autoAdvantage(mechs, kind, domain, auto);
         advFrom.push(...auto.adv.map(label => ({ label, lane: 'ENGINE' })));
         disFrom.push(...auto.dis.map(label => ({ label, lane: 'ENGINE' })));
@@ -306,23 +316,72 @@ async function handleCharacterRoll(
             if (worn) disFrom.push({ label: `${worn.name} (stealth disadvantage)`, lane: 'SHEET' });
         }
     }
+    // Play report 7 #7 (the owner's spec): declared advantage. The roll in
+    // the scope grammar's terms; scoped effect mechanics on the sheet fire by
+    // themselves (untagged: ENGINE) or on a context tag (EFFECT).
+    const context = args.context ?? [];
+    const rollScope: RollScope = kind === 'save'
+        ? { kind: 'save', ability: args.ability as ShortAbility }
+        : kind === 'skill' ? { kind: 'check', skill, ability: skillAbility ?? undefined } : { kind: 'check', ability: args.ability as ShortAbility };
+    const effectDecls = loadEffectDeclarations(db, charId);
+    const scopedAdv = scopedAdvantage(effectDecls, 'advantage', rollScope, context);
+    const scopedDis = scopedAdvantage(effectDecls, 'disadvantage', rollScope, context);
+    advFrom.push(...scopedAdv.fired.map(f => ({ label: f.label, lane: f.lane })));
+    disFrom.push(...scopedDis.fired.map(f => ({ label: f.label, lane: f.lane })));
+
+    // GM-named sources grant only what declares them for this roll (an
+    // effect's mechanic, a standard condition's 5e rule, a skillAdvantage
+    // trait for its skills; src/engine/advantage-sources.ts). A name that
+    // matches nothing, matches two things or declares nothing REFUSES the
+    // roll before any die, calculation or log row — it used to warn and roll.
+    const traits = (char as { skillAdvantage?: SkillAdvantageTrait[] }).skillAdvantage;
+    const namedTraits: GrantedSource[] = [];
+    const namedEffects = new Set<string>();
+    if (args.advantageSources?.length || args.disadvantageSources?.length) {
+        const owner: DeclaringOwner = {
+            ownerId: charId, ownerName: char.name,
+            conditions: ((char as { conditions?: Array<{ name: string; source?: string }> }).conditions ?? []).map(c => ({ ...c, on: 'sheet' as const })),
+            effects: effectDecls, traits
+        };
+        const adv = resolveAdvantageSources(args.advantageSources ?? [], 'advantage', owner, rollScope, context);
+        const dis = resolveAdvantageSources(args.disadvantageSources ?? [], 'disadvantage', owner, rollScope, context);
+        const problems = [...adv.problems, ...dis.problems];
+        if (problems.length) {
+            const what = kind === 'save' ? `${args.ability!.toUpperCase()} save` : kind === 'skill' ? `${args.skill} check` : `${args.ability!.toUpperCase()} check`;
+            return {
+                error: true, writes: 'none', actionType: `roll_${kind === 'save' ? 'saving_throw' : kind + '_check'}`,
+                characterId: charId, characterName: char.name, sourceProblems: problems,
+                message: `${char.name}'s ${what} was not rolled: ${problems.map(p => p.replace(/\.$/, '')).join(' | ')}. Nothing was rolled or logged.`
+            };
+        }
+        for (const g of adv.granted) { if (g.via === 'trait') namedTraits.push(g); else advFrom.push({ label: g.label, lane: g.lane }); if (g.via === 'effect') namedEffects.add(g.name.toLowerCase()); }
+        for (const g of dis.granted) { disFrom.push({ label: g.label, lane: g.lane }); if (g.via === 'effect') namedEffects.add(g.name.toLowerCase()); }
+    }
+    // The GM's own ruling: advantage: true is 'GM'; situationalAdvantage: '<reason>' is 'GM: <reason>' (SITUATIONAL), first in the list.
+    const situationalAdv = typeof args.situationalAdvantage === 'string' && args.situationalAdvantage.trim() ? args.situationalAdvantage.trim() : undefined;
+    const situationalDis = typeof args.situationalDisadvantage === 'string' && args.situationalDisadvantage.trim() ? args.situationalDisadvantage.trim() : undefined;
+    advFrom.unshift(...[...(args.advantage ? ['GM'] : []), ...(situationalAdv ? [`GM: ${situationalAdv}`] : [])].map(label => ({ label, lane: 'SITUATIONAL' })));
+    disFrom.unshift(...[...(args.disadvantage ? ['GM'] : []), ...(situationalDis ? [`GM: ${situationalDis}`] : [])].map(label => ({ label, lane: 'SITUATIONAL' })));
+
     // Play report 5 #8c: conditional traits as data (sheet skillAdvantage). A
     // tag on the check that matches a trait's `when` fires it; the scene's
     // senseDenial (per target, then scene-wide) or, for scent in a fight with
     // a wind and a known opponent, the wind, switches it off with the reason.
     // Read at roll time only: a later denial never touches this roll.
+    // Play report 7 #8: a trait named in advantageSources fires as its tag
+    // would (that trait only), through the same denial and wind.
     let traitAdvantage: string[] | undefined;
     let deniedAdvantage: Array<{ trait: string; when: string; reason: string }> | undefined;
     let conditionalAdvantage: string[] | undefined;
+    let conditionalDisadvantage: string[] | undefined;
     let windResult: WindCall | undefined;
-    const context = args.context ?? [];
     if (kind === 'skill') {
-        const skillKey = (args.skill || '').toLowerCase().replace(/ /g, '_');
-        const matched = matchSkillAdvantage((char as { skillAdvantage?: SkillAdvantageTrait[] }).skillAdvantage, skillKey, context);
-        if (matched.applied.length) {
+        const matched = matchSkillAdvantage(traits, skill, context);
+        const firing = [...matched.applied, ...namedTraits.filter(n => !matched.applied.some(a => a.name.toLowerCase() === n.name.toLowerCase())).map(n => ({ name: n.name, when: n.tag ?? '', label: n.label }))];
+        if (firing.length) {
             const senses = sceneSensesFor(db, charId, worldId);
             const wind = senses.wind ? parseWind(senses.wind) : undefined;
-            for (const t of matched.applied) {
+            for (const t of firing) {
                 let reason = denialFor(senses.senseDenial, charId, t.when);
                 if (!reason && wind && args.scentOpponent && normTag(t.when) === 'scent') {
                     const call = windCall(wind, { id: charId, name: char.name, position: tokenPosition(db, charId) }, { ...args.scentOpponent, position: tokenPosition(db, args.scentOpponent.id) });
@@ -338,34 +397,40 @@ async function handleCharacterRoll(
                 }
             }
         }
-        if (matched.gated.length && !context.length) {
-            conditionalAdvantage = matched.gated.map(g => `${g.label}: pass context: ['${g.when}'] when the check is ${g.when}-based`);
-            for (const c of conditionalAdvantage) breakdown.push(`conditional: ${c}`);
+        const gatedTraits = matched.gated.filter(g => !namedTraits.some(n => n.name.toLowerCase() === g.name.toLowerCase()));
+        if (gatedTraits.length && !context.length) {
+            conditionalAdvantage = gatedTraits.map(g => `${g.label}: pass context: ['${g.when}'] when the check is ${g.when}-based`);
         }
     }
-    // A tag or an observer on a check it cannot apply to is said, never swallowed.
+    // Play report 7 #7: a tagged mechanic in scope whose tag nobody asserted
+    // is told the tag (and the name), as an untagged trait check is.
+    if (!context.length) {
+        const hint = (which: 'advantage' | 'disadvantage') => (g: { effect: string; tag: string }) => `${g.effect} (${g.tag}): pass context: ['${g.tag}'] or ${which}Sources: ['${g.effect}'] when it holds`;
+        const advHints = scopedAdv.gated.filter(g => !namedEffects.has(g.effect.toLowerCase())).map(hint('advantage'));
+        const disHints = scopedDis.gated.filter(g => !namedEffects.has(g.effect.toLowerCase())).map(hint('disadvantage'));
+        if (advHints.length) conditionalAdvantage = [...(conditionalAdvantage ?? []), ...advHints];
+        if (disHints.length) conditionalDisadvantage = disHints;
+    }
+    for (const c of [...(conditionalAdvantage ?? []), ...(conditionalDisadvantage ?? [])]) breakdown.push(`conditional: ${c}`);
+    // A tag or an observer on a check it cannot apply to is said, never
+    // swallowed. Play report 7: tags now fire tagged effect mechanics on
+    // saves and ability checks too; a tag that fired nothing is said.
     if (context.length && kind !== 'skill') {
-        const note = `context [${context.join(', ')}] applies to skill checks only (skillAdvantage traits are per skill); not applied to this ${kind === 'save' ? 'save' : 'ability check'}`;
-        resolverProblems.push(note); breakdown.push(`⚠ ${note}`);
+        const fired = new Set([...scopedAdv.fired, ...scopedDis.fired].filter(f => f.tag).map(f => normTag(f.tag!)));
+        const unfired = context.filter(t => !fired.has(normTag(t)));
+        if (unfired.length) {
+            const note = `context [${unfired.join(', ')}] fired nothing on this ${kind === 'save' ? 'save' : 'ability check'}: no tagged effect on ${char.name} declares it here (skillAdvantage traits fire on skill checks only)`;
+            resolverProblems.push(note); breakdown.push(`⚠ ${note}`);
+        }
     }
     if (args.against && !(kind === 'skill' && normSkill(args.skill ?? '') === 'stealth')) {
         const note = `against applies to Stealth only (a hide or sneak past the observer named); not applied to this ${kind === 'skill' ? `${args.skill} check` : kind === 'save' ? 'save' : 'ability check'}`;
         resolverProblems.push(note); breakdown.push(`⚠ ${note}`);
     }
-    if (args.advantageSources?.length || args.disadvantageSources?.length) {
-        // Shared with grapple (src/engine/advantage-sources.ts): a miss or an
-        // ambiguous name is a problem line here and the roll still happens.
-        const owner = {
-            ownerName: char.name,
-            conditions: ((char as { conditions?: Array<{ name: string; source?: string }> }).conditions ?? []),
-            effectNames: loadEffectNames(db, charId)
-        };
-        const adv = resolveNamedSources(args.advantageSources ?? [], 'advantage', owner);
-        const dis = resolveNamedSources(args.disadvantageSources ?? [], 'disadvantage', owner);
-        resolverProblems.push(...adv.problems, ...dis.problems);
-        advFrom.push(...adv.labels.map(label => ({ label, lane: 'SITUATIONAL' })));
-        disFrom.push(...dis.labels.map(label => ({ label, lane: 'SITUATIONAL' })));
-    }
+    // One source, one line: a label already listed (an untagged mechanic also named, a tag also given) counts once.
+    const once = (list: Array<{ label: string; lane: string }>) => list.filter((x, i) => list.findIndex(y => y.label.toLowerCase() === x.label.toLowerCase()) === i);
+    advFrom.splice(0, advFrom.length, ...once(advFrom));
+    disFrom.splice(0, disFrom.length, ...once(disFrom));
     for (const a of advFrom) { contributions.push({ label: `ADV ← ${a.label}`, value: 0, lane: a.lane }); breakdown.push(`advantage ← ${a.label}`); }
     for (const d of disFrom) { contributions.push({ label: `DIS ← ${d.label}`, value: 0, lane: d.lane }); breakdown.push(`disadvantage ← ${d.label}`); }
     // Source problems found after the resolver block also print as warnings.
@@ -447,6 +512,8 @@ async function handleCharacterRoll(
         characterName: char.name,
         skill: args.skill,
         ability: args.ability,
+        // Play report 7 #11: the ability the skill rolled with (null: none) and where it came from.
+        ...(kind === 'skill' ? { skillAbility: skillAbility ?? null, skillAbilitySource } : {}),
         rolls: roll.rolls,
         natural: roll.natural,
         bonus,
@@ -457,6 +524,10 @@ async function handleCharacterRoll(
         resolverProblems: resolverProblems.length ? resolverProblems : undefined,
         advantageSources: advantageSources.length ? advantageSources : undefined,
         disadvantageSources: disadvantageSources.length ? disadvantageSources : undefined,
+        // Play report 7 #7: the GM's one-off rulings, as given.
+        ...(situationalAdv ? { situationalAdvantage: situationalAdv } : {}),
+        ...(situationalDis ? { situationalDisadvantage: situationalDis } : {}),
+        ...(conditionalDisadvantage ? { conditionalDisadvantage } : {}),
         // Play report 5 #8c: the traits that fired, the ones a denial stopped, the tag an untagged check would need, the wind call, the observer compared against.
         ...(context.length ? { context } : {}),
         ...(traitAdvantage ? { traitAdvantage } : {}),
@@ -1080,11 +1151,11 @@ export const MathManageTool = {
 
 🛡️ SAVES AND CHECKS (roll_saving_throw, roll_skill_check, roll_ability_check, opposed) — actions of this tool, not separate tools:
 - math_manage { action: "roll_saving_throw", characterId, ability: "wis" | "Wisdom", dc } reads the sheet: ability mod, save proficiency, autoApply traits
-- advantage / disadvantage: true, or advantageSources / disadvantageSources: ["VAUREK"] — each names one of the character's conditions or active effects (a miss or an ambiguous name is refused). The roll log records why: "wis save (adv: VAUREK)"
+- DECLARED ADVANTAGE (play report 7): a condition stays prose; what changes a roll is an effect mechanic {type: 'advantage_on' | 'disadvantage_on', value: '<scope>', condition?: '<when-tag>'} — scopes check:<skill>, check:<ability>, save:<ability> (and attack, grapple, initiative elsewhere). Untagged, it fires on every roll in scope by itself; tagged, on context: ['<tag>'] (saves and ability checks take context too) or when named in advantageSources (the GM asserting it: logged 'Choir Ward (the Choir sings, named)'). advantageSources / disadvantageSources: ["VAUREK"] grant only what DECLARES it for this roll: such a mechanic (or the older {value: 1, save: 'wisdom'} form), a standard condition's 5e rule (poisoned: disadvantage on checks; restrained: on DEX saves), or a skillAdvantage trait on its own skills (#8: advantageSources: ['Keen Smell'] on perception fires as context: ['scent'] would). A name that matches nothing, matches two things or declares nothing REFUSES the roll (writes: none, sourceProblems) with the call that declares it (improvisation_manage feature_from_condition {characterId, match, mechanics: [...]}). situationalAdvantage / situationalDisadvantage: '<reason>' is the GM's one-off, logged 'adv: GM: <reason>'; advantage / disadvantage: true still work, logged 'GM'. The roll log records why: "wis save (adv: VAUREK)"
 - context: ['scent'] (play report 5 #8c): a skillAdvantage trait on the sheet ({name: 'Keen Smell', skills: ['perception', 'survival'], when: 'scent'}) whose when matches a tag grants advantage by itself and is named (adv: Keen Smell (scent)); an untagged check gets none and conditionalAdvantage tells the tag. A scene_manage senseDenial for the tag removes it and the reply quotes the reason (deniedAdvantage); a denial set after a roll never touches it. opposed takes context (initiator) and targetContext (defender); with a scene wind and token positions the engine places the initiator upwind or downwind of a scent-tagged defender (wind). opposed stealth vs perception also compares the Stealth total to the defender's passive Perception (scent) unless denied: a total below it is noticed (passiveCheck, decidedBy). roll_skill_check stealth {against: observerId} does the same against a named observer (against). seed replays the d20 (tests and exact replays only)
 - declaredEffects: [{name}] applies a conditional trait's bonus, or its advantage_on
 - A failed save by a creature with legendary resistances left reports legendaryResistanceAvailable
-- Skill checks take the same fields: math_manage { action: "roll_skill_check", characterId, skill, dc }
+- Skill checks take the same fields: math_manage { action: "roll_skill_check", characterId, skill, dc }. Any spelling of an SRD skill rolls its ability ('sleight-of-hand' rolls DEX; reply skillAbility, skillAbilitySource); a skill that is neither SRD nor a world skill (table_rules skill), with no ability given, rolls with no ability and no proficiency and warns loudly — pass ability
 
 🎲 DICE ROLLING (roll) - Use ONLY for:
 - Stat generation (4d6dl1)
@@ -1154,9 +1225,12 @@ Actions: roll, probability, solve, simplify, projectile, roll_skill_check, roll_
         // Wishlist item 10 mirror law: named advantage sources.
         advantageSources: sourcesField('advantage'),
         disadvantageSources: sourcesField('disadvantage'),
+        // Play report 7 #7 (mirror): the GM's one-off ruling with its reason.
+        situationalAdvantage: situationalField('advantage'),
+        situationalDisadvantage: situationalField('disadvantage'),
         // Play report 5 #8c (mirror): tags on a check, the defender's tags, the observer a hide is made against.
         context: contextField(),
-        targetContext: z.preprocess(v => typeof v === 'string' ? [v] : v, z.array(z.string().min(1))).optional().describe("opposed: the defender's tags (['scent']); their skillAdvantage traits fire on them; with a scene wind and token positions the initiator is placed upwind or downwind"),
+        targetContext: z.preprocess(tagList, z.array(z.string().min(1))).optional().describe("opposed: the defender's tags (['scent']); their skillAdvantage traits fire on them; with a scene wind and token positions the initiator is placed upwind or downwind"),
         against: z.string().optional().describe('roll_skill_check stealth: the observer hidden from or sneaked past; the total is compared to their passive Perception and sense passives unless the scene denies the sense'),
         // #67 mirror law: opposed-check params.
         targetId: z.string().optional().describe('opposed: defender characterId'),

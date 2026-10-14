@@ -84,17 +84,76 @@ function shrink(value: unknown, budget: Budget): unknown {
     return undefined;
 }
 
+/**
+ * Play report 7 #9: top-level keys a summary keeps whole, because the chair
+ * must say them aloud: the turn order (initiative rows), who is first up,
+ * what a create assumed or kept (bandAssumed rows, warnings), what an area
+ * did to each unit, model by model (unitLines, play report 7 #1), a rider
+ * thrown from its mount (mounts), what each save the engine rolled took
+ * (saveSources, play report 7 lane G1: Danger Sense, restrained, both dice),
+ * and what each reaction did: an opportunity attack's hit and knockout, a
+ * held shot, an override, a PC's offered call (reactionLines, lane G2), and
+ * the end-of-turn save each save_ends condition took at an advance
+ * (endOfTurnSaves, lane H: the dice, the sources, the line; a concentration
+ * save's sources ride saveSources). Each row keeps its scalar fields (strings
+ * cut at 300) and its lists of scalars (play report 7 #7: an initiative row's
+ * advantage labels and both dice), 25 rows at most, the rest counted as
+ * {_more}.
+ */
+const SUMMARY_KEEP = new Set(['initiative', 'firstUp', 'bandAssumed', 'warnings', 'unitLines', 'mounts', 'saveSources', 'reactionLines', 'endOfTurnSaves']);
+
+/**
+ * Lane G2: kept lines that may carry a call to paste (a PC's offered
+ * opportunity attack, the onSubdue answer) are cut at 2000 characters, not
+ * 300: a call cut short cannot be pasted.
+ */
+const KEEP_LONG_LINES = new Set(['reactionLines']);
+
+const isScalarList = (v: unknown): v is unknown[] => Array.isArray(v) && v.every(isScalar);
+
+function scalarRow(v: unknown, maxString = MAX_STRING): unknown {
+    if (typeof v === 'string') return v.length > maxString ? `${v.slice(0, maxString)}… (${v.length} chars)` : v;
+    if (isScalar(v)) return v;
+    if (isScalarList(v)) return v.length > MAX_ID_ROWS ? [...v.slice(0, MAX_ID_ROWS).map(x => scalarRow(x)), { _more: v.length - MAX_ID_ROWS }] : v.map(x => scalarRow(x));
+    if (isPlainObject(v)) return Object.fromEntries(Object.entries(v).filter(([, x]) => isScalar(x) || isScalarList(x)).map(([k, x]) => [k, scalarRow(x)]));
+    return undefined;
+}
+
+function keepWhole(v: unknown, maxString = MAX_STRING): unknown {
+    if (!Array.isArray(v)) return scalarRow(v) ?? shrink(v, { rows: 0 });
+    const rows: unknown[] = v.slice(0, MAX_ID_ROWS).map(x => scalarRow(x, maxString)).filter(r => r !== undefined);
+    if (v.length > MAX_ID_ROWS) rows.push({ _more: v.length - MAX_ID_ROWS });
+    return rows;
+}
+
 /** A top-level `…Ids` (or id-named) list of scalars: kept whole up to 50, then counted. */
 function idScalars(k: string, v: unknown): unknown[] | undefined {
     if (!Array.isArray(v) || !(IDS_KEY.test(k) || ID_KEY.test(k)) || !v.every(isScalar)) return undefined;
     return v.length <= MAX_ID_SCALARS ? v : [...v.slice(0, MAX_ID_SCALARS), { _more: v.length - MAX_ID_SCALARS }];
 }
 
+/**
+ * Play report 7 #7 (review): the lines a refusal or a roll teaches with —
+ * the reason and the call to paste ('To grant one, improvisation_manage
+ * feature_from_condition {…}'), the scope grammar a refused mechanic names,
+ * a skill rolled with no ability. Kept word for word (25 lines, 2000
+ * characters each): a call cut at 300 characters cannot be pasted.
+ */
+const SUMMARY_VERBATIM = new Set(['sourceProblems', 'mechanicProblems', 'resolverProblems']);
+const MAX_VERBATIM = 2000;
+
+function keepVerbatim(v: unknown): unknown {
+    if (!Array.isArray(v) || !v.every(x => typeof x === 'string')) return undefined;
+    const lines: unknown[] = (v as string[]).slice(0, MAX_ID_ROWS).map(x => x.length > MAX_VERBATIM ? `${x.slice(0, MAX_VERBATIM)}… (${x.length} chars)` : x);
+    if (v.length > MAX_ID_ROWS) lines.push({ _more: v.length - MAX_ID_ROWS });
+    return lines;
+}
+
 export function summarizeResult(result: Record<string, unknown>): Record<string, unknown> {
     const out: Record<string, unknown> = {};
     const budget: Budget = { rows: MAX_ID_ROWS_PER_REPLY };
     for (const [k, v] of Object.entries(result)) {
-        const s = idScalars(k, v) ?? shrink(v, budget);
+        const s = (SUMMARY_VERBATIM.has(k) ? keepVerbatim(v) : undefined) ?? (SUMMARY_KEEP.has(k) ? keepWhole(v, KEEP_LONG_LINES.has(k) ? MAX_VERBATIM : MAX_STRING) : idScalars(k, v) ?? shrink(v, budget));
         if (s !== undefined) out[k] = s;
     }
     return out;

@@ -25,6 +25,10 @@ export const WorldEnvironmentSchema = z.object({
   // SAVE DUE, advance refused until death_save). A character's own
   // combat_profile.deathSaveMode overrides it.
   deathSaveMode: z.enum(['auto', 'prompt']).optional(),
+  // Play report 7 #6: combat_manage advance refuses to pass a living player
+  // character whose turn is untouched (TURN NOT TAKEN) unless the GM passes
+  // confirm: true. On by default; 'off' turns the guard off for this world.
+  pcTurnGuard: z.enum(['on', 'off']).optional(),
 }).strict();
 
 export type WorldEnvironment = z.infer<typeof WorldEnvironmentSchema>;

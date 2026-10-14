@@ -10,7 +10,8 @@ import type Database from 'better-sqlite3';
 import type { CombatEngine, CombatParticipant, CombatActionResult, DyingUpdate } from '../../engine/combat/engine.js';
 import { dyingTail } from '../../engine/combat/dying.js';
 import { normalizeCondition } from '../../engine/combat/conditions.js';
-import { rollParticipantSave, toLongAbility, type ParticipantSaveResult } from '../../engine/combat/saves.js';
+import { rollParticipantSave, toLongAbility, saveSidesNote, saveSourcesRow, type ParticipantSaveResult } from '../../engine/combat/saves.js';
+import { fightConcentrationDie, concentrationLabelled, concentrationLine, concentrationOutcome, concentrationSourcesRow, type ConcentrationOutcome } from '../../engine/combat/saves.js';
 import { findPool, type RuleSpec, type TableRule } from '../../engine/table-rules.js';
 import { applyScheduledOps } from '../../engine/scheduled-ops.js';
 import { engineRoller } from '../../math/logged-d20.js';
@@ -310,6 +311,7 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
 
     // ── Effects ──
     const effects: EffectResult[] = [];
+    const concentrationSaves: Array<ConcentrationOutcome & { targetId: string; name: string }> = [];
     const notes: string[] = [];
     const breakTests: BreakTest[] = [];
     if (lands) {
@@ -324,6 +326,8 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
             for (const tp of recipients) {
                 const out: EffectResult = { type: effect.type, targetId: tp.id, name: tp.name };
                 let saved = false;
+                // Play report 7 (lane H): a concentration save that took a source, for this target's line.
+                let concentrationNote = '';
                 if (effect.save && effect.type !== 'healing') {
                     const dc = effect.save.dc ?? fallbackDc;
                     const save = rollParticipantSave(engine, db, tp, effect.save.ability, dc, {
@@ -357,8 +361,14 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
                             if (concentrationRepo.isConcentrating(tp.id)) {
                                 if (out.defeated) breakConcentration({ characterId: tp.id, reason: 'death' }, concentrationRepo, charRepo);
                                 else {
-                                    const check = checkConcentration(tc, dmg, concentrationRepo, 0, () => engine.rollD20({ purpose: 'concentration', forId: tp.id }));
+                                    // Play report 7 (lane H): the target's declared save:con sides and conditions, on the fight's dice.
+                                    const check = checkConcentration(tc, dmg, concentrationRepo, 0, fightConcentrationDie(engine, db, tp.id));
                                     if (check.broken) breakConcentration({ characterId: tp.id, reason: 'damage', damageAmount: dmg }, concentrationRepo, charRepo);
+                                    if (concentrationLabelled(check)) {
+                                        const c = concentrationOutcome(check);
+                                        concentrationSaves.push({ targetId: tp.id, name: tp.name, ...c });
+                                        concentrationNote = `\n   🧠 ${concentrationLine(c)}`;
+                                    }
                                 }
                             }
                         }
@@ -398,8 +408,11 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
                 }
                 if (out.save) {
                     const s = out.save;
-                    out.line = `🎲 ${tp.name} ${s.ability.toUpperCase()} save: d20(${s.rolls.join(',')}) ${s.modifier >= 0 ? '+' : '-'} ${Math.abs(s.modifier)} = ${s.total} vs DC ${out.dc} [${s.saved ? 'PASS' : 'FAIL'}]${out.line ? `\n   ${out.line}` : ''}`;
+                    // Play report 7 (lane G1): the sources the save took (declared mechanics, conditions), and a tagged one's hint.
+                    const hints = [...(s.conditionalAdvantage ?? []), ...(s.conditionalDisadvantage ?? [])].map(c => `\n   conditional: ${c}`).join('');
+                    out.line = `🎲 ${tp.name} ${s.ability.toUpperCase()} save: d20(${s.rolls.join(',')}) ${s.modifier >= 0 ? '+' : '-'} ${Math.abs(s.modifier)} = ${s.total} vs DC ${out.dc} [${s.saved ? 'PASS' : 'FAIL'}]${saveSidesNote(s)}${hints}${out.line ? `\n   ${out.line}` : ''}`;
                 }
+                if (concentrationNote) out.line = `${out.line ?? ''}${concentrationNote}`;
                 effects.push(out);
             }
         }
@@ -493,6 +506,15 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
     } as unknown as CombatActionResult;
     const saves = effects.filter(e => e.save).map(e => ({ id: e.targetId, name: e.name, ...e.save! }));
     if (saves.length) (result as { saves?: unknown }).saves = saves;
+    // Play report 7 (lane G1): what each save took, for the reply's saveSources (lifted to the top level).
+    const saveSources = effects.filter(e => e.save).map(e => saveSourcesRow({ id: e.targetId, name: e.name }, e.save!)).filter(r => r !== undefined);
+    // Play report 7 (lane H): concentration saves that took a declared source (or a tagged one's hint), as their own rows.
+    for (const c of concentrationSaves) {
+        const row = concentrationSourcesRow({ id: c.targetId, name: c.name }, c);
+        if (row) saveSources.push(row);
+    }
+    if (saveSources.length) (result as { saveSources?: unknown }).saveSources = saveSources;
+    if (concentrationSaves.length) (result as { concentrationSaves?: unknown }).concentrationSaves = concentrationSaves;
     const conditionsApplied = effects.filter(e => e.condition).map(e => ({ id: e.targetId, name: e.name, condition: e.condition }));
     if (conditionsApplied.length) (result as { conditionsApplied?: unknown }).conditionsApplied = conditionsApplied;
     if (breakTests.length) (result as { breakTests?: unknown }).breakTests = breakTests;

@@ -159,12 +159,12 @@ describe('a scheduled part op reaches the live token', () => {
     it('a crippled wing healed gives speed back at the next turn start, not mid-turn', async () => {
         repo().update('manyskins', { parts: [{ name: 'left wing', kind: 'wing', state: 'crippled' }] } as any);
         const enc = await fight();
-        await manage({ action: 'advance', encounterId: enc }); await manage({ action: 'advance', encounterId: enc });
+        await manage({ action: 'advance', encounterId: enc, confirm: true }); await manage({ action: 'advance', encounterId: enc, confirm: true });
         expect(stored(enc, 'manyskins').movementRemaining).toBe(15);
         const s = await char({ action: 'schedule_change', characterId: 'manyskins', worldId: W, firesAtDay: 10, fireNow: true, writes: [{ op: 'set_part', part: 'left wing', state: 'intact' }] });
         expect(s.applied).toEqual([`set_part: left wing crippled → intact (sheet; token in ${enc})`]);
         expect(stored(enc, 'manyskins').movementRemaining).toBe(15);
-        await manage({ action: 'advance', encounterId: enc }); await manage({ action: 'advance', encounterId: enc });
+        await manage({ action: 'advance', encounterId: enc, confirm: true }); await manage({ action: 'advance', encounterId: enc, confirm: true });
         expect(stored(enc, 'manyskins').movementRemaining).toBe(30);
     });
 

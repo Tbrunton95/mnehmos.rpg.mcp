@@ -26,8 +26,8 @@ describe('regeneration', () => {
     });
     afterEach(() => closeDb());
 
-    async function fight(spawnHp: number) {
-        const created = tagJson((await handleCombatManage({ action: 'create', participants: [
+    async function fight(spawnHp: number, seed?: string) {
+        const created = tagJson((await handleCombatManage({ action: 'create', ...(seed ? { seed } : {}), participants: [
             { id: 'marine', name: 'Marine', hp: 100, maxHp: 100, initiative: 20 },
             { id: 'spawn', name: 'Chaos Spawn', hp: spawnHp, maxHp: 120, initiative: 5, isEnemy: true }
         ] }, ctx as any)).content[0].text, 'COMBAT_MANAGE');
@@ -38,7 +38,7 @@ describe('regeneration', () => {
     it('heals at the start of its own turn and says so', async () => {
         repo.update('spawn', { hp: 60 } as any);
         const enc = await fight(60);
-        const out = (await handleCombatManage({ action: 'advance', encounterId: enc }, ctx as any)).content[0].text;
+        const out = (await handleCombatManage({ action: 'advance', encounterId: enc, confirm: true }, ctx as any)).content[0].text;
         expect(out).toMatch(/Chaos Spawn regenerates 10 HP \(60 → 70\/120\)/);
         expect(spawnToken(enc).hp).toBe(70);
         expect(repo.findById('spawn')!.hp).toBe(70);
@@ -47,15 +47,19 @@ describe('regeneration', () => {
     it('never past max HP', async () => {
         repo.update('spawn', { hp: 115 } as any);
         const enc = await fight(115);
-        await handleCombatManage({ action: 'advance', encounterId: enc }, ctx as any);
+        await handleCombatManage({ action: 'advance', encounterId: enc, confirm: true }, ctx as any);
         expect(spawnToken(enc).hp).toBe(120);
     });
 
     it('not at 0 HP: destroyed stays destroyed', async () => {
         repo.update('spawn', { hp: 0 } as any);
-        const enc = await fight(0);
-        await handleCombatManage({ action: 'advance', encounterId: enc }, ctx as any);
-        await handleCombatManage({ action: 'advance', encounterId: enc }, ctx as any);
+        // The spawn has a character row, so at 0 HP it is dying and its slot
+        // rolls a death save (play report 5); a natural 20 would bring it back
+        // at 1 HP and regeneration would rightly run. Seeded so the saves are
+        // the same every run: this test is about regeneration, not the d20.
+        const enc = await fight(0, 'regen-destroyed');
+        await handleCombatManage({ action: 'advance', encounterId: enc, confirm: true }, ctx as any);
+        await handleCombatManage({ action: 'advance', encounterId: enc, confirm: true }, ctx as any);
         expect(spawnToken(enc).hp).toBe(0);
     });
 
