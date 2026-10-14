@@ -49,6 +49,102 @@ export function describeUnit(p: Pick<CombatParticipant, 'hp' | 'unit'>): string 
     return `${p.unit.routed ? 'ROUTED · ' : ''}×${t.models}/${t.maxModels} ${p.unit.packed ? 'packed' : 'spaced'} · volley ${t.dice ?? 'none'}${t.drops.length ? ` (${t.drops.join(', ')})` : ''}`;
 }
 
+/**
+ * Play report 7 #1: what an area did to a unit, model by model. The front
+ * (wounded) model is inside first; each model inside takes `full`, or `half`
+ * when its own save passed, and dies when that meets or beats its HP (the
+ * front model's remainder, else hpPerModel). Survivors keep their HP: a
+ * wound below a model's HP is not tracked (5e troop rules), so the pool
+ * loses exactly the dead models' HP and liveModels reads back
+ * modelsBefore − modelsKilled.
+ */
+export interface UnitAreaResult {
+    modelsBefore: number;
+    maxModels: number;
+    hpPerModel: number;
+    /** The front model's HP before the area (hpPerModel unless wounded). */
+    frontHp: number;
+    modelsInArea: number;
+    /** Saves rolled: failed and passed. Both 0 when the area allows none. */
+    failed: number;
+    saved: number;
+    /** The area allowed no save: every model inside took the full damage. */
+    noSave?: true;
+    /** The damage a model takes on a failed save (full) and on a success (half). */
+    perModel: { full: number; half: number };
+    modelsKilled: number;
+    modelsAfter: number;
+    /** HP off the unit's pool: the dead models' HP. */
+    hpLost: number;
+    /**
+     * Models inside that are still standing, by their save (both 0 when the
+     * area allowed none). A save's rider lands on the unit by what these got:
+     * the dead take no condition.
+     */
+    standing: { failed: number; saved: number };
+}
+
+export function areaOnUnit(
+    p: Pick<CombatParticipant, 'hp' | 'unit'>,
+    opts: { damage: number; half?: number; modelsInArea: number; saves?: boolean[] }
+): UnitAreaResult {
+    const u = p.unit;
+    const hpPerModel = u?.hpPerModel ?? 1;
+    const modelsBefore = liveModels(p);
+    const frontHp = modelsBefore > 0 ? p.hp - (modelsBefore - 1) * hpPerModel : 0;
+    const full = Math.max(0, opts.damage);
+    const half = Math.max(0, opts.half ?? Math.floor(full / 2));
+    const inside = Math.max(0, Math.min(modelsBefore, Math.floor(opts.modelsInArea)));
+    let failed = 0, saved = 0, modelsKilled = 0, hpLost = 0;
+    const standing = { failed: 0, saved: 0 };
+    for (let i = 0; i < inside; i++) {
+        const passed = !!opts.saves?.[i];
+        if (opts.saves) { if (passed) saved++; else failed++; }
+        const dmg = passed ? half : full;
+        const hp = i === 0 ? frontHp : hpPerModel;
+        if (dmg > 0 && dmg >= hp) { modelsKilled++; hpLost += hp; }
+        else if (opts.saves) { if (passed) standing.saved++; else standing.failed++; }
+    }
+    return {
+        modelsBefore, maxModels: u?.models ?? 0, hpPerModel, frontHp, modelsInArea: inside,
+        failed, saved, ...(opts.saves ? {} : { noSave: true as const }),
+        perModel: { full, half }, modelsKilled, modelsAfter: modelsBefore - modelsKilled, hpLost, standing
+    };
+}
+
+/** The owner's report line: "6 in the cone: 4 failed, 2 saved; 31 / 15 vs 9 HP each: 6 dead, 0/6 left". */
+export function unitAreaLine(p: Pick<CombatParticipant, 'unit'>, r: UnitAreaResult, shape = 'area'): string {
+    const where = r.modelsInArea < r.modelsBefore ? `${r.modelsInArea} of ${r.modelsBefore}` : `${r.modelsInArea}`;
+    const front = r.modelsInArea > 0 && r.frontHp !== r.hpPerModel ? ` (front ${r.frontHp})` : '';
+    const head = r.noSave
+        ? `${where} in the ${shape}, no save: ${r.perModel.full}`
+        : `${where} in the ${shape}: ${r.failed} failed, ${r.saved} saved; ${r.perModel.full} / ${r.perModel.half}`;
+    return `${head} vs ${r.hpPerModel} HP each${front}: ${r.modelsKilled} dead, ${r.modelsAfter}/${p.unit?.models ?? r.maxModels} left`;
+}
+
+const UNIT_ABILITY_LONG: Record<string, string> = { str: 'strength', dex: 'dexterity', con: 'constitution', int: 'intelligence', wis: 'wisdom', cha: 'charisma' };
+const UNIT_ABILITY_SHORT: Record<string, string> = Object.fromEntries(Object.entries(UNIT_ABILITY_LONG).map(([s, l]) => [l, s]));
+
+/**
+ * Play report 7 #1: a unit's save bonus against an area: the token's ability
+ * modifier (abilityScores, long or short keys; 10 when unset) plus the
+ * drilled bonus in unit.saves. Each model rolls with it.
+ */
+export function unitSaveBonus(
+    p: { abilityScores?: Partial<Record<string, number>>; unit?: { saves?: Partial<Record<string, number>> } },
+    ability: string
+): { ability: string; mod: number; drilled: number; total: number; parts: string[] } {
+    const a = ability.trim().toLowerCase();
+    const long = UNIT_ABILITY_SHORT[a] ? a : UNIT_ABILITY_LONG[a] ?? 'dexterity';
+    const short = UNIT_ABILITY_SHORT[long];
+    const score = p.abilityScores?.[long] ?? p.abilityScores?.[short] ?? 10;
+    const mod = Math.floor((score - 10) / 2);
+    const drilled = p.unit?.saves?.[short] ?? 0;
+    const parts = [`${short.toUpperCase()} ${mod >= 0 ? '+' : ''}${mod}`];
+    if (drilled) parts.push(`drilled ${drilled >= 0 ? '+' : ''}${drilled}`);
+    return { ability: long, mod, drilled, total: mod + drilled, parts };
+}
+
 /** A unit owes a break test when it drops through this fraction of its models, unless it sets its own breakAt. */
 export const DEFAULT_BREAK_AT = 0.5;
 

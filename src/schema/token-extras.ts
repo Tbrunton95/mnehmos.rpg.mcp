@@ -209,6 +209,24 @@ export const skillAdvantageTraitSchema = () => z.object({
 export type SkillAdvantageTrait = z.infer<ReturnType<typeof skillAdvantageTraitSchema>>;
 
 /**
+ * Play report 7 #2: ability scores a caller gives a token, as a record so
+ * any spelling crosses the SDK ('str', 'STR', 'strength'); the handler
+ * normalises the keys (toLongAbility), fills the missing ones and refuses an
+ * unknown key with the six valid ones. A fresh instance per use.
+ */
+export const abilityScoresInputSchema = () => z.record(z.string(), z.number().int().min(1).max(30));
+
+/**
+ * The two spellings combat_manage create participants[] and add_participant
+ * take: stats (the sheet's short keys) and abilityScores (the token's long
+ * keys, short ones accepted). Spread into each schema, fresh instances each time.
+ */
+export const tokenAbilityScoresShape = () => ({
+    stats: abilityScoresInputSchema().optional().describe("Ability scores, the sheet's short keys: {str: 15, dex: 14}. Missing ones are 10. Grapple contests, saves and the shove DC read them; initiativeBonus defaults to the DEX modifier. A sheet-backed token keeps its sheet's scores"),
+    abilityScores: abilityScoresInputSchema().optional().describe("Ability scores, long or short keys ({strength: 15} or {str: 15}); same as stats. Both given and different is refused")
+});
+
+/**
  * Participant extras shared by combat_manage create, add_participant and the
  * internal create_encounter schema. A plain shape so each schema can spread
  * it; outer mirrors list the same keys flat (arrays of objects as z.any).
@@ -237,7 +255,8 @@ export const ParticipantExtrasShape = {
     tags: z.array(z.string()).optional().describe("Free tags ('mob', 'ladz') that nearby matches read"),
     fightingStyle: FightingStyleSchema.optional().describe('great_weapon | dueling | archery | defense: applied by the engine on its attacks (defense on attacks against it); default from the sheet'),
     deathSaves: z.boolean().optional().describe('Play report 5 #5: tracks death saves at 0 HP (default from the character row: pc/npc yes, enemy no; a token with no row is a mook and just dies). true opts a sheetless villain in, false opts a named character out'),
-    deathSaveMode: deathSaveModeSchema().optional().describe("Play report 5 #5: auto (the engine rolls the save on advance) | prompt (DEATH SAVE DUE; advance refused until death_save). Default from the sheet, else the world's environment.deathSaveMode, else auto")
+    deathSaveMode: deathSaveModeSchema().optional().describe("Play report 5 #5: auto (the engine rolls the save on advance) | prompt (DEATH SAVE DUE; advance refused until death_save). Default from the sheet, else the world's environment.deathSaveMode, else auto"),
+    subdue: z.boolean().optional().describe("Play report 7 #5: a standing order 'take them alive': its automatic opportunity attacks and readied melee swings are non-lethal (a target they drop is knocked out, never killed). A readied RANGED shot cannot be non-lethal, so readying one under the order needs attack.onSubdue 'hold' | 'fire'. combat_manage set_subdue changes it mid-fight")
 };
 
 export const UnitTierSchema = z.object({
@@ -260,6 +279,48 @@ export const mobRuleSchema = () => z.object({
     }).optional().describe("Allied units in range add their live models to the morale count")
 });
 
+/** Play report 7 #1: the save keys a unit's drilled bonus takes, short form. */
+export const UNIT_SAVE_KEYS = ['str', 'dex', 'con', 'int', 'wis', 'cha'] as const;
+const UNIT_SAVE_LONG: Record<string, typeof UNIT_SAVE_KEYS[number]> = {
+    strength: 'str', dexterity: 'dex', constitution: 'con', intelligence: 'int', wisdom: 'wis', charisma: 'cha'
+};
+
+/**
+ * Play report 7 #1: a unit's drilled save bonus, {dex: 2}, added to the
+ * token's ability modifier on each model's save. Keys short or long, any
+ * case ('Dexterity', 'DEX'), stored short; an unknown key is refused.
+ */
+export function unitSavesSchema() {
+    return z.preprocess(v => {
+        if (!v || typeof v !== 'object' || Array.isArray(v)) return v;
+        const out: Record<string, unknown> = {};
+        for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+            const key = k.trim().toLowerCase();
+            out[UNIT_SAVE_LONG[key] ?? key] = val;
+        }
+        return out;
+    }, z.object({
+        str: z.number().int().optional(),
+        dex: z.number().int().optional(),
+        con: z.number().int().optional(),
+        int: z.number().int().optional(),
+        wis: z.number().int().optional(),
+        cha: z.number().int().optional()
+    }).strict());
+}
+/**
+ * Play report 7 #1: how many of a unit's models an area covers, {targetId: n}
+ * ('*' for every unit target); a bare number means every unit target. Read
+ * off combat_map aoe's per-unit hint. Required for a spaced unit.
+ */
+export function modelsInAreaSchema() {
+    return z.preprocess(v => typeof v === 'number' ? { '*': v } : v, z.record(z.string(), z.number().int().min(0)));
+}
+export const MODELS_IN_AREA_DESCRIBE = "Play report 7 #1: models of a unit token inside the area, {targetId: n} (a bare number: every unit target). A spaced unit needs it (refused without, nothing rolled); a packed unit defaults to every live model. Read it off combat_map aoe's modelsInArea hint. Giving it makes the damage an area";
+export const AREA_DESCRIBE = "Play report 7 #1: the damage is an area: each model of a unit token inside it rolls its own save on the fight's dice (full on a failure, half on a success; no save: full) and dies when that meets its HP. Without it, damage to a unit hits one model at most";
+
+export const UNIT_SAVES_DESCRIBE ="Play report 7 #1: drilled troops' save bonus per ability, {dex: 2} (str | dex | con | int | wis | cha, or the long names), added to the token's ability modifier on every model's save against an area";
+
 export const UnitSchema = z.object({
     models: z.number().int().min(1).describe('Models at full strength'),
     hpPerModel: z.number().int().min(1),
@@ -272,7 +333,8 @@ export const UnitSchema = z.object({
     morale: z.number().int().optional().describe("The unit's morale, shown on a BREAK TEST DUE line (the GM rolls the test)"),
     breakAt: z.number().gt(0).lt(1).optional().describe('Fraction of models: dropping through it owes a break test (default 0.5)'),
     routed: z.boolean().optional().describe('Routed: cannot volley and owes no more break tests (set_unit)'),
-    mobRule: mobRuleSchema().optional().describe('Mob rule: morale (and to-hit) grow with the models standing')
+    mobRule: mobRuleSchema().optional().describe('Mob rule: morale (and to-hit) grow with the models standing'),
+    saves: unitSavesSchema().optional().describe(UNIT_SAVES_DESCRIBE)
 });
 export type Unit = z.infer<typeof UnitSchema>;
 
@@ -286,7 +348,9 @@ export const ReadiedAttackSchema = z.object({
     damage: z.union([z.number(), z.string()]).optional(),
     damageType: z.string().optional(),
     withPart: z.string().optional().describe('The part that makes the attack'),
-    twoHanded: z.boolean().optional().describe('Swung in both hands (great weapon fighting; no dueling); default from the profile')
+    twoHanded: z.boolean().optional().describe('Swung in both hands (great weapon fighting; no dueling); default from the profile'),
+    ranged: z.boolean().optional().describe("Play report 7 (lane G2): a ranged shot (true) or a melee swing (false). Read when the attack is readied (a ranged one under a subdue order needs onSubdue) and when it fires, before the named profile's flag and the grid. Unset = the profile's flag, else the grid when it fires. A flag that disagrees with its profile wins and the reply says so"),
+    onSubdue: z.enum(['hold', 'fire']).optional().describe("Play report 7 #5: what a ranged readied shot does when its token is under a subdue order (a shot can't be non-lethal): 'hold' (the order wins: no shot, the reaction and the readied shot are kept) or 'fire' (the shot wins: it fires lethally, 'subdue order overridden'). Required when readying a ranged attack under the order; a melee swing under the order is non-lethal unless 'fire'")
 });
 export type ReadiedAttack = z.infer<typeof ReadiedAttackSchema>;
 
@@ -295,6 +359,23 @@ export const ReadiedSchema = z.object({
     trigger: z.string().min(1),
     on: z.enum(READIED_TRIGGERS).optional().describe('enters_reach | leaves_reach: the engine watches moves for it. Unset = free text, fired by hand with trigger_readied'),
     watch: z.string().optional().describe("Who sets it off: a participant id or name, 'enemy' (default) or 'any'"),
-    attack: ReadiedAttackSchema.optional().describe('{using?, attackBonus?, damage?, damageType?, withPart?}: with this the readied attack fires itself as a reaction')
+    attack: ReadiedAttackSchema.optional().describe("{using?, attackBonus?, damage?, damageType?, withPart?, ranged?, onSubdue?: 'hold' | 'fire'}: with this the readied attack fires itself as a reaction")
 });
 export type Readied = z.infer<typeof ReadiedSchema>;
+
+/** Lane G2 review: the keys a readied attack takes, to name the ones a call passed that it does not. */
+export const READIED_ATTACK_KEYS: readonly string[] = Object.keys(ReadiedAttackSchema.shape);
+
+/**
+ * Lane G2 review: the readied attack as a call takes it. A default-strip
+ * object dropped a key it does not declare in silence (a misspelt `ranged`
+ * under a subdue order skipped the ready-time refusal and nothing said why),
+ * so the input keeps unknown keys for the handler to name in ignoredParams
+ * and strip before anything is stored (splitReadiedAttack). Factories: one
+ * zod instance per use, inner and outer schemas alike. The stored form
+ * (ReadiedSchema, the encounter state) stays strict.
+ */
+export const readiedAttackInputSchema = () => ReadiedAttackSchema.passthrough();
+export const readiedInputSchema = () => ReadiedSchema.extend({
+    attack: readiedAttackInputSchema().optional().describe(ReadiedSchema.shape.attack.description ?? '')
+});

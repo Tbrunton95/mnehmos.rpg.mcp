@@ -139,7 +139,7 @@ describe('encounter environment', () => {
     it('movement budget is swimSpeed, else half speed', async () => {
         fresh();
         await fight({ environment: { medium: 'water' } });
-        await manage({ action: 'advance' });
+        await manage({ action: 'advance', confirm: true });
         expect(tok('eel').movementRemaining).toBe(40);
         await manage({ action: 'advance' });
         expect(tok('diver').movementRemaining).toBe(15);
@@ -149,7 +149,7 @@ describe('encounter environment', () => {
         fresh();
         await fight({ environment: { medium: 'water', depthFt: 300, pressure: { startsAtFt: 100, damagePerRound: 5 } } });
         // The eel carries the swim tag: pressure-adapted by default.
-        let text = await manage({ action: 'advance' });
+        let text = await manage({ action: 'advance', confirm: true });
         expect(text).not.toMatch(/takes \d+ pressure damage/);
         expect(tok('eel').hp).toBe(40);
         text = await manage({ action: 'advance' });
@@ -160,7 +160,7 @@ describe('encounter environment', () => {
     it('rolls dice pressure damage, and unlessTag names who is spared', async () => {
         fresh();
         await fight({ environment: { medium: 'water', depthFt: 300, pressure: { startsAtFt: 100, damagePerRound: '1d4', unlessTag: 'pressure-proof' } } });
-        await manage({ action: 'advance' });
+        await manage({ action: 'advance', confirm: true });
         expect(tok('eel').hp).toBeLessThan(40);
         expect(tok('eel').hp).toBeGreaterThanOrEqual(36);
     });

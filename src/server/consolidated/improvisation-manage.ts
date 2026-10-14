@@ -15,9 +15,7 @@ import { CustomEffectsRepository } from '../../storage/repos/custom-effects.repo
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import {
     WILD_SURGE_TABLE,
-    SKILL_TO_ABILITY,
     MechanicTypeSchema,
-    SkillName,
     TriggerEvent,
     ActorType
 } from '../../schema/improvisation.js';
@@ -25,9 +23,10 @@ import { loadAutoMechanics, autoSkillBonus, applyDeclaredEffects } from '../../e
 import { matchSkillAdvantage, denialFor, sceneSensesFor, type SkillAdvantageTrait } from '../../engine/senses.js';
 import { armourStealthDisadvantage } from '../../engine/armor.js';
 import { loggedD20, loggedRoller, type DiceRoller } from '../../math/logged-d20.js';
-import { resolveWorldId, worldSkillAbility } from '../../engine/table-rules.js';
+import { resolveWorldId, worldSkillAbility, loadRules } from '../../engine/table-rules.js';
+import { validateAdvantageMechanics } from '../../engine/advantage-scope.js';
 import { worldProgression } from '../../engine/progression.js';
-import { skillModifier as sheetSkillModifier, abilityModifier as sheetAbilityModifier, overrideColumn, signed, type SkillSheet, type ShortAbility, type SkillModifier } from '../../engine/skill-modifier.js';
+import { skillModifier as sheetSkillModifier, abilityModifier as sheetAbilityModifier, overrideColumn, signed, skillKey as canonicalSkillKey, resolveSkillAbility, unmappedSkillWarning, type SkillSheet, type ShortAbility, type SkillModifier } from '../../engine/skill-modifier.js';
 import { getOrLoadEngine, syncParticipantHpFromDb } from '../handlers/combat-handlers.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { v4 as uuidv4 } from 'uuid';
@@ -227,8 +226,8 @@ const ApplyEffectSchema = z.object({
     sourceEntityName: z.string().optional(),
     mechanics: z.array(z.object({
         type: z.string().describe('Canonical: attack_bonus, damage_bonus, ac_bonus, damage_resistance, saving_throw_bonus, skill_bonus, advantage_on, disadvantage_on — #96: obvious words (advantage, resistance, immunity, attack, damage, ac, save, skill) auto-normalize to these at write time'),
-        value: z.union([z.string(), z.number()]).optional().describe('Fixed value — optional when valueFromPool is present (FINDINGS #60)'),
-        condition: z.string().optional(),
+        value: z.union([z.string(), z.number()]).optional().describe("Fixed value — optional when valueFromPool is present (FINDINGS #60). Play report 7: on advantage_on / disadvantage_on, text is a scope (attack, attack:melee, attack:ranged, grapple, grapple:<move>, check:<skill>, check:<ability>, save:<ability>, initiative), checked at write time"),
+        condition: z.string().optional().describe("Prose gate, or an autoApply domain filter. Play report 7: on a scoped advantage_on / disadvantage_on, a when-tag ('head-on'): it fires only when the roll passes context: ['head-on'] or names the effect in advantageSources; untagged, it fires on every roll in its scope"),
         autoApply: z.boolean().optional().describe('RESOLVER OPT-IN: engine consumes this mechanic at call time'),
         valueFromPool: z.object({
             pool: z.string(),
@@ -393,14 +392,38 @@ function normalizeMechanics<T extends { type: string }>(mechanics: T[] | undefin
     });
 }
 
+/**
+ * Play report 7 #7 (the owner's spec): an advantage_on / disadvantage_on
+ * mechanic with text in value is a scope — 'grapple', 'check:athletics',
+ * 'save:dex' — checked here, before anything is written, and stored in its
+ * canonical form. Anything outside the grammar is refused naming the
+ * accepted forms; check:<skill> takes the 18 SRD skills, an ability, or the
+ * target's world skills (a target with no world takes any skill name). The
+ * older form (a number in value, skill/save/autoApply) passes untouched.
+ */
+function scopeCheckedMechanics<T extends { type: string }>(db: ReturnType<typeof getDb>, targetId: string, mechanics: T[] | undefined, actionType: string, stored?: readonly unknown[]): { mechanics?: T[]; refusal?: Record<string, unknown> } {
+    const normalized = normalizeMechanics(mechanics);
+    if (!normalized?.length) return { mechanics: normalized };
+    const worldId = resolveWorldId(db, { characterIds: [targetId] });
+    const worldSkills = worldId ? loadRules(db, worldId, 'skill').map(r => r.name) : undefined;
+    // edit_effect / replace_effect: a mechanic the row already holds, re-sent unchanged, passes as it is.
+    const checked = validateAdvantageMechanics(normalized, { worldSkills, stored });
+    if (!checked.problems.length) return { mechanics: checked.mechanics };
+    return {
+        refusal: {
+            error: true, actionType, writes: 'none', mechanicProblems: checked.problems,
+            message: `${actionType} refused: ${checked.problems.join(' ')} A condition stays prose; an advantage is declared as {type: 'advantage_on', value: '<scope>', condition?: '<when-tag>'} (docs/table-rules/advantage.md). Nothing was written.`
+        }
+    };
+}
+
 async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionContext): Promise<object> {
     const { db, charRepo } = ensureDb();
     // Item 8: which ability the skill rolls with, before any die is rolled.
-    const srdSkill = args.skill.toLowerCase().replace(/[\s-]+/g, '_') as SkillName;
+    // Play report 7 #11: the shared resolver (given, world, SRD in any spelling).
     const worldAbility = worldSkillAbility(db, resolveWorldId(db, { encounterId: args.encounterId, characterIds: [args.actorId] }), args.skill);
-    const stuntAbility = args.ability
-        ?? (worldAbility ? LONG_ABILITY[worldAbility] : undefined)
-        ?? (Object.hasOwn(SKILL_TO_ABILITY, srdSkill) ? SKILL_TO_ABILITY[srdSkill] : undefined);
+    const resolvedAbility = resolveSkillAbility(args.skill, { given: args.ability, world: worldAbility }).ability;
+    const stuntAbility = resolvedAbility ? LONG_ABILITY[resolvedAbility] : undefined;
     if (!stuntAbility) {
         throw new Error(`Skill '${args.skill}' is not an SRD skill or a skill this world defines (table_rules skill): pass ability (str, dex, con, int, wis or cha) for it. Nothing was rolled.`);
     }
@@ -434,7 +457,7 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
         const actor = charRepo.findById(args.actorId);
         if (actor?.stats) {
             actorName = actor.name;
-            const skillKey = (args.skill || '').toLowerCase().replace(/ /g, '_');
+            const skillKey = canonicalSkillKey(args.skill || '');
             // Play report 2 #5: the stunt rolls the SAME number roll_skill_check
             // rolls (src/engine/skill-modifier.ts) — ability + proficiency
             // (+ expertise, case-folded, #104-D) on the world's curve, or the
@@ -471,7 +494,7 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
     const autoApplied: import('../../engine/effects-resolver.js').AutoApplication[] = [];
     const resolverProblems: string[] = [];
     try {
-        const skillKey = (args.skill || '').toLowerCase().replace(/ /g, '_');
+        const skillKey = canonicalSkillKey(args.skill || '');
         const mechs = loadAutoMechanics(db, args.actorId);
         skillModifier += autoSkillBonus(mechs, skillKey, autoApplied);
         const dRefs = args.declaredEffects ?? [];
@@ -658,9 +681,11 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
 }
 
 async function handleApplyEffect(args: z.infer<typeof ApplyEffectSchema>): Promise<object> {
-    const { effectsRepo, charRepo } = ensureDb();
+    const { db, effectsRepo, charRepo } = ensureDb();
     const callStarted = new Date().toISOString();
     const targetId = canonicalTargetId(charRepo, args.targetId);
+    const scoped = scopeCheckedMechanics(db, targetId, args.mechanics, 'apply_effect');
+    if (scoped.refusal) return scoped.refusal;
 
     const effect = effectsRepo.apply({
         target_id: targetId,
@@ -670,7 +695,7 @@ async function handleApplyEffect(args: z.infer<typeof ApplyEffectSchema>): Promi
         category: args.category,
         power_level: args.powerLevel,
         source: { type: args.sourceType, entity_name: args.sourceEntityName },
-        mechanics: normalizeMechanics(args.mechanics) as any,
+        mechanics: scoped.mechanics as any,
         duration: { type: args.durationType as any, value: args.durationValue },
         triggers: args.triggers?.map(t => ({ event: t.event as any, condition: t.condition })) || [],
         removal_conditions: [{ type: 'duration_expires' as const }],
@@ -699,14 +724,16 @@ async function handleApplyEffect(args: z.infer<typeof ApplyEffectSchema>): Promi
 }
 
 async function handleEditEffect(args: z.infer<typeof EditEffectSchema>): Promise<object> {
-    const { effectsRepo, charRepo } = ensureDb();
+    const { db, effectsRepo, charRepo } = ensureDb();
     const found = args.effectId !== undefined
         ? effectsRepo.findById(args.effectId)
         : args.targetId && args.name ? effectsRepo.findByTargetAndName(canonicalTargetId(charRepo, args.targetId), args.targetType, args.name) : null;
     if (!found) throw new Error(`No active effect ${args.effectId ?? `'${args.name}' on ${args.targetId}`}. Nothing was written.`);
+    const scoped = args.mechanics ? scopeCheckedMechanics(db, found.target_id, args.mechanics, 'edit_effect', found.mechanics as unknown[]) : undefined;
+    if (scoped?.refusal) return scoped.refusal;
     const edited = effectsRepo.editFields(found.id, {
         name: args.rename, description: args.description, descriptionReplace: args.descriptionReplace,
-        mechanics: args.mechanics ? normalizeMechanics(args.mechanics) as never : undefined,
+        mechanics: scoped ? scoped.mechanics as never : undefined,
         triggers: args.triggers?.map(t => ({ event: t.event as never, condition: t.condition })),
         cost: args.cost, durationType: args.durationType, durationValue: args.durationValue
     });
@@ -715,19 +742,21 @@ async function handleEditEffect(args: z.infer<typeof EditEffectSchema>): Promise
 }
 
 async function handleFeatureFromCondition(args: z.infer<typeof FeatureFromConditionSchema>): Promise<object> {
-    const { effectsRepo, charRepo } = ensureDb();
+    const { db, effectsRepo, charRepo } = ensureDb();
     const char = charRepo.findById(args.characterId);
     if (!char) throw new Error(`Character ${args.characterId} not found`);
     const conds = (char.conditions ?? []) as Array<{ name: string; duration?: number; source?: string }>;
     const hits = conds.filter(c => c.name.toLowerCase().includes(args.match.toLowerCase()));
     if (hits.length !== 1) throw new Error(hits.length ? `'${args.match}' matches ${hits.length} conditions; use more of the text. Nothing was written.` : `'${args.match}' matches no condition. Nothing was written.`);
+    const scoped = scopeCheckedMechanics(db, char.id, args.mechanics ?? [], 'feature_from_condition');
+    if (scoped.refusal) return scoped.refusal;
     const text = hits[0].name;
     const name = args.name ?? (text.split(':')[0].trim().slice(0, 80) || text.slice(0, 80));
     const effect = effectsRepo.apply({
         target_id: char.id, target_type: args.targetType, name, description: text,
         category: args.category, power_level: args.powerLevel,
         source: { type: args.sourceType, entity_name: args.sourceEntityName ?? hits[0].source },
-        mechanics: normalizeMechanics(args.mechanics ?? []) as never,
+        mechanics: (scoped.mechanics ?? []) as never,
         duration: { type: args.durationType as never, value: args.durationValue },
         triggers: args.triggers?.map(t => ({ event: t.event as never, condition: t.condition })) || [],
         removal_conditions: [{ type: 'duration_expires' as const }], stackable: false, max_stacks: 1, cost: args.cost
@@ -795,7 +824,6 @@ async function handleRemoveEffect(args: z.infer<typeof RemoveEffectSchema>): Pro
 async function handleReplaceEffect(args: z.infer<typeof ReplaceEffectSchema>): Promise<object> {
     const { db, effectsRepo, charRepo } = ensureDb();
     const targetId = canonicalTargetId(charRepo, args.targetId);
-
     // Resolve the OLD row first. The NEW payload already passed schema
     // validation (incl. the silent-zero mechanic guard) before this handler
     // ran — so a bad payload refused with the old row UNTOUCHED.
@@ -807,6 +835,10 @@ async function handleReplaceEffect(args: z.infer<typeof ReplaceEffectSchema>): P
         old = effectsRepo.getEffectsOnTarget(targetId, args.targetType as ActorType, {})
             .find(e => e.name.toLowerCase() === wantName) ?? null;
     }
+    // Play report 7 #7: the new payload's scopes are checked before the old
+    // row is touched; a mechanic the old row holds, re-sent unchanged, passes.
+    const scoped = scopeCheckedMechanics(db, targetId, args.mechanics, 'replace_effect', old?.mechanics as unknown[] | undefined);
+    if (scoped.refusal) return scoped.refusal;
     if (!old) {
         return {
             error: true,
@@ -827,7 +859,7 @@ async function handleReplaceEffect(args: z.infer<typeof ReplaceEffectSchema>): P
             category: args.category,
             power_level: args.powerLevel,
             source: { type: args.sourceType, entity_name: args.sourceEntityName },
-            mechanics: normalizeMechanics(args.mechanics) as any,
+            mechanics: scoped.mechanics as any,
             duration: { type: args.durationType as any, value: args.durationValue },
             triggers: args.triggers?.map(t => ({ event: t.event as any, condition: t.condition })) || [],
             removal_conditions: [{ type: 'duration_expires' as const }],
@@ -1162,7 +1194,7 @@ async function handleMontage(args: z.infer<typeof MontageSchema>): Promise<objec
     // traits (skillAdvantage + context) and the worn armour's stealth penalty;
     // advantage rolls the notation twice and keeps the higher total, disadvantage
     // the lower, and the two cancel as normal. A scene denial is quoted.
-    const skillKey = args.skill ? args.skill.trim().toLowerCase().replace(/[\s-]+/g, '_') : undefined;
+    const skillKey = args.skill ? canonicalSkillKey(args.skill) : undefined;
     const advFrom: string[] = [];
     const disFrom: string[] = [];
     let deniedAdvantage: Array<{ trait: string; when: string; reason: string }> | undefined;
@@ -1194,12 +1226,6 @@ async function handleMontage(args: z.infer<typeof MontageSchema>): Promise<objec
         advantageRoll = { rolls: [rolled.total, second.total], kept: kept.total, mode: advantage ? 'higher kept' : 'lower kept' };
         rolled = kept;
     }
-    const MONTAGE_SKILL_ABILITY: Record<string, string> = {
-        athletics: 'str', acrobatics: 'dex', sleight_of_hand: 'dex', stealth: 'dex',
-        arcana: 'int', history: 'int', investigation: 'int', nature: 'int', religion: 'int',
-        animal_handling: 'wis', insight: 'wis', medicine: 'wis', perception: 'wis', survival: 'wis',
-        deception: 'cha', intimidation: 'cha', performance: 'cha', persuasion: 'cha'
-    };
     // Play report 6 #1: the montage rolls the SAME number roll_skill_check and
     // stunts roll (src/engine/skill-modifier.ts) — ability + proficiency
     // (doubled by expertise) on the world's progression curve, or the
@@ -1207,7 +1233,8 @@ async function handleMontage(args: z.infer<typeof MontageSchema>): Promise<objec
     // skill's governing stat only; proficiency still applies. Ability alone
     // (no skill) adds just that ability's modifier. Varek rolled 16 where
     // roll_skill_check rolled 19 because this line added the bare stat.
-    const abilityName = args.ability ?? (skillKey ? (worldSkillAbility(db, worldId, args.skill) ?? MONTAGE_SKILL_ABILITY[skillKey]) : undefined);
+    // Play report 7 #11: the shared resolver (given, world, SRD in any spelling).
+    const abilityName = args.ability ?? (skillKey ? resolveSkillAbility(args.skill!, { world: worldSkillAbility(db, worldId, args.skill) }).ability : undefined);
     const ability = abilityName ? abilityName.substring(0, 3).toLowerCase() as ShortAbility : undefined;
     let sm: SkillModifier | undefined;
     let abilityMod = 0;
@@ -1222,7 +1249,7 @@ async function handleMontage(args: z.infer<typeof MontageSchema>): Promise<objec
     }
     // A skill the engine cannot map rolls with no skill modifier: said, not swallowed.
     const montageWarnings: string[] = [];
-    if (skillKey && !ability) montageWarnings.push(`skill '${args.skill}' names no ability (not an SRD skill or a world skill): rolled with no skill modifier (no ability, no proficiency) — pass ability, or define it with table_rules {kind: 'skill', name: '${args.skill}', spec: {ability}}`);
+    if (skillKey && !ability) montageWarnings.push(unmappedSkillWarning(args.skill!));
     const total = rolled.total + skillMod + args.modifier;
     const cleanAt = args.dc + args.cleanMargin;
     const tier: MontageTier = total >= cleanAt ? 'clean' : total >= args.dc ? 'hard_won' : 'costly';
@@ -1428,6 +1455,7 @@ CUSTOM EFFECTS (apply_effect):
 - type ∈ ${MechanicTypeSchema.options.join(', ')}
 - Categories: boon, curse, neutral, transformative | Power levels 1-5 | Duration types: rounds, minutes, hours, days, permanent, until_removed
 - Use custom_trigger (value 1) for narrative-only effects with no numeric rider
+- DECLARED ADVANTAGE (play report 7): a condition stays prose; anything that changes a roll is a mechanic {type: 'advantage_on' | 'disadvantage_on', value: '<scope>', condition?: '<when-tag>'}. Scopes: attack, attack:melee, attack:ranged, grapple, grapple:<move>, check:<skill>, check:<ability>, save:<ability>, initiative — anything else is refused at write time (apply_effect, edit_effect, replace_effect, feature_from_condition; writes: none, mechanicProblems). Untagged, it fires on every roll in its scope; with condition: 'head-on' it fires only when the roll passes context: ['head-on'] or names the effect in advantageSources. Convert a prose condition in one call: feature_from_condition {characterId, match: 'Horn-Lock', mechanics: [{type: 'advantage_on', value: 'grapple', condition: 'head-on'}]}. The older form ({value: 1, save: 'wisdom'}, autoApply) keeps its meaning. docs/table-rules/advantage.md
 - Example: { action: "apply_effect", targetId: "char_1", targetType: "character", name: "Forge Blessing", category: "boon", powerLevel: 2, durationType: "until_removed", mechanics: [{ type: "attack_bonus", value: 2, condition: "melee" }, { type: "damage_resistance", value: "fire" }] }
 
 MONTAGE (forty-eight cells, one roll):
@@ -1479,7 +1507,7 @@ ARCANE SYNTHESIS:
         powerLevel: z.number().optional(),
         sourceType: z.string().optional(),
         sourceEntityName: z.string().optional(),
-        mechanics: z.array(z.any()).optional().describe('apply_effect: array of {type, value, condition?}. type is a closed enum (attack_bonus, damage_bonus, ac_bonus, saving_throw_bonus, skill_bonus, advantage_on, disadvantage_on, damage_resistance, damage_vulnerability, damage_immunity, damage_over_time, healing_over_time, extra_action, prevent_action, movement_modifier, sense_granted, sense_removed, speak_language, cannot_speak, custom_trigger). value is number for bonuses or string for typed effects'),
+        mechanics: z.array(z.any()).optional().describe('apply_effect: array of {type, value, condition?}. type is a closed enum (attack_bonus, damage_bonus, ac_bonus, saving_throw_bonus, skill_bonus, advantage_on, disadvantage_on, damage_resistance, damage_vulnerability, damage_immunity, damage_over_time, healing_over_time, extra_action, prevent_action, movement_modifier, sense_granted, sense_removed, speak_language, cannot_speak, custom_trigger). value is number for bonuses or string for typed effects. advantage_on / disadvantage_on (play report 7): value is a scope — attack, attack:melee, attack:ranged, grapple, grapple:<move>, check:<skill>, check:<ability>, save:<ability>, initiative — and condition a when-tag; anything else is refused at write time'),
         durationType: z.string().optional(),
         durationValue: z.number().optional(),
         triggers: z.array(z.any()).optional().describe('apply_effect: array of {event, condition?}. event is a closed enum (always_active, start_of_turn, end_of_turn, on_attack, on_hit, on_miss, on_damage_taken, on_heal, on_rest, on_spell_cast, on_death)'),

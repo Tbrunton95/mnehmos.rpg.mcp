@@ -355,7 +355,9 @@ registerSpell({
         damageType: 'force',
         upcastBonus: { dice: '1d8', perLevel: 2 }
     }],
-    autoHit: false
+    autoHit: false,
+    // 5e: the weapon makes a melee spell attack against a creature within 5 ft of it.
+    spellAttack: 'melee'
 });
 
 // ============================================================================

@@ -111,6 +111,53 @@ describe('action router unknownKeys', () => {
         expect(JSON.parse((await quiet({ action: 'create', name: 'n', bogus: 1 })).content[0].text).ignoredParams).toEqual(['bogus']);
     });
 
+    // Play report 7 #2: a handler that reports keys it dropped itself (nested
+    // participant keys at combat_manage create) keeps them; the router's
+    // top-level keys are added after, never written over them.
+    it("a handler's own ignoredParams are merged with the router's, not overwritten", async () => {
+        const nested = createActionRouter({
+            actions: ['create'] as const,
+            definitions: {
+                create: {
+                    schema: z.object({ action: z.string(), name: z.string() }),
+                    handler: async (a: { name: string }) => ({
+                        success: true, name: a.name, ignoredParams: ['participants[1].str'],
+                        message: "Created. Ignored params (not participant keys; nothing was written for them): participants[1].str — an ability score."
+                    })
+                }
+            }
+        });
+        const both = JSON.parse((await nested({ action: 'create', name: 'X', nmae: 'Y' })).content[0].text);
+        expect(both.ignoredParams).toEqual(['participants[1].str', 'nmae']);
+        expect(both.message).toContain('participants[1].str — an ability score');
+        expect(both.message).toContain("nmae — nearest valid key 'name'");
+        const own = JSON.parse((await nested({ action: 'create', name: 'X' })).content[0].text);
+        expect(own.ignoredParams).toEqual(['participants[1].str']);
+    });
+
+    // Review: a key the handler already named is not listed (or noted) twice.
+    it('a top-level key the handler already reported is not listed or noted twice', async () => {
+        const self = createActionRouter({
+            actions: ['create'] as const,
+            definitions: {
+                create: {
+                    schema: z.object({ action: z.string(), name: z.string() }),
+                    handler: async (a: { name: string }) => ({
+                        success: true, name: a.name, ignoredParams: ['nmae'],
+                        message: "Created. Ignored params (not create parameters; nothing was written for them): nmae — nearest valid key 'name'."
+                    })
+                }
+            }
+        });
+        const one = JSON.parse((await self({ action: 'create', name: 'X', nmae: 'Y' })).content[0].text);
+        expect(one.ignoredParams).toEqual(['nmae']);
+        expect(one.message.split('nmae —').length - 1).toBe(1);
+        const two = JSON.parse((await self({ action: 'create', name: 'X', nmae: 'Y', bogus: 1 })).content[0].text);
+        expect(two.ignoredParams).toEqual(['nmae', 'bogus']);
+        expect(two.message.split('nmae —').length - 1).toBe(1);
+        expect(two.message).toContain('bogus —');
+    });
+
     it('an error reply is never decorated', async () => {
         const failing = createActionRouter({
             actions: ['boom'] as const,

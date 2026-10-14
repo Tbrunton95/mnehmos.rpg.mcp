@@ -9,6 +9,7 @@ import { withOperation } from '../../src/server/operation-guard.js';
 import { withSession } from '../../src/server/types.js';
 import { clearCombatState } from '../../src/server/handlers/combat-handlers.js';
 import { closeDb, getDb } from '../../src/storage/index.js';
+import { CustomEffectsRepository } from '../../src/storage/repos/custom-effects.repo.js';
 
 /**
  * Play report 4, item 1, over the real MCP boundary. The GM's words were
@@ -81,6 +82,32 @@ describe('grapple advantage over the MCP boundary (play report 4)', () => {
         expect(props.disadvantage?.type).toBe('boolean');
         expect(props.advantageSources).toEqual(expect.objectContaining({ type: 'array', items: expect.objectContaining({ type: 'string' }) }));
         expect(props.disadvantageSources).toEqual(expect.objectContaining({ type: 'array', items: expect.objectContaining({ type: 'string' }) }));
+        // Play report 7 #7: the GM's one-off reasons and the grapple's tags.
+        expect(props.situationalAdvantage?.type).toBe('string');
+        expect(props.situationalDisadvantage?.type).toBe('string');
+        expect(props.context).toEqual(expect.objectContaining({ type: 'array', items: expect.objectContaining({ type: 'string' }) }));
+    });
+
+    it("play report 7: situationalAdvantage and context cross the boundary; a declared, tagged effect fires on the tag", async () => {
+        new CustomEffectsRepository(getDb()).apply({
+            target_id: 'marine', target_type: 'character', name: 'Horn-Lock', description: 'locks horns head-on',
+            category: 'neutral', power_level: 1, source: { type: 'unknown' },
+            mechanics: [{ type: 'advantage_on', value: 'grapple', condition: 'head-on' }] as never, duration: { type: 'until_removed' as never },
+            triggers: [], removal_conditions: [{ type: 'duration_expires' as const }], stackable: false, max_stacks: 1
+        } as never);
+        await fight([marine, cultist]);
+        let spy = dice(5, 18, 9);
+        const downhill = await call('combat_action', { action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', situationalAdvantage: 'downhill' });
+        expect(downhill.error).toBeFalsy();
+        expect(downhill.situational).toEqual(['Marine: advantage (GM: downhill)']);
+        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (adv: GM: downhill)' }));
+        spy = dice(5, 18, 9);
+        const headOn = await call('combat_action', { action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', context: ['head-on'] });
+        expect(headOn.advantageSources).toEqual(['Horn-Lock (head-on)']);
+        expect(headOn.rolls.actor).toEqual([5, 18]);
+        // An empty reason is refused by the SDK before the handler.
+        const empty = await client.callTool({ name: 'combat_action', arguments: { action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', situationalAdvantage: '' } }) as { isError?: boolean };
+        expect(empty.isError).toBe(true);
     });
 
     it("the GM's call — grapple {move: 'throw', advantage: true} — rolls the actor two d20s, keeps the high one and names the reason", async () => {
@@ -106,6 +133,13 @@ describe('grapple advantage over the MCP boundary (play report 4)', () => {
     });
 
     it('advantageSources survive the outer schema as an array and as a JSON string; disadvantage: true keeps the low die', async () => {
+        // Play report 7 #7: the token's prose condition declares nothing; the feature beside it (same label) does.
+        new CustomEffectsRepository(getDb()).apply({
+            target_id: 'marine', target_type: 'character', name: 'Bulwark Stance', description: 'braced',
+            category: 'neutral', power_level: 1, source: { type: 'unknown' },
+            mechanics: [{ type: 'advantage_on', value: 1, skill: 'athletics' }] as never, duration: { type: 'until_removed' as never },
+            triggers: [], removal_conditions: [{ type: 'duration_expires' as const }], stackable: false, max_stacks: 1
+        } as never);
         await fight([marine, cultist]);
         dice(5, 18, 9);
         const arr = await call('combat_action', { action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantageSources: ['bulwark'] });

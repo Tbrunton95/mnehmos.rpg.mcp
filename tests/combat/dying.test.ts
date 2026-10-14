@@ -367,7 +367,7 @@ describe('through the tools', () => {
         it('auto-rolls the save; a natural 20 writes 1 HP to the sheet and the next sync keeps it', async () => {
             await start();
             d20(20);
-            const r = await manage({ action: 'advance', encounterId: enc });
+            const r = await manage({ action: 'advance', encounterId: enc, confirm: true });
             expect(r.currentTurn.id).toBe('hero');
             expect(r.deathSaves[0]).toMatchObject({ participantId: 'hero', roll: 20, regainedHp: true });
             expect(r.rawText).toMatch(/NATURAL 20/);
@@ -380,7 +380,7 @@ describe('through the tools', () => {
             await start();
             setToken('hero', { deathSaveFailures: 2 });
             d20(4);
-            const r = await manage({ action: 'advance', encounterId: enc });
+            const r = await manage({ action: 'advance', encounterId: enc, confirm: true });
             expect(r.rawText).toMatch(/Hero.*DEAD/);
             expect(r.deathSaves[0]).toMatchObject({ participantId: 'hero', isDead: true });
             expect(r.killed[0]).toMatchObject({ participantId: 'hero', cause: expect.stringMatching(/death save/) });
@@ -392,7 +392,7 @@ describe('through the tools', () => {
         it('a success and a failure show as counters in the state view and STATE_JSON', async () => {
             await start();
             d20(15);
-            await manage({ action: 'advance', encounterId: enc });
+            await manage({ action: 'advance', encounterId: enc, confirm: true });
             const got = await manage({ action: 'get', encounterId: enc });
             expect(got.rawText).toMatch(/Hero.*🩸 DYING ✓1 ✗0/);
             expect(got.participants.find((p: any) => p.id === 'hero').deathSaves).toMatchObject({ successes: 1, failures: 0, status: 'dying' });
@@ -402,7 +402,7 @@ describe('through the tools', () => {
             new WorldRepository(getDb()).updateEnvironment(W, { deathSaveMode: 'prompt' });
             await start();
             const spy = d20(14);
-            const due = await manage({ action: 'advance', encounterId: enc });
+            const due = await manage({ action: 'advance', encounterId: enc, confirm: true });
             expect(spy).not.toHaveBeenCalled();
             expect(due.currentTurn.id).toBe('hero');
             expect(due.deathSaveDue).toMatchObject({ participantId: 'hero', name: 'Hero', successes: 0, failures: 0 });
@@ -423,7 +423,7 @@ describe('through the tools', () => {
             expect(row('hero').deathSaveMode).toBe('prompt');
             await start();
             const spy = d20(14);
-            const due = await manage({ action: 'advance', encounterId: enc });
+            const due = await manage({ action: 'advance', encounterId: enc, confirm: true });
             expect(spy).not.toHaveBeenCalled();
             expect(due.deathSaveDue.participantId).toBe('hero');
         });
@@ -470,8 +470,8 @@ describe('through the tools', () => {
     describe('damage and healing through the tools', () => {
         it('a hit on the downed hero adds failures and reports them; the dropping blow adds the conditions and mirrors them', async () => {
             await start({ hp: 6 });
-            await manage({ action: 'advance', encounterId: enc }); // medic → hero passes? no: hero is at 6 HP, so hero acts
-            await manage({ action: 'advance', encounterId: enc }); // → gob
+            await manage({ action: 'advance', encounterId: enc, confirm: true }); // medic → hero passes? no: hero is at 6 HP, so hero acts
+            await manage({ action: 'advance', encounterId: enc, confirm: true }); // → gob
             const drop = await act({ action: 'attack', encounterId: enc, actorId: 'gob', targetId: 'hero', outcome: 'hit', damage: 6, ranged: true });
             expect(drop.actionResult.dying).toMatchObject({ dropped: true, failures: 0 });
             expect(drop.rawText).toMatch(/DYING ✓0 ✗0/);
@@ -487,8 +487,8 @@ describe('through the tools', () => {
 
         it('massive damage from a hit kills: the sheet is killed with a corpse', async () => {
             await start({ hp: 6 });
-            await manage({ action: 'advance', encounterId: enc });
-            await manage({ action: 'advance', encounterId: enc });
+            await manage({ action: 'advance', encounterId: enc, confirm: true });
+            await manage({ action: 'advance', encounterId: enc, confirm: true });
             const r = await act({ action: 'attack', encounterId: enc, actorId: 'gob', targetId: 'hero', outcome: 'hit', damage: 30, ranged: true });
             expect(r.actionResult.dying).toMatchObject({ dead: true, instantDeath: true });
             expect(r.actionResult.killed).toMatchObject({ participantId: 'hero' });

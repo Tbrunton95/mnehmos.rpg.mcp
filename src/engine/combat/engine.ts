@@ -3,14 +3,18 @@ import { fightingStyleEffects } from './fighting-style.js';
 import { absorbWithShields, roleState, sectionRole } from './vessel.js';
 import { damageWithModifiers } from './damage-modifiers.js';
 import { findPart as findNamedPart, matchProfile } from './parts.js';
-import { CombatRNG, CheckResult } from './rng.js';
+import { CombatRNG, CheckResult, checkDegreeOf } from './rng.js';
 import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS, conditionAttackModifiers, conditionSpeedFactor } from './conditions.js';
 
 import { SizeCategory, GridBounds, edgeDistanceSquares, effectiveReachFt, type EncounterEnvironment } from '../../schema/encounter.js';
 import { resolveCover, coverArithmetic, ignoredCoverLine, totalCoverRefusal, ignoreCoverFor, type CoverResolution, type StandingCover, type IgnoreCoverScopes, type IgnoreCover } from './cover.js';
 import { mobAttackBonus } from './units.js';
 import { nonlethalSource, isNonlethalUnconscious, clearNonlethalUnconscious } from './nonlethal.js';
+import { controlledMountOf, isControlledMount } from './mounts.js';
 import { applyDeathSaveOutcome, damageAtZero, deathSaveCall, dyingLabel, dyingTail, isDying, outcomeOfRoll, wakeFromDying, markStable, counters as deathCounters, type DeathSaveMode, type DeathSaveOutcome, type DeathSaveResult, type DyingUpdate } from './dying.js';
+import { offTurnEconomyNote } from './turn-guard.js';
+import { hasSides, purposeWithSources, rollSidesNote, type DeclaredSides, type InitiativeDeclared } from '../attack-advantage.js';
+import { conditionSaveDisadvantage, tokenSaveConditions } from '../advantage-sources.js';
 export type { DeathSaveResult, DyingUpdate, DeathSaveMode, DeathSaveOutcome } from './dying.js';
 
 /**
@@ -53,6 +57,7 @@ export interface CombatParticipant {
     isDodging?: boolean;          // Dodge: attacks against it roll at disadvantage until its next turn
     helpedBy?: string;            // Help: advantage on its next attack, granted by this participant
     band?: string;                // Table rules: power band (see table_rules band)
+    bandAssumed?: boolean;        // Play report 7 #3: band is the world's lowest, assumed at create (nothing gave one); set_band clears it
     regeneration?: number;        // Table rules: HP healed at the start of each of its own turns
     parts?: Part[];               // Named body parts with states (crippled, dead, latched, breached)
     unit?: Unit;                  // A mortal unit as one token (models, volley tiers)
@@ -129,6 +134,14 @@ export interface CombatParticipant {
     movedThisTurn?: number;          // Feet walked this turn (the move handler adds them; reset at turn start)
     movedSinceDash?: number;         // Feet walked since this turn's Dash (Dash resets it; requires.dashed + movedAtLeast reads it)
     meleeHitsThisTurn?: string[];    // Targets this token hit in melee this turn (requires.hitThisTurn)
+    // Play report 7 #6: any combat action this token took this turn (a free one, a placement); reset at its turn start. The PC turn guard reads it.
+    actedThisTurn?: boolean;
+    // Play report 7 #5: a standing order 'take them alive': opportunity attacks and readied melee swings are non-lethal.
+    subdue?: boolean;
+    // Play report 7 #10: rider and mount. The rider carries mountedOn; the mount carries riderId, and controlledBy when the rider controls it.
+    mountedOn?: string;
+    riderId?: string;
+    controlledBy?: string;
     // REQUEST 5: the void-combat lane (a token made from a create_vessel row)
     vessel?: VesselProfile;          // Section roles, shield regen; marks the token a vessel
     shields?: Shields;               // Drained before the hull; regen at the start of its turn
@@ -212,6 +225,14 @@ export interface CombatActionResult {
     // Play report 5, item 4: a non-lethal blow dropped the target — Unconscious
     // (sourced 'nonlethal: <actor>') and stable; no death saves, no kill, no corpse.
     knockedOut?: { by: string; stable: true };
+    // Play report 7 #5: how a standing subdue order shaped this automatic swing
+    // (an opportunity attack or a readied attack): non-lethal, n/a against a
+    // unit, or overridden by onSubdue 'fire'.
+    subdue?: { mode: 'non-lethal' | 'n/a: unit' | 'overridden'; note: string };
+    // Play report 7 #7 (lane F): the declared sources this attack roll took
+    // ('Bloodlust (attack:melee)', 'Horn Charge (charging, named)', 'GM: downhill').
+    advantageSources?: string[];
+    disadvantageSources?: string[];
     // A heal from 0 removed these (the knockout's Unconscious) from the target.
     woke?: { conditionsRemoved: string[] };
 
@@ -258,6 +279,50 @@ export interface DeathSaveEvent extends DeathSaveResult {
     note: string;
 }
 
+/**
+ * Play report 7 (lane H): what the handler layer knows of a saver that the
+ * pure engine does not, for a save the engine rolls by itself (the
+ * end-of-turn save of a save_ends condition): its declared sides for a save
+ * of this ability (the labels of untagged save:<ability> mechanics on its
+ * active effects; a tagged one as a hint, since nothing asserts a tag there)
+ * and its save modifier as every other engine save composes it (ability and
+ * save proficiency, with the parts). The engine never reads the database;
+ * the handlers pass a provider (saves.ts engineSaverSides) on create, advance
+ * and remove_participant. Undefined: the engine's own reading only.
+ */
+export interface SaverSides {
+    advantage: string[];
+    disadvantage: string[];
+    conditionalAdvantage?: string[];
+    conditionalDisadvantage?: string[];
+    modifier?: { total: number; parts: string[] };
+}
+export type SaverSidesProvider = (participant: CombatParticipant, ability: Ability) => SaverSides | undefined;
+
+/**
+ * Play report 7 (lane H): an end-of-turn save the last advance rolled for a
+ * save_ends condition: the dice (both when two were rolled; `natural` is the
+ * kept one), the modifier and its parts, whether it ended the condition, the
+ * sources and hints, and the line (also in turnStartNotes).
+ */
+export interface EndOfTurnSave {
+    participantId: string;
+    name: string;
+    condition: string;
+    ability: Ability;
+    dc: number;
+    rolls: number[];
+    natural: number;
+    modifier: number;
+    parts: string[];
+    total: number;
+    saved: boolean;
+    advantage?: string[];
+    disadvantage?: string[];
+    conditional?: string[];
+    line: string;
+}
+
 export interface EventEmitter {
     publish(topic: string, payload: any): void;
 }
@@ -274,8 +339,19 @@ export interface EventEmitter {
 export class CombatEngine {
     /** What happened at the start of the new turn (regeneration), for the advance output. */
     turnStartNotes: string[] = [];
+    /**
+     * Play report 7 #7 (lane F): the initiative rolls the last startEncounter
+     * or addParticipants made with a declared source, by participant id: the
+     * labels on each side and both dice when two were rolled. Read by the
+     * create and add_participant replies (lane B's initiative rows).
+     */
+    initiativeDeclared: Map<string, InitiativeDeclared> = new Map();
     /** Play report 5 #5: the death saves the last advance rolled on dying slots it passed (or stopped at). */
     deathSaveEvents: DeathSaveEvent[] = [];
+    /** Play report 7 (lane H): the end-of-turn saves (save_ends conditions) the last advance rolled. */
+    endOfTurnSaves: EndOfTurnSave[] = [];
+    /** Play report 7 (lane H): the handler-supplied reader for those saves (see SaverSides); unset: the engine's own reading. */
+    private saverSides: SaverSidesProvider | undefined;
     /** The world's default death-save mode for the advance in progress (handler-supplied; auto when unset). */
     private deathSaveModeDefault: DeathSaveMode | undefined;
     private rng: CombatRNG;
@@ -321,12 +397,13 @@ export class CombatEngine {
      * each, resorts the turn order, and keeps currentTurnIndex pointing at
      * the same actor (so an insertion ahead of the active turn doesn't skip it).
      */
-    addParticipants(newParticipants: CombatParticipant[]): CombatState {
+    addParticipants(newParticipants: CombatParticipant[], opts: { initiativeSources?: Record<string, DeclaredSides> } = {}): CombatState {
         if (!this.state) throw new Error('No active combat');
 
+        this.initiativeDeclared = new Map();
         const withInit = newParticipants.map(p => ({
             ...p,
-            initiative: this.tagged({ purpose: 'initiative', forId: p.id }, () => this.rng.d20(p.initiativeBonus)),
+            initiative: this.rollInitiative(p, opts.initiativeSources?.[p.id]),
             isEnemy: p.isEnemy ?? this.detectIsEnemy(p.id, p.name),
             // Legendary counters start full; a spent resistance (from the sheet) stays spent.
             legendaryActionsRemaining: p.legendaryActions ?? p.legendaryActionsRemaining,
@@ -379,10 +456,37 @@ export class CombatEngine {
         return this.getState()!;
     }
 
-    startEncounter(participants: CombatParticipant[]): CombatState {
-        // Roll initiative for each participant and store the value
+    /**
+     * One initiative roll on the fight's logged dice. Play report 7 #7 (lane
+     * F): a declared source (an untagged initiative or check:dex mechanic, or
+     * a tagged one its context asserts; resolved by the caller) rolls two d20s
+     * and keeps the higher (advantage) or the lower (disadvantage); both
+     * cancel to one die. The purpose names the sources and the roll is kept
+     * in initiativeDeclared. With no source it is the one die it always was.
+     */
+    private rollInitiative(p: CombatParticipant, sides?: DeclaredSides): number {
+        if (!hasSides(sides)) return this.tagged({ purpose: 'initiative', forId: p.id }, () => this.rng.d20(p.initiativeBonus));
+        const adv = sides!.advantage ?? [], dis = sides!.disadvantage ?? [];
+        const two = !!adv.length !== !!dis.length;
+        const rolls = this.tagged({ purpose: purposeWithSources('initiative', sides), forId: p.id }, () => two ? [this.rng.d20(0), this.rng.d20(0)] : [this.rng.d20(0)]);
+        const natural = !two ? rolls[0] : adv.length ? Math.max(...rolls) : Math.min(...rolls);
+        this.initiativeDeclared.set(p.id, {
+            ...(adv.length ? { advantage: [...adv] } : {}),
+            ...(dis.length ? { disadvantage: [...dis] } : {}),
+            ...(two ? { rolls } : {})
+        });
+        return natural + (p.initiativeBonus ?? 0);
+    }
+
+    startEncounter(participants: CombatParticipant[], opts: { initiativeSources?: Record<string, DeclaredSides>; saverSides?: SaverSidesProvider } = {}): CombatState {
+        // Roll initiative for each participant and store the value. A given
+        // initiative is kept as given: no die, no declared source.
+        this.initiativeDeclared = new Map();
+        // Play report 7 (lane H): a surprised first slot's end-of-turn saves read it.
+        if (opts.saverSides) this.saverSides = opts.saverSides;
+        this.endOfTurnSaves = [];
         const participantsWithInitiative = participants.map(p => {
-            const rolledInitiative = p.initiative ?? this.tagged({ purpose: 'initiative', forId: p.id }, () => this.rng.d20(p.initiativeBonus));
+            const rolledInitiative = p.initiative ?? this.rollInitiative(p, opts.initiativeSources?.[p.id]);
             return {
                 ...p,
                 ac: p.ac,
@@ -557,9 +661,13 @@ export class CombatEngine {
      * (spent) and standard-condition modifiers a weapon attack reads. Within
      * 5 ft comes from the grid when both tokens are placed, else it is
      * assumed unless the attack is ranged. Logged as 'spell attack'.
+     * Play report 7 #7 (lane F): `declared` is the caster's declared advantage
+     * for this spell attack's lane (resolved by the caller), each source named
+     * in the situational lines and the purpose.
      */
-    rollSpellAttackD20(actorId: string, targetId: string, opts: { ranged?: boolean; advantage?: boolean; disadvantage?: boolean } = {}): {
-        natural: number; rolls: number[]; advantage: boolean; disadvantage: boolean; situational: string[]; autoCrit?: string
+    rollSpellAttackD20(actorId: string, targetId: string, opts: { ranged?: boolean; advantage?: boolean; disadvantage?: boolean; declared?: DeclaredSides } = {}): {
+        natural: number; rolls: number[]; advantage: boolean; disadvantage: boolean; situational: string[]; autoCrit?: string;
+        advantageSources?: string[]; disadvantageSources?: string[]
     } {
         if (!this.state) throw new Error('No active combat');
         const actor = this.state.participants.find(p => p.id === actorId);
@@ -581,8 +689,15 @@ export class CombatEngine {
         const mods = conditionAttackModifiers(actor, target, { within5ft, participants: this.state.participants });
         if (mods.adv.length) { advantage = true; situational.push(...mods.adv); }
         if (mods.dis.length) { disadvantage = true; situational.push(...mods.dis); }
-        const r = this.tagged({ purpose: 'spell attack', forId: actorId, targetId }, () => this.rng.rollAttackD20(0, 0, advantage, disadvantage));
-        return { natural: r.roll, rolls: r.allRolls, advantage, disadvantage, situational, ...(mods.autoCrit ? { autoCrit: mods.autoCrit } : {}) };
+        const declaredAdv = opts.declared?.advantage ?? [], declaredDis = opts.declared?.disadvantage ?? [];
+        for (const a of declaredAdv) { advantage = true; situational.push(`advantage ← ${a}`); }
+        for (const d of declaredDis) { disadvantage = true; situational.push(`disadvantage ← ${d}`); }
+        const r = this.tagged({ purpose: purposeWithSources('spell attack', opts.declared), forId: actorId, targetId }, () => this.rng.rollAttackD20(0, 0, advantage, disadvantage));
+        return {
+            natural: r.roll, rolls: r.allRolls, advantage, disadvantage, situational, ...(mods.autoCrit ? { autoCrit: mods.autoCrit } : {}),
+            ...(declaredAdv.length ? { advantageSources: [...declaredAdv] } : {}),
+            ...(declaredDis.length ? { disadvantageSources: [...declaredDis] } : {})
+        };
     }
 
     /** Roll under a tag so the audit log says who the dice were for and why. */
@@ -874,6 +989,11 @@ export class CombatEngine {
         // spent. The bonus is added to dc here, so every path (attack, volley,
         // opportunity, readied, legendary) prints the same arithmetic.
         // Play report 5: nonlethal knocks out instead of defeating (melee only).
+        // Play report 7 #7 (lane F): `declared` is the attacker's declared
+        // advantage per lane, resolved by the caller from its effect mechanics
+        // (attack, attack:melee, attack:ranged), named sources and the GM's own
+        // ruling; this attack reads the side for its own lane (the same lane
+        // cover and fighting style read) and names every source.
         partOpts?: {
             withPart?: string; atPart?: string; uncapped?: boolean; ranged?: boolean; ignoreConditions?: boolean; opportunity?: boolean;
             nonlethal?: boolean;
@@ -882,6 +1002,7 @@ export class CombatEngine {
             extraDamageDice?: Array<{ dice: string; label: string }>;
             attackBonusDie?: { dice: string; label: string; onlyIfMiss?: boolean; maxMissBy?: number };
             cover?: CoverResolution; ignoreCover?: IgnoreCoverScopes | IgnoreCover;
+            declared?: Partial<Record<'melee' | 'ranged', DeclaredSides>>;
         }
     ): CombatActionResult {
         if (!this.state) throw new Error('No active combat');
@@ -1004,6 +1125,15 @@ export class CombatEngine {
         for (const b of buffs) {
             if (b.attackAdvantage) { advantage = true; situational.push(`${b.name} (advantage)`); }
         }
+        // Play report 7 #7 (lane F): declared advantage for this attack's lane,
+        // each source named ('advantage ← Bloodlust (attack:melee)'). It cancels
+        // with any disadvantage as usual. A posted outcome rolls nothing.
+        const declared = partOpts?.declared?.[coverLane];
+        const declaredAdv = resolved ? [] : declared?.advantage ?? [];
+        const declaredDis = resolved ? [] : declared?.disadvantage ?? [];
+        for (const a of declaredAdv) { advantage = true; situational.push(`advantage ← ${a}`); }
+        for (const d of declaredDis) { disadvantage = true; situational.push(`disadvantage ← ${d}`); }
+        if (resolved && hasSides(declared)) situational.push(`declared advantage ignored: posted outcome, no roll (${[...(declared!.advantage ?? []).map(a => `adv: ${a}`), ...(declared!.disadvantage ?? []).map(d => `dis: ${d}`)].join('; ')})`);
         // Mob rule: a unit hits harder to miss the more models it has standing.
         const mob = mobAttackBonus(actor);
         if (mob.bonus) {
@@ -1066,7 +1196,7 @@ export class CombatEngine {
                 isHit: resolved !== 'miss', isCrit: resolved === 'crit',
                 allRolls: [], resolved
             }
-            : this.tagged({ purpose: partOpts?.opportunity ? 'opportunity attack' : 'attack', forId: actorId, targetId }, () => this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage));
+            : this.tagged({ purpose: purposeWithSources(partOpts?.opportunity ? 'opportunity attack' : 'attack', { advantage: declaredAdv, disadvantage: declaredDis }), forId: actorId, targetId }, () => this.rng.rollAttackD20(attackBonus, dc, advantage, disadvantage));
         // Paralyzed or unconscious within 5 ft: a rolled hit is a crit. A
         // GM-posted result lands exactly as posted, with a pointer instead.
         if (autoCrit && attackRoll.isHit && !attackRoll.isCrit) {
@@ -1341,6 +1471,8 @@ export class CombatEngine {
             ...(attackBonusDieSkipped ? { attackBonusDieSkipped } : {}),
             ...(extraDamage ? { extraDamage } : {}),
             ...(knockedOut ? { knockedOut } : {}),
+            ...(declaredAdv.length ? { advantageSources: declaredAdv } : {}),
+            ...(declaredDis.length ? { disadvantageSources: declaredDis } : {}),
             success: attackRoll.isHit,
             defeated,
             message,
@@ -1760,6 +1892,67 @@ export class CombatEngine {
         participant.movedThisTurn = 0;
         participant.movedSinceDash = 0;
         participant.meleeHitsThisTurn = [];
+        participant.actedThisTurn = false;
+    }
+
+    /**
+     * Play report 7 #6: the token took a combat action (any combat_action, a
+     * free battle cry or ability, a readied action set this turn). The PC
+     * turn guard reads it with the economy; its turn start clears it.
+     */
+    markActed(participantId: string): void {
+        const participant = this.state?.participants.find(p => p.id === participantId);
+        if (!participant) return;
+        participant.actedThisTurn = true;
+        // A controlled mount acts at its rider's word (Dash, Disengage, Dodge on
+        // the rider's turn): the rider's turn is touched too.
+        if (this.state && isControlledMount(this.state, participant)) {
+            const rider = this.state.participants.find(p => p.id === participant.controlledBy);
+            if (rider) rider.actedThisTurn = true;
+        }
+    }
+
+    /**
+     * Play report 7 #6: run a token's turn start outside an advance, for a
+     * natural 20 answering DEATH SAVE DUE (the advance stopped on the slot at
+     * 0 HP and skipped its start). Returns what the start did (regeneration,
+     * recharge, fading buffs), as an advance prints them.
+     */
+    beginTurn(participantId: string): string[] {
+        const participant = this.state?.participants.find(p => p.id === participantId);
+        this.turnStartNotes = [];
+        if (participant && participant.hp > 0) this.processStartOfTurnConditions(participant);
+        return [...this.turnStartNotes];
+    }
+
+    /**
+     * Play report 7 #6: remove_participant took the actor that was up out of
+     * the order (`removedIndex`: its slot before the removal). The next slot
+     * comes up exactly as an advance brings it up: a surprised slot passes, a
+     * dying slot rolls its death save (prompt mode: DEATH SAVE DUE), a
+     * controlled mount's slot and an orphaned LAIR pass, past the last slot
+     * the next round opens, and the new actor's turn starts. No end-of-turn
+     * runs: the creature whose turn it was has left. turnStartNotes and
+     * deathSaveEvents carry what happened, as after an advance.
+     */
+    startNextAfterRemoval(removedIndex: number, opts: { deathSaveMode?: DeathSaveMode; encounterId?: string; saverSides?: SaverSidesProvider } = {}): CombatParticipant | null {
+        if (!this.state || this.state.turnOrder.length === 0) return null;
+        this.turnStartNotes = [];
+        this.deathSaveEvents = [];
+        // Play report 7 (lane H): a surprised slot passed here rolls its end-of-turn saves.
+        this.endOfTurnSaves = [];
+        if (opts.saverSides) this.saverSides = opts.saverSides;
+        this.deathSaveModeDefault = opts.deathSaveMode;
+        if (opts.encounterId) this.encounterId = opts.encounterId;
+        this.state.currentTurnIndex = removedIndex - 1;
+        const up = this.advanceToNextActor();
+        this.emitter?.publish('combat', {
+            type: 'turn_changed',
+            round: this.state.round,
+            activeParticipantId: up?.id,
+            isLairAction: this.isLairActionPending()
+        });
+        return up;
     }
 
     /**
@@ -2019,6 +2212,13 @@ export class CombatEngine {
 
         // HIGH-003: Reset reaction at start of turn
         this.resetTurnResources(participant);
+        // Play report 7 #10: a controlled mount's turn starts with its rider's
+        // (movement, reaction, durations, regeneration), as its slot passes.
+        const steed = this.controlledMountOf(participant);
+        if (steed && steed.hp > 0) {
+            this.processStartOfTurnConditions(steed);
+            this.turnStartNotes.push(`🐎 ${steed.name} acts on ${participant.name}'s turn (controlled mount): ${steed.movementRemaining ?? this.effectiveSpeed(steed)} ft of its own movement; it may Dash, Disengage or Dodge`);
+        }
 
         // LEGENDARY: Reset legendary actions at start of legendary creature's turn
         this.resetLegendaryActions(participant);
@@ -2117,14 +2317,70 @@ export class CombatEngine {
 
             // Handle save-ends conditions
             if (condition.durationType === DurationType.SAVE_ENDS && condition.saveDC && condition.saveAbility) {
-                const saveBonus = this.getSaveBonus(participant, condition.saveAbility);
-                const degree = this.tagged({ purpose: `save vs ${condition.type}`, forId: participant.id }, () => this.rng.checkDegree(saveBonus, condition.saveDC!));
-
-                if (degree === 'success' || degree === 'critical-success') {
+                const save = this.rollEndOfTurnSave(participant, condition);
+                if (save.saved) {
                     this.removeCondition(participant.id, condition.id);
                 }
             }
         }
+    }
+
+    /**
+     * Play report 7 (lane H): the end-of-turn save of a save_ends condition,
+     * a 5e saving throw like every other save the engine rolls. The handler
+     * layer's provider (SaverSides) gives the saver's declared sides (untagged
+     * save:<ability> mechanics; tagged ones as hints) and its modifier (the
+     * sheet's ability and save proficiency on the world's curve); without one,
+     * the token's ability modifier as before; a unit token adds its drilled
+     * unit.saves bonus either way. The token's own conditions add
+     * their 5e save rules here (restrained: DEX, the very condition being
+     * saved against included; exhaustion 3+). Advantage or disadvantage rolls
+     * two dice under one labelled purpose and keeps one; both cancel to one
+     * die. The kept die meets the DC by the same degree rule as before
+     * (checkDegreeOf). A turn note and an endOfTurnSaves row say what happened.
+     */
+    private rollEndOfTurnSave(participant: CombatParticipant, condition: Condition): EndOfTurnSave {
+        const ability = condition.saveAbility!;
+        const dc = condition.saveDC!;
+        const short = ability.slice(0, 3) as 'str' | 'dex' | 'con' | 'int' | 'wis' | 'cha';
+        let read: SaverSides | undefined;
+        // A provider that cannot read (no database) leaves the engine's own reading.
+        try { read = this.saverSides?.(participant, ability); } catch { read = undefined; }
+        const once = (list: string[]) => list.filter((x, i) => list.findIndex(y => y.toLowerCase() === x.toLowerCase()) === i);
+        const advantage = once([...(read?.advantage ?? [])]);
+        const disadvantage = once([...(read?.disadvantage ?? []), ...conditionSaveDisadvantage(tokenSaveConditions(participant.conditions), short)]);
+        const conditional = [...(read?.conditionalAdvantage ?? []), ...(read?.conditionalDisadvantage ?? [])];
+        const ownMod = this.getSaveBonus(participant, ability);
+        // Lane H review: a unit token's drilled bonus (unit.saves) rides this
+        // save as it rides each model's area save (unitSaveBonus).
+        const drilled = participant.unit?.saves?.[short] ?? 0;
+        const modifier = (read?.modifier?.total ?? ownMod) + drilled;
+        const parts = [...(read?.modifier?.parts ?? [`${short.toUpperCase()} ${ownMod >= 0 ? '+' : ''}${ownMod}`]), ...(drilled ? [`drilled ${drilled >= 0 ? '+' : ''}${drilled}`] : [])];
+        const tag = { purpose: purposeWithSources(`save vs ${condition.type}`, { advantage, disadvantage }), forId: participant.id };
+        const two = !!advantage.length !== !!disadvantage.length;
+        const rolls = [this.rollD20(tag)];
+        if (two) rolls.push(this.rollD20(tag));
+        const natural = !two ? rolls[0] : advantage.length ? Math.max(...rolls) : Math.min(...rolls);
+        const check = checkDegreeOf(natural, modifier, dc);
+        const saved = check.degree === 'success' || check.degree === 'critical-success';
+        // Lane H review: the old degree rule lets a natural 1 fail a total that
+        // meets the DC (and a natural 20 save one that misses it); the line says
+        // so, or '13 vs DC 13 ✗ failed' reads as an error.
+        const natural20or1 = saved !== (check.total >= dc) ? ` on a natural ${natural}` : '';
+        const line = `${participant.name}'s end-of-turn ${short.toUpperCase()} save vs ${condition.type}: d20 ${natural} ${modifier >= 0 ? '+' : '-'} ${Math.abs(modifier)} = ${check.total} vs DC ${dc}`
+            + `${parts.length ? ` (${parts.join(', ')})` : ''} ${saved ? `✓ saved${natural20or1}: ${condition.type} ends` : `✗ failed${natural20or1}: still ${condition.type}`}`
+            + rollSidesNote(rolls, { advantage, disadvantage });
+        const save: EndOfTurnSave = {
+            participantId: participant.id, name: participant.name, condition: String(condition.type), ability, dc,
+            rolls, natural, modifier, parts, total: check.total, saved,
+            ...(advantage.length ? { advantage } : {}),
+            ...(disadvantage.length ? { disadvantage } : {}),
+            ...(conditional.length ? { conditional } : {}),
+            line
+        };
+        this.endOfTurnSaves.push(save);
+        this.turnStartNotes.push(line + conditional.map(c => `\n   conditional: ${c}`).join(''));
+        return save;
     }
 
     /**
@@ -2142,10 +2398,14 @@ export class CombatEngine {
      * Enhanced nextTurn with condition processing and legendary action reset
      * Now auto-skips dead participants (HP <= 0)
      */
-    nextTurnWithConditions(opts: { deathSaveMode?: DeathSaveMode; encounterId?: string } = {}): CombatParticipant | null {
+    nextTurnWithConditions(opts: { deathSaveMode?: DeathSaveMode; encounterId?: string; saverSides?: SaverSidesProvider } = {}): CombatParticipant | null {
         if (!this.state) return null;
         this.turnStartNotes = [];
         this.deathSaveEvents = [];
+        // Play report 7 (lane H): the handlers pass the saver reader on every
+        // advance, so an engine rehydrated in a new process has it too.
+        this.endOfTurnSaves = [];
+        if (opts.saverSides) this.saverSides = opts.saverSides;
         this.deathSaveModeDefault = opts.deathSaveMode;
         if (opts.encounterId) this.encounterId = opts.encounterId;
 
@@ -2153,6 +2413,9 @@ export class CombatEngine {
         const currentParticipant = this.getCurrentParticipant();
         if (currentParticipant && currentParticipant.hp > 0) {
             this.processEndOfTurnConditions(currentParticipant);
+            // Play report 7 #10: a controlled mount acts on its rider's turn, so its turn ends with the rider's.
+            const steed = this.controlledMountOf(currentParticipant);
+            if (steed && steed.hp > 0) this.processEndOfTurnConditions(steed);
         }
         // Item 16: conditions that end at the end of THIS creature's turn on
         // other creatures (Menacing's fright), whether or not it is still up.
@@ -2221,6 +2484,13 @@ export class CombatEngine {
             // Mooks, the stable and the dead pass as they always did.
             if (!passed && newParticipant && isDying(newParticipant)) {
                 stopHere = this.dyingSlot(newParticipant);
+            }
+            // Play report 7 #10: a controlled mount moves on its rider's turn
+            // (5e: its initiative matches the rider's), so its own slot passes.
+            if (!passed && !stopHere && newParticipant && newParticipant.hp > 0 && isControlledMount(this.state, newParticipant)) {
+                const rider = this.state.participants.find(p => p.id === newParticipant!.controlledBy);
+                this.turnStartNotes.push(`🐎 ${newParticipant.name} moves on ${rider?.name ?? newParticipant.controlledBy}'s turn (controlled mount): its own slot passes`);
+                passed = true;
             }
         } while (
             !stopHere &&
@@ -2321,6 +2591,11 @@ export class CombatEngine {
         return !!owner && owner.hp <= 0;
     }
 
+    /** Play report 7 #10: the mount this participant rides and controls, if any. */
+    controlledMountOf(participant: CombatParticipant): CombatParticipant | undefined {
+        return this.state ? controlledMountOf(this.state, participant) : undefined;
+    }
+
     /**
      * Check if a participant can take actions (not incapacitated)
      */
@@ -2381,7 +2656,9 @@ export class CombatEngine {
         // 2. Check Action availability (a banked extra action reopens it)
         if (actionType === 'action') {
             if (participant.actionUsed && !((participant.extraActions ?? 0) > 0)) {
-                return { valid: false, error: 'Action already used this turn' };
+                // Play report 7 #6: off its own turn, say whose turn it is and that its own has ended.
+                const offTurn = offTurnEconomyNote(this.state, participantId, 'action');
+                return { valid: false, error: `Action already used this turn${offTurn ? ` — ${offTurn}` : ''}` };
             }
             
             // Bonus Action Spell Rule: If bonus spell cast, Action can only be Cantrip (level 0)
@@ -2393,7 +2670,8 @@ export class CombatEngine {
         } 
         else if (actionType === 'bonus') {
             if (participant.bonusActionUsed) {
-                return { valid: false, error: 'Bonus Action already used this turn' };
+                const offTurn = offTurnEconomyNote(this.state, participantId, 'bonus');
+                return { valid: false, error: `Bonus Action already used this turn${offTurn ? ` — ${offTurn}` : ''}` };
             }
 
             // Bonus Action Spell Rule: If casting spell as BA, no leveled Action spell allowed
@@ -2437,7 +2715,8 @@ export class CombatEngine {
         }
         const economy = this.validateActionEconomy(participantId, 'action');
         if (!economy.valid && of > 1 && made >= of) {
-            return { valid: false, error: `Action already used this turn (attacks ${made}/${of})` };
+            const offTurn = ownTurn ? undefined : offTurnEconomyNote(this.state, participantId, 'action');
+            return { valid: false, error: `Action already used this turn (attacks ${made}/${of})${offTurn ? ` — ${offTurn}` : ''}` };
         }
         return economy;
     }
@@ -2529,12 +2808,18 @@ export class CombatEngine {
         if (mover.hasDisengaged) return [];
 
         const attackers: Array<{ attacker: CombatParticipant; stepIndex: number }> = [];
+        // Play report 7 #10 (review): a mount carries its rider, so a reactor
+        // hostile to either is provoked: an enemy rider on a mount left without
+        // isEnemy still draws the swing (the move handler picks which it strikes).
+        const carried = mover.riderId ? this.state.participants.find(p => p.id === mover.riderId && p.mountedOn === mover.id) : undefined;
 
         for (const p of this.state.participants) {
             // Skip self, the defeated, allies, spent reactions and unplaced tokens
             if (p.id === moverId) continue;
+            // Play report 7 #10: a rider never strikes its own mount (or the mount its rider).
+            if (p.id === mover.riderId || p.id === mover.mountedOn) continue;
             if (p.hp <= 0) continue;
-            if (!!p.isEnemy === !!mover.isEnemy) continue;
+            if (!!p.isEnemy === !!mover.isEnemy && !(carried && !!p.isEnemy !== !!carried.isEnemy)) continue;
             if (p.reactionUsed) continue;
             if (!p.position) continue;
             // Stunned, paralysed, unconscious and the like cannot react.
@@ -2573,19 +2858,25 @@ export class CombatEngine {
      * reactor's reach, measured with the readied attack's profile reach
      * when it names one. Reactors that cannot react are skipped.
      */
-    getReadiedTriggers(moverId: string, path: Array<{ x: number; y: number }>): Array<{ reactor: CombatParticipant; stepIndex: number; readied: Readied }> {
+    getReadiedTriggers(moverId: string, path: Array<{ x: number; y: number }>, opts: { watched?: string } = {}): Array<{ reactor: CombatParticipant; stepIndex: number; readied: Readied }> {
         if (!this.state || path.length < 2) return [];
         const mover = this.state.participants.find(p => p.id === moverId);
         if (!mover) return [];
+        // Play report 7 #10: a rider carried by its mount is watched for (its
+        // id, name, side) while the reach is measured to the mount's footprint,
+        // the space the rider shares.
+        const who = (opts.watched ? this.state.participants.find(p => p.id === opts.watched) : undefined) ?? mover;
         const hits: Array<{ reactor: CombatParticipant; stepIndex: number; readied: Readied }> = [];
         for (const p of this.state.participants) {
             const readied = p.readied;
-            if (!readied?.on || p.id === moverId || !p.position) continue;
+            if (!readied?.on || p.id === moverId || p.id === who.id || !p.position) continue;
+            // Play report 7 #10: the linked partner moves with the mover; it never sets off its own readied action.
+            if (p.id === mover.riderId || p.id === mover.mountedOn) continue;
             if (p.reactionUsed || !this.canTakeReactions(p.id)) continue;
             const watch = (readied.watch ?? 'enemy').trim().toLowerCase();
             const watched = watch === 'any'
-                || (watch === 'enemy' && !!p.isEnemy !== !!mover.isEnemy)
-                || watch === mover.id.toLowerCase() || watch === mover.name.toLowerCase();
+                || (watch === 'enemy' && !!p.isEnemy !== !!who.isEnemy)
+                || watch === who.id.toLowerCase() || watch === who.name.toLowerCase();
             if (!watched) continue;
             const profile = readied.attack?.using && p.attacks?.length ? matchProfile(p.attacks, readied.attack.using) : undefined;
             const step = this.firstReachChange(p, mover, path, readied.on, profile?.reachFt ?? undefined);
@@ -2603,7 +2894,10 @@ export class CombatEngine {
      */
     executeOpportunityAttack(
         attackerId: string,
-        targetId: string
+        targetId: string,
+        // Play report 7 #7 (lane F): the attacker's declared advantage per lane
+        // (untagged mechanics only: an opportunity attack carries no context).
+        opts: { declared?: Partial<Record<'melee' | 'ranged', DeclaredSides>> } = {}
     ): CombatActionResult {
         if (!this.state) throw new Error('No active combat');
 
@@ -2630,15 +2924,30 @@ export class CombatEngine {
             ?? (target.abilityScores ? 10 + mod(target.abilityScores.dexterity)
                 : 10 + (target.initiativeBonus > 0 ? Math.floor(target.initiativeBonus / 2) : 0));
 
+        // Play report 7 #5: under a standing subdue order the swing is
+        // non-lethal (a mover it drops is knocked out); a unit is a formation,
+        // not one body, so the order does not apply to it and the swing says so.
+        const subdue: CombatActionResult['subdue'] = attacker.subdue
+            ? (target.unit ? { mode: 'n/a: unit', note: `subdue: n/a against a unit (${target.name} is a formation; the swing is lethal)` } : { mode: 'non-lethal', note: 'subdue order: non-lethal (take them alive)' })
+            : undefined;
+
+        // Play report 7 #7 (lane F review): an opportunity attack is melee (5e),
+        // so it reads the melee side whatever lane the grid gives the swing (a
+        // 10-ft token reach with a 5-ft default profile would read as a shot).
+        const declared = opts.declared?.melee ? { melee: opts.declared.melee, ranged: opts.declared.melee } : undefined;
         const result = this.executeAttack(attackerId, targetId, attackBonus, targetAC, damage, damageType,
-            false, false, undefined, undefined, undefined, undefined, { opportunity: true, twoHanded: profile?.twoHanded, reachFt: profile?.reachFt });
+            false, false, undefined, undefined, undefined, undefined, { opportunity: true, twoHanded: profile?.twoHanded, reachFt: profile?.reachFt, ...(subdue?.mode === 'non-lethal' ? { nonlethal: true } : {}), ...(declared ? { declared } : {}) });
 
         // Mark reaction as used
         attacker.reactionUsed = true;
 
-        result.detailedBreakdown = `⚡ OPPORTUNITY ATTACK by ${attacker.name}!\n${result.detailedBreakdown}`;
+        if (subdue) {
+            result.subdue = subdue;
+            result.situational = [...(result.situational ?? []), subdue.note];
+        }
+        result.detailedBreakdown = `⚡ OPPORTUNITY ATTACK by ${attacker.name}!${subdue ? ` (${subdue.note})` : ''}\n${result.detailedBreakdown}`;
         result.message = result.success
-            ? `OPPORTUNITY ATTACK HIT! ${attacker.name} strikes ${target.name} for ${result.damage} damage${result.defeated ? ' [DEFEATED]' : ''}`
+            ? `OPPORTUNITY ATTACK HIT! ${attacker.name} strikes ${target.name} for ${result.damage} damage${result.knockedOut ? ' [KNOCKED OUT]' : result.defeated ? ' [DEFEATED]' : ''}`
             : `OPPORTUNITY ATTACK MISS! ${attacker.name}'s attack misses ${target.name}`;
         return result;
     }

@@ -2,6 +2,8 @@ import { CombatEngine } from '../../src/engine/combat/engine.js';
 import { handleCombatManage } from '../../src/server/consolidated/combat-manage.js';
 import { handleCombatAction, CombatActionTool } from '../../src/server/consolidated/combat-action.js';
 import { handleTableRules } from '../../src/server/consolidated/table-rules.js';
+import { handleImprovisationManage, ImprovisationManageTool } from '../../src/server/consolidated/improvisation-manage.js';
+import { handleSceneManage, SceneManageTool } from '../../src/server/consolidated/scene-manage.js';
 import { clearCombatState, getOrLoadEngine } from '../../src/server/handlers/combat-handlers.js';
 import { withOperation } from '../../src/server/operation-guard.js';
 import { CharacterRepository } from '../../src/storage/repos/character.repo.js';
@@ -103,6 +105,18 @@ describe('one-call grapple', () => {
         expect(res.error).toBeFalsy();
         expect(tok('marine').actionUsed).toBe(true);
         expect(JSON.stringify((new EncounterRepository(getDb()).loadState(encounterId) as any).rngState)).not.toBe(before);
+    });
+
+    // Play report 7 #2: hounds built with stats {str: 15} used to contest at
+    // +0 (create dropped the scores); the contest now reads STR 15 (+2).
+    it('ad-hoc hounds with stats {str: 15} contest at +2 on both sides of the hold', async () => {
+        await fight([
+            { id: 'hound', name: 'Hound', hp: 11, maxHp: 11, initiative: 20, isEnemy: true, stats: { str: 15 } },
+            { id: 'pup', name: 'Pup', hp: 5, maxHp: 5, initiative: 5, stats: { str: 15 } }
+        ]);
+        dice(10, 10);
+        const res = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'hound', targetId: 'pup' });
+        expect(res.breakdown).toBe('Hound d20(10)+2stat+0prof = 12  vs  Pup d20(10)+2stat+0prof = 12');
     });
 
     it('the lower band rolls at disadvantage, once, with the reason printed', async () => {
@@ -638,12 +652,16 @@ describe('grapple honours advantage (play report 4)', () => {
         const now = new Date().toISOString();
         new CharacterRepository(getDb()).create({ id, name, stats: { str: 16, dex: 12, con: 14, int: 10, wis: 10, cha: 10 }, hp: 50, maxHp: 50, ac: 14, level: 5, createdAt: now, updatedAt: now, ...extra } as any);
     };
-    const effect = (targetId: string, name: string) => new CustomEffectsRepository(getDb()).apply({
+    const effect = (targetId: string, name: string, mechanics: unknown[] = [{ type: 'custom_trigger', value: name }]) => new CustomEffectsRepository(getDb()).apply({
         target_id: targetId, target_type: 'character', name, description: name,
         category: 'neutral', power_level: 1, source: { type: 'unknown' },
-        mechanics: [{ type: 'custom_trigger', value: name }] as never, duration: { type: 'until_removed' as never },
+        mechanics: mechanics as never, duration: { type: 'until_removed' as never },
         triggers: [], removal_conditions: [{ type: 'duration_expires' as const }], stackable: false, max_stacks: 1
     } as never);
+    // Play report 7 #7: a named source grants only what declares it. These
+    // fixtures declare advantage on Athletics in the older skill form, which
+    // keeps its meaning.
+    const ATHLETICS_ADV = [{ type: 'advantage_on', value: 1, skill: 'athletics' }];
     const rollLog = () => { try { return getDb().prepare('SELECT for_id, purpose, expression FROM roll_log WHERE purpose LIKE ? ORDER BY rowid').all('grapple%') as Array<{ for_id: string; purpose: string; expression: string }>; } catch { return []; } };
 
     beforeEach(() => { closeDb(); getDb(':memory:'); clearCombatState(); });
@@ -718,9 +736,14 @@ describe('grapple honours advantage (play report 4)', () => {
     });
 
     it("sources resolve against the actor's token conditions, sheet conditions and active custom effects", async () => {
+        // Play report 7 #7: each source declares what it grants — a feature
+        // beside the token's and the sheet's conditions (same label), an
+        // effect, and Poisoned's 5e disadvantage on checks.
         mkSheet('marine', 'Marine', { conditions: [{ name: 'Blessed', source: 'chaplain' }] });
-        effect('marine', 'Iron Grip');
-        await fight([{ ...marine, conditions: [{ name: 'Bulwark Stance', source: 'ritual' }] }, cultist]);
+        effect('marine', 'Iron Grip', ATHLETICS_ADV);
+        effect('marine', 'Bulwark Stance', ATHLETICS_ADV);
+        effect('marine', 'Blessed', ATHLETICS_ADV);
+        await fight([{ ...marine, conditions: [{ name: 'Bulwark Stance', source: 'ritual' }, { name: 'Poisoned', source: 'tainted rations' }] }, cultist]);
         // A token condition, by a substring of its name.
         let spy = dice(5, 18, 9);
         const token = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantageSources: ['bulwark'] });
@@ -737,18 +760,18 @@ describe('grapple honours advantage (play report 4)', () => {
         expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (adv: GM, Blessed)' }));
         // A custom effect for advantage and a condition for disadvantage cancel.
         spy = dice(7, 12);
-        const both = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantageSources: ['iron grip'], disadvantageSources: ['ritual'] });
+        const both = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantageSources: ['iron grip'], disadvantageSources: ['tainted rations'] });
         expect(both.rolls).toEqual({ actor: [7], defender: [12] });
         expect(both.rollMode.actor).toBe('cancelled');
         expect(both.advantageSources).toEqual(['Iron Grip']);
-        expect(both.disadvantageSources).toEqual(['Bulwark Stance']);
-        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (adv: Iron Grip; dis: Bulwark Stance)' }));
+        expect(both.disadvantageSources).toEqual(['Poisoned']);
+        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (adv: Iron Grip; dis: Poisoned)' }));
         // A disadvantage source alone keeps the low die.
         dice(15, 3, 10);
-        const dis = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', disadvantageSources: ['Iron Grip'] });
+        const dis = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', disadvantageSources: ['Poisoned'] });
         expect(dis.rolls.actor).toEqual([15, 3]);
         expect(dis.rollMode.actor).toBe('disadvantage');
-        expect(dis.situational).toEqual(['Marine: disadvantage (Iron Grip)']);
+        expect(dis.situational).toEqual(['Marine: disadvantage (Poisoned)']);
     });
 
     it('a source that matches nothing, or two things, is refused before any roll or spend', async () => {
@@ -797,8 +820,9 @@ describe('grapple honours advantage (play report 4)', () => {
         expect(dis.rolls.actor).toHaveLength(2);
         log = rollLog().filter(r => r.for_id === 'luciel');
         expect(log[1]).toEqual({ for_id: 'luciel', purpose: 'grapple (dis: GM)', expression: '2d20kl1' });
-        // A sheet condition names a source without an encounter too.
+        // A sheet condition names a source without an encounter too (its feature declares it: play report 7).
         new CharacterRepository(getDb()).update('luciel', { conditions: [{ name: 'Bulwark', source: 'ritual' }] } as never);
+        effect('luciel', 'Bulwark', ATHLETICS_ADV);
         const src = await act({ action: 'grapple', move: 'clinch', actorId: 'luciel', targetId: 'foe', advantageSources: ['bulwark'] });
         expect(src.advantageSources).toEqual(['Bulwark']);
         expect(rollLog().filter(r => r.for_id === 'luciel')[2].purpose).toBe('grapple (adv: Bulwark)');
@@ -892,7 +916,9 @@ describe('grapple honours advantage (play report 4)', () => {
     });
 
     it('a direct caller (batch_manage) may hand the sources over as a JSON string or one bare name; the outer schema has not run for it', async () => {
-        await fight([{ ...marine, conditions: [{ name: 'Bulwark Stance', source: 'ritual' }] }, cultist]);
+        // Play report 7 #7: Bulwark Stance's feature declares the advantage; Poisoned (sourced 'ritual') the disadvantage.
+        effect('marine', 'Bulwark Stance', ATHLETICS_ADV);
+        await fight([{ ...marine, conditions: [{ name: 'Bulwark Stance', source: 'oath' }, { name: 'Poisoned', source: 'ritual' }] }, cultist]);
         dice(5, 18, 9);
         const json = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', advantageSources: '["bulwark"]' });
         expect(json.error).toBeFalsy();
@@ -901,7 +927,183 @@ describe('grapple honours advantage (play report 4)', () => {
         dice(15, 3, 10);
         const bare = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'marine', targetId: 'cultist', disadvantageSources: 'ritual' });
         expect(bare.error).toBeFalsy();
-        expect(bare.disadvantageSources).toEqual(['Bulwark Stance']);
+        expect(bare.disadvantageSources).toEqual(['Poisoned']);
         expect(bare.rolls.actor).toEqual([15, 3]);
+    });
+});
+
+/**
+ * Play report 7 #7 (the owner's spec) and #8 on grapple. Horn-Lock was a
+ * prose condition that granted advantage on every grapple it was named on.
+ * Now it is declared — {type: 'advantage_on', value: 'grapple', condition:
+ * 'head-on'} — and fires only on a head-on lock: context: ['head-on'], or
+ * advantageSources: ['Horn-Lock'] (the GM asserting it; the log says
+ * 'named'). A rival that circles gives no tag and gets nothing.
+ */
+describe('declared advantage on grapple (play report 7)', () => {
+    let encounterId: string;
+    const W = 'blackcrown';
+    const tokens = () => new EncounterRepository(getDb()).loadState(encounterId)!.participants as any[];
+    const tok = (id: string) => tokens().find(t => t.id === id);
+    const fight = async (participants: Array<Record<string, unknown>>) => {
+        const created = await manage({ action: 'create', seed: 'grapple-declared', participants });
+        encounterId = created.encounterId;
+    };
+    const mkSheet = (id: string, name: string, extra: Record<string, unknown> = {}) => {
+        const now = new Date().toISOString();
+        new CharacterRepository(getDb()).create({ id, name, stats: { str: 16, dex: 12, con: 14, int: 10, wis: 10, cha: 10 }, hp: 50, maxHp: 50, ac: 14, level: 5, createdAt: now, updatedAt: now, ...extra } as any);
+        getDb().prepare('UPDATE characters SET world_id = ? WHERE id = ?').run(W, id);
+    };
+    const effect = (targetId: string, name: string, mechanics: unknown[]) => new CustomEffectsRepository(getDb()).apply({
+        target_id: targetId, target_type: 'character', name, description: name,
+        category: 'neutral', power_level: 1, source: { type: 'unknown' },
+        mechanics: mechanics as never, duration: { type: 'until_removed' as never },
+        triggers: [], removal_conditions: [{ type: 'duration_expires' as const }], stackable: false, max_stacks: 1
+    } as never);
+    const improv = async (a: Record<string, unknown>) => embedded(await withOperation('improvisation_manage', (x: any) => handleImprovisationManage(ImprovisationManageTool.inputSchema.parse(x), ctx as any))(a), 'IMPROVISATION_MANAGE');
+    const varek = { id: 'varek', name: 'Varek', hp: 50, maxHp: 50, initiative: 20, attacksPerAction: 4 };
+    const rival = { id: 'rival', name: 'Rival', hp: 40, maxHp: 40, initiative: 5, isEnemy: true };
+
+    beforeEach(() => {
+        closeDb(); const db = getDb(':memory:'); clearCombatState();
+        const now = new Date().toISOString();
+        new WorldRepository(db).create({ id: W, name: 'Blackcrown', seed: 's', width: 20, height: 20, createdAt: now, updatedAt: now } as any);
+        try { db.exec('ALTER TABLE characters ADD COLUMN world_id TEXT'); } catch { /* exists */ }
+        mkSheet('varek', 'Varek', {
+            conditions: [{ name: 'Horn-Lock: locks horns with a rival head-on', source: 'Gor heritage' }, { name: 'Gor Hunter' }],
+            skillAdvantage: [{ name: 'Keen Smell', skills: ['perception', 'survival'], when: 'scent' }, { name: 'Bull Rush', skills: ['athletics'], when: 'charge' }]
+        });
+    });
+    afterEach(() => { vi.restoreAllMocks(); closeDb(); });
+
+    it("Horn-Lock end to end: converted once, it fires on a head-on lock by context or by name, and not on a rival that circles", async () => {
+        const converted = await improv({ action: 'feature_from_condition', characterId: 'varek', match: 'Horn-Lock', mechanics: [{ type: 'advantage_on', value: 'grapple', condition: 'head-on' }] });
+        expect(converted.success).toBe(true);
+        await fight([varek, rival]);
+        // Head-on, by context.
+        let spy = dice(5, 18, 9);
+        const headOn = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival', context: ['head-on'] });
+        expect(headOn.error).toBeFalsy();
+        expect(headOn.rolls.actor).toEqual([5, 18]);
+        expect(headOn.advantageSources).toEqual(['Horn-Lock (head-on)']);
+        expect(headOn.situational).toEqual(['Varek: advantage (Horn-Lock (head-on))']);
+        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (adv: Horn-Lock (head-on))' }));
+        // By name: the GM asserts head-on, and the log says so.
+        spy = dice(5, 18, 9);
+        const named = await act({ action: 'grapple', move: 'takedown', encounterId, actorId: 'varek', targetId: 'rival', advantageSources: ['Horn-Lock'] });
+        expect(named.rolls.actor).toEqual([5, 18]);
+        expect(named.advantageSources).toEqual(['Horn-Lock (head-on, named)']);
+        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (adv: Horn-Lock (head-on, named))' }));
+        // A rival that circles: no tag, no cage; the reply names the tag.
+        dice(11, 4);
+        const circling = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival' });
+        expect(circling.rolls.actor).toEqual([11]);
+        expect(circling.rollMode.actor).toBe('normal');
+        expect(circling.advantageSources).toBeUndefined();
+        expect(circling.conditionalAdvantage).toEqual(["Horn-Lock (head-on): pass context: ['head-on'] or advantageSources: ['Horn-Lock'] when it holds"]);
+    });
+
+    it('a context tag that fires nothing is said, not swallowed (Horn-Lock not converted yet)', async () => {
+        await fight([varek, rival]);
+        dice(11, 4);
+        const res = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival', context: ['head-on'] });
+        expect(res.error).toBeFalsy();
+        expect(res.rolls.actor).toEqual([11]);
+        expect(res.contextUnfired).toEqual(['head-on']);
+        expect(res.situational).toEqual(["context [head-on] fired nothing on this grapple: no tagged effect or skillAdvantage trait on Varek declares it here (convert a prose condition with improvisation_manage feature_from_condition)"]);
+        // A tag that fires stays quiet; one beside it that does not is named.
+        dice(5, 18, 9);
+        const mixed = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival', context: ['charge', 'head-on'] });
+        expect(mixed.advantageSources).toEqual(['Bull Rush (charge)']);
+        expect(mixed.contextUnfired).toEqual(['head-on']);
+    });
+
+    it("'Gor Hunter' grants nothing: refused before any roll or spend, with the conversion call", async () => {
+        await fight([varek, rival]);
+        const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
+        const res = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival', advantageSources: ['Gor Hunter'] });
+        expect(res.error).toBe(true);
+        expect(res.writes).toBe('none');
+        expect(res.sourceProblems).toEqual([`'Gor Hunter' grants no advantage on a grapple (clinch). To grant one, improvisation_manage feature_from_condition {characterId: 'varek', match: 'Gor Hunter', mechanics: [{type: 'advantage_on', value: 'grapple'}]}; for a one-off, use situationalAdvantage: '<reason>'.`]);
+        expect(String(res.message)).toMatch(/situationalAdvantage: '<reason>' for your own ruling\. Nothing was rolled or spent\./);
+        expect(spy).not.toHaveBeenCalled();
+        expect(tok('varek').attacksMade ?? 0).toBe(0);
+        expect(tok('rival').conditions).toEqual([]);
+    });
+
+    it("situationalAdvantage is the GM's one-off with its reason; a non-text value from a direct caller is refused", async () => {
+        await fight([varek, rival]);
+        let spy = dice(5, 18, 9);
+        const down = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival', situationalAdvantage: 'downhill' });
+        expect(down.rolls.actor).toEqual([5, 18]);
+        expect(down.situational).toEqual(['Varek: advantage (GM: downhill)']);
+        expect(down.situationalAdvantage).toBe('downhill');
+        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (adv: GM: downhill)' }));
+        spy = dice(15, 3, 10);
+        const mud = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival', situationalDisadvantage: 'knee-deep mud' });
+        expect(mud.rolls.actor).toEqual([15, 3]);
+        expect(spy).toHaveBeenNthCalledWith(1, expect.objectContaining({ purpose: 'grapple (dis: GM: knee-deep mud)' }));
+        vi.restoreAllMocks();
+        const roll = vi.spyOn(CombatEngine.prototype, 'rollD20');
+        const bad = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival', situationalAdvantage: true });
+        expect(bad.error).toBe(true);
+        expect(bad.writes).toBe('none');
+        expect(String(bad.message)).toMatch(/situationalAdvantage takes the reason as text \('downhill'\), not true/);
+        expect(roll).not.toHaveBeenCalled();
+    });
+
+    it('untagged scoped mechanics fire by themselves: the actor\'s on its grapple, the defender\'s on its Athletics or Acrobatics', async () => {
+        effect('varek', 'Gor Strength', [{ type: 'advantage_on', value: 'check:athletics' }]);
+        effect('rival', 'Eel Skin', [{ type: 'advantage_on', value: 'check:acrobatics' }]);
+        effect('varek', 'Hates Water', [{ type: 'disadvantage_on', value: 'grapple:throw' }]);
+        await fight([varek, rival]);
+        const spy = dice(5, 18, 9, 12);
+        const res = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival' });
+        expect(res.rolls).toEqual({ actor: [5, 18], defender: [9, 12] });
+        expect(res.rollMode).toEqual({ actor: 'advantage', defender: 'advantage' });
+        expect(res.advantageSources).toEqual(['Gor Strength']);
+        expect(res.defenderAdvantageSources).toEqual(['Eel Skin']);
+        expect(res.situational).toEqual(['Varek: advantage (Gor Strength)', 'Rival: advantage (Eel Skin)']);
+        expect(spy).toHaveBeenNthCalledWith(3, expect.objectContaining({ purpose: 'grapple (adv: Eel Skin)', forId: 'rival' }));
+        // grapple:throw only on a throw.
+        dice(5, 18, 9, 12);
+        const thrown = await act({ action: 'grapple', move: 'throw', encounterId, actorId: 'varek', targetId: 'rival' });
+        expect(thrown.rollMode.actor).toBe('cancelled');
+        expect(thrown.disadvantageSources).toEqual(['Hates Water']);
+    });
+
+    it('#8: a skillAdvantage trait covering Athletics fires by name or tag, through the scene denial; one that does not is refused', async () => {
+        await fight([varek, rival]);
+        dice(5, 18, 9);
+        const named = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival', advantageSources: ['Bull Rush'] });
+        expect(named.advantageSources).toEqual(['Bull Rush (charge, named)']);
+        expect(named.rolls.actor).toEqual([5, 18]);
+        dice(5, 18, 9);
+        const tagged = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival', context: 'charge' });
+        expect(tagged.advantageSources).toEqual(['Bull Rush (charge)']);
+        const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
+        const nose = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival', advantageSources: ['Keen Smell'] });
+        expect(nose.error).toBe(true);
+        expect(nose.writes).toBe('none');
+        expect(nose.sourceProblems).toEqual([`'Keen Smell' is Varek's skillAdvantage trait for perception, survival (when: scent); a grapple rolls Athletics, so it does not apply; nothing granted`]);
+        expect(spy).not.toHaveBeenCalled();
+        vi.restoreAllMocks();
+        await embedded(await handleSceneManage(SceneManageTool.inputSchema.parse({ worldId: W, action: 'set', narration: 'Mud.', participants: ['varek'], senseDenial: { charge: 'knee-deep mud' } }), ctx as any), 'SCENE_MANAGE');
+        dice(11, 4);
+        const denied = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival', advantageSources: ['Bull Rush'] });
+        expect(denied.error).toBeFalsy();
+        expect(denied.rolls.actor).toEqual([11]);
+        expect(denied.deniedAdvantage).toEqual([{ trait: 'Bull Rush', when: 'charge', reason: 'knee-deep mud' }]);
+    });
+
+    it('a standard condition declares its disadvantage on the grapple check; posted results still ignore every source', async () => {
+        await fight([{ ...varek, conditions: [{ name: 'Frightened', source: 'the Horned One' }] }, rival]);
+        dice(15, 3, 10);
+        const scared = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival', disadvantageSources: ['frightened'] });
+        expect(scared.rolls.actor).toEqual([15, 3]);
+        expect(scared.disadvantageSources).toEqual(['Frightened']);
+        const posted = await act({ action: 'grapple', move: 'clinch', encounterId, actorId: 'varek', targetId: 'rival', outcome: 'win', situationalAdvantage: 'downhill', context: ['head-on'], advantageSources: ['Gor Hunter'] });
+        expect(posted.error).toBeFalsy();
+        expect(posted.situational).toEqual(['advantage ignored: no contest rolled']);
     });
 });

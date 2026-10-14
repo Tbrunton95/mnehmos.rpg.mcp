@@ -282,6 +282,8 @@ export const CONDITION_EFFECTS: Record<ConditionType, {
     autoCritWithin5ft?: boolean;
     abilityCheckDisadvantage?: boolean;
     savingThrowDisadvantage?: boolean;
+    /** Play report 7 #7: the saves savingThrowDisadvantage covers (restrained, slowed: DEX). Read when the GM names the condition as a disadvantage source. */
+    savingThrowDisadvantageAbilities?: Ability[];
     speed?: number; // 0 means no movement
     autoFail?: Ability[];
     canTakeActions?: boolean;
@@ -352,6 +354,7 @@ export const CONDITION_EFFECTS: Record<ConditionType, {
         speed: 0,
         attackDisadvantage: true,
         savingThrowDisadvantage: true,
+        savingThrowDisadvantageAbilities: [Ability.DEXTERITY],
         attacksAgainstAdvantage: true
     },
     [ConditionType.STUNNED]: {
@@ -395,7 +398,8 @@ export const CONDITION_EFFECTS: Record<ConditionType, {
     },
     [ConditionType.SLOWED]: {
         description: 'Reduced speed and disadvantage on DEX saves',
-        savingThrowDisadvantage: true
+        savingThrowDisadvantage: true,
+        savingThrowDisadvantageAbilities: [Ability.DEXTERITY]
     },
     [ConditionType.BLESSED]: {
         description: 'Bonus to attack rolls and saving throws',

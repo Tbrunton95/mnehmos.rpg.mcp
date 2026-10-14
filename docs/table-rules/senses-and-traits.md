@@ -81,6 +81,8 @@ improvisation_manage montage {characterId, task, dc, skill: 'survival', context:
 
 Any trait whose `when` matches a tag applies advantage by itself; the breakdown reads `advantage ← Keen Smell (scent)`, the reply carries `traitAdvantage: ['Keen Smell (scent)']`, and the roll log's purpose is `perception check (adv: Keen Smell (scent))`. An untagged check gets no advantage and `conditionalAdvantage` names the tag it would need. A tag on a skill the trait does not list fires nothing. Advantage and disadvantage still cancel as normal (a GM `disadvantage: true`, or stealth armour, brings it back to one die). A Survival check to follow a trail takes `context: ['scent']` the same way.
 
+Play report 7 #8: naming the trait works too. `advantageSources: ['Keen Smell']` on a Perception or Survival check fires that trait as its tag would (the scene's denial and the wind still apply and are quoted), logged `perception check (adv: Keen Smell (scent, named))`: naming it is the GM asserting the circumstance. On a skill the trait does not list, on a save or an ability check, or in `disadvantageSources`, it is refused with the exact `roll_skill_check {…, context: ['scent']}` call, and nothing is rolled. `combat_action grapple` fires a trait listing Athletics (Acrobatics on a break) by name or by `context`. See docs/table-rules/advantage.md for the rest of declared advantage.
+
 The montage rolls its notation twice and keeps the higher (`advantageRoll {rolls, kept, mode}`); with `skill` and no `ability`, the skill's 5e or world ability supplies the modifier.
 
 ### Denial, stated before the roll

@@ -73,11 +73,13 @@ describe('combat_manage apply_damage in an encounter', () => {
         const r = await manage({ action: 'apply_damage', encounterId: enc, targetIds: ['ardboyz'], dice: '6d10', damageType: 'fire', source: 'burning rubble' });
         expect(r.success).toBe(true);
         expect(r.damageRolls).toHaveLength(6);
-        // 55 HP (11 of 20 models) less 6..54 lands at or below half and still standing.
-        expect(r.targets[0]).toMatchObject({ targetId: 'ardboyz', damageTaken: r.damageRolled, hpAfter: 55 - r.damageRolled });
-        expect(r.breakTests?.[0]).toMatchObject({ participantId: 'ardboyz', maxModels: 20 });
+        // Play report 7 #1: not an area (no area / modelsInArea), so one model
+        // at most: 55 HP is 10 full models and a front model on 5; 6d10 (6+)
+        // takes the front model and the unit falls to 10/20, a break test.
+        expect(r.targets[0]).toMatchObject({ targetId: 'ardboyz', damageTaken: 5, hpAfter: 50, unitCap: { before: r.damageRolled, after: 5 } });
+        expect(r.breakTests?.[0]).toMatchObject({ participantId: 'ardboyz', maxModels: 20, modelsAfter: 10 });
         expect(r.message).toMatch(/BREAK TEST DUE/);
-        expect(tok('ardboyz').hp).toBe(55 - r.damageRolled);
+        expect(tok('ardboyz').hp).toBe(50);
         expect(tok('ardboyz').actionUsed).toBe(true);
         expect(tok('hero').actionUsed).toBeFalsy();
         const logged = queryRolls(getDb(), { encounterId: enc, limit: 20 }).find((x: any) => x.purpose === 'damage: burning rubble');
@@ -122,11 +124,14 @@ describe('combat_manage apply_damage in an encounter', () => {
     it('lair_action gains the break test through the shared resolver', async () => {
         const created = await manage({ action: 'create', seed: 'apply-damage-lair', participants: [
             { id: 'dragon', name: 'Dragon', hp: 200, maxHp: 200, initiative: 10, hasLairActions: true },
-            { id: 'ardboyz', name: 'Ardboyz', hp: 50, maxHp: 50, initiative: 5, isEnemy: true, unit: { models: 10, hpPerModel: 5, packed: true, attackBonus: 4, morale: 7 } }
+            { id: 'ardboyz', name: 'Ardboyz', hp: 50, maxHp: 50, initiative: 5, isEnemy: true, unit: { models: 10, hpPerModel: 5, packed: false, attackBonus: 4, morale: 7 } }
         ] });
         enc = created.encounterId;
-        const text = (await guarded({ action: 'lair_action', encounterId: enc, actionDescription: 'the roof falls', targetIds: ['ardboyz'], damage: 30 })).content[0].text;
+        // Play report 7 #1: a lair action is an area, model by model; half the
+        // spaced unit is under the roof, so five die and it owes a break test.
+        const text = (await guarded({ action: 'lair_action', encounterId: enc, actionDescription: 'the roof falls', targetIds: ['ardboyz'], damage: 30, modelsInArea: { ardboyz: 5 } })).content[0].text;
         expect(text).toMatch(/BREAK TEST DUE/);
+        expect(tok('ardboyz').hp).toBe(25);
     });
 });
 

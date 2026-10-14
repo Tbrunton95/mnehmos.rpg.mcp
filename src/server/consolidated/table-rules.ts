@@ -11,7 +11,8 @@ import { randomUUID } from 'crypto';
 import { RichFormatter } from '../utils/formatter.js';
 import { getDb } from '../../storage/index.js';
 import { SessionContext } from '../types.js';
-import { RULE_KINDS, RuleKind, parseRuleSpec, listRules, TableRule, findPool } from '../../engine/table-rules.js';
+import { RULE_KINDS, RuleKind, parseRuleSpec, listRules, loadRules, TableRule, findPool } from '../../engine/table-rules.js';
+import { validateAdvantageMechanics } from '../../engine/advantage-scope.js';
 import { rollAndApply } from '../roll-table-apply.js';
 import { RULE_PRESETS } from '../../data/table-rules/day-366.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
@@ -73,11 +74,36 @@ function view(r: TableRule) {
     return { name: r.name, kind: r.kind, enabled: r.enabled, spec: r.spec };
 }
 
+/**
+ * Play report 7 #7 (review): a roll_table entry's gift is an effect the roll
+ * writes onto the character, so its advantage_on / disadvantage_on scopes
+ * are checked here, at write time, as improvisation_manage checks them, and
+ * stored in canonical form. A bad scope throws with nothing written.
+ */
+function giftScopesChecked<T>(worldId: string, kind: string, name: string, spec: T): T {
+    if (kind !== 'roll_table') return spec;
+    const entries = (spec as { entries?: Array<{ apply?: { gift?: { mechanics?: unknown[] } } }> }).entries ?? [];
+    if (!entries.some(e => e?.apply?.gift?.mechanics?.length)) return spec;
+    const worldSkills = loadRules(getDb(), worldId, 'skill').map(r => r.name);
+    const problems: string[] = [];
+    const out = entries.map((e, i) => {
+        const gift = e?.apply?.gift;
+        if (!gift?.mechanics?.length) return e;
+        const checked = validateAdvantageMechanics(gift.mechanics, { worldSkills });
+        problems.push(...checked.problems.map(p => `entries[${i}].apply.gift.${p}`));
+        return { ...e, apply: { ...e.apply, gift: { ...gift, mechanics: checked.mechanics } } };
+    });
+    if (problems.length) {
+        throw new Error(`roll_table '${name}': ${problems.join(' ')} A gift's advantage is declared as {type: 'advantage_on', value: '<scope>', condition?: '<when-tag>'} (docs/table-rules/advantage.md). Nothing was written.`);
+    }
+    return { ...spec, entries: out };
+}
+
 function upsert(input: { worldId: string; kind: string; name: string; spec?: Record<string, unknown>; enabled?: boolean }): { created: boolean } {
     if (!(RULE_KINDS as string[]).includes(input.kind)) {
         throw new Error(`Unknown rule kind '${input.kind}'. Kinds: ${RULE_KINDS.join(', ')}`);
     }
-    const spec = parseRuleSpec(input.kind as RuleKind, input.spec ?? {});
+    const spec = giftScopesChecked(input.worldId, input.kind, input.name, parseRuleSpec(input.kind as RuleKind, input.spec ?? {}));
     const db = getDb();
     const now = new Date().toISOString();
     const existing = db.prepare('SELECT id, kind, name FROM table_rules WHERE world_id = ? AND lower(name) = lower(?)').get(input.worldId, input.name) as { id: string; kind: string; name: string } | undefined;
@@ -207,7 +233,7 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
             // leaves a half-imported rule set.
             for (const e of entries) {
                 if (!(RULE_KINDS as string[]).includes(e.kind)) throw new Error(`Rule '${e.name}': unknown kind '${e.kind}'`);
-                parseRuleSpec(e.kind as RuleKind, e.spec ?? {});
+                giftScopesChecked(input.worldId, e.kind, e.name, parseRuleSpec(e.kind as RuleKind, e.spec ?? {}));
             }
             // Play report 2, item 11: a principle the world already has is a
             // GM's text (reference, never enforced) — a re-import keeps it
@@ -254,7 +280,7 @@ export const TableRulesTool = {
 
 Actions: define, get, list, enable, disable, delete, import
 Kinds:
-- band {order, damageScale?}: power bands, lowest first. Characters and combat tokens carry band. damageScale {perStepBelow: 0.5, perStepAbove: 1.25, floor: 0.25, cap: 2} (all optional, these defaults) opts the world into band-scaled damage: steps = attacker's band index − target's, multiplier perStepAbove^steps above or perStepBelow^steps below, clamped to [floor, cap]; damage = max(1, floor(damage × multiplier)). Applies to attacks, volleys, grapple surface damage and apply_damage with actorId; never to spells, heals, execute or actorless damage. Results carry bandScale {steps, multiplier, before, after}.
+- band {order, damageScale?, requireBand?}: power bands, lowest first. Characters and combat tokens carry band. A token created with no band, no sheet and no creature or preset band takes the lowest band (of the ladder the fight's bands sit on, when the world has several), marked assumed (bandAssumed; the reply names it, every band-dependent line against it prints (band assumed), combat_manage set_band changes it); a sheet with no band is never assumed, only named. requireBand: true refuses such a token at create / add_participant instead. damageScale {perStepBelow: 0.5, perStepAbove: 1.25, floor: 0.25, cap: 2} (all optional, these defaults) opts the world into band-scaled damage: steps = attacker's band index − target's, multiplier perStepAbove^steps above or perStepBelow^steps below, clamped to [floor, cap]; damage = max(1, floor(damage × multiplier)). Applies to attacks, volleys, grapple surface damage and apply_damage with actorId; never to spells, heals, execute or actorless damage. Results carry bandScale {steps, multiplier, before, after}.
 - peer_consequence {thresholdFraction, onCrit, options, direction}: a hit on a peer (same band or higher) that crits or deals ≥ the fraction of max HP flags CONSEQUENCE DUE; direction 'both' flags a higher band's hits on a lower one too. A hit that kills, or a hit on a unit, never flags; the GM names it and applies it with combat_manage set_part.
 - called_strike {requirePeer, limbs}: combat_action attack calledStrike: 'leg'|'arm' or any named part of the target ('jaw', 'collar chain') cripples it on a hit (no roll penalty, no threshold). A named part keeps its kind and reads limbs[name] ?? limbs[kind] ?? limbs.other.
 - prepared_asset {catastrophicMargin, missOptions, hitEffect, catastrophicEffect}: combat_action attack preparedAsset: <rule name> reports the tier (miss / hit / catastrophic); the GM names the effect.
@@ -264,7 +290,7 @@ Kinds:
 - principle {text}: reference text shown at session boot, never enforced.
 - creature {hp, ac, displayName?, maxHp?, stats?, initiativeBonus?, attackBonus/attackDamage or attacks[], attacksPerAction?, abilities?, size?, movementSpeed?, cr?, band?, species?, tags?, regeneration?, parts?, unit?, resistances?, traits?, legendary counts, hasLairActions?}: the world's bestiary. Spawn with combat_manage spawn_quick_enemy {creature, worldId} or add_participant {creature, count}; a world entry beats a built-in preset of the same name. define can capture one: fromToken {encounterId, participantId} or fromCharacterId, with spec merged on top. Boot counts these as the bestiary; they are never enforced.
 - vessel {displayName?, hull, ac, shields?: {max, regenPerRound}, sections: [{name, hp, ac?, breakAt?, role: drive | guns | bridge | reactor | hangar | other}], weapons: [{name, attackBonus, damage, damageType?, range?, section?}], speed?, band?, crew?, size?, traits}: a ship or station for the void-combat lane. character_manage create_vessel {worldId, vessel, name?} makes a character row from it (hull = HP, sections = system parts with roles, weapons = attack profiles tied to their section, shields = a pool drained before the hull and refilled at turn start); combat_manage board opens a linked boarding encounter. Data, read by the row. See docs/table-rules/vessels.md.
-- roll_table {entries: [{weight | min/max, text, chain?, apply?}], dice?, modifierPool?, poolDivisor}: a random table (omens, miscasts, the Eye of the Gods). Weights read as cumulative ranges from 1; the default die is 1d<total weight> or 1d<highest max>. An entry's apply {gift?: {name, description?, category?, powerLevel?, mechanics?}, condition?: {name, duration?, source?, pinned?}, writes?: [ops as schedule_change, set_part / remove_part included: a part op writes the sheet and every live token], form?: '<creature>' | 'base', hpMode?, terminal?: 'kill', corpse?} acts on the character rolled for, in that order (gift, condition and writes, form, death). Data, never enforced.
+- roll_table {entries: [{weight | min/max, text, chain?, apply?}], dice?, modifierPool?, poolDivisor}: a random table (omens, miscasts, the Eye of the Gods). Weights read as cumulative ranges from 1; the default die is 1d<total weight> or 1d<highest max>. An entry's apply {gift?: {name, description?, category?, powerLevel?, mechanics? (an advantage_on / disadvantage_on value is a scope, checked when the table is defined or imported: docs/table-rules/advantage.md)}, condition?: {name, duration?, source?, pinned?}, writes?: [ops as schedule_change, set_part / remove_part included: a part op writes the sheet and every live token], form?: '<creature>' | 'base', hpMode?, terminal?: 'kill', corpse?} acts on the character rolled for, in that order (gift, condition and writes, form, death). Data, never enforced.
 - pool_family {pools, max?, floor?, jealousy: {gainer: {rival: fraction}}, offering_values}: rival pools (the gods' favour). character_manage adjust_pool {family} moves a member; a gain makes jealous rivals lose round(gain × fraction). Data, never enforced.
 - skill {ability, description?}: a world skill. roll_skill_check and improvisation stunt read its ability (a stunt on any other non-SRD skill takes ability).
 - species {size?, speed?, abilityBonuses?, languages, traits, hpPerLevel?}, char_class {hitDie (8), saves, skills, armor?, weapons?, casting?: {as: '<SRD caster class>'}}, background {skills, languages, tools, gold?}: the world's character options. character_manage create reads the world's entry first and the SRD second; options {worldId} lists them. A class with casting.as casts SRD spells with that caster's slots and ability. Data, never enforced.

@@ -375,50 +375,7 @@ export class CombatRNG {
         modifier: number,
         dc: number
     ): CheckResult {
-        const roll = this.rollDie(20);
-        const total = roll + modifier;
-        const margin = total - dc;
-
-        // Natural 20/1 adjust degree by one step
-        let degree: 'critical-failure' | 'failure' | 'success' | 'critical-success';
-
-        if (margin >= 10) {
-            degree = 'critical-success';
-        } else if (margin >= 0) {
-            degree = 'success';
-        } else if (margin >= -10) {
-            degree = 'failure';
-        } else {
-            degree = 'critical-failure';
-        }
-
-        const isNat20 = roll === 20;
-        const isNat1 = roll === 1;
-
-        // Adjust for natural 20 (improve by one step)
-        if (isNat20) {
-            if (degree === 'failure') degree = 'success';
-            else if (degree === 'success') degree = 'critical-success';
-        }
-
-        // Adjust for natural 1 (worsen by one step)
-        if (isNat1) {
-            if (degree === 'success') degree = 'failure';
-            else if (degree === 'critical-success') degree = 'success';
-        }
-
-        return {
-            roll,
-            modifier,
-            total,
-            dc,
-            margin,
-            degree,
-            isNat20,
-            isNat1,
-            isHit: degree === 'success' || degree === 'critical-success',
-            isCrit: degree === 'critical-success'
-        };
+        return checkDegreeOf(this.rollDie(20), modifier, dc);
     }
 
     /**
@@ -493,6 +450,60 @@ export interface CheckResult {
     isNat1: boolean;
     isHit: boolean;         // success or critical-success
     isCrit: boolean;        // critical-success
+}
+
+/**
+ * The degree of one d20 already rolled against a DC: the margin decides
+ * (10 or more over crits, 10 or more under crit-fails), a natural 20 lifts
+ * it one step and a natural 1 drops it one. checkDegreeDetailed rolls its die
+ * and asks this; play report 7 (lane H): the engine's end-of-turn save keeps
+ * one of two dice at advantage and asks the same, so one die reads exactly
+ * as it always did.
+ */
+export function checkDegreeOf(roll: number, modifier: number, dc: number): CheckResult {
+    const total = roll + modifier;
+    const margin = total - dc;
+
+    // Natural 20/1 adjust degree by one step
+    let degree: 'critical-failure' | 'failure' | 'success' | 'critical-success';
+
+    if (margin >= 10) {
+        degree = 'critical-success';
+    } else if (margin >= 0) {
+        degree = 'success';
+    } else if (margin >= -10) {
+        degree = 'failure';
+    } else {
+        degree = 'critical-failure';
+    }
+
+    const isNat20 = roll === 20;
+    const isNat1 = roll === 1;
+
+    // Adjust for natural 20 (improve by one step)
+    if (isNat20) {
+        if (degree === 'failure') degree = 'success';
+        else if (degree === 'success') degree = 'critical-success';
+    }
+
+    // Adjust for natural 1 (worsen by one step)
+    if (isNat1) {
+        if (degree === 'success') degree = 'failure';
+        else if (degree === 'critical-success') degree = 'success';
+    }
+
+    return {
+        roll,
+        modifier,
+        total,
+        dc,
+        margin,
+        degree,
+        isNat20,
+        isNat1,
+        isHit: degree === 'success' || degree === 'critical-success',
+        isCrit: degree === 'critical-success'
+    };
 }
 
 /**

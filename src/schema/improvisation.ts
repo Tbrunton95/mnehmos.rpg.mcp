@@ -8,6 +8,7 @@
  */
 
 import { z } from 'zod';
+import { SRD_SKILL_ABILITY } from '../engine/skill-modifier.js';
 
 // ============================================================================
 // SHARED TYPES
@@ -462,24 +463,10 @@ export const POWER_LEVEL_GUIDELINES = {
     5: { duration: 'Permanent', impact: 'Reality-warping', example: 'Demigod status' }
 } as const;
 
-// Skill to ability mapping for modifier calculation
-export const SKILL_TO_ABILITY: Record<SkillName, AbilityName> = {
-    athletics: 'strength',
-    acrobatics: 'dexterity',
-    sleight_of_hand: 'dexterity',
-    stealth: 'dexterity',
-    arcana: 'intelligence',
-    history: 'intelligence',
-    investigation: 'intelligence',
-    nature: 'intelligence',
-    religion: 'intelligence',
-    animal_handling: 'wisdom',
-    insight: 'wisdom',
-    medicine: 'wisdom',
-    perception: 'wisdom',
-    survival: 'wisdom',
-    deception: 'charisma',
-    intimidation: 'charisma',
-    performance: 'charisma',
-    persuasion: 'charisma'
-};
+// Skill to ability mapping for modifier calculation, by long ability name.
+// Play report 7 #11: derived from the one SRD map (src/engine/skill-modifier.ts)
+// so the two can never disagree.
+const LONG_ABILITY_NAME: Record<string, AbilityName> = { str: 'strength', dex: 'dexterity', con: 'constitution', int: 'intelligence', wis: 'wisdom', cha: 'charisma' };
+export const SKILL_TO_ABILITY: Record<SkillName, AbilityName> = Object.fromEntries(
+    SkillNameSchema.options.map(skill => [skill, LONG_ABILITY_NAME[SRD_SKILL_ABILITY[skill]]])
+) as Record<SkillName, AbilityName>;

@@ -386,12 +386,12 @@ describe('Category 2: Spell Slot Exhaustion', () => {
 
         // Level 1 wizard has 2 first-level slots
         await castSpell(wizard.id!, 'Magic Missile', { encounterId }); // Slot 1 used
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         await castSpell(wizard.id!, 'Magic Missile', { encounterId }); // Slot 2 used
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         await expect(castSpell(wizard.id!, 'Magic Missile', { encounterId })).rejects.toThrow(
             /no (spell slots remaining|level 1\+ spell slots available)/i
@@ -405,12 +405,12 @@ describe('Category 2: Spell Slot Exhaustion', () => {
 
         // Exhaust 3rd level slots (level 5 wizard has 2)
         await castSpell(wizard.id!, 'Fireball', { encounterId });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         await castSpell(wizard.id!, 'Fireball', { encounterId });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         // Try to cast again - should fail even though 1st/2nd slots remain
         await expect(castSpell(wizard.id!, 'Fireball', { encounterId })).rejects.toThrow(
@@ -452,8 +452,8 @@ describe('Category 2: Spell Slot Exhaustion', () => {
         for (let i = 0; i < 5; i++) {
             await castSpell(wizard.id!, 'Fire Bolt', { encounterId });
             // Advance turn twice to get back to wizard
-            await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-            await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+            await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+            await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
         }
 
         const afterChar = await getCharacter(wizard.id!);
@@ -472,8 +472,8 @@ describe('Category 2: Spell Slot Exhaustion', () => {
         expect(before?.spellSlots?.level3?.current).toBe(2);
 
         await castSpell(wizard.id!, 'Magic Missile', { encounterId }); // Uses 1st level
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
         await castSpell(wizard.id!, 'Fireball', { encounterId });      // Uses 3rd level
 
         const after = await getCharacter(wizard.id!);
@@ -659,28 +659,28 @@ describe('Category 5: Spell Slot Recovery (CRIT-002)', () => {
 
         // Expending slot 1
         await castSpell(wizard.id!, 'Magic Missile', { encounterId });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
         
         // Expending slot 2
         await castSpell(wizard.id!, 'Magic Missile', { encounterId });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
         
         // Slot 3
         await castSpell(wizard.id!, 'Magic Missile', { encounterId });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
         
         // Slot 4
         await castSpell(wizard.id!, 'Magic Missile', { encounterId });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
         
         // Level 3 Slot 1
         await castSpell(wizard.id!, 'Fireball', { encounterId });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
         
         // Level 3 Slot 2
         await castSpell(wizard.id!, 'Fireball', { encounterId });
@@ -721,13 +721,13 @@ describe('Category 5: Spell Slot Recovery (CRIT-002)', () => {
 
         // Level 5 warlock:        // Consumes pact slot 1
         await castSpell(warlock.id!, 'Hex', { encounterId });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         // Consumes pact slot 2
         await castSpell(warlock.id!, 'Hex', { encounterId });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         const exhausted = await getCharacter(warlock.id!);
         expect(exhausted?.pactMagicSlots?.current).toBe(0);
@@ -896,15 +896,15 @@ describe('Category 7: Concentration Mechanics', () => {
         const encounterId = await setupCombatEncounter(wizard.id!);
 
         await castSpell(wizard.id!, 'Haste', { targetId: ally.id, encounterId });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         let char = await getCharacter(wizard.id!);
         expect(char?.concentratingOn).toBe('Haste');
 
         await castSpell(wizard.id!, 'Fly', { targetId: wizard.id, encounterId });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         char = await getCharacter(wizard.id!);
         expect(char?.concentratingOn).toBe('Fly');
@@ -945,8 +945,8 @@ describe('Category 7: Concentration Mechanics', () => {
         const encounterId = match ? match[1] : 'unknown';
 
         await castSpell(wizard.id!, 'Hold Person', { targetId: 'bystander', encounterId });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         // Enemy attacks wizard for 20 damage
         await handleExecuteCombatAction({
@@ -991,8 +991,8 @@ describe('Category 7: Concentration Mechanics', () => {
         const encounterId = match ? match[1] : 'unknown';
 
         await castSpell(wizard.id!, 'Hold Person', { targetId: 'bystander', encounterId });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         // Enemy deals lethal damage
         await handleExecuteCombatAction({
@@ -1254,8 +1254,8 @@ describe('Category 10: Spell Save DC & Attack Rolls', () => {
             targetId: target.id,
             encounterId
         });
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         expect(result.damage).toBeDefined();
         expect(result.damage).toBeGreaterThan(0);
@@ -1295,8 +1295,8 @@ describe('Category 10: Spell Save DC & Attack Rolls', () => {
                 targetPoint: { x: 5, y: 5 },
                 encounterId
             });
-            await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-            await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+            await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+            await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
             
             if (result.rawText.includes('✓ PASSED')) {
                 foundPassed = true;
@@ -1527,9 +1527,9 @@ describe('Integration: Full Combat Spell Scenarios', () => {
             spellName: 'Magic Missile',
             targetId: 'goblin-1'
         }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         // Parse MCP response
         const mmResponseObj = mmResponse as { content: Array<{ type: string; text: string }> };
@@ -1548,9 +1548,9 @@ describe('Integration: Full Combat Spell Scenarios', () => {
             targetId: 'goblin-1'
         }, getTestContext() as any);
 
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         // 2. Fire Bolt (Action)
         const fbResponse = await handleExecuteCombatAction({
@@ -1560,8 +1560,8 @@ describe('Integration: Full Combat Spell Scenarios', () => {
             spellName: 'Fire Bolt',
             targetId: 'goblin-2'
         }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
-        await handleAdvanceTurn({ encounterId }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, getTestContext() as any);
 
         // Parse MCP response
         const fbResponseObj = fbResponse as { content: Array<{ type: string; text: string }> };

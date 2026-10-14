@@ -28,6 +28,14 @@ export const ConcentrationCheckResultSchema = z.object({
     saveTotal: z.number().int().optional(), // Roll + modifier
     damageAmount: z.number().int().optional(), // Damage that triggered the check
     constitutionModifier: z.number().int().optional(),
+    // Play report 7 (lane H): what put the CON save at advantage or disadvantage
+    // (an untagged save:con mechanic, exhaustion 3+), both dice when two were
+    // rolled, and a tagged mechanic's hint. Absent for a save that took none.
+    advantageSources: z.array(z.string()).optional(),
+    disadvantageSources: z.array(z.string()).optional(),
+    saveRolls: z.array(z.number().int()).optional(),
+    conditionalAdvantage: z.array(z.string()).optional(),
+    conditionalDisadvantage: z.array(z.string()).optional(),
 });
 
 export type ConcentrationCheckResult = z.infer<typeof ConcentrationCheckResultSchema>;

@@ -6,6 +6,7 @@ import {
     handleAdvanceTurn, handleExecuteLairAction, clearCombatState, getOrLoadEngine
 } from '../../src/server/handlers/combat-handlers.js';
 import { withOperation } from '../../src/server/operation-guard.js';
+import { handleCombatManage } from '../../src/server/consolidated/combat-manage.js';
 import { handleConcentrationManage } from '../../src/server/consolidated/concentration-manage.js';
 import { ConcentrationRepository } from '../../src/storage/repos/concentration.repo.js';
 import { closeDb, getDb } from '../../src/storage/index.js';
@@ -114,6 +115,20 @@ describe('spell saves inside an encounter', () => {
         expect(result.saves[0].modifier).toBe(3);
     });
 
+    // Play report 7 #2: the consolidated create used to strip stats and
+    // abilityScores, so a hand-built token saved at +0 whatever it was given.
+    it('combat_manage create participants[].stats reaches the spell save (no live-token patch)', async () => {
+        const wizardId = uuid();
+        charRepo.create(wizard(wizardId));
+        const created = await handleCombatManage({ action: 'create', seed: `saves-${uuid()}`, participants: [
+            { id: wizardId, name: 'Evoker', hp: 30, maxHp: 30, initiative: 20 },
+            { id: 'ogre', name: 'Ogre', hp: 100, maxHp: 100, initiative: 1, isEnemy: true, stats: { dex: 16 } }
+        ] }, ctx as any);
+        const encounterId = created.content[0].text.match(/"encounterId":"(encounter-[^"]+)"/)![1];
+        const res = await cast({ encounterId, action: 'cast_spell', actorId: wizardId, spellName: 'Fireball', targetId: 'ogre' });
+        expect(stateOf(res.content[0].text).actionResult.saves[0].modifier).toBe(3);
+    });
+
     it('does not roll the save with Math.random', async () => {
         const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
         await fireballAt({ id: 'ogre', name: 'Ogre' });
@@ -199,7 +214,7 @@ describe('lair saves read the sheet', () => {
             ]
         }, ctx as any);
         const encounterId = created.content[0].text.match(/Encounter ID: (encounter-[^\n\s]+)/)![1];
-        await handleAdvanceTurn({ encounterId }, ctx as any);
+        await handleAdvanceTurn({ encounterId, confirm: true }, ctx as any);
         vi.spyOn(CombatEngine.prototype, 'rollD20').mockReturnValue(10);
         const res = await handleExecuteLairAction({
             encounterId, actionDescription: 'Stalactites fall', targetIds: ['hero'],

@@ -105,7 +105,7 @@ afterEach(() => { vi.restoreAllMocks(); closeDb(); });
 describe('every road that drops a tracked token mirrors the sheet and runs the kill', () => {
     it('an opportunity attack fired by a move: the dropped mover is DYING on token and sheet', async () => {
         await start({ hp: 6 });
-        await manage({ action: 'advance', encounterId: enc }); // medic → hero (6 HP, acts)
+        await manage({ action: 'advance', encounterId: enc, confirm: true }); // medic → hero (6 HP, acts)
         const r = await act({ action: 'move', encounterId: enc, actorId: 'hero', targetPosition: { x: 1, y: 3 } });
         expect(r.error).toBeUndefined();
         expect(r.actionResult.opportunityAttacks).toHaveLength(1);
@@ -119,7 +119,7 @@ describe('every road that drops a tracked token mirrors the sheet and runs the k
 
     it('an opportunity attack of massive damage kills: the sheet is killed with a corpse and the reply says so', async () => {
         await start({ hp: 6 }, { attackDamage: '1d1+29' });
-        await manage({ action: 'advance', encounterId: enc });
+        await manage({ action: 'advance', encounterId: enc, confirm: true });
         const r = await act({ action: 'move', encounterId: enc, actorId: 'hero', targetPosition: { x: 1, y: 3 } });
         expect(r.error).toBeUndefined();
         expect(stored('hero').isDead).toBe(true);
@@ -160,7 +160,7 @@ describe('every road that drops a tracked token mirrors the sheet and runs the k
         });
         await start({ hp: 6 }, {}, [{ id: 'evoker', name: 'Evoker', hp: 30, maxHp: 30, initiative: 15, position: { x: 5, y: 5 } }]);
         // The evoker acts: medic → evoker.
-        await manage({ action: 'advance', encounterId: enc });
+        await manage({ action: 'advance', encounterId: enc, confirm: true });
         // Every die at its minimum (8d6 = 8 fire): the hero fails the save and drops to 0 with 2 past.
         vi.spyOn(CombatEngine.prototype, 'rollDice').mockImplementation((n: string) => {
             const rolls: number[] = []; let modifier = 0;
@@ -198,7 +198,7 @@ describe('every road that heals above 0 wakes the sheet', () => {
         await start();
         repo().update('hero', { conditions: [{ name: 'Unconscious', source: 'dying' }, { name: 'Prone', source: 'dying' }] } as any);
         d20(20);
-        const r = await manage({ action: 'advance', encounterId: enc });
+        const r = await manage({ action: 'advance', encounterId: enc, confirm: true });
         expect(r.deathSaves[0]).toMatchObject({ participantId: 'hero', regainedHp: true });
         expect(row('hero').hp).toBe(1);
         expect(rowDying('hero')).toEqual([]);
@@ -249,7 +249,7 @@ describe('the slot and the sheet path', () => {
         const posted = await manage({ action: 'death_save', encounterId: enc, participantId: 'hero' });
         expect(posted.deathSave).toMatchObject({ successes: 1, failures: 0 });
         const spy = d20(3);
-        const r = await manage({ action: 'advance', encounterId: enc }); // medic → hero's slot, same round
+        const r = await manage({ action: 'advance', encounterId: enc, confirm: true }); // medic → hero's slot, same round
         expect(r.error).toBeUndefined();
         expect(stored('hero')).toMatchObject({ deathSaveSuccesses: 1, deathSaveFailures: 0 });
         expect(spy).not.toHaveBeenCalled();
@@ -259,7 +259,7 @@ describe('the slot and the sheet path', () => {
 
     it('the DEATH SAVE DUE line in the advance state view carries the real encounter id', async () => {
         await start({ deathSaveMode: 'prompt' });
-        const r = await manage({ action: 'advance', encounterId: enc });
+        const r = await manage({ action: 'advance', encounterId: enc, confirm: true });
         expect(r.deathSaveDue).toMatchObject({ participantId: 'hero' });
         expect(r.rawText).not.toMatch(/<encounterId>/);
         expect(r.rawText).toContain(`combat_manage death_save {encounterId: '${enc}', participantId: 'hero'}`);

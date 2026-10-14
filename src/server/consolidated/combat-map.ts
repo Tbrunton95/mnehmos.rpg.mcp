@@ -247,7 +247,7 @@ export const CombatMapTool = {
 
 🗺️ VISUALIZATION:
 - render - ASCII map of combat state (positions, terrain, combatants)
-- aoe - Calculate area of effect (circle/cone/line)
+- aoe - Calculate area of effect (circle/cone/line): every square of a token counts (cellsInside / footprint); a unit token gets a modelsInArea hint (packed: every live model; spaced: by the squares covered) to pass to the damage call
 - measure - Distance between points or entities
 
 🏔️ TERRAIN:

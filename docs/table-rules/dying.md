@@ -41,7 +41,7 @@ The notes ride `turnStartNotes`; STATE_JSON carries `deathSaves: [{participantId
 🩸 DEATH SAVE DUE: Hero (0 HP, ✓1 ✗2) — combat_manage death_save {encounterId: '…', participantId: 'hero'}
 ```
 
-and `advance` is refused (`writes: 'none'`) until the save is rolled or posted. Set it per world (`world_manage update {worldId, environment: {deathSaveMode: 'prompt'}}`) or per character (`character_manage update {characterId, deathSaveMode: 'prompt'}`); a character's own mode wins over the world's.
+and `advance` is refused (`writes: 'none'`) until the save is rolled or posted. A natural 20 that answers it brings the creature back at 1 HP and starts its turn there (fresh action, movement and reaction; play report 7 #6), so its first swing is not refused with the economy left from the turn it dropped. See [turns.md](turns.md). Set it per world (`world_manage update {worldId, environment: {deathSaveMode: 'prompt'}}`) or per character (`character_manage update {characterId, deathSaveMode: 'prompt'}`); a character's own mode wins over the world's.
 
 ## death_save
 

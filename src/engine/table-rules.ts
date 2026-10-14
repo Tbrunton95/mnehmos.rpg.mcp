@@ -81,7 +81,13 @@ export const RuleSpecSchemas = {
             perStepAbove: z.number().gt(0).default(1.25),
             floor: z.number().gt(0).default(0.25),
             cap: z.number().gt(0).default(2)
-        }).passthrough().optional()
+        }).passthrough().optional(),
+        /**
+         * Play report 7 #3: without it, a token created with no band (and no
+         * sheet, creature or preset band) takes the lowest band, marked
+         * assumed. true makes create / add_participant refuse such a token.
+         */
+        requireBand: z.boolean().optional()
     }).passthrough(),
     peer_consequence: z.object({
         thresholdFraction: z.number().gt(0).max(1).default(0.25),

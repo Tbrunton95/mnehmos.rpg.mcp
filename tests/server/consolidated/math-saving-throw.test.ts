@@ -63,7 +63,10 @@ describe('math_manage roll_saving_throw', () => {
         expect(r2.bonus).toBe(1);
     });
 
+    // Play report 7 #7: a name grants only what declares it. VAUREK's prose
+    // condition declares nothing; the feature kept beside it (same label) does.
     it('an advantage source matched against a condition rolls 2d20 and logs why', async () => {
+        effect('kessa', 'VAUREK', [{ type: 'advantage_on', value: 1, save: 'wisdom' }]);
         const r = json(await math({ action: 'roll_saving_throw', characterId: 'kessa', ability: 'wis', dc: 15, advantageSources: ['vaurek'] }));
         expect(r.rolls).toHaveLength(2);
         expect(r.natural).toBe(Math.max(...r.rolls));
@@ -77,7 +80,9 @@ describe('math_manage roll_saving_throw', () => {
     });
 
     it('a source can match by condition source text or by active effect name', async () => {
-        effect('kessa', 'Iron Choir Blessing', [{ type: 'custom_trigger', value: 'blessed' }]);
+        // Play report 7 #7: each declares what it grants (the older skill/save form still does).
+        effect('kessa', 'Iron Choir Blessing', [{ type: 'advantage_on', value: 1, save: 'wisdom' }]);
+        effect('kessa', 'Shaken by the Warp', [{ type: 'disadvantage_on', value: 1, save: 'wisdom' }]);
         const r = json(await math({ action: 'roll_saving_throw', characterId: 'kessa', ability: 'wis', disadvantageSources: ['daemon gaze'], advantageSources: ['iron choir blessing'] }));
         expect(r.disadvantageSources).toEqual(['Shaken by the Warp']);
         expect(r.advantageSources).toEqual(['Iron Choir Blessing']);
@@ -87,18 +92,22 @@ describe('math_manage roll_saving_throw', () => {
         expect(row.purpose).toBe('wis save (adv: Iron Choir Blessing; dis: Shaken by the Warp)');
     });
 
+    // Play report 7 #7: refused means refused — the roll used to go ahead with
+    // a warning; now nothing is rolled or logged (writes: 'none').
     it('a missing or ambiguous source is refused and grants nothing', async () => {
         const miss = json(await math({ action: 'roll_saving_throw', characterId: 'kessa', ability: 'wis', advantageSources: ['Khorne'] }));
-        expect(miss.rolls).toHaveLength(1);
-        expect(miss.advantageSources ?? []).toEqual([]);
-        expect(miss.resolverProblems.join(' ')).toMatch(/Khorne.*matches nothing/);
+        expect(miss.error).toBe(true);
+        expect(miss.writes).toBe('none');
+        expect(miss.rolls).toBeUndefined();
+        expect(miss.sourceProblems.join(' ')).toMatch(/Khorne.*matches nothing/);
         const amb = json(await math({ action: 'roll_saving_throw', characterId: 'kessa', ability: 'wis', disadvantageSources: ['shaken'] }));
-        expect(amb.rolls).toHaveLength(1);
-        expect(amb.resolverProblems.join(' ')).toMatch(/shaken.*matches 2.*by prefix/);
+        expect(amb.error).toBe(true);
+        expect(amb.sourceProblems.join(' ')).toMatch(/shaken.*matches 2.*by prefix/);
+        expect(json(await session({ action: 'rolls', forId: 'kessa' })).rolls ?? []).toEqual([]);
     });
 
     it('an exact name beats a longer name that contains it', async () => {
-        effect('kessa', 'Blessed', [{ type: 'custom_trigger', value: 'blessed' }]);
+        effect('kessa', 'Blessed', [{ type: 'advantage_on', value: 1, save: 'wisdom' }]);
         effect('kessa', 'Blessed by Nurgle', [{ type: 'custom_trigger', value: 'rot' }]);
         const r = json(await math({ action: 'roll_saving_throw', characterId: 'kessa', ability: 'wis', advantageSources: ['Blessed'] }));
         expect(r.advantageSources).toEqual(['Blessed']);
@@ -120,10 +129,12 @@ describe('math_manage roll_saving_throw', () => {
     });
 
     it('skill checks take advantage sources too', async () => {
+        // Play report 7 #7: declared in the scope grammar with a when-tag; naming it asserts the tag, and the log says so.
+        effect('kessa', 'VAUREK', [{ type: 'advantage_on', value: 'check:insight', condition: 'vs Khorne' }]);
         const r = json(await math({ action: 'roll_skill_check', characterId: 'kessa', skill: 'insight', advantageSources: ['VAUREK'] }));
         expect(r.rolls).toHaveLength(2);
         const row = json(await session({ action: 'rolls', forId: 'kessa' })).rolls.find((x: any) => x.id === r.rollId);
-        expect(row.purpose).toBe('insight check (adv: VAUREK)');
+        expect(row.purpose).toBe('insight check (adv: VAUREK (vs Khorne, named))');
     });
 
     it('a failed save reports an available legendary resistance without spending it', async () => {

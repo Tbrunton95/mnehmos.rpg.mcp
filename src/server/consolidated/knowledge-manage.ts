@@ -18,6 +18,8 @@ import { SessionContext } from '../types.js';
 import { CustomEffectsRepository } from '../../storage/repos/custom-effects.repo.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { EffectMechanicSchema } from '../../schema/improvisation.js';
+import { loadRules } from '../../engine/table-rules.js';
+import { validateAdvantageMechanics } from '../../engine/advantage-scope.js';
 
 const ACTIONS = ['record', 'learn', 'who_knows', 'what_knows', 'can_know', 'forget', 'list'] as const;
 const ROADS = ['witnessed', 'told', 'position', 'deduced', 'read', 'rumour'] as const;
@@ -143,6 +145,18 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
         case 'record': case 'add': {
             if (!input.key || !input.statement) return { error: true, message: 'record needs key and statement', writes: 'none' };
             if (fact(input.key)) return { error: true, message: `'${input.key}' already exists in this world; use learn to add knowers`, writes: 'none' };
+            // Play report 7 #7 (review): the effect every knower gains is an
+            // effect mechanic like any other — its advantage scopes are
+            // checked before anything is written, and stored canonical.
+            let effectOnKnower = input.effectOnKnower;
+            if (effectOnKnower?.mechanics?.length) {
+                const worldSkills = loadRules(getDb(), input.worldId, 'skill').map(r => r.name);
+                const checked = validateAdvantageMechanics(effectOnKnower.mechanics, { worldSkills });
+                if (checked.problems.length) {
+                    return { error: true, actionType: 'record', writes: 'none', mechanicProblems: checked.problems.map(p => `effectOnKnower.${p}`), message: `record refused: ${checked.problems.map(p => `effectOnKnower.${p}`).join(' ')} An advantage is declared as {type: 'advantage_on', value: '<scope>', condition?: '<when-tag>'} (docs/table-rules/advantage.md). Nothing was written.` };
+                }
+                effectOnKnower = { ...effectOnKnower, mechanics: checked.mechanics };
+            }
             // Play report 5 #9: every knower is checked BEFORE the fact is
             // written, so a refusal here leaves nothing behind (the fact used
             // to land first, and a retry was then refused as 'already exists').
@@ -162,7 +176,7 @@ async function route(args: unknown): Promise<Record<string, unknown>> {
                 resolved.push({ ...k, how, fromId });
             }
             db.prepare('INSERT INTO knowledge_facts (id, world_id, key, statement, secrecy, effect, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-                .run(`fact-${randomUUID().slice(0, 8)}`, input.worldId, input.key, input.statement, input.secrecy ?? 'secret', input.effectOnKnower ? JSON.stringify(input.effectOnKnower) : null, now);
+                .run(`fact-${randomUUID().slice(0, 8)}`, input.worldId, input.key, input.statement, input.secrecy ?? 'secret', effectOnKnower ? JSON.stringify(effectOnKnower) : null, now);
             const f = fact(input.key)!;
             const effects = resolved.map(k => addHolder(f, k)).filter(Boolean);
             return { success: true, actionType: 'record', key: f.key, statement: f.statement, secrecy: f.secrecy, knowers: holders(f).map(road), effects, message: `Recorded '${f.key}' with ${holders(f).length} knower(s)` };
@@ -240,7 +254,7 @@ Actions: record, learn, who_knows, what_knows, can_know, forget, list
 - learn {worldId, key, knowerId, how: witnessed | told | position | deduced | read | rumour, fromId?, note?, day?}: told needs a teller who already knows (refused otherwise).
 - can_know {worldId, key, knowerId}: yes with the road, or "no road: they cannot state it".
 - who_knows {key} / what_knows {knowerId}: the spread of a secret, or one character's journal of what they know.
-- effectOnKnower {name, description, mechanics}: applied to each knower on learn (mechanics with autoApply feed rolls), removed on forget.
+- effectOnKnower {name, description, mechanics}: applied to each knower on learn (mechanics with autoApply feed rolls), removed on forget. An advantage_on / disadvantage_on value is a scope (check:deception, save:wis), checked before the fact is written (docs/table-rules/advantage.md).
 worldId REQUIRED on every call.`,
     inputSchema: KnowledgeInputSchema,
     actionSchemas: Object.fromEntries(ACTIONS.map(a => [a, { schema: KnowledgeInputSchema, aliases: [] as string[] }]))

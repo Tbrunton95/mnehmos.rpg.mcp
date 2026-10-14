@@ -8,7 +8,11 @@
  * Every lane is defensive — a missing table or column is an empty lane.
  */
 import type Database from 'better-sqlite3';
-import { signed } from '../engine/skill-modifier.js';
+import { signed, skillKey, srdSkillAbility, type ShortAbility } from '../engine/skill-modifier.js';
+import { resolveAdvantageSources, loadEffectDeclarations, standardConditionRules } from '../engine/advantage-sources.js';
+import { worldSkillAbility } from '../engine/table-rules.js';
+import type { SkillAdvantageTrait } from '../engine/senses.js';
+import { suggestedScope, abilityOf, type RollScope } from '../engine/advantage-scope.js';
 
 export const RECONCILE_KINDS = [
     'equipped_missing',
@@ -18,7 +22,8 @@ export const RECONCILE_KINDS = [
     'ability_spent_outside_combat',
     'legendary_depleted_outside_combat',
     'xp_unposted',
-    'skill_override_migrated'
+    'skill_override_migrated',
+    'advantage_source_undeclared'
 ] as const;
 export type ReconcileKind = typeof RECONCILE_KINDS[number];
 
@@ -121,6 +126,97 @@ function inventoryNames(db: Database.Database, characterId: string): Set<string>
         add(r.id); add(r.custom_name); add(r.name);
     }
     return names;
+}
+
+/**
+ * A logged purpose read back ('wis save (adv: VAUREK)', 'grapple (adv: GM,
+ * Horn-Lock; dis: lower band)'): the roll it was, in the scope grammar's
+ * terms, and the text of each side's source list.
+ */
+function purposeSources(purpose: string, abilityOfSkill: (skill: string) => ShortAbility | undefined): { roll?: RollScope; adv: string; dis: string } {
+    const m = /^(.*?) \(((?:adv|dis): .*)\)$/.exec(purpose.trim());
+    if (!m) return { adv: '', dis: '' };
+    const base = m[1].trim().toLowerCase();
+    let adv = '', dis = '';
+    for (const seg of m[2].split('; ')) {
+        if (seg.startsWith('adv: ')) adv = seg.slice(5);
+        else if (seg.startsWith('dis: ')) dis = seg.slice(5);
+    }
+    let roll: RollScope | undefined;
+    const save = /^(\w+) save$/.exec(base);
+    const checkOf = /^(.+) check$/.exec(base);
+    if (base === 'grapple') roll = { kind: 'grapple', move: 'clinch', skills: ['athletics'], abilities: ['str'] };
+    else if (save && abilityOf(save[1])) roll = { kind: 'save', ability: abilityOf(save[1])! };
+    // A skill check rolled with its skill's ability (the world's, else the
+    // SRD map), so check:str covers a logged Athletics check as the roll did.
+    else if (checkOf) roll = abilityOf(checkOf[1]) ? { kind: 'check', ability: abilityOf(checkOf[1]) } : { kind: 'check', skill: skillKey(checkOf[1]), ability: abilityOfSkill(checkOf[1]) };
+    return { roll, adv, dis };
+}
+
+/** Whether a source list ('GM, Horn-Lock', 'Keen Smell (scent)') names this label as one of its entries. */
+function listsLabel(side: string, label: string): boolean {
+    const s = side.toLowerCase(), l = label.toLowerCase();
+    if (!s || !l) return false;
+    return s === l || s.startsWith(`${l}, `) || s.startsWith(`${l} (`) || s.includes(`, ${l}, `) || s.includes(`, ${l} (`) || s.endsWith(`, ${l}`);
+}
+
+/**
+ * Play report 7 #7: the sheet's conditions the roll log shows were named as
+ * a source, which declare nothing for those rolls now (the resolver the
+ * rolls use decides), with the call that declares them.
+ */
+function undeclaredSources(db: Database.Database, c: CharRow, worldId: string): Array<{ detail: string; fix: string }> {
+    const conditions = parseJson<Condition[]>(c.conditions, []).filter(x => x && typeof x.name === 'string');
+    if (!conditions.length) return [];
+    const abilityOfSkill = (skill: string) => worldSkillAbility(db, worldId, skill) ?? srdSkillAbility(skill);
+    const purposes = tryRows(() => db.prepare("SELECT purpose FROM roll_log WHERE for_id = ? AND (purpose LIKE '%(adv: %' OR purpose LIKE '%(dis: %' OR purpose LIKE '%; dis: %') ORDER BY rowid").all(c.id) as Array<{ purpose: string }>).map(r => purposeSources(r.purpose, abilityOfSkill)).filter(p => p.roll);
+    if (!purposes.length) return [];
+    const effects = loadEffectDeclarations(db, c.id);
+    // The roll's own candidates: a skillAdvantage trait sharing a condition's name declares for it.
+    const traits = parseJson<{ skillAdvantage?: SkillAdvantageTrait[] }>(c.combat_profile, {}).skillAdvantage;
+    const owner = { ownerId: c.id, ownerName: c.name, conditions: conditions.map(x => ({ name: x.name!, source: x.source, on: 'sheet' as const })), effects, traits: Array.isArray(traits) ? traits : [] };
+    const out: Array<{ detail: string; fix: string }> = [];
+    const names = [...new Set(conditions.map(x => (x.name!.split(':')[0].trim() || x.name!).slice(0, 60)))];
+    for (const name of names) {
+        let rolls = 0;
+        const sides = new Set<'advantage' | 'disadvantage'>();
+        const wants: Array<{ which: 'advantage' | 'disadvantage'; scope: string }> = [];
+        for (const p of purposes) {
+            for (const [which, side] of [['advantage', p.adv], ['disadvantage', p.dis]] as const) {
+                if (!listsLabel(side, name)) continue;
+                const r = resolveAdvantageSources([name], which, owner, p.roll!);
+                if (!r.problems.length) continue;
+                rolls++;
+                sides.add(which);
+                const scope = suggestedScope(p.roll!);
+                if (!wants.some(w => w.which === which && w.scope === scope)) wants.push({ which, scope });
+            }
+        }
+        if (!rolls) continue;
+        const as = sides.size === 2 ? 'an advantage and disadvantage' : sides.has('advantage') ? 'an advantage' : 'a disadvantage';
+        const named = `condition '${name}' was named as ${as} source in ${rolls} logged roll${rolls === 1 ? '' : 's'} (${[...new Set(wants.map(w => w.scope))].join(', ')}) and declares nothing for ${rolls === 1 ? 'it' : 'them'} now: the next one is refused`;
+        // A standard condition is never converted: a feature made from it
+        // would take the condition, and its 5e rules, off the sheet.
+        const std = conditions.filter(x => (x.name!.split(':')[0].trim() || x.name!).slice(0, 60) === name).map(x => standardConditionRules(x.name!)).find(Boolean);
+        if (std) {
+            const which = [...sides].map(w => `situational${w === 'advantage' ? 'Advantage' : 'Disadvantage'}: '<reason>'`).join(' or ');
+            out.push({
+                detail: `${named} — a standard condition: it declares only its 5e rules (${std.join('; ') || 'none on a roll'})`,
+                fix: `pass ${which} on such a roll instead of naming '${name}'; do not convert it: a feature made from it would take '${name}' and its 5e rules off the sheet. The finding clears when the condition ends`
+            });
+            continue;
+        }
+        const added = wants.map(w => `{type: "${w.which}_on", value: "${w.scope}"}`);
+        const feature = effects.find(e => e.name.toLowerCase() === name.toLowerCase());
+        const fix = feature
+            ? `improvisation_manage edit_effect {targetId: ${JSON.stringify(c.id)}, name: ${JSON.stringify(feature.name)}, mechanics: [${[...feature.mechanics.map(m => JSON.stringify(m)), ...added].join(', ')}]}`
+            : `improvisation_manage feature_from_condition {characterId: ${JSON.stringify(c.id)}, match: ${JSON.stringify(name)}, mechanics: [${added.join(', ')}]}`;
+        out.push({
+            detail: named,
+            fix: `${fix} — add condition: "<when-tag>" if it holds only sometimes`
+        });
+    }
+    return out;
 }
 
 export function reconcileWorld(db: Database.Database, worldId: string, characterId?: string): ReconcileReport {
@@ -243,6 +339,13 @@ export function reconcileWorld(db: Database.Database, worldId: string, character
             push('skill_override_migrated', `${m.skill} ${signed(m.before ?? 0)} -> ${fmt(m.after)} (computed ${signed(m.computed ?? 0)}; ${why}${now})`,
                 `character_manage update {characterId: "${c.id}", ${m.skill}Override: ${m.before ?? 0}} restores the old number, or world_manage reconcile {worldId: "${worldId}", acknowledge: ["skill_override_migrated"]} accepts the move`);
         }
+    }
+
+    // 9. Play report 7 #7: prose conditions the roll log shows were named as
+    // advantage (or disadvantage) sources, which declare nothing now — the
+    // next roll that names them is refused. Converted before play, not after.
+    for (const c of chars) {
+        for (const f of undeclaredSources(db, c, worldId)) findings.push({ kind: 'advantage_source_undeclared', characterId: c.id, characterName: c.name, ...f });
     }
 
     const byKind: Partial<Record<ReconcileKind, number>> = {};

@@ -14,7 +14,7 @@ import { SessionContext } from '../types.js';
 import { getDb } from '../../storage/index.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
-import { loggedD20 } from '../../math/logged-d20.js';
+import { sheetConcentrationDie, saveDieLabels, concentrationSidesNote } from '../../engine/combat/saves.js';
 import {
     checkConcentration,
     breakConcentration,
@@ -90,8 +90,10 @@ async function handleCheckSave(args: z.infer<typeof CheckSaveSchema>): Promise<o
     }
 
     // Seeded and logged like every other save (roll_log purpose 'concentration').
+    // Play report 7 (lane H): the character's declared save:con sides and sheet
+    // conditions fire by themselves ('concentration (adv: Steady Mind (save:con))').
     const result = checkConcentration(character, args.damageAmount, concentrationRepo, 0,
-        () => loggedD20(getDb(), { purpose: 'concentration', forId: character.id }, { tool: 'concentration_manage' }).natural);
+        sheetConcentrationDie(getDb(), character.id, 'concentration_manage'));
 
     if (result.broken) {
         breakConcentration(
@@ -110,11 +112,13 @@ async function handleCheckSave(args: z.infer<typeof CheckSaveSchema>): Promise<o
         saveTotal: result.saveTotal,
         saveDC: result.saveDC,
         damageAmount: args.damageAmount,
+        // Play report 7 (lane H): what put the save at advantage or disadvantage, both dice, a tagged one's hint.
+        ...saveDieLabels({ ...result, rolls: result.saveRolls }),
         message: result.spell === 'none'
             ? 'Character is not concentrating on any spell.'
-            : result.broken
+            : `${result.broken
                 ? `Concentration broken on ${result.spell}!`
-                : `Concentration maintained on ${result.spell}!`
+                : `Concentration maintained on ${result.spell}!`}${concentrationSidesNote(result)}`
     };
 }
 
@@ -277,6 +281,8 @@ export const ConcentrationManageTool = {
 ⚔️ COMBAT INTEGRATION:
 When a concentrating character takes damage, ALWAYS call check_save!
 The engine handles the CON save automatically.
+
+🎲 DECLARED SIDES (play report 7): the CON save reads the character's own sides, as every engine save does: an untagged effect mechanic {type: 'advantage_on', value: 'save:con'} (War Caster, 'Steady Mind') rolls two d20s and keeps the higher; Exhaustion 3+ gives disadvantage; both cancel to one die. A tagged one never fires here and is named in conditionalAdvantage. The reply carries advantageSources / disadvantageSources / saveRolls; the roll log reads 'concentration (adv: Steady Mind (save:con))'.
 
 🔮 SPELL EXAMPLES (require concentration):
 Hold Person, Bless, Haste, Hex, Hunter's Mark, Spirit Guardians

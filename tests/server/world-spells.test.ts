@@ -3,7 +3,9 @@ import { handleCombatAction } from '../../src/server/consolidated/combat-action.
 import { handleTableRules, TableRulesTool } from '../../src/server/consolidated/table-rules.js';
 import { withOperation } from '../../src/server/operation-guard.js';
 import { CharacterRepository } from '../../src/storage/repos/character.repo.js';
+import { CustomEffectsRepository } from '../../src/storage/repos/custom-effects.repo.js';
 import { WorldRepository } from '../../src/storage/repos/world.repo.js';
+import { ConcentrationRepository } from '../../src/storage/repos/concentration.repo.js';
 import { closeDb, getDb } from '../../src/storage/index.js';
 import { queryRolls } from '../../src/storage/roll-log.js';
 import { CombatEngine } from '../../src/engine/combat/engine.js';
@@ -192,6 +194,45 @@ describe('castWorldSpell', () => {
         const ar = stateOf(res.content[0].text).actionResult;
         expect(ar.worldSpell.effects[0]).toMatchObject({ targetId: 'orc', rolled: 24, saved: true, dc: 11, damage: 12 });
         expect(await hpOf(encounterId, 'orc')).toBe(28);
+    });
+
+    it("play report 7 (lane G1): the target's untagged save:dex mechanic puts the world spell's save at advantage, named everywhere", async () => {
+        await define('spell', 'Firestorm', { castingRoll: { target: 5 }, effects: [{ type: 'damage', dice: '4d6', save: { ability: 'dex' }, saveEffect: 'half' }] });
+        new CustomEffectsRepository(getDb()).apply({
+            target_id: 'orc', target_type: 'character', name: 'Danger Sense', description: 'Danger Sense', category: 'boon', power_level: 1,
+            source: { type: 'unknown' }, mechanics: [{ type: 'advantage_on', value: 'save:dex' }] as never, duration: { type: 'until_removed' as never },
+            triggers: [], removal_conditions: [{ type: 'duration_expires' as const }], stackable: false, max_stacks: 1
+        } as never);
+        fixCasting({ 'cast ': [6, 5], 'Firestorm': [6, 6, 6, 6] });
+        const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
+        spy.mockReturnValueOnce(3).mockReturnValueOnce(18);
+        const encounterId = await encounter();
+        const res = await act({ encounterId, action: 'cast_spell', actorId: 'lex', spellName: 'Firestorm', targetId: 'orc' });
+        const sj = stateOf(res.content[0].text);
+        expect(sj.actionResult.worldSpell.effects[0]).toMatchObject({ saved: true, damage: 12, save: { rolls: [3, 18], natural: 18, advantageSources: ['Danger Sense (save:dex)'] } });
+        expect(sj.saveSources).toEqual([{ targetId: 'orc', name: 'Orc', ability: 'dexterity', rolls: [3, 18], advantage: ['Danger Sense (save:dex)'] }]);
+        expect(res.content[0].text).toMatch(/Orc DEXTERITY save: d20\(3,18\).*\[d20 3, 18; adv: Danger Sense \(save:dex\)\]/);
+    });
+
+    it("play report 7 (lane H): a concentrating target's Steady Mind (save:con) rolls its concentration save twice, named everywhere", async () => {
+        mkChar('vex');
+        new ConcentrationRepository(getDb()).create({ characterId: 'vex', activeSpell: 'Bless', spellLevel: 1, targetIds: [], startedAt: 1, maxDuration: 10, saveDCBase: 10 } as any);
+        new CustomEffectsRepository(getDb()).apply({
+            target_id: 'vex', target_type: 'character', name: 'Steady Mind', description: 'Steady Mind', category: 'boon', power_level: 1,
+            source: { type: 'unknown' }, mechanics: [{ type: 'advantage_on', value: 'save:con' }] as never, duration: { type: 'until_removed' as never },
+            triggers: [], removal_conditions: [{ type: 'duration_expires' as const }], stackable: false, max_stacks: 1
+        } as never);
+        fixCasting({ 'cast ': [6, 5], 'Smite': [3, 4] });
+        const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
+        spy.mockReturnValueOnce(2).mockReturnValueOnce(16);
+        const encounterId = await encounter([{ id: 'vex', name: 'Vex', hp: 30, maxHp: 30, initiative: 2, isEnemy: true }]);
+        const res = await act({ encounterId, action: 'cast_spell', actorId: 'lex', spellName: 'Smite', targetId: 'vex' });
+        const sj = stateOf(res.content[0].text);
+        // 7 damage: DC 10; CON 12 (+1): 16 + 1 = 17, held.
+        expect(sj.actionResult.concentrationSaves).toEqual([{ targetId: 'vex', name: 'Vex', spell: 'Bless', broken: false, reason: 'damage', saveRoll: 16, saveTotal: 17, saveDC: 10, saveRolls: [2, 16], advantageSources: ['Steady Mind (save:con)'] }]);
+        expect(sj.saveSources).toEqual([{ targetId: 'vex', name: 'Vex', ability: 'constitution', save: 'concentration on Bless', broken: false, rolls: [2, 16], advantage: ['Steady Mind (save:con)'] }]);
+        expect(res.content[0].text).toMatch(/Concentration on Bless: CON save 17 vs DC 10 ✓ held \[d20 2, 16; adv: Steady Mind \(save:con\)\]/);
+        expect(spy).toHaveBeenCalledWith(expect.objectContaining({ purpose: 'concentration (adv: Steady Mind (save:con))', forId: 'vex' }));
     });
 
     it('a condition effect lands on a failed save; a pool effect moves the target pool', async () => {
