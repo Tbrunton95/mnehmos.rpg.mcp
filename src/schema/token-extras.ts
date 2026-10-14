@@ -317,9 +317,19 @@ export function modelsInAreaSchema() {
     return z.preprocess(v => typeof v === 'number' ? { '*': v } : v, z.record(z.string(), z.number().int().min(0)));
 }
 export const MODELS_IN_AREA_DESCRIBE = "Play report 7 #1: models of a unit token inside the area, {targetId: n} (a bare number: every unit target). A spaced unit needs it (refused without, nothing rolled); a packed unit defaults to every live model. Read it off combat_map aoe's modelsInArea hint. Giving it makes the damage an area";
-export const AREA_DESCRIBE = "Play report 7 #1: the damage is an area: each model of a unit token inside it rolls its own save on the fight's dice (full on a failure, half on a success; no save: full) and dies when that meets its HP. Without it, damage to a unit hits one model at most";
+export const AREA_DESCRIBE = "Play report 7 #1: the damage is an area: each model of a unit token inside it rolls its own save on the fight's dice (full on a failure, half on a success; no save: full), the most wounded inside first, and dies when that meets its current HP; a survivor keeps the wound (unit.wounded), so the next area finds it hurt. Without it, damage to a unit hits one model at most, the most wounded first";
 
 export const UNIT_SAVES_DESCRIBE ="Play report 7 #1: drilled troops' save bonus per ability, {dex: 2} (str | dex | con | int | wis | cha, or the long names), added to the token's ability modifier on every model's save against an area";
+
+/**
+ * Play report 7 follow-up (lane W): the current HP of each wounded live model
+ * of a unit, each below hpPerModel; unhurt models are implicit, so
+ * hp = unhurt × hpPerModel + Σ wounded. The engine writes it as wounds land.
+ */
+export function unitWoundedSchema() {
+    return z.array(z.number().int().min(1));
+}
+export const UNIT_WOUNDED_DESCRIBE = "Play report 7 follow-up: the current HP of each wounded model, each below hpPerModel (most wounded first; unhurt models are not listed). The engine keeps it as wounds land: repeated damage adds up, a single blow finishes the most wounded model first";
 
 export const UnitSchema = z.object({
     models: z.number().int().min(1).describe('Models at full strength'),
@@ -334,7 +344,8 @@ export const UnitSchema = z.object({
     breakAt: z.number().gt(0).lt(1).optional().describe('Fraction of models: dropping through it owes a break test (default 0.5)'),
     routed: z.boolean().optional().describe('Routed: cannot volley and owes no more break tests (set_unit)'),
     mobRule: mobRuleSchema().optional().describe('Mob rule: morale (and to-hit) grow with the models standing'),
-    saves: unitSavesSchema().optional().describe(UNIT_SAVES_DESCRIBE)
+    saves: unitSavesSchema().optional().describe(UNIT_SAVES_DESCRIBE),
+    wounded: unitWoundedSchema().optional().describe(UNIT_WOUNDED_DESCRIBE)
 });
 export type Unit = z.infer<typeof UnitSchema>;
 

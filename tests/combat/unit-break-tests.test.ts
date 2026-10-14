@@ -143,10 +143,17 @@ describe('break tests in play', () => {
         await setup();
         try { getDb().exec('ALTER TABLE characters ADD COLUMN world_id TEXT'); } catch { /* exists */ }
         getDb().prepare('UPDATE characters SET world_id = ?').run(W);
-        await handleTableRules(TableRulesTool.inputSchema.parse({ worldId: W, action: 'define', kind: 'spell', name: 'Quake', spec: { effects: [{ type: 'damage', dice: '30' }] } }), ctx as any);
-        const r = await act({ action: 'cast_spell', actorId: 'mage', spellName: 'Quake', targetId: 'scions' });
-        expect(r.text).toMatch(/BREAK TEST DUE: Scions/);
-        expect(r.r.breakTests?.[0]).toMatchObject({ participantId: 'scions' });
+        // Play report 7 follow-up (lane S): damage resolves by its shape. Quake
+        // is an area (its rule says so), so it goes model by model like
+        // Fireball above: 30 over the five spaced 5-HP models inside kills
+        // those five, and the break test reads the real count (5/10).
+        await handleTableRules(TableRulesTool.inputSchema.parse({ worldId: W, action: 'define', kind: 'spell', name: 'Quake', spec: { area: { shape: 'cylinder', size: 30 }, effects: [{ type: 'damage', dice: '30' }] } }), ctx as any);
+        await manage({ action: 'set_unit', participantId: 'scions', packed: false });
+        const r = await act({ action: 'cast_spell', actorId: 'mage', spellName: 'Quake', targetId: 'scions', modelsInArea: { scions: 5 } });
+        expect(r.r.unitAreas?.[0]).toMatchObject({ targetId: 'scions', shape: 'cylinder', modelsInArea: 5, noSave: true, modelsKilled: 5, modelsAfter: 5 });
+        expect(tok('scions').hp).toBe(25);
+        expect(r.text).toMatch(/BREAK TEST DUE: Scions fell to 5\/10 models/);
+        expect(r.r.breakTests?.[0]).toMatchObject({ participantId: 'scions', modelsAfter: 5 });
     });
 
     it('set_unit routs, sets morale and breakAt; a routed unit cannot volley', async () => {

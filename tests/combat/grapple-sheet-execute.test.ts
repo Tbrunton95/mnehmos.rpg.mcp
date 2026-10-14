@@ -111,6 +111,33 @@ describe('grapple execute on character sheets', () => {
         expect(res.message).toMatch(/Concentration on Bless: (held|BROKEN) \[d20 \d+, \d+; adv: Steady Mind \(save:con\)\]/);
     });
 
+    it("lane K: the survivor's failed concentration save spends its autoLegendaryResistance from the sheet, so its spell holds; without it the restore call is reported", async () => {
+        const repo = new CharacterRepository(getDb());
+        const now = new Date().toISOString();
+        // CON 10 against DC 30 (60 damage): the save always fails.
+        repo.create({
+            id: 'warlock', name: 'Warlock', stats: { str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 16 }, ac: 12, level: 5, hp: 200, maxHp: 200,
+            band: 'Mortal', characterType: 'enemy', legendaryResistances: 3, legendaryResistancesRemaining: 3, autoLegendaryResistance: true,
+            conditions: [{ name: 'Restrained', source: 'grapple: luciel' }], createdAt: now, updatedAt: now
+        } as any);
+        new ConcentrationRepository(getDb()).create({ characterId: 'warlock', activeSpell: 'Hex', spellLevel: 1, startedAt: 1, maxDuration: 10, targetIds: [] });
+        const res = await act({ action: 'grapple', move: 'execute', actorId: 'luciel', targetId: 'warlock', damage: 60 });
+        expect(res.error).toBeFalsy();
+        expect(res.concentration).toMatchObject({ spell: 'Hex', broken: false, legendaryResisted: true, legendaryRemaining: 2, legendaryOf: 3 });
+        expect(res.message).toMatch(/Concentration on Hex: failed → 👑 legendary resistance \(LR 2\/3 left\): held/);
+        expect(new ConcentrationRepository(getDb()).findByCharacterId('warlock')?.activeSpell).toBe('Hex');
+        expect(sheet('warlock').legendaryResistancesRemaining).toBe(2);
+
+        repo.update('warlock', { autoLegendaryResistance: false } as any);
+        const offered = await act({ action: 'grapple', move: 'execute', actorId: 'luciel', targetId: 'warlock', damage: 60 });
+        const repair = "concentration_manage restore {characterId: 'warlock', spell: 'Hex', spellLevel: 1, startedAt: 1, maxDuration: 10, spendLegendaryResistance: true}";
+        expect(offered.concentration).toMatchObject({ broken: true, legendaryResistanceAvailable: 2, legendaryOffer: { remaining: 2, of: 3, call: repair } });
+        expect(offered.legendaryOffers).toEqual([expect.objectContaining({ participantId: 'warlock', kind: 'concentration', call: repair, noFight: true })]);
+        expect(offered.message).toContain(`BROKEN ⭐ LR 2/3 left, spend one? ${repair}`);
+        expect(new ConcentrationRepository(getDb()).isConcentrating('warlock')).toBe(false);
+        expect(sheet('warlock').legendaryResistancesRemaining).toBe(2);
+    });
+
     it('refusals write nothing: missing row, peer band, unpinned target, posted lose, already down', async () => {
         const cases: Array<[Record<string, unknown>, RegExp]> = [
             [{ targetId: 'nobody' }, /No character nobody/],

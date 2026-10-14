@@ -1,4 +1,4 @@
-import { areaOnUnit, unitSaveBonus, liveModels, breakTestDue, unitAreaLine } from '../../src/engine/combat/units.js';
+import { areaOnUnit, unitSaveBonus, liveModels, breakTestDue, unitAreaLine, applyToModels } from '../../src/engine/combat/units.js';
 import { UnitSchema } from '../../src/schema/token-extras.js';
 import { handleCombatManage, CombatManageTool } from '../../src/server/consolidated/combat-manage.js';
 import { handleCombatAction, CombatActionTool } from '../../src/server/consolidated/combat-action.js';
@@ -42,23 +42,35 @@ describe('areaOnUnit (pure)', () => {
 
     it('12 over 9-HP models: the saved take 6 and live, the failed take 12 and die', () => {
         const r = areaOnUnit(militia(), { damage: 12, modelsInArea: 6, saves: [true, false, true, false, false, true] });
-        expect(r).toMatchObject({ failed: 3, saved: 3, perModel: { full: 12, half: 6 }, modelsKilled: 3, modelsAfter: 3, hpLost: 27 });
-        // The pool reads back the real count: no overflow crosses models.
-        expect(liveModels({ hp: 54 - r.hpLost, unit: militia().unit })).toBe(3);
+        // Lane W (wounds tracked): hpLost was 27 (the dead only); the three
+        // that saved now keep their 6-point wounds, so it is 27 + 18 = 45.
+        expect(r).toMatchObject({ failed: 3, saved: 3, perModel: { full: 12, half: 6 }, modelsKilled: 3, modelsAfter: 3, hpLost: 45 });
+        // The models read back the real count: no overflow crosses models.
+        const m = militia();
+        applyToModels(m, r.modelDamage);
+        expect(liveModels(m)).toBe(3);
+        expect(m.unit.wounded).toEqual([3, 3, 3]);
     });
 
     it('the wounded front model is first inside and dies to what it has left', () => {
         // 50 HP = five full models and a front model on 5.
         const r = areaOnUnit(militia(50), { damage: 12, modelsInArea: 6, saves: [true, true, true, true, true, true] });
-        expect(r).toMatchObject({ frontHp: 5, modelsBefore: 6, modelsKilled: 1, modelsAfter: 5, hpLost: 5 });
-        expect(liveModels({ hp: 50 - r.hpLost, unit: militia().unit })).toBe(5);
-        // A front model that survives keeps its wound; the others are whole.
+        // Lane W: hpLost was 5 (the front model only); the five that saved
+        // now keep 6-point wounds: 5 + 5 × 6 = 35.
+        expect(r).toMatchObject({ frontHp: 5, modelsBefore: 6, modelsKilled: 1, modelsAfter: 5, hpLost: 35 });
+        const a = militia(50);
+        applyToModels(a, r.modelDamage);
+        expect(liveModels(a)).toBe(5);
+        // A front model that survives keeps its wound; the others take theirs
+        // (lane W: hpLost was 0, now 4 + 5 × 4 = 24).
         const kept = areaOnUnit(militia(50), { damage: 4, modelsInArea: 6 });
-        expect(kept).toMatchObject({ modelsKilled: 0, hpLost: 0, modelsAfter: 6 });
-        // Kills behind a surviving front model leave the front model's wound in the pool.
+        expect(kept).toMatchObject({ modelsKilled: 0, hpLost: 24, modelsAfter: 6 });
+        // Kills behind a surviving front model leave its wound and the others' (lane W: hpLost was 18, now 4 + 18 + 3 × 4 = 34).
         const behind = areaOnUnit(militia(50), { damage: 9, modelsInArea: 6, saves: [true, false, false, true, true, true] });
-        expect(behind).toMatchObject({ modelsKilled: 2, hpLost: 18, modelsAfter: 4 });
-        expect(liveModels({ hp: 50 - behind.hpLost, unit: militia().unit })).toBe(4);
+        expect(behind).toMatchObject({ modelsKilled: 2, hpLost: 34, modelsAfter: 4 });
+        const b = militia(50);
+        applyToModels(b, behind.modelDamage);
+        expect(liveModels(b)).toBe(4);
     });
 
     it('an area with no save: every model inside takes the full damage', () => {
@@ -213,7 +225,8 @@ describe('area damage on a unit token, per model (play report 7 #1)', () => {
         expect(ua.failed + ua.saved).toBe(6);
         expect(ua.modelsKilled).toBe(ua.failed);
         expect(ua.modelsAfter).toBe(ua.saved);
-        expect(tok('militia').hp).toBe(54 - 9 * ua.failed);
+        // Lane W: each that saved stands on 3 (9 − 6) instead of a whole 9: hp was 54 − 9 × failed.
+        expect(tok('militia').hp).toBe(3 * ua.saved);
         const logged = modelSaves();
         expect(logged).toHaveLength(6);
         expect(logged.map((x: any) => x.purpose).sort()).toEqual([1, 2, 3, 4, 5, 6].map(i => `Fire Breath save (model ${i}/6)`).sort());
@@ -225,8 +238,9 @@ describe('area damage on a unit token, per model (play report 7 #1)', () => {
         d20s(20, 1, 20, 1, 1, 20);
         const { r } = await breath({ damage: 12 });
         expect(r.targets[0].unitArea).toMatchObject({ failed: 3, saved: 3, perModel: { full: 12, half: 6 }, modelsKilled: 3, modelsAfter: 3 });
-        expect(r.targets[0].damageTaken).toBe(27);
-        expect(tok('militia').hp).toBe(27);
+        // Lane W: the saved keep their wounds: damageTaken 27 → 45, hp 27 → 9 (three models on 3).
+        expect(r.targets[0].damageTaken).toBe(45);
+        expect(tok('militia').hp).toBe(9);
         expect(liveModels(tok('militia'))).toBe(3);
     });
 
@@ -236,7 +250,8 @@ describe('area damage on a unit token, per model (play report 7 #1)', () => {
         d20s(20, 20, 20, 20, 20, 20);
         const { r } = await breath({ damage: 12 });
         expect(r.targets[0].unitArea).toMatchObject({ frontHp: 5, saved: 6, modelsKilled: 1, modelsAfter: 5 });
-        expect(tok('militia').hp).toBe(45);
+        // Lane W: the five that saved stand on 3 each: hp 45 → 15.
+        expect(tok('militia').hp).toBe(15);
         expect(r.message).toContain('(front 5)');
     });
 
@@ -361,8 +376,9 @@ describe('cast_spell on a unit token (play report 7 #1)', () => {
         d20s(20, 1, 20, 1, 1, 20);
         const { text, r } = await act({ action: 'cast_spell', actorId: 'mage', spellName: 'Burning Hands', targetIds: ['militia'] });
         expect(r.unitAreas?.[0]).toMatchObject({ targetId: 'militia', shape: 'cone', modelsInArea: 6, failed: 3, saved: 3, perModel: { full: 12, half: 6 }, modelsKilled: 3, modelsAfter: 3 });
-        expect(text).toContain('6 in the cone: 3 failed, 3 saved; 12 / 6 vs 9 HP each: 3 dead, 3/6 left');
-        expect(tok('militia').hp).toBe(27);
+        expect(text).toContain('6 in the cone: 3 failed, 3 saved; 12 / 6 vs 9 HP each: 3 dead, 3/6 left (3 at 3/9)');
+        // Lane W: the three that saved stand on 3 each: hp 27 → 9.
+        expect(tok('militia').hp).toBe(9);
         expect(r.breakTests?.[0]).toMatchObject({ participantId: 'militia', modelsAfter: 3 });
     });
 

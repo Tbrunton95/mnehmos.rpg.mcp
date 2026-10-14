@@ -3,19 +3,22 @@ import { fightingStyleEffects } from './fighting-style.js';
 import { absorbWithShields, roleState, sectionRole } from './vessel.js';
 import { damageWithModifiers } from './damage-modifiers.js';
 import { findPart as findNamedPart, matchProfile } from './parts.js';
-import { CombatRNG, CheckResult, checkDegreeOf } from './rng.js';
-import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS, conditionAttackModifiers, conditionSpeedFactor } from './conditions.js';
+import { CombatRNG, CheckResult } from './rng.js';
+import { Condition, ConditionType, DurationType, Ability, CONDITION_EFFECTS, conditionAttackModifiers, conditionSpeedFactor, parseAbility, type OngoingEffect } from './conditions.js';
 
 import { SizeCategory, GridBounds, edgeDistanceSquares, effectiveReachFt, type EncounterEnvironment } from '../../schema/encounter.js';
 import { resolveCover, coverArithmetic, ignoredCoverLine, totalCoverRefusal, ignoreCoverFor, type CoverResolution, type StandingCover, type IgnoreCoverScopes, type IgnoreCover } from './cover.js';
-import { mobAttackBonus } from './units.js';
+import { mobAttackBonus, unitCapFor, spreadOnModels, applyToModels, healModels, areaOnUnit, unitAreaLine, liveModels, woundLine, woundParts } from './units.js';
+import { tickSaveText, tickSaveRow, tickUnitSavesLine, tickDamageText, type TickSave, type TickUnitArea, type TurnDamageEvent } from './turn-damage.js';
 import { nonlethalSource, isNonlethalUnconscious, clearNonlethalUnconscious } from './nonlethal.js';
 import { controlledMountOf, isControlledMount } from './mounts.js';
 import { applyDeathSaveOutcome, damageAtZero, deathSaveCall, dyingLabel, dyingTail, isDying, outcomeOfRoll, wakeFromDying, markStable, counters as deathCounters, type DeathSaveMode, type DeathSaveOutcome, type DeathSaveResult, type DyingUpdate } from './dying.js';
 import { offTurnEconomyNote } from './turn-guard.js';
 import { hasSides, purposeWithSources, rollSidesNote, type DeclaredSides, type InitiativeDeclared } from '../attack-advantage.js';
 import { conditionSaveDisadvantage, tokenSaveConditions } from '../advantage-sources.js';
+import { expireLegendaryOffers, legendaryOfferPhrase, legendaryOnFailedSave, nextOfferRef, offerSaveLabel, recordLegendaryOffer, type LegendaryOfferRow, type PendingLegendaryOffer } from './legendary-resistance.js';
 export type { DeathSaveResult, DyingUpdate, DeathSaveMode, DeathSaveOutcome } from './dying.js';
+export type { TurnDamageEvent } from './turn-damage.js';
 
 /**
  * Character interface for combat participants
@@ -146,6 +149,10 @@ export interface CombatParticipant {
     vessel?: VesselProfile;          // Section roles, shield regen; marks the token a vessel
     shields?: Shields;               // Drained before the hull; regen at the start of its turn
     reactorBreach?: boolean;         // A reactor section is dead: a d6 at each turn start, 1 destroys it
+    // Play report 7 follow-up (lane L): offered legendary resistances the GM can still answer with saveRef (combat_manage legendary_resistance); they lapse when its next turn starts.
+    pendingLegendaryOffers?: PendingLegendaryOffer[];
+    // Lane K review: this round's refs already answered or lapsed, never handed to a later offer.
+    closedLegendaryRefs?: string[];
 }
 
 /**
@@ -296,6 +303,14 @@ export interface SaverSides {
     conditionalAdvantage?: string[];
     conditionalDisadvantage?: string[];
     modifier?: { total: number; parts: string[] };
+    /**
+     * Play report 7 follow-up (lane L): a player-controlled creature (a pc
+     * row on the heroes' side). Its legendary resistance is offered to the
+     * player, never spent for it, autoLegendaryResistance or not.
+     */
+    playerDecides?: boolean;
+    /** Lane L: a legendary resistance the engine spent on this save; the handlers mirror the count to the sheet. */
+    onSpent?: (remaining: number) => void;
 }
 export type SaverSidesProvider = (participant: CombatParticipant, ability: Ability) => SaverSides | undefined;
 
@@ -320,7 +335,33 @@ export interface EndOfTurnSave {
     advantage?: string[];
     disadvantage?: string[];
     conditional?: string[];
+    /** Lane L: the condition instance saved against (a saveRef answer or remove_condition names it). */
+    conditionId: string;
+    /** Lane L: the save failed and a legendary resistance turned it into a success (autoLegendaryResistance). */
+    legendaryResisted?: boolean;
+    /** Lane L: the save failed and a legendary resistance is offered: the saveRef and the call that spends it and ends the condition. */
+    legendaryOffer?: { saveRef: string; remaining: number; of?: number; askPlayer?: true; call: string };
     line: string;
+}
+
+/** Lane O: one tick the engine deals at a turn's start or end (pressure, a condition's ongoing damage). */
+interface TickSpec {
+    source: 'pressure' | 'ongoing';
+    /** The condition's name, or 'water pressure'. */
+    label: string;
+    condition?: Condition;
+    when: 'start' | 'end';
+    /** Rolled once, before saves and resistances. */
+    rolled: number;
+    damageType?: string;
+    save?: { ability: Ability; dc: number; success: 'none' | 'half' | 'end' };
+    /** The roll log purpose stem ('ongoing burning', 'pressure'). */
+    purpose: string;
+    /** The turn note's start ('🔥 Orc — burning (start of turn): '). */
+    head: string;
+    /** A unit line's start, after the name ('burning (start of turn): '). */
+    unitHead: string;
+    depthFt?: number;
 }
 
 export interface EventEmitter {
@@ -350,6 +391,14 @@ export class CombatEngine {
     deathSaveEvents: DeathSaveEvent[] = [];
     /** Play report 7 (lane H): the end-of-turn saves (save_ends conditions) the last advance rolled. */
     endOfTurnSaves: EndOfTurnSave[] = [];
+    /** Lane L: the legendary resistances the last advance offered (saveRef and the call), for the reply's legendaryOffers. */
+    legendaryOffers: LegendaryOfferRow[] = [];
+    /**
+     * Play report 7 follow-up (lane O): the damage the last advance's turn
+     * starts and ends dealt by themselves (water pressure, ongoing damage),
+     * one row per tick, for the handlers' break tests, unit lines and deaths.
+     */
+    turnDamage: TurnDamageEvent[] = [];
     /** Play report 7 (lane H): the handler-supplied reader for those saves (see SaverSides); unset: the engine's own reading. */
     private saverSides: SaverSidesProvider | undefined;
     /** The world's default death-save mode for the advance in progress (handler-supplied; auto when unset). */
@@ -478,13 +527,15 @@ export class CombatEngine {
         return natural + (p.initiativeBonus ?? 0);
     }
 
-    startEncounter(participants: CombatParticipant[], opts: { initiativeSources?: Record<string, DeclaredSides>; saverSides?: SaverSidesProvider } = {}): CombatState {
+    startEncounter(participants: CombatParticipant[], opts: { initiativeSources?: Record<string, DeclaredSides>; saverSides?: SaverSidesProvider; environment?: EncounterEnvironment } = {}): CombatState {
         // Roll initiative for each participant and store the value. A given
         // initiative is kept as given: no die, no declared source.
         this.initiativeDeclared = new Map();
         // Play report 7 (lane H): a surprised first slot's end-of-turn saves read it.
         if (opts.saverSides) this.saverSides = opts.saverSides;
         this.endOfTurnSaves = [];
+        this.legendaryOffers = [];
+        this.turnDamage = [];
         const participantsWithInitiative = participants.map(p => {
             const rolledInitiative = p.initiative ?? this.rollInitiative(p, opts.initiativeSources?.[p.id]);
             return {
@@ -548,7 +599,9 @@ export class CombatEngine {
             currentTurnIndex: 0,
             round: 1,
             hasLairActions,
-            lairOwnerId: lairOwner?.id
+            lairOwnerId: lairOwner?.id,
+            // Lane O: a surprised first slot's turn start reads the medium (water pressure).
+            ...(opts.environment ? { environment: opts.environment } : {})
         };
 
         // A surprised creature first in the order loses that turn at once:
@@ -1336,15 +1389,19 @@ export class CombatEngine {
             }
             // A single blow on a unit kills at most one model; cleave on a
             // packed unit, volleys and area attacks flow through models.
+            // Lane W: the most wounded model first, capped at its HP; below
+            // that it keeps the wound (unit.wounded).
             else if (target.unit && !partOpts?.uncapped && target.hp > 0) {
-                const models = Math.ceil(target.hp / target.unit.hpPerModel);
-                const currentModelHp = target.hp - (models - 1) * target.unit.hpPerModel;
-                if (damageDealt > currentModelHp) {
-                    situational.push(`one model at most: ${damageDealt} → ${currentModelHp} (cleave a packed unit to go through)`);
-                    damageDealt = currentModelHp;
+                const capped = unitCapFor(target, damageDealt);
+                if (capped.cap) {
+                    situational.push(`one model at most: ${capped.cap.before} → ${capped.cap.after} (cleave a packed unit to go through)`);
+                    damageDealt = capped.damage;
                 }
             }
-            target.hp = Math.max(0, target.hp - damageDealt);
+            // Lane W: a unit's models take it most wounded first (a capped
+            // blow lands on one; cleave and volleys carry over in order).
+            if (target.unit) spreadOnModels(target, damageDealt);
+            else target.hp = Math.max(0, target.hp - damageDealt);
             this.refreshVessel(target);
         }
 
@@ -1523,7 +1580,9 @@ export class CombatEngine {
 
         const hpBefore = target.hp;
         const actualHeal = Math.min(amount, target.maxHp - target.hp);
-        target.hp = Math.min(target.maxHp, target.hp + amount);
+        // Lane W: a unit heals its most wounded models first, then revives.
+        if (target.unit) healModels(target, Math.max(0, actualHeal));
+        else target.hp = Math.min(target.maxHp, target.hp + amount);
         // Coming back above 0 clears the death-save track and wakes a knockout.
         const woke = hpBefore <= 0 && target.hp > 0 ? this.riseFromZero(target) : [];
 
@@ -1595,17 +1654,31 @@ export class CombatEngine {
     }
 
     /**
-     * Apply damage to a participant
+     * Apply damage to a participant.
+     *
+     * Lane W: on a unit token the models take it. `models` is an area's
+     * per-model damage, most wounded first (rollUnitArea's modelDamage), so
+     * each model keeps its own wound; without it the damage spreads through
+     * the models most wounded first, killing in order (a pooled road: cap it
+     * with unitCapFor first when it is a single blow).
      */
-    applyDamage(participantId: string, damage: number, opts: { crit?: boolean; melee?: boolean } = {}): DyingUpdate | undefined {
+    applyDamage(participantId: string, damage: number, opts: { crit?: boolean; melee?: boolean; models?: number[] } = {}): DyingUpdate | undefined {
         if (!this.state) return undefined;
 
         const participant = this.state.participants.find(p => p.id === participantId);
         if (!participant) return undefined;
-        // Request 5: a vessel's shields take it first.
         const hpBefore = participant.hp;
+        // Lane W: an area's per-model damage lands model by model.
+        if (participant.unit && opts.models) {
+            const change = applyToModels(participant, opts.models);
+            const dying = damageAtZero(participant, hpBefore, change.absorbed, opts);
+            this.emitter?.publish('combat', { type: 'damage_applied', participantId, amount: change.absorbed, newHp: participant.hp, ...(dying ? { dying } : {}) });
+            return dying;
+        }
+        // Request 5: a vessel's shields take it first.
         const soak = absorbWithShields(participant, damage);
-        participant.hp = Math.max(0, participant.hp - soak.through);
+        if (participant.unit) spreadOnModels(participant, soak.through);
+        else participant.hp = Math.max(0, participant.hp - soak.through);
         this.refreshVessel(participant);
         // Play report 5 #5: a tracked token dropped to 0 goes unconscious and
         // prone; one already down takes a failed save (two on a crit).
@@ -1671,7 +1744,9 @@ export class CombatEngine {
         const participant = this.state.participants.find(p => p.id === participantId);
         if (participant) {
             const wasAtZero = participant.hp === 0;
-            participant.hp = Math.min(participant.maxHp, participant.hp + amount);
+            // Lane W: a unit heals its most wounded models first, then revives.
+            if (participant.unit) healModels(participant, Math.max(0, Math.min(amount, participant.maxHp - participant.hp)));
+            else participant.hp = Math.min(participant.maxHp, participant.hp + amount);
 
             // MED-003: Reset death saves when healed from 0 HP (and wake a knockout, play report 5)
             if (wasAtZero && participant.hp > 0) this.riseFromZero(participant);
@@ -1918,9 +1993,15 @@ export class CombatEngine {
      * 0 HP and skipped its start). Returns what the start did (regeneration,
      * recharge, fading buffs), as an advance prints them.
      */
-    beginTurn(participantId: string): string[] {
+    beginTurn(participantId: string, opts: { encounterId?: string; saverSides?: SaverSidesProvider } = {}): string[] {
         const participant = this.state?.participants.find(p => p.id === participantId);
         this.turnStartNotes = [];
+        // Lane O: the turn start ticks (pressure, ongoing damage) and their saves
+        // read the handlers' provider; what they did is read as after an advance.
+        this.legendaryOffers = [];
+        this.turnDamage = [];
+        if (opts.saverSides) this.saverSides = opts.saverSides;
+        if (opts.encounterId) this.encounterId = opts.encounterId;
         if (participant && participant.hp > 0) this.processStartOfTurnConditions(participant);
         return [...this.turnStartNotes];
     }
@@ -1941,6 +2022,8 @@ export class CombatEngine {
         this.deathSaveEvents = [];
         // Play report 7 (lane H): a surprised slot passed here rolls its end-of-turn saves.
         this.endOfTurnSaves = [];
+        this.legendaryOffers = [];
+        this.turnDamage = [];
         if (opts.saverSides) this.saverSides = opts.saverSides;
         this.deathSaveModeDefault = opts.deathSaveMode;
         if (opts.encounterId) this.encounterId = opts.encounterId;
@@ -1953,6 +2036,19 @@ export class CombatEngine {
             isLairAction: this.isLairActionPending()
         });
         return up;
+    }
+
+    /**
+     * Lane L: the creature's turn has come round, so its open legendary
+     * resistance offers lapse, each with a turn note. Lane L review: a slot
+     * that comes round at 0 HP (dying, knocked out) passes without its turn
+     * start, and its offers lapse here too, so a creature healed rounds later
+     * cannot answer a save from long ago.
+     */
+    private lapseLegendaryOffers(participant: CombatParticipant): void {
+        for (const o of expireLegendaryOffers(participant)) {
+            this.turnStartNotes.push(`⭐ ${participant.name}: the legendary resistance offer on the ${offerSaveLabel(o)} (${o.ref}) lapsed: its turn has begun`);
+        }
     }
 
     /**
@@ -2204,6 +2300,8 @@ export class CombatEngine {
      * Process start-of-turn condition effects
      */
     private processStartOfTurnConditions(participant: CombatParticipant): void {
+        // Lane L: an offered legendary resistance lapses when the creature's next turn starts.
+        this.lapseLegendaryOffers(participant);
         // Battle cries end first, so this turn's speed no longer carries them.
         this.expireBuffs(participant);
         // Item 16: a fright whose source is gone or down ends at the bearer's
@@ -2227,13 +2325,17 @@ export class CombatEngine {
         // start of each of its turns. Destroyed stays destroyed: not at 0 HP.
         if (participant.regeneration && participant.hp > 0 && participant.hp < participant.maxHp) {
             const before = participant.hp;
-            participant.hp = Math.min(participant.maxHp, participant.hp + participant.regeneration);
+            // Lane W: a regenerating unit heals its most wounded models first.
+            if (participant.unit) healModels(participant, Math.min(participant.regeneration, participant.maxHp - participant.hp));
+            else participant.hp = Math.min(participant.maxHp, participant.hp + participant.regeneration);
             this.turnStartNotes.push(`${participant.name} regenerates ${participant.hp - before} HP (${before} → ${participant.hp}/${participant.maxHp})`);
         }
 
         // Pressure: in a water encounter at or below the threshold depth, a
         // token that is not pressure-adapted (the unlessTag, else the swim
         // tag) takes the stated damage at the start of each of its turns.
+        // Lane O: pressure is an area: on a unit every model in the deep water
+        // takes it separately (and saves, when the pressure allows one).
         const env = this.environmentOf();
         const pressure = env.pressure;
         if (pressure && env.medium === 'water' && participant.hp > 0 && (env.depthFt ?? 0) >= pressure.startsAtFt
@@ -2241,11 +2343,7 @@ export class CombatEngine {
             const amount = typeof pressure.damagePerRound === 'number'
                 ? pressure.damagePerRound
                 : this.tagged({ purpose: 'pressure', forId: participant.id }, () => this.rng.roll(pressure.damagePerRound as string));
-            if (amount > 0) {
-                const before = participant.hp;
-                this.applyDamage(participant.id, amount);
-                this.turnStartNotes.push(`${participant.name} takes ${amount} pressure damage at ${env.depthFt} ft (${before} → ${participant.hp}/${participant.maxHp})`);
-            }
+            if (amount > 0) this.pressureTick(participant, Math.max(0, amount), pressure, env.depthFt ?? 0);
         }
         // Request 5: shields regen and the reactor-breach die.
         this.processVesselTurnStart(participant);
@@ -2260,21 +2358,10 @@ export class CombatEngine {
         }
 
         for (const condition of [...participant.conditions]) {
-            // Process ongoing effects
-            if (condition.ongoingEffects) {
-                for (const effect of condition.ongoingEffects) {
-                    if (effect.trigger === 'start_of_turn') {
-                        if (effect.type === 'damage' && effect.amount) {
-                            this.applyDamage(participant.id, effect.amount);
-                        } else if (effect.type === 'healing' && effect.amount) {
-                            this.heal(participant.id, effect.amount);
-                        } else if (effect.type === 'damage' && effect.dice) {
-                            const damage = this.tagged({ purpose: `ongoing ${condition.type}`, forId: participant.id }, () => this.rng.roll(effect.dice!));
-                            this.applyDamage(participant.id, damage);
-                        }
-                    }
-                }
-            }
+            // Process ongoing effects. Lane O: one tick helper for both loops.
+            this.tickOngoingEffects(participant, condition, 'start');
+            // A tick may have ended it (a saved 'end', its model dead, an empty area).
+            if (!participant.conditions.includes(condition)) continue;
 
             // Handle duration for START_OF_TURN conditions
             if (condition.durationType === DurationType.START_OF_TURN) {
@@ -2294,21 +2381,10 @@ export class CombatEngine {
      */
     private processEndOfTurnConditions(participant: CombatParticipant): void {
         for (const condition of [...participant.conditions]) {
-            // Process ongoing effects
-            if (condition.ongoingEffects) {
-                for (const effect of condition.ongoingEffects) {
-                    if (effect.trigger === 'end_of_turn') {
-                        if (effect.type === 'damage' && effect.amount) {
-                            this.applyDamage(participant.id, effect.amount);
-                        } else if (effect.type === 'healing' && effect.amount) {
-                            this.heal(participant.id, effect.amount);
-                        } else if (effect.type === 'damage' && effect.dice) {
-                            const damage = this.tagged({ purpose: `ongoing ${condition.type}`, forId: participant.id }, () => this.rng.roll(effect.dice!));
-                            this.applyDamage(participant.id, damage);
-                        }
-                    }
-                }
-            }
+            // Process ongoing effects. Lane O: one tick helper for both loops.
+            this.tickOngoingEffects(participant, condition, 'end');
+            // A tick may have ended it: no end-of-turn save for a condition gone.
+            if (!participant.conditions.includes(condition)) continue;
 
             // Handle duration for END_OF_TURN conditions
             if (condition.durationType === DurationType.END_OF_TURN) {
@@ -2336,15 +2412,82 @@ export class CombatEngine {
      * their 5e save rules here (restrained: DEX, the very condition being
      * saved against included; exhaustion 3+). Advantage or disadvantage rolls
      * two dice under one labelled purpose and keeps one; both cancel to one
-     * die. The kept die meets the DC by the same degree rule as before
-     * (checkDegreeOf). A turn note and an endOfTurnSaves row say what happened.
+     * die. Lane L: plain 5e, the total against the DC (a natural 1 or 20 means
+     * nothing on a save). A failed save asks legendaryOnFailedSave, as every
+     * engine save does: autoLegendaryResistance spends one (the save succeeds;
+     * the provider's onSpent mirrors the count to the sheet); otherwise it is
+     * offered with a saveRef and the call (pendingLegendaryOffers, until the
+     * creature's next turn starts); a player-controlled creature (the
+     * provider's playerDecides) is asked, never spent for. A unit token's own
+     * save follows the creature rule. A turn note and an endOfTurnSaves row
+     * say what happened.
      */
     private rollEndOfTurnSave(participant: CombatParticipant, condition: Condition): EndOfTurnSave {
         const ability = condition.saveAbility!;
         const dc = condition.saveDC!;
+        // Lane O: the composition and the die every save the engine rolls by itself shares.
+        const { read, short, advantage, disadvantage, conditional, modifier, parts } = this.saverFor(participant, ability);
+        const { rolls, natural } = this.rollSaverDie(participant.id, `save vs ${condition.type}`, { advantage, disadvantage });
+        // Lane L: plain 5e, like every other save the engine rolls.
+        const total = natural + modifier;
+        let saved = total >= dc;
+        // Lane L: a failed save spends or offers a legendary resistance.
+        let legendaryResisted: boolean | undefined;
+        let legendaryOffer: EndOfTurnSave['legendaryOffer'];
+        let outcome = saved ? `✓ saved: ${condition.type} ends` : `✗ failed: still ${condition.type}`;
+        let offerPhrase = '';
+        if (!saved) {
+            const verdict = legendaryOnFailedSave(this, participant, { playerDecides: read?.playerDecides });
+            if (verdict.resisted) {
+                saved = true;
+                legendaryResisted = true;
+                outcome = `✗ failed → 👑 legendary resistance (LR ${verdict.resisted.remaining}/${participant.legendaryResistances ?? verdict.resisted.remaining} left): ${condition.type} ends`;
+                // The sheet keeps the count (resistances last the day); a mirror that cannot write leaves the save as rolled.
+                try { read?.onSpent?.(verdict.resisted.remaining); } catch { /* no database */ }
+            } else if (verdict.available) {
+                const round = this.state?.round ?? 1;
+                const row = recordLegendaryOffer(participant, {
+                    ref: nextOfferRef(participant, 'eot', round), kind: 'save_ends',
+                    conditionId: condition.id, condition: String(condition.type), round
+                }, verdict.available, !!verdict.askPlayer, this.encounterId);
+                this.legendaryOffers.push(row);
+                legendaryOffer = { saveRef: row.saveRef, remaining: row.remaining, ...(row.of !== undefined ? { of: row.of } : {}), ...(row.askPlayer ? { askPlayer: true as const } : {}), call: row.call };
+                offerPhrase = ` ${legendaryOfferPhrase(participant.name, row.remaining, row.of, !!row.askPlayer, row.call)}`;
+            }
+        }
+        const line = `${participant.name}'s end-of-turn ${short.toUpperCase()} save vs ${condition.type}: d20 ${natural} ${modifier >= 0 ? '+' : '-'} ${Math.abs(modifier)} = ${total} vs DC ${dc}`
+            + `${parts.length ? ` (${parts.join(', ')})` : ''} ${outcome}`
+            + rollSidesNote(rolls, { advantage, disadvantage })
+            + offerPhrase;
+        const save: EndOfTurnSave = {
+            participantId: participant.id, name: participant.name, condition: String(condition.type), ability, dc,
+            rolls, natural, modifier, parts, total, saved,
+            ...(advantage.length ? { advantage } : {}),
+            ...(disadvantage.length ? { disadvantage } : {}),
+            ...(conditional.length ? { conditional } : {}),
+            conditionId: condition.id,
+            ...(legendaryResisted ? { legendaryResisted } : {}),
+            ...(legendaryOffer ? { legendaryOffer } : {}),
+            line
+        };
+        this.endOfTurnSaves.push(save);
+        this.turnStartNotes.push(line + conditional.map(c => `\n   conditional: ${c}`).join(''));
+        return save;
+    }
+
+    /**
+     * Play report 7 (lane H), shared by lane O: what the handler layer's
+     * provider (SaverSides) knows of a saver and the token's own 5e rules, as
+     * one composition: the declared sides (untagged save:<ability>
+     * mechanics; tagged ones as hints), the conditions' save disadvantage
+     * (restrained on DEX, exhaustion 3+), the modifier (the sheet's ability
+     * and save proficiency; without a provider the token's ability modifier)
+     * and a unit token's drilled bonus (unit.saves). A provider that cannot
+     * read (no database) leaves the engine's own reading.
+     */
+    private saverFor(participant: CombatParticipant, ability: Ability) {
         const short = ability.slice(0, 3) as 'str' | 'dex' | 'con' | 'int' | 'wis' | 'cha';
         let read: SaverSides | undefined;
-        // A provider that cannot read (no database) leaves the engine's own reading.
         try { read = this.saverSides?.(participant, ability); } catch { read = undefined; }
         const once = (list: string[]) => list.filter((x, i) => list.findIndex(y => y.toLowerCase() === x.toLowerCase()) === i);
         const advantage = once([...(read?.advantage ?? [])]);
@@ -2356,31 +2499,326 @@ export class CombatEngine {
         const drilled = participant.unit?.saves?.[short] ?? 0;
         const modifier = (read?.modifier?.total ?? ownMod) + drilled;
         const parts = [...(read?.modifier?.parts ?? [`${short.toUpperCase()} ${ownMod >= 0 ? '+' : ''}${ownMod}`]), ...(drilled ? [`drilled ${drilled >= 0 ? '+' : ''}${drilled}`] : [])];
-        const tag = { purpose: purposeWithSources(`save vs ${condition.type}`, { advantage, disadvantage }), forId: participant.id };
-        const two = !!advantage.length !== !!disadvantage.length;
+        return { read, short, advantage, disadvantage, conditional, modifier, drilled, parts };
+    }
+
+    /** One save die on the fight's logged stream: two kept high or low when one side is declared, both cancelling to one. */
+    private rollSaverDie(forId: string, purpose: string, sides: { advantage: string[]; disadvantage: string[] }): { rolls: number[]; natural: number } {
+        const tag = { purpose: purposeWithSources(purpose, sides), forId };
+        const two = !!sides.advantage.length !== !!sides.disadvantage.length;
         const rolls = [this.rollD20(tag)];
         if (two) rolls.push(this.rollD20(tag));
-        const natural = !two ? rolls[0] : advantage.length ? Math.max(...rolls) : Math.min(...rolls);
-        const check = checkDegreeOf(natural, modifier, dc);
-        const saved = check.degree === 'success' || check.degree === 'critical-success';
-        // Lane H review: the old degree rule lets a natural 1 fail a total that
-        // meets the DC (and a natural 20 save one that misses it); the line says
-        // so, or '13 vs DC 13 ✗ failed' reads as an error.
-        const natural20or1 = saved !== (check.total >= dc) ? ` on a natural ${natural}` : '';
-        const line = `${participant.name}'s end-of-turn ${short.toUpperCase()} save vs ${condition.type}: d20 ${natural} ${modifier >= 0 ? '+' : '-'} ${Math.abs(modifier)} = ${check.total} vs DC ${dc}`
-            + `${parts.length ? ` (${parts.join(', ')})` : ''} ${saved ? `✓ saved${natural20or1}: ${condition.type} ends` : `✗ failed${natural20or1}: still ${condition.type}`}`
-            + rollSidesNote(rolls, { advantage, disadvantage });
-        const save: EndOfTurnSave = {
-            participantId: participant.id, name: participant.name, condition: String(condition.type), ability, dc,
-            rolls, natural, modifier, parts, total: check.total, saved,
-            ...(advantage.length ? { advantage } : {}),
-            ...(disadvantage.length ? { disadvantage } : {}),
-            ...(conditional.length ? { conditional } : {}),
+        const natural = !two ? rolls[0] : sides.advantage.length ? Math.max(...rolls) : Math.min(...rolls);
+        return { rolls, natural };
+    }
+
+    /** Lane O: one plain-5e save against a tick (a creature's, or one model's): the total against the DC. */
+    private rollTickSave(participant: CombatParticipant, ability: Ability, dc: number, purpose: string): TickSave & { read?: SaverSides } {
+        const c = this.saverFor(participant, ability);
+        const { rolls, natural } = this.rollSaverDie(participant.id, purpose, c);
+        const total = natural + c.modifier;
+        return {
+            read: c.read, ability, dc, rolls, natural, modifier: c.modifier, total, saved: total >= dc, parts: c.parts,
+            ...(c.advantage.length ? { advantage: c.advantage } : {}),
+            ...(c.disadvantage.length ? { disadvantage: c.disadvantage } : {}),
+            ...(c.conditional.length ? { conditional: c.conditional } : {})
+        };
+    }
+
+    // ── Lane O: pressure and ongoing damage by shape ─────────────────────
+
+    /**
+     * Play report 7 follow-up (lane O): a condition's ongoing effects that
+     * tick now ('start' or 'end' of the bearer's turn). One helper for both
+     * loops. Healing heals as before (with a note). Damage is rolled once on
+     * the fight's logged dice (purpose 'ongoing <condition>') and lands by
+     * its source's shape:
+     *  - a creature (not a unit): its own plain-5e save if the effect has
+     *    one, legendary resistance spent or offered (kind 'ongoing', a saveRef
+     *    whose answer refunds what the success would have avoided), then
+     *    resistances;
+     *  - single on a unit (a single-target hit, and every legacy effect with
+     *    no shape): the most wounded model takes it, capped at it; when that
+     *    model dies the condition ends;
+     *  - area on a unit: min(recorded, live) models, most wounded first, each
+     *    with its own save (never the token's legendary resistance), landed
+     *    per model with their wounds; the count drops by the dead (and, on
+     *    onSuccess 'end', by the models that saved); at 0 the condition ends.
+     * Every tick prints a turn note and a turnDamage row.
+     */
+    private tickOngoingEffects(participant: CombatParticipant, condition: Condition, when: 'start' | 'end'): void {
+        const trigger = when === 'start' ? 'start_of_turn' : 'end_of_turn';
+        for (const effect of condition.ongoingEffects ?? []) {
+            if (effect.trigger !== trigger) continue;
+            // An earlier effect of the same condition may have ended it.
+            if (!participant.conditions.includes(condition)) return;
+            if (effect.type === 'healing' && effect.amount) {
+                const before = participant.hp;
+                this.heal(participant.id, effect.amount);
+                this.turnStartNotes.push(`💚 ${participant.name} — ${condition.type} (${when} of turn): regains ${participant.hp - before}, HP ${before} → ${participant.hp}/${participant.maxHp}`);
+                continue;
+            }
+            if (effect.type !== 'damage' || (!effect.amount && !effect.dice)) continue;
+            // A unit with no model standing has nothing left to burn.
+            if (participant.unit && liveModels(participant) <= 0) continue;
+            const rolled = effect.amount
+                ? effect.amount
+                : Math.max(0, this.tagged({ purpose: `ongoing ${condition.type}`, forId: participant.id }, () => this.rng.roll(effect.dice!)));
+            this.ongoingTick(participant, condition, effect, when, rolled);
+        }
+    }
+
+    private ongoingTick(participant: CombatParticipant, condition: Condition, effect: OngoingEffect, when: 'start' | 'end', rolled: number): void {
+        const label = String(condition.type);
+        const ability = effect.save ? (parseAbility(effect.save.ability) ?? Ability.DEXTERITY) : undefined;
+        const save = effect.save && ability ? { ability, dc: effect.save.dc, success: effect.save.onSuccess ?? 'none' as const } : undefined;
+        const spec: TickSpec = {
+            source: 'ongoing', label, condition, when, rolled, damageType: effect.damageType, save,
+            purpose: `ongoing ${label}`, head: `🔥 ${participant.name} — ${label} (${when} of turn): `, unitHead: `${label} (${when} of turn): `
+        };
+        if (participant.unit && effect.shape?.kind === 'area') {
+            const recorded = Math.max(0, Math.floor(effect.shape.models));
+            const inside = Math.min(recorded, liveModels(participant));
+            const ev = this.tickUnitArea(participant, spec, inside, 'area');
+            // The models killed leave the area; with onSuccess 'end', so do those that saved.
+            const left = Math.max(0, inside - (ev.unitArea.modelsKilled ?? 0) - (save?.success === 'end' ? ev.unitArea.standing.saved : 0));
+            effect.shape = { kind: 'area', models: left };
+            ev.modelsInArea = left;
+            let tail = '';
+            if (left <= 0) {
+                this.removeCondition(participant.id, condition.id);
+                ev.conditionEnded = 'no model left in the area';
+                tail = `; ${label} ends: no model left in the area`;
+            } else if (left !== recorded) {
+                tail = `; the area now covers ${left}`;
+            }
+            // The tail closes the unit's line, before its saves line.
+            const cut = ev.line.indexOf('\n');
+            ev.line = cut < 0 ? ev.line + tail : `${ev.line.slice(0, cut)}${tail}${ev.line.slice(cut)}`;
+            ev.unitLine += tail;
+            this.recordTick(ev);
+            return;
+        }
+        if (participant.unit) { this.recordTick(this.tickUnitSingle(participant, spec)); return; }
+        this.recordTick(this.tickCreature(participant, spec));
+    }
+
+    /**
+     * Lane O: water pressure is an area (the owner: "every model in the deep
+     * water takes it, each separately"). The whole field is water, so every
+     * live model of a unit is inside (a spaced unit needs no count), each
+     * with its own save when the pressure allows one; any other token takes
+     * one save, with legendary resistance as on every engine save.
+     */
+    private pressureTick(participant: CombatParticipant, amount: number, pressure: NonNullable<EncounterEnvironment['pressure']>, depthFt: number): void {
+        const ability = pressure.save ? (parseAbility(pressure.save.ability) ?? Ability.CONSTITUTION) : undefined;
+        const save = pressure.save && ability ? { ability, dc: pressure.save.dc, success: pressure.save.half === false ? 'none' as const : 'half' as const } : undefined;
+        const spec: TickSpec = {
+            source: 'pressure', label: 'water pressure', when: 'start', rolled: amount, damageType: pressure.damageType, save,
+            purpose: 'pressure', head: `🌊 ${participant.name} — pressure at ${depthFt} ft: `, unitHead: `pressure at ${depthFt} ft: `, depthFt
+        };
+        if (participant.unit) {
+            const inside = liveModels(participant);
+            if (inside > 0) this.recordTick(this.tickUnitArea(participant, spec, inside, 'deep water'));
+            return;
+        }
+        this.recordTick(this.tickCreature(participant, spec));
+    }
+
+    private recordTick(ev: TurnDamageEvent): void {
+        this.turnDamage.push(ev);
+        this.turnStartNotes.push(ev.line);
+    }
+
+    /** Lane O: a tick on one creature: its save, legendary resistance, resistances, the HP. */
+    private tickCreature(p: CombatParticipant, spec: TickSpec): TurnDamageEvent {
+        let save: (TickSave & { read?: SaverSides }) | undefined;
+        let saved = false;
+        let legendaryResisted: true | undefined;
+        let offerFor: { remaining: number; askPlayer: boolean } | undefined;
+        let outcome = '';
+        if (spec.save) {
+            save = this.rollTickSave(p, spec.save.ability, spec.save.dc, `${spec.purpose} save (${spec.save.ability})`);
+            saved = save.saved;
+            outcome = saved ? `✓ saved${spec.save.success === 'half' ? ' (half)' : ''}` : '✗ failed';
+            if (!saved) {
+                // Lane L's rule, as on every engine save: spent, offered, or asked of the player.
+                const verdict = legendaryOnFailedSave(this, p, { playerDecides: save.read?.playerDecides });
+                if (verdict.resisted) {
+                    saved = true;
+                    legendaryResisted = true;
+                    outcome = `✗ failed → 👑 legendary resistance (LR ${verdict.resisted.remaining}/${p.legendaryResistances ?? verdict.resisted.remaining} left)${spec.save.success === 'half' ? ' (half)' : ''}`;
+                    try { save.read?.onSpent?.(verdict.resisted.remaining); } catch { /* no database */ }
+                } else if (verdict.available) {
+                    offerFor = { remaining: verdict.available, askPlayer: !!verdict.askPlayer };
+                }
+            }
+        }
+        const full = this.calculateDamageWithModifiers(spec.rolled, spec.damageType, p);
+        const successRaw = spec.save?.success === 'half' ? Math.floor(spec.rolled / 2) : 0;
+        const onSuccess = this.calculateDamageWithModifiers(successRaw, spec.damageType, p);
+        const dealt = saved ? onSuccess.finalDamage : full.finalDamage;
+        const mod = saved ? onSuccess : full;
+        const hpBefore = p.hp;
+        const dying = dealt > 0 ? this.applyDamage(p.id, dealt) : undefined;
+        const lost = hpBefore - p.hp;
+        let conditionEnded: string | undefined;
+        if (saved && spec.save?.success === 'end' && spec.condition) {
+            this.removeCondition(p.id, spec.condition.id);
+            conditionEnded = 'saved';
+        }
+        // The offer: a spend turns the failed save into a success after the
+        // fact, healing back what the success would have avoided.
+        let legendaryOffer: TurnDamageEvent['legendaryOffer'];
+        let offerPhrase = '';
+        if (offerFor && spec.save) {
+            const round = this.state?.round ?? 1;
+            const refund = Math.max(0, lost - Math.min(onSuccess.finalDamage, hpBefore));
+            const row = recordLegendaryOffer(p, {
+                ref: nextOfferRef(p, 'ong', round), kind: 'ongoing',
+                conditionId: spec.condition?.id ?? 'pressure', condition: spec.label, round, refund,
+                ...(spec.save.success === 'end' && spec.condition ? { endsCondition: true as const } : {})
+            }, offerFor.remaining, offerFor.askPlayer, this.encounterId);
+            this.legendaryOffers.push(row);
+            legendaryOffer = { saveRef: row.saveRef, remaining: row.remaining, ...(row.of !== undefined ? { of: row.of } : {}), ...(row.askPlayer ? { askPlayer: true as const } : {}), refund, call: row.call };
+            offerPhrase = ` ${legendaryOfferPhrase(p.name, row.remaining, row.of, !!row.askPlayer, row.call)}`;
+        }
+        const sidesNote = save ? rollSidesNote(save.rolls, { advantage: save.advantage ?? [], disadvantage: save.disadvantage ?? [] }) : '';
+        const saveText = save ? `${tickSaveText(save, sidesNote)} ${outcome}` : '';
+        const tail = p.hp <= 0 ? dyingTail(p, dying) : '';
+        let line: string;
+        if (spec.source === 'pressure') {
+            const what = dealt > 0 || !saved ? `takes ${dealt} pressure damage${spec.damageType ? ` (${spec.damageType})` : ''}` : 'takes no pressure damage';
+            line = `🌊 ${p.name} ${what} at ${spec.depthFt} ft (${hpBefore} → ${p.hp}/${p.maxHp})${tail}${saveText ? ` — ${saveText}` : ''}`;
+        } else {
+            const damageText = saved && dealt <= 0
+                ? 'no damage'
+                : `${tickDamageText(dealt, saved ? successRaw : spec.rolled, spec.damageType, mod.modifier)}, HP ${hpBefore} → ${p.hp}/${p.maxHp}${tail}`;
+            line = `${spec.head}${saveText ? `${saveText}: ` : ''}${damageText}${conditionEnded ? `; ${spec.label} ends` : ''}`;
+        }
+        line += offerPhrase;
+        if (save?.conditional?.length) line += save.conditional.map(c => `\n   conditional: ${c}`).join('');
+        return {
+            participantId: p.id, name: p.name, source: spec.source,
+            ...(spec.condition ? { condition: spec.label, conditionId: spec.condition.id } : {}),
+            when: spec.when, shape: 'single', rolled: spec.rolled,
+            ...(spec.damageType ? { damageType: spec.damageType } : {}),
+            damage: dealt, hpBefore, hpAfter: p.hp,
+            ...(save ? { save: { ...tickSaveRow(save), saved } } : {}),
+            ...(conditionEnded ? { conditionEnded } : {}),
+            ...(legendaryResisted ? { legendaryResisted } : {}),
+            ...(legendaryOffer ? { legendaryOffer } : {}),
+            ...(dying ? { dying } : {}),
             line
         };
-        this.endOfTurnSaves.push(save);
-        this.turnStartNotes.push(line + conditional.map(c => `\n   conditional: ${c}`).join(''));
-        return save;
+    }
+
+    /**
+     * Lane O: a single-target tick on a unit: the most wounded model takes it,
+     * capped at that model's HP (the same model a single blow would finish).
+     * Its save is one model's: it never spends the token's legendary
+     * resistance. When the model dies, the condition ends.
+     */
+    private tickUnitSingle(p: CombatParticipant, spec: TickSpec): TurnDamageEvent {
+        const save = spec.save ? this.rollTickSave(p, spec.save.ability, spec.save.dc, `${spec.purpose} save (${spec.save.ability}) (most wounded model)`) : undefined;
+        const saved = !!save?.saved;
+        const raw = saved ? (spec.save?.success === 'half' ? Math.floor(spec.rolled / 2) : 0) : spec.rolled;
+        const mod = this.calculateDamageWithModifiers(raw, spec.damageType, p);
+        const capped = unitCapFor(p, mod.finalDamage);
+        const hpBefore = p.hp;
+        const modelsBefore = liveModels(p);
+        if (capped.damage > 0) this.applyDamage(p.id, capped.damage);
+        const modelsAfter = liveModels(p);
+        const killed = Math.max(0, modelsBefore - modelsAfter);
+        let conditionEnded: string | undefined;
+        let endText = '';
+        if (spec.condition && killed > 0) {
+            this.removeCondition(p.id, spec.condition.id);
+            conditionEnded = 'its model died';
+            endText = `; ${spec.label} ends: the model it was on is dead`;
+        } else if (spec.condition && saved && spec.save?.success === 'end') {
+            this.removeCondition(p.id, spec.condition.id);
+            conditionEnded = 'saved';
+            endText = `; ${spec.label} ends`;
+        }
+        const outcome = save
+            ? `${tickSaveText(save, rollSidesNote(save.rolls, { advantage: save.advantage ?? [], disadvantage: save.disadvantage ?? [] }))} ${saved ? `✓ saved${spec.save?.success === 'half' ? ' (half)' : ''}` : '✗ failed'}: `
+            : '';
+        const what = saved && capped.damage <= 0
+            ? 'no damage'
+            : `${tickDamageText(capped.damage, raw, spec.damageType, mod.modifier)} on the most wounded model${capped.cap ? ` (one model at most: ${capped.cap.before} → ${capped.cap.after})` : ''}: ${killed} dead, ${modelsAfter}/${p.unit!.models} left`;
+        const wounds = woundLine(p);
+        const parts = woundParts(p);
+        const body = `${what}${modelsAfter > 0 && capped.damage > 0 && parts ? ` (${parts})` : ''}${endText}`;
+        return {
+            participantId: p.id, name: p.name, source: spec.source,
+            ...(spec.condition ? { condition: spec.label, conditionId: spec.condition.id } : {}),
+            when: spec.when, shape: 'single', rolled: spec.rolled,
+            ...(spec.damageType ? { damageType: spec.damageType } : {}),
+            damage: hpBefore - p.hp, hpBefore, hpAfter: p.hp,
+            ...(save ? { save: tickSaveRow(save) } : {}),
+            ...(capped.cap ? { unitCap: capped.cap } : {}),
+            modelsBefore, modelsAfter, modelsKilled: killed, wounds,
+            ...(conditionEnded ? { conditionEnded } : {}),
+            unitLine: `${spec.unitHead}${outcome}${body}`,
+            line: `${spec.head}${outcome}${body}`
+        };
+    }
+
+    /**
+     * Lane O: an area tick on a unit (pressure; an area condition's ongoing
+     * damage): the damage rolled once, `inside` models most wounded first,
+     * each with its own plain-5e save through the provider's composition
+     * (read once for the token; never its legendary resistance), resistances
+     * per model, landed per model so each keeps its wound (lane W).
+     */
+    private tickUnitArea(p: CombatParticipant, spec: TickSpec, inside: number, shapeWord: string): TurnDamageEvent & { unitArea: TickUnitArea; unitLine: string } {
+        let saves: boolean[] | undefined;
+        let rows: NonNullable<TickUnitArea['saves']> | undefined;
+        let saveBonus: TickUnitArea['saveBonus'];
+        let sides: { advantage: string[]; disadvantage: string[] } | undefined;
+        if (spec.save) {
+            const c = this.saverFor(p, spec.save.ability);
+            sides = { advantage: c.advantage, disadvantage: c.disadvantage };
+            saves = [];
+            rows = [];
+            for (let i = 1; i <= inside; i++) {
+                const { rolls, natural } = this.rollSaverDie(p.id, `${spec.purpose} save (${spec.save.ability}) (model ${i}/${inside})`, sides);
+                const total = natural + c.modifier;
+                saves.push(total >= spec.save.dc);
+                rows.push({ model: i, natural, rolls, total, saved: total >= spec.save.dc });
+            }
+            saveBonus = { ability: spec.save.ability, dc: spec.save.dc, total: c.modifier, drilled: c.drilled, parts: c.parts };
+        }
+        const full = this.calculateDamageWithModifiers(spec.rolled, spec.damageType, p).finalDamage;
+        const half = spec.save?.success === 'half' ? this.calculateDamageWithModifiers(Math.floor(spec.rolled / 2), spec.damageType, p).finalDamage : 0;
+        const area = areaOnUnit(p, { damage: full, half, modelsInArea: inside, ...(saves ? { saves } : {}) });
+        const hpBefore = p.hp;
+        if (area.hpLost > 0) this.applyDamage(p.id, area.hpLost, { models: area.modelDamage });
+        const { modelDamage: _modelDamage, ...result } = area;
+        void _modelDamage;
+        const areaLine = unitAreaLine(p, area, shapeWord);
+        const unitArea: TickUnitArea = {
+            ...result,
+            ...(saveBonus ? { saveBonus } : {}),
+            ...(rows ? { saves: rows } : {}),
+            ...(sides?.advantage.length ? { advantageSources: sides.advantage } : {}),
+            ...(sides?.disadvantage.length ? { disadvantageSources: sides.disadvantage } : {}),
+            line: areaLine
+        };
+        const savesLine = tickUnitSavesLine(unitArea);
+        return {
+            participantId: p.id, name: p.name, source: spec.source,
+            ...(spec.condition ? { condition: spec.label, conditionId: spec.condition.id } : {}),
+            when: spec.when, shape: 'area', rolled: spec.rolled,
+            ...(spec.damageType ? { damageType: spec.damageType } : {}),
+            damage: hpBefore - p.hp, hpBefore, hpAfter: p.hp,
+            unitArea,
+            modelsBefore: area.modelsBefore, modelsAfter: area.modelsAfter, modelsKilled: area.modelsKilled,
+            wounds: woundLine(p),
+            unitLine: `${spec.unitHead}${areaLine}`,
+            line: `${spec.head}${areaLine}${savesLine ? `\n   ${savesLine}` : ''}`
+        };
     }
 
     /**
@@ -2405,6 +2843,8 @@ export class CombatEngine {
         // Play report 7 (lane H): the handlers pass the saver reader on every
         // advance, so an engine rehydrated in a new process has it too.
         this.endOfTurnSaves = [];
+        this.legendaryOffers = [];
+        this.turnDamage = [];
         if (opts.saverSides) this.saverSides = opts.saverSides;
         this.deathSaveModeDefault = opts.deathSaveMode;
         if (opts.encounterId) this.encounterId = opts.encounterId;
@@ -2465,6 +2905,8 @@ export class CombatEngine {
 
             newParticipant = this.getCurrentParticipant();
             iterations++;
+            // Lane L review: a slot at 0 HP gets no turn start below, but its turn has come round.
+            if (newParticipant && newParticipant.hp <= 0) this.lapseLegendaryOffers(newParticipant);
 
             // Surprise lasts until the creature's first slot has come round,
             // alive or not: a downed one clears the flag without a pass note,

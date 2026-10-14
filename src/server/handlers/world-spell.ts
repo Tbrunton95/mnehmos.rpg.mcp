@@ -5,6 +5,13 @@
  * costs written with history, an optional unbind contest, the effects on
  * each target (saves, resistances, conditions, pools) and a miscast table
  * on a double, a failure or a fumble.
+ *
+ * Play report 7 follow-up (lane S): damage resolves by its shape. A spell
+ * whose rule carries area {shape, size} resolves a damage effect aimed at
+ * its targets on a unit token model by model (rollUnitArea: one save per
+ * model inside, no token save, no legendary resistance per model); an
+ * unmarked spell, or an effect aimed at the caster, hits one model at most
+ * (unitCapFor). Condition effects stay one save per token, as on the SRD road.
  */
 import type Database from 'better-sqlite3';
 import type { CombatEngine, CombatParticipant, CombatActionResult, DyingUpdate } from '../../engine/combat/engine.js';
@@ -20,8 +27,10 @@ import { calculateSpellSaveDC } from '../../engine/magic/spell-validator.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { checkConcentration, breakConcentration } from '../../engine/magic/concentration.js';
+import { fightConcentrationLegendary, type LegendaryReplyRow } from './legendary-saves.js';
 import type { Character } from '../../schema/character.js';
 import { breakTestDue, moraleModifiers, type BreakTest } from '../../engine/combat/units.js';
+import { rollUnitArea, unitsNeedingCount, areaCountRefusal, unitCapFor, unitSavesLine, unitSummaryLine, type ModelsInArea, type UnitAreaReport } from '../../engine/combat/unit-area.js';
 import { nearbyAllies, type SpeciesOf } from '../../engine/combat/nearby.js';
 import { applyGrowth, type GrowthOutcome } from '../growth.js';
 
@@ -134,6 +143,10 @@ export interface CastWorldSpellInput {
     unbinderId?: string;
     damage?: number | string;
     boost?: SpellBoost;
+    /** Play report 7 follow-up (lane S): models of each unit target inside an area spell (combat_action modelsInArea). */
+    modelsInArea?: ModelsInArea | number;
+    /** Lane K: the encounter a legendary resistance offer's call names (default: the engine's own id). */
+    encounterId?: string;
 }
 
 interface EffectResult {
@@ -155,6 +168,19 @@ interface EffectResult {
     defeated?: boolean;
     /** Play report 5 #5: what this damage did to a tracked target at or into 0 HP (the caller mirrors the sheet and runs the kill). */
     dying?: DyingUpdate;
+    /** Play report 7 follow-up (lane S): an area spell on a unit token, model by model. */
+    unitArea?: UnitAreaReport;
+    /** Play report 7 follow-up (lane S): a single-target hit on a unit token, capped at one model. */
+    unitCap?: { before: number; after: number };
+}
+
+/**
+ * The one-model cap's line for a world spell: the hint names the rule's area
+ * flag, not apply_damage's. An area spell's effect aimed at the caster is a
+ * single hit by design, so it says that instead of asking for the flag.
+ */
+function worldUnitCapLine(name: string, cap: { before: number; after: number }, areaSpell: boolean): string {
+    return `one model at most: ${cap.before} → ${cap.after} (${areaSpell ? `aimed at the caster: a single hit, not ${name}'s area` : `${name} is not an area: give its spell rule area: {shape, size} for an area`})`;
 }
 
 /**
@@ -206,6 +232,16 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
             if (ft > spec.range) throw new Error(`${t.name} is ${ft} ft away; ${name} reaches ${spec.range} ft`);
         }
         targets.push(t);
+    }
+
+    // Play report 7 follow-up (lane S): an area spell that deals damage to its
+    // targets needs a spaced unit's count before any cost is paid or the
+    // casting roll is rolled (a packed unit has every live model inside).
+    const area = spec.area ?? undefined;
+    const areaDamage = !!area && spec.effects.some(e => e.type === 'damage' && e.target !== 'caster');
+    if (areaDamage) {
+        const needs = unitsNeedingCount(state.participants, targets.map(t => t.id), input.modelsInArea);
+        if (needs.length) throw areaCountRefusal(needs);
     }
 
     const reason = `cast ${name}`;
@@ -312,8 +348,16 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
     // ── Effects ──
     const effects: EffectResult[] = [];
     const concentrationSaves: Array<ConcentrationOutcome & { targetId: string; name: string }> = [];
+    // Lane K: the legendary resistances those concentration saves offered (top-level legendaryOffers).
+    const legendaryOffers: LegendaryReplyRow[] = [];
     const notes: string[] = [];
     const breakTests: BreakTest[] = [];
+    // The break test each unit report produced, for its unitLines entry (two damage effects make two reports).
+    const breakTestOf = new Map<EffectResult, BreakTest>();
+    if (input.modelsInArea !== undefined && targets.some(t => t.unit)) {
+        if (!area) notes.push(`modelsInArea ignored: ${name} has no area flag, so it hits one model of a unit at most. For per-model damage, give its spell rule area: {shape, size} (table_rules define)`);
+        else if (!areaDamage) notes.push(`modelsInArea unused: ${name} deals no damage to its targets (a condition is one save per token)`);
+    }
     if (lands) {
         const fallbackDc = casting?.total ?? (char ? (char.spellSaveDC || calculateSpellSaveDC(char)) : 10);
         const concentrationRepo = new ConcentrationRepository(db);
@@ -328,7 +372,10 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
                 let saved = false;
                 // Play report 7 (lane H): a concentration save that took a source, for this target's line.
                 let concentrationNote = '';
-                if (effect.save && effect.type !== 'healing') {
+                // Play report 7 follow-up (lane S): an area's damage on a unit goes model by model, each model saving.
+                // A unit already wiped out goes this way too (no model inside), as on the SRD road: no token save.
+                const perModel = effect.type === 'damage' && !!area && effect.target !== 'caster' && !!tp.unit;
+                if (effect.save && effect.type !== 'healing' && !perModel) {
                     const dc = effect.save.dc ?? fallbackDc;
                     const save = rollParticipantSave(engine, db, tp, effect.save.ability, dc, {
                         purpose: `${toLongAbility(effect.save.ability) ?? effect.save.ability} save vs ${name}`
@@ -339,20 +386,49 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
                 if (effect.type === 'damage') {
                     let dmg = rolled!.total;
                     out.rolled = dmg;
-                    if (saved) dmg = effect.saveEffect === 'half' ? Math.floor(dmg / 2) : 0;
-                    const typed = engine.calculateDamageWithModifiers(dmg, effect.damageType ?? 'force', tp);
-                    dmg = typed.finalDamage;
+                    let damageModifier: string;
+                    // Lane W: an area writes each model's own damage (a saved model keeps its wound);
+                    // a bare total on a unit would spread through the models and kill too many.
+                    let modelDamage: number[] | undefined;
+                    if (perModel) {
+                        // One damage roll; one save per model inside on the fight's
+                        // dice (the unit token's declared sides, read once); the pool
+                        // loses what the models inside took.
+                        const dc = effect.save ? (effect.save.dc ?? fallbackDc) : undefined;
+                        const unitRoll = rollUnitArea(engine, db, tp, {
+                            damage: dmg, halfOnSave: effect.saveEffect === 'half',
+                            savingThrow: effect.save ? { ability: effect.save.ability, dc: dc! } : undefined,
+                            damageType: effect.damageType ?? 'force', purpose: name,
+                            modelsInArea: input.modelsInArea, shape: area!.shape
+                        });
+                        if (dc !== undefined) out.dc = dc;
+                        if (unitRoll.report.saves?.length) out.saved = unitRoll.majoritySaved;
+                        out.unitArea = unitRoll.report;
+                        dmg = unitRoll.hpLost;
+                        modelDamage = unitRoll.modelDamage;
+                        damageModifier = unitRoll.damageModifier;
+                    } else {
+                        if (saved) dmg = effect.saveEffect === 'half' ? Math.floor(dmg / 2) : 0;
+                        const typed = engine.calculateDamageWithModifiers(dmg, effect.damageType ?? 'force', tp);
+                        dmg = typed.finalDamage;
+                        damageModifier = typed.modifier;
+                        // A single-target hit (an unmarked spell, or one aimed at the caster) takes one model of a unit at most.
+                        if (tp.unit) {
+                            const cap = unitCapFor(tp, dmg);
+                            if (cap.cap) { dmg = cap.damage; out.unitCap = cap.cap; }
+                        }
+                    }
                     out.hpBefore = tp.hp;
-                    const dying = dmg > 0 ? engine.applyDamage(tp.id, dmg) : undefined;
+                    const dying = dmg > 0 ? engine.applyDamage(tp.id, dmg, modelDamage ? { models: modelDamage } : {}) : undefined;
                     if (dying) out.dying = dying;
                     const after = engine.getState()?.participants.find(p => p.id === tp.id);
                     out.hpAfter = after?.hp ?? 0;
                     out.defeated = out.hpAfter <= 0;
                     out.damage = dmg;
-                    out.damageModifier = typed.modifier;
+                    out.damageModifier = damageModifier;
                     if (after?.unit) {
                         const due = breakTestDue(after, out.hpBefore, { moraleBonus: moraleModifiers(after, engine.getState()?.participants ?? [], speciesOf) });
-                        if (due) breakTests.push(due);
+                        if (due) { breakTests.push(due); breakTestOf.set(out, due); }
                     }
                     if (dmg > 0) {
                         const tc = charRepo.findById(tp.id);
@@ -363,9 +439,14 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
                                 else {
                                     // Play report 7 (lane H): the target's declared save:con sides and conditions, on the fight's dice.
                                     const check = checkConcentration(tc, dmg, concentrationRepo, 0, fightConcentrationDie(engine, db, tp.id));
+                                    // Lane K: a failed save spends a legendary resistance (the spell holds) or offers one (reversible with saveRef).
+                                    const held = check.broken ? concentrationRepo.findByCharacterId(tp.id) : null;
+                                    const legendary = held ? fightConcentrationLegendary(engine, db, tp.id, input.encounterId, held) : undefined;
+                                    if (legendary?.holds) { check.broken = false; check.reason = 'damage'; }
+                                    if (legendary?.row) legendaryOffers.push(legendary.row);
                                     if (check.broken) breakConcentration({ characterId: tp.id, reason: 'damage', damageAmount: dmg }, concentrationRepo, charRepo);
-                                    if (concentrationLabelled(check)) {
-                                        const c = concentrationOutcome(check);
+                                    if (concentrationLabelled(check) || legendary) {
+                                        const c = concentrationOutcome({ ...check, ...legendary?.fields });
                                         concentrationSaves.push({ targetId: tp.id, name: tp.name, ...c });
                                         concentrationNote = `\n   🧠 ${concentrationLine(c)}`;
                                     }
@@ -373,7 +454,12 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
                             }
                         }
                     }
-                    out.line = `💥 ${tp.name}: ${dmg} ${effect.damageType ?? 'force'}${typed.modifier !== 'normal' ? ` (${typed.modifier})` : ''} | ${out.hpBefore} → ${out.hpAfter} HP${out.defeated ? (after && dying ? dyingTail(after, dying) : ' 💀 DEFEATED') : ''}${dying?.failuresAdded ? ` — hit while down: +${dying.failuresAdded} failed death save${dying.failuresAdded > 1 ? 's' : ''}` : ''}`;
+                    out.line = `💥 ${tp.name}: ${dmg} ${effect.damageType ?? 'force'}${damageModifier !== 'normal' ? ` (${damageModifier})` : ''} | ${out.hpBefore} → ${out.hpAfter} HP${out.defeated ? (after && dying ? dyingTail(after, dying) : ' 💀 DEFEATED') : ''}${dying?.failuresAdded ? ` — hit while down: +${dying.failuresAdded} failed death save${dying.failuresAdded > 1 ? 's' : ''}` : ''}`;
+                    // Play report 7 follow-up (lane S): what the area did to the unit, model by model, or the one-model cap.
+                    if (out.unitArea) {
+                        const sl = unitSavesLine(out.unitArea);
+                        out.line += `\n   🎯 ${out.unitArea.line}${sl ? `\n   ${sl}` : ''}`;
+                    } else if (out.unitCap) out.line += `\n   🎯 ${worldUnitCapLine(name, out.unitCap, !!area)}`;
                 } else if (effect.type === 'healing') {
                     out.rolled = rolled!.total;
                     out.hpBefore = tp.hp;
@@ -410,7 +496,10 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
                     const s = out.save;
                     // Play report 7 (lane G1): the sources the save took (declared mechanics, conditions), and a tagged one's hint.
                     const hints = [...(s.conditionalAdvantage ?? []), ...(s.conditionalDisadvantage ?? [])].map(c => `\n   conditional: ${c}`).join('');
-                    out.line = `🎲 ${tp.name} ${s.ability.toUpperCase()} save: d20(${s.rolls.join(',')}) ${s.modifier >= 0 ? '+' : '-'} ${Math.abs(s.modifier)} = ${s.total} vs DC ${out.dc} [${s.saved ? 'PASS' : 'FAIL'}]${saveSidesNote(s)}${hints}${out.line ? `\n   ${out.line}` : ''}`;
+                    // Lane L review: a legendary resistance spent on the save, or offered after it failed (a player character is asked, never spent for).
+                    const legendaryNote = s.legendaryResisted ? ' (legendary resistance)'
+                        : s.legendaryResistanceAvailable ? ` ⭐ ${s.legendaryResistanceAvailable} legendary resistance(s) left: ${s.legendaryResistanceAskPlayer ? 'ask the player' : 'the GM may spend one'}` : '';
+                    out.line = `🎲 ${tp.name} ${s.ability.toUpperCase()} save: d20(${s.rolls.join(',')}) ${s.modifier >= 0 ? '+' : '-'} ${Math.abs(s.modifier)} = ${s.total} vs DC ${out.dc} [${s.saved ? 'PASS' : 'FAIL'}]${legendaryNote}${saveSidesNote(s)}${hints}${out.line ? `\n   ${out.line}` : ''}`;
                 }
                 if (concentrationNote) out.line = `${out.line ?? ''}${concentrationNote}`;
                 effects.push(out);
@@ -506,8 +595,13 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
     } as unknown as CombatActionResult;
     const saves = effects.filter(e => e.save).map(e => ({ id: e.targetId, name: e.name, ...e.save! }));
     if (saves.length) (result as { saves?: unknown }).saves = saves;
-    // Play report 7 (lane G1): what each save took, for the reply's saveSources (lifted to the top level).
-    const saveSources = effects.filter(e => e.save).map(e => saveSourcesRow({ id: e.targetId, name: e.name }, e.save!)).filter(r => r !== undefined);
+    // Play report 7 (lane G1): what each save took, for the reply's saveSources (lifted to the top level);
+    // a unit in an area gives one row for all its models (lane S).
+    const saveSources = effects.map(e => e.save
+        ? saveSourcesRow({ id: e.targetId, name: e.name }, e.save)
+        : e.unitArea?.saveBonus
+            ? saveSourcesRow({ id: e.targetId, name: e.name }, { ability: e.unitArea.saveBonus.ability, ...e.unitArea }, { models: e.unitArea.saves?.length ?? 0 })
+            : undefined).filter(r => r !== undefined);
     // Play report 7 (lane H): concentration saves that took a declared source (or a tagged one's hint), as their own rows.
     for (const c of concentrationSaves) {
         const row = concentrationSourcesRow({ id: c.targetId, name: c.name }, c);
@@ -515,8 +609,18 @@ export async function castWorldSpell(input: CastWorldSpellInput): Promise<{ outp
     }
     if (saveSources.length) (result as { saveSources?: unknown }).saveSources = saveSources;
     if (concentrationSaves.length) (result as { concentrationSaves?: unknown }).concentrationSaves = concentrationSaves;
+    if (legendaryOffers.length) (result as { legendaryOffers?: unknown }).legendaryOffers = legendaryOffers;
     const conditionsApplied = effects.filter(e => e.condition).map(e => ({ id: e.targetId, name: e.name, condition: e.condition }));
     if (conditionsApplied.length) (result as { conditionsApplied?: unknown }).conditionsApplied = conditionsApplied;
     if (breakTests.length) (result as { breakTests?: unknown }).breakTests = breakTests;
+    // Play report 7 follow-up (lane S): per-unit area reports, the owner's line per unit
+    // (lifted to the reply's top level, where output_mode 'summary' keeps it whole), one-model caps.
+    const areaEffects = effects.filter(e => e.unitArea);
+    if (areaEffects.length) {
+        (result as { unitAreas?: unknown }).unitAreas = areaEffects.map(e => ({ targetId: e.targetId, name: e.name, ...e.unitArea! }));
+        (result as { unitLines?: string[] }).unitLines = areaEffects.map(e => unitSummaryLine(e.name, e.unitArea!, breakTestOf.get(e)));
+    }
+    const unitCaps = effects.filter(e => e.unitCap).map(e => ({ targetId: e.targetId, name: e.name, ...e.unitCap! }));
+    if (unitCaps.length) (result as { unitCaps?: unknown }).unitCaps = unitCaps;
     return { output, result };
 }

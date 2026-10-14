@@ -18,6 +18,7 @@ import { worldProgression } from '../progression.js';
 import { loggedD20 } from '../../math/logged-d20.js';
 import { loadEffectDeclarations, conditionSaveDisadvantage, tokenSaveConditions } from '../advantage-sources.js';
 import { declaredOnRoll, purposeWithSources, rollSidesNote } from '../attack-advantage.js';
+import { legendaryOnFailedSave, type LegendaryOutcome, type LegendaryOfferNote } from './legendary-resistance.js';
 
 export type AbilityLong = 'strength' | 'dexterity' | 'constitution' | 'intelligence' | 'wisdom' | 'charisma';
 export type AbilityShort = 'str' | 'dex' | 'con' | 'int' | 'wis' | 'cha';
@@ -130,6 +131,8 @@ export interface ParticipantSaveResult {
     legendaryResisted?: boolean;
     /** Failed, and this many legendary resistances are left for the GM to spend. */
     legendaryResistanceAvailable?: number;
+    /** Lane L: a player-controlled creature: the resistance is the player's to spend (ask them); never spent for them. */
+    legendaryResistanceAskPlayer?: boolean;
     /**
      * Play report 7 (lane G1): what put this save at advantage or
      * disadvantage: the caller's own sources, the saver's untagged
@@ -228,6 +231,9 @@ export interface SaveSourcesRow {
     save?: string;
     /** Lane H review: a concentration row's outcome (true: the spell ended), so a summary reply says whether it held. */
     broken?: boolean;
+    /** Lane K: a concentration row's legendary resistance: spent (the spell held), or offered with the call. */
+    legendaryResisted?: true;
+    legendaryOffer?: LegendaryOfferNote;
     rolls?: number[];
     models?: number;
     advantage?: string[];
@@ -366,14 +372,31 @@ export function sheetConcentrationDie(db: Database.Database, saverId: string, to
     });
 }
 
-/** What a concentration result carries on a reply: concentrationAfterDamage's shape and the save's labels. */
-export type ConcentrationOutcome = { spell: string; broken: boolean; reason: string; saveRoll?: number; saveTotal?: number; saveDC?: number } & SaveDieLabels;
+/**
+ * What a concentration result carries on a reply: concentrationAfterDamage's
+ * shape and the save's labels. Lane K: and what legendary resistance did on a
+ * failed save (spent: the spell held; offered; reported off the fight).
+ */
+export type ConcentrationOutcome = { spell: string; broken: boolean; reason: string; saveRoll?: number; saveTotal?: number; saveDC?: number } & SaveDieLabels & LegendaryOutcome;
 
-/** A concentration check as a reply carries it: the fields it always had and, only when the save took any, its labels. */
-export function concentrationOutcome(check: { spell: string; broken: boolean; reason: string; saveRoll?: number; saveTotal?: number; saveDC?: number } & SaveDieLabels): ConcentrationOutcome {
+/** Lane K: only the legendary fields a result carries (none when nothing was spent or offered). */
+export function legendaryFieldsOf(c: LegendaryOutcome): LegendaryOutcome {
+    return {
+        ...(c.legendaryResisted ? { legendaryResisted: true as const } : {}),
+        ...(c.legendaryRemaining !== undefined ? { legendaryRemaining: c.legendaryRemaining } : {}),
+        ...(c.legendaryOf !== undefined ? { legendaryOf: c.legendaryOf } : {}),
+        ...(c.legendaryResistanceAvailable ? { legendaryResistanceAvailable: c.legendaryResistanceAvailable } : {}),
+        ...(c.legendaryResistanceAskPlayer ? { legendaryResistanceAskPlayer: true as const } : {}),
+        ...(c.legendaryOffer ? { legendaryOffer: c.legendaryOffer } : {})
+    };
+}
+
+/** A concentration check as a reply carries it: the fields it always had and, only when the save took any, its labels (lane K: and its legendary resistance). */
+export function concentrationOutcome(check: { spell: string; broken: boolean; reason: string; saveRoll?: number; saveTotal?: number; saveDC?: number } & SaveDieLabels & LegendaryOutcome): ConcentrationOutcome {
     return {
         spell: check.spell, broken: check.broken, reason: check.reason, saveRoll: check.saveRoll, saveTotal: check.saveTotal, saveDC: check.saveDC,
-        ...saveDieLabels({ ...check, rolls: check.saveRolls })
+        ...saveDieLabels({ ...check, rolls: check.saveRolls }),
+        ...legendaryFieldsOf(check)
     };
 }
 
@@ -397,11 +420,20 @@ export function concentrationSidesNote(c: SaveDieLabels & { saveRoll?: number },
 /**
  * A concentration result's line, as every road prints it: 'Concentration on
  * Bless: CON save 15 vs DC 10 ✓ held' (or 'ends at 0 HP'), with the sources'
- * tail when the save took any.
+ * tail when the save took any. Lane K: a failed save a legendary resistance
+ * turned ('✗ failed → 👑 legendary resistance (LR 2/3 left): held'), or the
+ * offer and its call after the dice.
  */
 export function concentrationLine(c: ConcentrationOutcome, indent = '   '): string {
     if (c.reason === 'death') return `Concentration on ${c.spell}: ends at 0 HP`;
-    return `Concentration on ${c.spell}: CON save ${c.saveTotal} vs DC ${c.saveDC} ${c.broken ? '✗ BROKEN' : '✓ held'}${concentrationSidesNote(c, indent)}`;
+    const left = c.legendaryRemaining !== undefined ? ` (LR ${c.legendaryRemaining}${c.legendaryOf !== undefined ? `/${c.legendaryOf}` : ''} left)` : '';
+    const outcome = c.legendaryResisted ? `✗ failed → 👑 legendary resistance${left}: held` : c.broken ? '✗ BROKEN' : '✓ held';
+    const rolls = c.saveRolls ?? (c.saveRoll !== undefined ? [c.saveRoll] : []);
+    const hints = [...(c.conditionalAdvantage ?? []), ...(c.conditionalDisadvantage ?? [])].map(h => `\n${indent}conditional: ${h}`).join('');
+    return `Concentration on ${c.spell}: CON save ${c.saveTotal} vs DC ${c.saveDC} ${outcome}`
+        + rollSidesNote(rolls, { advantage: c.advantageSources, disadvantage: c.disadvantageSources })
+        + (c.legendaryOffer ? ` ${c.legendaryOffer.line}` : '')
+        + hints;
 }
 
 /** The reply's saveSources row for a concentration save, with whether the spell ended (undefined when the save took no source). */
@@ -411,7 +443,13 @@ export function concentrationSourcesRow(target: { id: string; name: string }, c:
     if (!row) return undefined;
     // Lane H review: the outcome rides the row (output_mode summary keeps saveSources whole, not the target rows).
     const { targetId, name, ability, save, ...rest } = row;
-    return { targetId, name, ability, save, broken: c.broken, ...rest };
+    return {
+        targetId, name, ability, save, broken: c.broken,
+        // Lane K: the legendary resistance spent on the save, or offered after it.
+        ...(c.legendaryResisted ? { legendaryResisted: true as const } : {}),
+        ...(c.legendaryOffer ? { legendaryOffer: c.legendaryOffer } : {}),
+        ...rest
+    };
 }
 
 /**
@@ -447,6 +485,37 @@ export function sheetSaveConditions(db: Database.Database, row: SheetLike): Save
 }
 
 /**
+ * Play report 7 follow-up (lane L): a creature the players run: on the
+ * heroes' side with a pc character row of exactly its id (the rule of
+ * combat-handlers' isPlayerReactor, written here to avoid an import cycle;
+ * an allied npc row and a sheetless token are the GM's). Its legendary
+ * resistance is offered to the player, never spent for it.
+ */
+export function isPlayerControlled(db: Database.Database | undefined, p: Pick<CombatParticipant, 'id' | 'isEnemy'>): boolean {
+    if (p.isEnemy || !db) return false;
+    try {
+        const row = new CharacterRepository(db).findById(p.id);
+        return !!row && row.id === p.id && (row.characterType ?? 'pc') === 'pc';
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Legendary resistances last the day, so a spend in a fight is written to the
+ * creature's sheet (the next fight hydrates from it). Exact id only: findById
+ * falls back to a unique-prefix match, which would write another creature's
+ * sheet. Returns whether a sheet was written.
+ */
+export function mirrorLegendaryToSheet(db: Database.Database | undefined, participantId: string, remaining: number): boolean {
+    if (!db) return false;
+    const repo = new CharacterRepository(db);
+    if (repo.findById(participantId)?.id !== participantId) return false;
+    repo.update(participantId, { legendaryResistancesRemaining: remaining });
+    return true;
+}
+
+/**
  * Play report 7 (lane H): the provider the handler layer gives the pure
  * engine for the save it rolls by itself (a save_ends condition's end-of-turn
  * save): the saver's declared sides through lane G1's reading (untagged
@@ -455,6 +524,10 @@ export function sheetSaveConditions(db: Database.Database, row: SheetLike): Save
  * sheet's ability and save proficiency on the world's curve, else the token's
  * own scores). The engine applies the token's conditions itself. `db` is read
  * at each save, so a provider outlives a reopened database.
+ *
+ * Lane L: it also says whether a legendary resistance on that save is the
+ * player's to spend (isPlayerControlled; read only for a creature with one
+ * left) and mirrors a resistance the engine spent to the sheet (exact id).
  */
 export function engineSaverSides(db: () => Database.Database | undefined): SaverSidesProvider {
     return (participant, ability) => {
@@ -462,11 +535,14 @@ export function engineSaverSides(db: () => Database.Database | undefined): Saver
         const long = toLongAbility(ability) ?? 'dexterity';
         const sides = engineSaveSides(long, engineSaveDeclarations(handle, participant.id, long), [], {});
         const m = saveModifier(saveSourceFor(handle, participant), long);
+        const hasLegendary = (participant.legendaryResistancesRemaining ?? 0) > 0;
         return {
             advantage: sides.adv, disadvantage: sides.dis,
             ...(sides.labels.conditionalAdvantage ? { conditionalAdvantage: sides.labels.conditionalAdvantage } : {}),
             ...(sides.labels.conditionalDisadvantage ? { conditionalDisadvantage: sides.labels.conditionalDisadvantage } : {}),
-            modifier: { total: m.total, parts: m.parts }
+            modifier: { total: m.total, parts: m.parts },
+            ...(hasLegendary && isPlayerControlled(handle, participant) ? { playerDecides: true } : {}),
+            ...(hasLegendary ? { onSpent: (remaining: number) => { mirrorLegendaryToSheet(db(), participant.id, remaining); } } : {})
         };
     };
 }
@@ -505,7 +581,10 @@ export function rollCharacterSave(
  * disadvantage roll two dice and cancel when both are set; named sources go
  * into the roll's purpose. Exhaustion 3 or more adds its own disadvantage. On a failed save a creature set to
  * autoLegendaryResistance spends one and succeeds; otherwise the remaining
- * count is reported so the GM can choose.
+ * count is reported so the GM can choose. Lane L: one rule with the engine's
+ * own saves (legendaryOnFailedSave), and a player-controlled creature
+ * (isPlayerControlled) is never spent for: the count is reported with
+ * legendaryResistanceAskPlayer, for the player to decide.
  *
  * Play report 7 (lane G1): every save the engine rolls by itself comes here,
  * so the saver's declared sides fire here: untagged save:<ability> mechanics
@@ -545,25 +624,18 @@ export function rollParticipantSave(
     const total = natural + modifier;
     const result: ParticipantSaveResult = { ability: long, dc, rolls, natural, modifier, total, saved: total >= dc, parts, ...labels };
 
-    if (!result.saved && !opts.noLegendaryResistance) {
-        const remaining = participant.legendaryResistancesRemaining ?? 0;
-        if (remaining > 0 && participant.autoLegendaryResistance) {
-            const spent = engine.useLegendaryResistance(participant.id);
-            if (spent.success) {
-                result.saved = true;
-                result.legendaryResisted = true;
-                parts.push(`legendary resistance (${spent.remaining} left)`);
-                // Resistances last the day, so the sheet keeps the count (as
-                // the legendary_resistance verb does); the next fight hydrates from it.
-                if (db) {
-                    const repo = new CharacterRepository(db);
-                    if (repo.findById(participant.id)?.id === participant.id) {
-                        repo.update(participant.id, { legendaryResistancesRemaining: spent.remaining });
-                    }
-                }
-            }
-        } else if (remaining > 0) {
-            result.legendaryResistanceAvailable = remaining;
+    if (!result.saved && !opts.noLegendaryResistance && (participant.legendaryResistancesRemaining ?? 0) > 0) {
+        const verdict = legendaryOnFailedSave(engine, participant, { playerDecides: isPlayerControlled(db, participant) });
+        if (verdict.resisted) {
+            result.saved = true;
+            result.legendaryResisted = true;
+            parts.push(`legendary resistance (${verdict.resisted.remaining} left)`);
+            // Resistances last the day, so the sheet keeps the count (as
+            // the legendary_resistance verb does); the next fight hydrates from it.
+            mirrorLegendaryToSheet(db, participant.id, verdict.resisted.remaining);
+        } else if (verdict.available) {
+            result.legendaryResistanceAvailable = verdict.available;
+            if (verdict.askPlayer) result.legendaryResistanceAskPlayer = true;
         }
     }
     return result;

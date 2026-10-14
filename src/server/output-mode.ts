@@ -105,9 +105,34 @@ const SUMMARY_KEEP = new Set(['initiative', 'firstUp', 'bandAssumed', 'warnings'
 /**
  * Lane G2: kept lines that may carry a call to paste (a PC's offered
  * opportunity attack, the onSubdue answer) are cut at 2000 characters, not
- * 300: a call cut short cannot be pasted.
+ * 300: a call cut short cannot be pasted. Lane W review: a unit's line
+ * carries its wound groups before and after the area and ends with the
+ * BREAK TEST DUE the GM must see; at 300 a big, much-wounded unit lost it.
  */
-const KEEP_LONG_LINES = new Set(['reactionLines']);
+const KEEP_LONG_LINES = new Set(['reactionLines', 'unitLines']);
+
+/**
+ * Play report 7 follow-up (lane L): a legendary resistance an engine save
+ * offered (legendaryOffers: saveRef and the call to paste) is kept whole, and
+ * an end-of-turn save's line, which ends with that call, is cut at 2000.
+ */
+SUMMARY_KEEP.add('legendaryOffers');
+KEEP_LONG_LINES.add('legendaryOffers');
+KEEP_LONG_LINES.add('endOfTurnSaves');
+// Lane L review: a spend without saveRef names the offers it did not answer
+// (saveRef, condition, conditionId for remove_condition); two rows outgrow the
+// inline limit and would shrink to their conditionIds alone.
+SUMMARY_KEEP.add('openOffers');
+/**
+ * Play report 7 follow-up (lane O): each pressure or ongoing tick a turn's
+ * start or end dealt (turnDamage: who, what, the HP, the line). A tick's line
+ * ends with the call that answers its legendary resistance offer, so it is
+ * cut at 2000. A unit's line is in unitLines, its break test named.
+ */
+SUMMARY_KEEP.add('turnDamage');
+KEEP_LONG_LINES.add('turnDamage');
+// Lane O: add_condition's line per ongoing effect ('1d6 fire at the start of its turn (area: 4 models)').
+SUMMARY_KEEP.add('ongoing');
 
 const isScalarList = (v: unknown): v is unknown[] => Array.isArray(v) && v.every(isScalar);
 
@@ -115,7 +140,7 @@ function scalarRow(v: unknown, maxString = MAX_STRING): unknown {
     if (typeof v === 'string') return v.length > maxString ? `${v.slice(0, maxString)}… (${v.length} chars)` : v;
     if (isScalar(v)) return v;
     if (isScalarList(v)) return v.length > MAX_ID_ROWS ? [...v.slice(0, MAX_ID_ROWS).map(x => scalarRow(x)), { _more: v.length - MAX_ID_ROWS }] : v.map(x => scalarRow(x));
-    if (isPlainObject(v)) return Object.fromEntries(Object.entries(v).filter(([, x]) => isScalar(x) || isScalarList(x)).map(([k, x]) => [k, scalarRow(x)]));
+    if (isPlainObject(v)) return Object.fromEntries(Object.entries(v).filter(([, x]) => isScalar(x) || isScalarList(x)).map(([k, x]) => [k, scalarRow(x, maxString)]));
     return undefined;
 }
 

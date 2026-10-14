@@ -22,6 +22,7 @@ import { SpatialRepository } from '../../storage/repos/spatial.repo.js';
 import { PoiRepository } from '../../storage/repos/poi.repo.js';
 import { SessionContext } from '../types.js';
 import { CombatEngine, CombatParticipant } from '../../engine/combat/engine.js';
+import { engineSaverSides } from '../../engine/combat/saves.js';
 import { getCombatManager } from '../state/combat-manager.js';
 // generateEncounterMap removed - using local simple renderer
 import { expandCreatureTemplate } from '../../data/creature-presets.js';
@@ -644,7 +645,9 @@ async function handleSpawnEncounter(input: SpawnManageInput, ctx: SessionContext
     const encounterId = `encounter-${input.seed || randomUUID()}-${Date.now()}`;
     const namespacedId = `${ctx.sessionId}:${encounterId}`;
     const engine = input.seed ? new CombatEngine(input.seed) : CombatEngine.crypto();
-    const encounterState = engine.startEncounter(participants);
+    // Play report 7 follow-up (lane O): the engine's own saves at a turn start or end (save_ends, ongoing damage, pressure) read the saver through the handlers' provider, on every create road.
+    engine.encounterId = encounterId;
+    const encounterState = engine.startEncounter(participants, { saverSides: engineSaverSides(() => getDb()) });
     combatManager.create(namespacedId, engine);
 
     // Save to database
@@ -1129,7 +1132,9 @@ async function handleSpawnTactical(input: SpawnManageInput, ctx: SessionContext)
     const encounterId = `encounter-${input.seed || randomUUID()}-${Date.now()}`;
     const namespacedId = `${ctx.sessionId}:${encounterId}`;
     const engine = input.seed ? new CombatEngine(input.seed) : CombatEngine.crypto();
-    const encounterState = engine.startEncounter(participants);
+    // Play report 7 follow-up (lane O): the engine's own saves at a turn start or end (save_ends, ongoing damage, pressure) read the saver through the handlers' provider, on every create road.
+    engine.encounterId = encounterId;
+    const encounterState = engine.startEncounter(participants, { saverSides: engineSaverSides(() => getDb()) });
     (encounterState as any).terrain = terrain;
     combatManager.create(namespacedId, engine);
 

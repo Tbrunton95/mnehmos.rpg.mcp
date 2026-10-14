@@ -27,7 +27,10 @@ import { resolveWorldId, worldSkillAbility, loadRules } from '../../engine/table
 import { validateAdvantageMechanics } from '../../engine/advantage-scope.js';
 import { worldProgression } from '../../engine/progression.js';
 import { skillModifier as sheetSkillModifier, abilityModifier as sheetAbilityModifier, overrideColumn, signed, skillKey as canonicalSkillKey, resolveSkillAbility, unmappedSkillWarning, type SkillSheet, type ShortAbility, type SkillModifier } from '../../engine/skill-modifier.js';
-import { getOrLoadEngine, syncParticipantHpFromDb } from '../handlers/combat-handlers.js';
+import { getOrLoadEngine, liveEncounterFor, syncParticipantHpFromDb } from '../handlers/combat-handlers.js';
+import type { CombatEngine } from '../../engine/combat/engine.js';
+import { fightLegendary, sheetLegendary, type LegendarySave, type LegendaryReplyRow } from '../handlers/legendary-saves.js';
+import type { LegendaryOutcome } from '../../engine/combat/legendary-resistance.js';
 import { EncounterRepository } from '../../storage/repos/encounter.repo.js';
 import { v4 as uuidv4 } from 'uuid';
 import { applyScheduledOps, scheduledWriteOpSchema, SCHEDULED_OP_SHAPE, MONTAGE_COSTS_EXAMPLE, describeReceived } from '../../engine/scheduled-ops.js';
@@ -619,11 +622,33 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
                 applied: boolean;
                 hpBefore?: number;
                 hpAfter?: number;
-            }> = [];
+            } & LegendaryOutcome> = [];
+            // Lane K: a target's failed save asks legendary resistance, as every
+            // save the engine rolls does. In a fight (encounterId, the target's
+            // token there) the token's count: autoLegendaryResistance spends one
+            // (the save succeeds), otherwise it is offered with a saveRef that
+            // heals the avoided damage back; a player character is asked. Off a
+            // fight a report only: the count and the repair to paste.
+            // Lane K review: a target with a live token is in that fight even
+            // when the stunt names no encounterId (as apply_damage and
+            // concentration_manage check_save route it): its token's count,
+            // an offer on that encounter row. Each fight touched is saved below.
+            const fightFor = (tid: string): { engine: CombatEngine; encounterId: string } | undefined => {
+                if (!ctx) return undefined;
+                for (const id of [args.encounterId, liveEncounterFor(db, tid)]) {
+                    const engine = id ? getOrLoadEngine(ctx, id) : null;
+                    if (id && engine?.getState()?.participants.some(p => p.id === tid)) return { engine, encounterId: id };
+                }
+                return undefined;
+            };
+            const fightsTouched = new Set<string>();
+            const legendaryOffers: LegendaryReplyRow[] = [];
             for (let i = 0; i < args.targetIds.length; i++) {
                 let targetDamage = result.damage as number;
                 let saved = false;
                 let save: { natural: number; modifier: number; total: number; dc: number } | undefined;
+                let legendary: LegendarySave | undefined;
+                const target = damageTargets[i];
 
                 if (args.savingThrowAbility && args.savingThrowDc) {
                     const saveStats = (damageTargets[i]?.stats ?? {}) as Record<string, number>;
@@ -631,11 +656,26 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
                     const saveRoll = loggedD20(db, { purpose: 'stunt save', forId: args.targetIds[i], targetId: args.actorId }, { tool: 'improvisation_manage' }).natural;
                     saved = saveRoll + saveMod >= args.savingThrowDc;
                     save = { natural: saveRoll, modifier: saveMod, total: saveRoll + saveMod, dc: args.savingThrowDc };
-                    if (saved && args.halfDamageOnSave) targetDamage = Math.floor(targetDamage / 2);
-                    else if (saved) targetDamage = 0;
+                    const onSave = args.halfDamageOnSave ? Math.floor(targetDamage / 2) : 0;
+                    if (!saved) {
+                        const tid = args.targetIds[i];
+                        const fight = fightFor(tid);
+                        if (fight) fightsTouched.add(fight.encounterId);
+                        // Lane K review: the refund is the HP a success would have kept, not the damage
+                        // difference: a blow that overkilled took only what the target had.
+                        const refund = target ? Math.max(0, target.hp - onSave) - Math.max(0, target.hp - targetDamage) : targetDamage - onSave;
+                        legendary = fight
+                            ? fightLegendary(fight.engine, db, tid, fight.encounterId, { kind: 'stunt', condition: args.narrativeIntent, refund })
+                            : sheetLegendary(db, tid, {
+                                kind: 'stunt', condition: args.narrativeIntent, spend: false,
+                                repair: (remaining) => `character_manage update {characterId: '${tid.replace(/'/g, "\\'")}', legendaryResistancesRemaining: ${remaining - 1}${target ? `, hp: ${Math.max(0, target.hp - onSave)}` : ''}}`
+                            });
+                        if (legendary?.holds) saved = true;
+                        if (legendary?.row) legendaryOffers.push(legendary.row);
+                    }
+                    if (saved) targetDamage = onSave;
                 }
 
-                const target = damageTargets[i];
                 const hpBefore = target?.hp;
                 const hpAfter = target ? Math.max(0, target.hp - targetDamage) : undefined;
 
@@ -647,9 +687,11 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
                     condition: !saved && args.applyCondition ? args.applyCondition : undefined,
                     applied: Boolean(target),
                     hpBefore,
-                    hpAfter
+                    hpAfter,
+                    ...(legendary?.fields ?? {})
                 });
             }
+            if (legendaryOffers.length) result.legendaryOffers = legendaryOffers;
             const commitDamage = db.transaction(() => {
                 for (const target of targets) {
                     if (target.hpBefore !== undefined && target.hpAfter !== undefined && target.hpAfter !== target.hpBefore) {
@@ -670,6 +712,16 @@ async function handleStunt(args: z.infer<typeof StuntSchema>, ctx?: SessionConte
                     new EncounterRepository(db).saveState(args.encounterId, state);
                     result.encounterTokensUpdated = true;
                 }
+            }
+            // Lane K review: a live fight a target's legendary resistance was
+            // spent or offered in (no encounterId named) keeps it, and the HP.
+            for (const id of fightsTouched) {
+                if (id === args.encounterId || !ctx) continue;
+                const state = getOrLoadEngine(ctx, id)?.getState();
+                if (!state) continue;
+                syncParticipantHpFromDb(state);
+                new EncounterRepository(db).saveState(id, state);
+                result.encounterTokensUpdated = true;
             }
         }
     } else if (!success && criticalFailure && args.failureDamage) {
@@ -1448,6 +1500,7 @@ STUNT (Rule of Cool):
 - Use effectType: "none" (or omit it) for a non-damaging check; omit successDamage, failureDamage, and damageType, e.g. { action: "stunt", actorId: "char_1", skill: "investigation", dc: 12, effectType: "none" }
 - Use effectType: "damage" with successDamage/failureDamage when the stunt should cause harm
 - If successDamage is supplied, targetIds is required and every target must exist; the committed HP changes are returned in targets[]
+- A target's failed save (savingThrowAbility + savingThrowDc) asks legendary resistance (lane K). In a fight (the target's token in encounterId, or in a live fight when none is named) autoLegendaryResistance spends one and the save succeeds; otherwise targets[].legendaryOffer and legendaryOffers carry 'LR 2/3 left, spend one?' with combat_manage legendary_resistance {…, saveRef} (heals back the HP a success would have kept); a player character is asked. Off a fight a report only: legendaryResistanceAvailable and the character_manage update to paste. See docs/table-rules/legendary-resistance.md
 
 CUSTOM EFFECTS (apply_effect):
 - Required: targetId, targetType, name, category, mechanics[], durationType
@@ -1495,7 +1548,7 @@ ARCANE SYNTHESIS:
         failureDamage: z.string().optional(),
         damageType: z.string().optional(),
         applyCondition: z.string().optional(),
-        savingThrowAbility: z.string().optional(),
+        savingThrowAbility: z.string().optional().describe('stunt: the targets\' save ability; a failed save asks legendary resistance (spent or offered in a fight, reported off one)'),
         savingThrowDc: z.number().optional(),
         halfDamageOnSave: z.boolean().optional(),
         // Effect params
@@ -1590,6 +1643,11 @@ export async function handleImprovisationManage(args: unknown, ctx: SessionConte
                 if (parsed.damage) output += `▌ ⌁ ${parsed.damage} ${parsed.damageType ?? ''}\n`;
                 if (parsed.selfDamage) output += `▌ ⌁ backfire ${parsed.selfDamage}\n`;
                 if (parsed.xpAwarded) output += `▌ xp +${parsed.xpAwarded} (written to the sheet by this call)\n`;
+                // Lane K: a target's save that a legendary resistance turned, or the offer and its call.
+                for (const t of (parsed.targets ?? []) as Array<{ id: string } & LegendaryOutcome>) {
+                    if (t.legendaryResisted) output += `▌ 👑 ${t.id}: the failed save becomes a success (legendary resistance${t.legendaryRemaining !== undefined ? `, LR ${t.legendaryRemaining}${t.legendaryOf !== undefined ? `/${t.legendaryOf}` : ''} left` : ''})\n`;
+                    else if (t.legendaryOffer) output += `▌ ${t.id}: ${t.legendaryOffer.line}${t.legendaryOffer.saveRef ? '' : ' (no fight holds the offer: the call spends it on the sheet and sets the HP a success would have left)'}\n`;
+                }
                 break;
 
             case 'apply_effect':

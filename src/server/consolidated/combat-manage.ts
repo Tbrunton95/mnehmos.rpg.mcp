@@ -6,14 +6,14 @@
  */
 
 import { PartSchema, UnitSchema, readiedInputSchema, readiedAttackInputSchema, PART_STATES, PART_KINDS, ParticipantExtrasShape, tokenAbilityScoresShape, abilityScoresInputSchema, SizeCategorySchema, FightingStyleSchema, nearbyMatchSchema, mobRuleSchema, sensesSchema, type Buff } from '../../schema/token-extras.js';
-import { modelsInAreaSchema, unitSavesSchema, MODELS_IN_AREA_DESCRIBE, AREA_DESCRIBE, UNIT_SAVES_DESCRIBE } from '../../schema/token-extras.js';
-import { unitsNeedingCount, areaCountMessage, modelsKilledBetween, unitSummaryLine, type ModelsInArea } from '../../engine/combat/unit-area.js';
+import { modelsInAreaSchema, unitSavesSchema, MODELS_IN_AREA_DESCRIBE, AREA_DESCRIBE, UNIT_SAVES_DESCRIBE, unitWoundedSchema, UNIT_WOUNDED_DESCRIBE } from '../../schema/token-extras.js';
+import { unitsNeedingCount, areaCountMessage, modelsKilledBetween, unitSummaryLine, modelsInAreaFor, type ModelsInArea } from '../../engine/combat/unit-area.js';
 import { hydrateExtras, type ExtrasRow } from '../../engine/combat/participant-extras.js';
 import { applyDyingConditions, wakeFromDying, tracksDeathSaves, dyingLabel, rowTracksDeathSaves, withDyingRowConditions, DEATH_SAVE_OUTCOMES, type RowCondition } from '../../engine/combat/dying.js';
 import { environmentGlyph } from '../../render/pda.js';
 import { setPartOn, removePartFrom } from '../../engine/combat/parts.js';
 import { patchRowAbility, perRestSpentNote } from '../../engine/combat/abilities.js';
-import { volleyTier, describeUnit, breakTestDue, moraleModifiers, liveModels } from '../../engine/combat/units.js';
+import { volleyTier, describeUnit, breakTestDue, moraleModifiers, liveModels, woundLine, setUnitHp, setWounded, settleWounds, woundedFitProblem } from '../../engine/combat/units.js';
 import { sheetSpecies } from '../handlers/world-spell.js';
 import { nearbyAllies } from '../../engine/combat/nearby.js';
 import type { CombatParticipant } from '../../engine/combat/engine.js';
@@ -51,7 +51,7 @@ import { INITIATIVE_CONTEXT_DESCRIBE, type InitiativeDeclared } from '../../engi
 import { heldReadied, onSubdueAnswer, onSubdueAnswerText, ON_SUBDUE } from '../../engine/combat/subdue.js';
 import { rolledReactionLine, heldFireLine, notStruckDownLine, readiedFiredNoAttackLine } from '../../engine/combat/reaction-lines.js';
 import { MountSchema, DismountSchema, handleMount, handleDismount, settleMountsAfter, foldSettleIntoReply } from '../handlers/mounts.js';
-import { settleDeath, type KilledRecord } from '../handlers/combat-handlers.js';
+import { settleDeath, settleTurnDamage, type KilledRecord } from '../handlers/combat-handlers.js';
 import { readWorldEnvironment } from '../../engine/world-clock.js';
 import { isDying, counters as deathCounters, deathSaveCall, type DeathSaveMode } from '../../engine/combat/dying.js';
 import { controlledMountActionRefusal } from '../../engine/combat/mounts.js';
@@ -59,6 +59,9 @@ import { budgetEncounter, describeParty, type BudgetMonster } from '../../engine
 import { toLongAbility, rollCharacterSave, tokenAbilityScores, abilityScoresLine, ABILITY_LONG_KEYS, type AbilityScoresLong } from '../../engine/combat/saves.js';
 import { saveSidesNote, ENGINE_SAVE_DESCRIBE } from '../../engine/combat/saves.js';
 import { sheetConcentrationDie, concentrationLine, engineSaverSides } from '../../engine/combat/saves.js';
+import { mirrorLegendaryToSheet } from '../../engine/combat/saves.js';
+import { answerLegendaryOffer, legendaryOfferProblem, offerSaveLabel } from '../../engine/combat/legendary-resistance.js';
+import { concentrationLegendaryHook, concentrationRestoreCall, concentrationRestoreProblem, restoreConcentrationRow, type LegendaryReplyRow } from '../handlers/legendary-saves.js';
 import { damageWithModifiers, type DamageDefences } from '../../engine/combat/damage-modifiers.js';
 import { concentrationAfterDamage } from '../../engine/magic/concentration.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
@@ -75,7 +78,7 @@ import { CombatEngine } from '../../engine/combat/engine.js';
 import { ConditionInputSchema, SIZE_TABLE, EnvironmentSchema } from '../../schema/encounter.js';
 import { coverEnum, coverByTargetSchema, standingAgainstSchema, ignoreCoverSchema, normalizeCover, COVER_BY_TARGET_DESCRIBE, IGNORE_COVER_DESCRIBE, type CoverKind, type StandingCover } from '../../schema/cover.js';
 import { saveArithmetic, coverBonus, type CoverResolution } from '../../engine/combat/cover.js';
-import { normalizeCondition, normalizeConditions, sourceNamesHolder, grappleSource } from '../../engine/combat/conditions.js';
+import { normalizeCondition, normalizeConditions, sourceNamesHolder, grappleSource, stampOngoingShape, ongoingSummary } from '../../engine/combat/conditions.js';
 import { getCombatManager } from '../state/combat-manager.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { recordAward } from '../../storage/xp-awards.js';
@@ -288,7 +291,7 @@ const CreateSchema = z.object({
     seed: z.string().optional().describe('Omit for crypto dice (default). A seed makes the fight a deterministic, replayable stream; the id echoes it'),
     participants: z.array(ParticipantSchema).min(1),
     terrain: TerrainSchema,
-    environment: environmentField().optional().describe("The medium and light of the fight: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed? (default false in water), meleeDisadvantageUnlessDamageType? (default ['piercing']), swimTag? (default 'aquatic'), light?: 'bright' | 'dim' | 'darkness' (darkness: tokens can attempt a Hide from foes without darkvision; get shows canHide)}"),
+    environment: environmentField().optional().describe("The medium and light of the fight: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?, damageType?, save?: {ability, dc, half? (default true)}} (an area: every model of a unit takes it separately, each with its own save; any other token one save, legendary resistance offered), rangedAllowed? (default false in water), meleeDisadvantageUnlessDamageType? (default ['piercing']), swimTag? (default 'aquatic'), light?: 'bright' | 'dim' | 'darkness' (darkness: tokens can attempt a Hide from foes without darkvision; get shows canHide)}"),
     includeParty: z.boolean().optional().describe('T1.2 (Findings #34): prepend the active party as PC-side participants'),
     partyId: z.string().optional().describe('Party to include (defaults to the only active party)'),
     worldId: z.string().optional().describe('FINDINGS #105: stamp the encounter to this world; omitted → derived from the first participant whose character row is claimed'),
@@ -523,8 +526,11 @@ const AddConditionSchema = z.object({
     action: z.literal('add_condition'),
     encounterId: z.string(),
     participantId: z.string().describe('Participant/token id'),
-    condition: ConditionInputSchema.optional().describe('A name ("prone") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?, level?}; unknown names are kept as custom conditions'),
+    condition: ConditionInputSchema.optional().describe("A name (\"prone\") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?, level?, ongoing?}; unknown names are kept as custom conditions. ongoing: {damage: number | dice, damageType?, when: start | end, save?: {ability, dc, onSuccess?: none | half | end}} ticks on the bearer's turn"),
     name: z.string().optional().describe('Shorthand for condition: a bare condition name'),
+    // Play report 7 follow-up (lane O): ongoing damage follows its source's shape.
+    area: z.boolean().optional().describe("Play report 7 follow-up: the condition's ongoing damage comes from an area (a lingering cloud, a burning field): on a unit token it ticks per model inside, each with its own save, the count dropping as they die. A packed unit: every live model; a spaced one needs modelsInArea. Unset: single target (the most wounded model takes each tick, capped at it; the condition ends when that model dies)"),
+    modelsInArea: modelsInAreaSchema().optional().describe('Play report 7 follow-up: models of the unit inside the area that left the ongoing damage (a bare number, or {participantId: n}); giving it makes the ongoing damage an area'),
     replace: z.boolean().optional().describe('Drop existing conditions of the same type first'),
     mirrorToCharacter: z.boolean().optional().describe('Also add it to the character sheet (upsert by name)'),
     fromGrapple: z.string().optional().describe("Holder (participant id or name): writes source 'grapple: <holder id>' so grapple execute and break recognise the hold; refused when ambiguous or when condition.source names someone else"),
@@ -582,7 +588,7 @@ const RemovePartSchema = z.object({
 const SetEnvironmentSchema = z.object({
     action: z.literal('set_environment'),
     encounterId: z.string(),
-    environment: environmentField().describe("{medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?, light?: 'bright' | 'dim' | 'darkness'} — replaces the whole environment (medium defaults to air: pass it again when setting light in a water fight). Darkness lets tokens attempt a Hide from foes without darkvision (get shows canHide)"),
+    environment: environmentField().describe("{medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?, damageType?, save?: {ability, dc, half? (default true)}} (an area: every model of a unit takes it separately, each with its own save; any other token one save, legendary resistance offered), rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?, light?: 'bright' | 'dim' | 'darkness'} — replaces the whole environment (medium defaults to air: pass it again when setting light in a water fight). Darkness lets tokens attempt a Hide from foes without darkvision (get shows canHide)"),
     reason: z.string().optional()
 });
 
@@ -601,6 +607,7 @@ const SetUnitSchema = z.object({
     models: z.number().int().min(1).optional().describe('Reinforce or reduce: the new full strength. Raising it adds the new models × hpPerModel to HP; lowering it clamps HP to the new maximum'),
     hpPerModel: z.number().int().min(1).optional().describe('New HP per model; the maximum follows (models × hpPerModel) and HP is clamped'),
     saves: unitSavesSchema().nullable().optional().describe(`${UNIT_SAVES_DESCRIBE}. Replaces the block; null clears`),
+    wounded: unitWoundedSchema().nullable().optional().describe(`${UNIT_WOUNDED_DESCRIBE}. set_unit {wounded: [5, 2]} sets the wounded models' HP, the live count kept: HP moves to match (unhurt × hpPerModel + the list); [] heals every wound; null drops the list (the pool reads the old way, a remainder below hpPerModel one wounded model). A new hpPerModel, or fewer models than stand, resets it; reinforcing keeps it (new models arrive unhurt)`),
     reason: z.string().optional()
 });
 
@@ -640,6 +647,9 @@ const SetSurprisedSchema = z.object({
     reason: z.string().optional().describe('Why — logged')
 });
 
+// Play report 7 follow-up (lane L): an offered failed save the engine rolled, answered after the fact.
+const LEGENDARY_SAVE_REF_DESCRIBE = "legendary_resistance: the offer to answer ('eot-2-boss-1'), from an offered save (endOfTurnSaves[].legendaryOffer, concentrationSaves[].legendaryOffer, a stunt target's legendaryOffer, legendaryOffers[]): the spend turns that failed save into a success. A save_ends condition ends; a concentration save ('con-…') puts the spell back as it stood (refused if the creature has started concentrating on something else since, or is at 0 HP); a stunt's save ('stu-…') heals back the damage a success would have avoided, on the token and its sheet. Offers lapse when the creature's next turn starts; an unknown, lapsed or already-answered ref, or a condition already gone, is refused with nothing spent. An ongoing tick's or a creature's pressure save ('ong-…', turnDamage[].legendaryOffer) heals back the damage the success would have avoided, and ends the condition when its save ends it on a success. Without it the spend only lowers the count, as before";
+
 const LegendaryActionSchema = z.object({
     action: z.literal('legendary_action'),
     encounterId: z.string(),
@@ -653,7 +663,8 @@ const LegendaryResistanceSchema = z.object({
     action: z.literal('legendary_resistance'),
     encounterId: z.string(),
     participantId: z.string(),
-    reason: z.string().describe('The save it turns into a success')
+    reason: z.string().describe('The save it turns into a success'),
+    saveRef: z.string().optional().describe(LEGENDARY_SAVE_REF_DESCRIBE)
 });
 
 // FINDINGS #80: the ghost hunt gets a verb — encounters could previously only
@@ -780,6 +791,9 @@ async function appendToEncounter(ctx: SessionContext, encounterId: string, newPa
             return { ok: false, writes: 'none', message: `id '${id}' is already in this encounter (${holder?.name ?? String(np.name)})${opts.duplicateHint ? `: ${opts.duplicateHint}` : ''}. Nothing was written.` };
         }
         seen.add(id);
+        // Lane W review: a wound list that cannot stand beside the HP is refused, not silently read as the pool.
+        const woundProblem = np.unit && typeof np.hp === 'number' ? woundedFitProblem({ hp: np.hp, unit: np.unit as CombatParticipant['unit'] }) : null;
+        if (woundProblem) return { ok: false, writes: 'none', message: `${String(np.name ?? id)}: ${woundProblem}. Nothing was written.` };
     }
     // Play report 7 #7 (lane F): declared initiative for each joiner (untagged
     // initiative / check:dex mechanics on its effects; tagged ones the call's
@@ -884,6 +898,13 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 const twin = cleaned.findIndex(c => c.id === p.id);
                 if (twin >= 0) {
                     return { error: true, actionType: 'create', writes: 'none', message: `participants[${twin}] and participants[${i}] share id '${String(p.id)}' (${cleaned[twin].name}, ${String(p.name)}): one id, one token. Encounter NOT created; nothing was written.` };
+                }
+                // Lane W review: a wound list that cannot stand beside the HP is refused, not silently read as the pool.
+                const unitGiven = p.unit as CombatParticipant['unit'];
+                const hpGiven = typeof p.hp === 'number' ? p.hp : row?.hp;
+                const woundProblem = unitGiven && hpGiven !== undefined ? woundedFitProblem({ hp: hpGiven, unit: unitGiven }) : null;
+                if (woundProblem) {
+                    return { error: true, actionType: 'create', writes: 'none', message: `participants[${i}] (${String(p.name ?? p.id)}): ${woundProblem}. Encounter NOT created; nothing was written.` };
                 }
                 cleaned.push(p as typeof params.participants[number]);
             }
@@ -1208,7 +1229,9 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             const unitLines = (result as { unitLines?: string[] }).unitLines;
             // Play report 7 (lane G1): what each save took (summary keeps it whole too).
             const saveSources = (result as { saveSources?: unknown[] }).saveSources;
-            return { ...extractResultData(result, 'lair_action'), ...(unitLines?.length ? { unitLines } : {}), ...(saveSources?.length ? { saveSources } : {}) };
+            // Lane K: a legendary resistance a concentration save offered (saveRef and the call; summary keeps it whole).
+            const legendaryOffers = (result as { legendaryOffers?: unknown[] }).legendaryOffers;
+            return { ...extractResultData(result, 'lair_action'), ...(unitLines?.length ? { unitLines } : {}), ...(saveSources?.length ? { saveSources } : {}), ...(legendaryOffers?.length ? { legendaryOffers } : {}) };
         },
         aliases: ['lair', 'boss_action']
     },
@@ -1687,9 +1710,14 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             } else {
                 state.currentTurnIndex = state.turnOrder.indexOf(currentActorId);
             }
+            // Play report 7 follow-up (lane O): the turn that came up ticked
+            // (pressure, ongoing damage): what it owes, as after an advance.
+            const ticks: Awaited<ReturnType<typeof settleTurnDamage>> = wasUp ? await settleTurnDamage(engine, params.encounterId) : { killed: [], lines: [] };
+            killed.push(...ticks.killed);
             const startNotes = wasUp ? [...engine.turnStartNotes] : [];
             const deathSaves = wasUp ? [...engine.deathSaveEvents] : [];
             const endOfTurnSaves = wasUp ? [...engine.endOfTurnSaves] : [];
+            const legendaryOffers = wasUp ? [...engine.legendaryOffers] : [];
             const due = upNow?.deathSaveDue && isDying(upNow)
                 ? { participantId: upNow.id, name: upNow.name, ...deathCounters(upNow), call: deathSaveCall(params.encounterId, upNow.id) }
                 : undefined;
@@ -1706,10 +1734,14 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 round: state.round,
                 ...(startNotes.length ? { turnStartNotes: startNotes } : {}),
                 ...(endOfTurnSaves.length ? { endOfTurnSaves } : {}),
+                ...(legendaryOffers.length ? { legendaryOffers } : {}),
+                ...(ticks.turnDamage ? { turnDamage: ticks.turnDamage } : {}),
+                ...(ticks.breakTests ? { breakTests: ticks.breakTests } : {}),
+                ...(ticks.unitLines ? { unitLines: ticks.unitLines } : {}),
                 ...(deathSaves.length ? { deathSaves } : {}),
                 ...(killed.length ? { killed } : {}),
                 ...(due ? { deathSaveDue: due } : {}),
-                message: `${gone.name} is out of the fight — removed from initiative. ${state.participants.length} remain.${wasUp ? ` ${upName} is up${state.round !== roundBefore ? ` (round ${state.round})` : ''}.` : ''}${startNotes.length ? `\n${startNotes.join('\n')}` : ''}${killed.length ? `\n${killedLines(killed).join('\n')}` : ''}`
+                message: `${gone.name} is out of the fight — removed from initiative. ${state.participants.length} remain.${wasUp ? ` ${upName} is up${state.round !== roundBefore ? ` (round ${state.round})` : ''}.` : ''}${startNotes.length ? `\n${startNotes.join('\n')}` : ''}${ticks.lines.length ? `\n${ticks.lines.join('\n')}` : ''}${killed.length ? `\n${killedLines(killed).join('\n')}` : ''}`
             };
         },
         aliases: ['flee', 'banish', 'despawn'],
@@ -1758,7 +1790,10 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 }
             }
             if (params.revive && after > 0) p.isDead = false;
-            p.hp = after;
+            // Lane W: a unit's correction moves through its models: a loss
+            // spreads most wounded first, a gain heals the most wounded first.
+            if (p.unit) setUnitHp(p, after);
+            else p.hp = after;
             // Play report 5: a correction that lifts a knocked-out token above 0
             // wakes it — the knockout's Unconscious leaves the token and the sheet.
             const wokeFrom = before <= 0 && after > 0 ? engine.wakeFromNonlethal(p.id) : [];
@@ -1791,9 +1826,10 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 deathSaves: { successes: p.deathSaveSuccesses ?? 0, failures: p.deathSaveFailures ?? 0 },
                 ...(after <= 0 && dyingLabel(p) ? { dying: dyingLabel(p) } : {}),
                 reason: params.reason,
+                ...(p.unit ? { wounds: woundLine(p) } : {}),
                 ...(breakTest ? { breakTest } : {}),
                 ...(wokeAll ? { woke: wokeAll } : {}),
-                message: `${p.name}: HP ${before} → ${after}/${p.maxHp} (GM correction: ${params.reason})${after <= 0 && dyingLabel(p) ? ` — ${dyingLabel(p)}` : ''}${wokeAll ? ` — comes round (${wokeAll.conditionsRemoved.join(', ')} cleared)` : ''}${breakTest ? `\n${breakTest.line}` : ''}`
+                message: `${p.name}: HP ${before} → ${after}/${p.maxHp} (GM correction: ${params.reason})${p.unit && after > 0 ? ` · ${woundLine(p)}` : ''}${after <= 0 && dyingLabel(p) ? ` — ${dyingLabel(p)}` : ''}${wokeAll ? ` — comes round (${wokeAll.conditionsRemoved.join(', ')} cleared)` : ''}${breakTest ? `\n${breakTest.line}` : ''}`
             };
         },
         aliases: ['set_hp', 'fix_hp', 'correct_hp', 'hp_correction'],
@@ -1811,6 +1847,28 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
             const normalized = normalizeCondition(params.condition ?? params.name!, p.id);
             if (!normalized) return refuse('Condition needs a name');
+            // Play report 7 follow-up (lane O): ongoing damage follows its source's
+            // shape. Single unless the GM says it came from an area; an area on a
+            // unit records the models inside (every live one of a packed unit; a
+            // spaced unit needs the count, refused before anything is written).
+            const wantsArea = params.area ?? params.modelsInArea !== undefined;
+            const ticks = (normalized.ongoingEffects ?? []).some(e => e.type === 'damage');
+            const shapeNotes: string[] = [];
+            if (wantsArea && ticks && p.unit) {
+                const live = liveModels(p);
+                const given = modelsInAreaFor(params.modelsInArea as ModelsInArea | undefined, p.id);
+                if (given === undefined && !p.unit.packed) {
+                    const needs = [{ targetId: p.id, name: p.name, liveModels: live }];
+                    return { ...refuse(areaCountMessage(needs)), modelsInAreaNeeded: needs };
+                }
+                const models = Math.min(live, given ?? live);
+                if (models <= 0) return refuse(`modelsInArea: no model of ${p.name} is inside (${given ?? 0} given, ${live} standing), so the ongoing damage would never tick`);
+                stampOngoingShape(normalized, { kind: 'area', models });
+            } else if (wantsArea && ticks) {
+                shapeNotes.push(`${p.name} is not a unit: one creature, so the area changes nothing (it ticks on ${p.name})`);
+            } else if (wantsArea) {
+                shapeNotes.push('area / modelsInArea shape ongoing damage only; this condition has none');
+            }
             // Play report 2, item 2: fromGrapple names the holder; the source
             // becomes the canonical 'grapple: <holder id>' that execute and
             // break read. A participant by id, else by name (one match only),
@@ -1845,12 +1903,16 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             const mirrored = params.mirrorToCharacter ? mirrorConditionToRow(p.id, 'add', applied.type, normalized.duration, normalized.sourceId) : false;
             const held = heldBy ? ` (held by ${heldBy.name})` : '';
             logConditionChange(params.encounterId, state, 'add_condition', p.id, `${p.name} gains ${applied.type}${held}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
+            // Lane O: what the condition ticks, a line each.
+            const ongoing = (applied.ongoingEffects ?? []).filter(e => e.type === 'damage').map(ongoingSummary);
             return {
                 success: true, actionType: 'add_condition', encounterId: params.encounterId,
                 participantId: p.id, condition: applied, replaced, mirroredToCharacter: mirrored,
                 ...(heldBy ? { heldBy } : {}),
+                ...(ongoing.length ? { ongoing } : {}),
+                ...(shapeNotes.length ? { notes: shapeNotes } : {}),
                 conditions: p.conditions.map(c => c.type),
-                message: `${p.name}: +${applied.type}${held}${replaced ? ` (replaced ${replaced})` : ''}`
+                message: `${p.name}: +${applied.type}${held}${replaced ? ` (replaced ${replaced})` : ''}${ongoing.length ? ` — ongoing: ${ongoing.join('; ')}` : ''}${shapeNotes.length ? ` (${shapeNotes.join('; ')})` : ''}`
             };
         },
         aliases: ['apply_condition', 'inflict', 'condition'],
@@ -1969,6 +2031,33 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
             // Review of play report 7 #3: the owner offered set_unit {band}; set_band is the road.
             if (!p.unit) return refuse(`${p.name} is not a unit token (create it with unit: {models, hpPerModel, ...}); a token's band is changed with combat_manage set_band {encounterId, participantId, band}`);
+            // Reinforce: new models arrive at full HP each; a smaller unit
+            // (or thinner models) clamps HP to the new maximum. Lane W: a new
+            // hpPerModel resets the wound list; so does a cut that leaves it
+            // out of step with the pool; reinforcing keeps it.
+            const strength = (t: { hp: number; maxHp: number; unit?: CombatParticipant['unit'] }) => {
+                const u = t.unit!;
+                const modelsBefore = u.models, hpPerBefore = u.hpPerModel, hpBefore = t.hp, maxBefore = t.maxHp;
+                const models = params.models ?? modelsBefore;
+                const hpPerModel = params.hpPerModel ?? hpPerBefore;
+                const added = Math.max(0, models - modelsBefore);
+                if (hpPerModel !== hpPerBefore) delete (u as { wounded?: number[] }).wounded;
+                u.models = models;
+                u.hpPerModel = hpPerModel;
+                t.maxHp = models * hpPerModel;
+                t.hp = Math.max(0, Math.min(t.maxHp, hpBefore + added * hpPerModel));
+                settleWounds(t);
+                return { modelsBefore, models, added, lost: Math.max(0, modelsBefore - models), hpPerModel, hpBefore, hp: t.hp, maxHpBefore: maxBefore, maxHp: t.maxHp, liveModels: liveModels(t) };
+            };
+            const reinforcing = params.models !== undefined || params.hpPerModel !== undefined;
+            // Lane W: a wound list is checked on a copy first (after any new
+            // strength), so a refusal writes nothing.
+            if (params.wounded) {
+                const dry = { hp: p.hp, maxHp: p.maxHp, unit: JSON.parse(JSON.stringify(p.unit)) as NonNullable<CombatParticipant['unit']> };
+                if (reinforcing) strength(dry);
+                const check = setWounded(dry, params.wounded);
+                if (!check.ok) return refuse(`${p.name}: ${check.message}. Nothing was written`);
+            }
             for (const k of ['suppressed', 'inMelee', 'brokenFormation', 'packed', 'routed', 'morale', 'breakAt'] as const) {
                 if (params[k] !== undefined) (p.unit as Record<string, unknown>)[k] = params[k];
             }
@@ -1977,28 +2066,26 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             // Play report 7 #1: the drilled save bonus each model adds against an area.
             if (params.saves === null) delete (p.unit as Record<string, unknown>).saves;
             else if (params.saves !== undefined) p.unit.saves = params.saves;
-            // Reinforce: new models arrive at full HP each; a smaller unit
-            // (or thinner models) clamps HP to the new maximum.
             let reinforced: Record<string, unknown> | undefined;
-            if (params.models !== undefined || params.hpPerModel !== undefined) {
-                const modelsBefore = p.unit.models, hpPerBefore = p.unit.hpPerModel, hpBefore = p.hp, maxBefore = p.maxHp;
-                const models = params.models ?? modelsBefore;
-                const hpPerModel = params.hpPerModel ?? hpPerBefore;
-                const added = Math.max(0, models - modelsBefore);
-                p.unit.models = models;
-                p.unit.hpPerModel = hpPerModel;
-                p.maxHp = models * hpPerModel;
-                p.hp = Math.max(0, Math.min(p.maxHp, hpBefore + added * hpPerModel));
-                reinforced = { modelsBefore, models, added, lost: Math.max(0, modelsBefore - models), hpPerModel, hpBefore, hp: p.hp, maxHpBefore: maxBefore, maxHp: p.maxHp, liveModels: liveModels(p) };
+            if (reinforcing) reinforced = strength(p);
+            // Lane W: the wounded models, the live count kept; HP moves to match.
+            let woundsSet: { hpBefore: number; hp: number } | undefined;
+            if (params.wounded !== undefined) {
+                const hpBefore = p.hp;
+                const set = setWounded(p, params.wounded);
+                if (set.ok) woundsSet = { hpBefore, hp: p.hp };
             }
             new EncounterRepository(getDb()).saveState(params.encounterId, state);
             const tier = volleyTier(p);
-            logConditionChange(params.encounterId, state, 'set_unit', p.id, `${p.name}: ${describeUnit(p)}${reinforced ? ` (models ${String(reinforced.modelsBefore)} → ${String(reinforced.models)}, HP ${String(reinforced.hpBefore)} → ${String(reinforced.hp)}/${String(reinforced.maxHp)})` : ''}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
-            return { success: true, actionType: 'set_unit', encounterId: params.encounterId, participantId: p.id, unit: p.unit, volley: tier, ...(reinforced ? { reinforced } : {}), message: `${p.name}: ${describeUnit(p)}${reinforced ? ` · models ${String(reinforced.modelsBefore)} → ${String(reinforced.models)}, HP ${String(reinforced.hpBefore)} → ${String(reinforced.hp)}/${String(reinforced.maxHp)}` : ''}` };
+            const woundsNote = woundsSet && woundsSet.hp !== woundsSet.hpBefore ? ` · wounds set, HP ${woundsSet.hpBefore} → ${woundsSet.hp}/${p.maxHp}` : '';
+            logConditionChange(params.encounterId, state, 'set_unit', p.id, `${p.name}: ${describeUnit(p)}${reinforced ? ` (models ${String(reinforced.modelsBefore)} → ${String(reinforced.models)}, HP ${String(reinforced.hpBefore)} → ${String(reinforced.hp)}/${String(reinforced.maxHp)})` : ''}${woundsNote}${params.reason ? ` — ${params.reason}` : ''}`, params.reason);
+            // Lane W review: the wounds as the line, not one entry per model (the state view drops the list too).
+            const { wounded: _list, ...unitShown } = p.unit;
+            return { success: true, actionType: 'set_unit', encounterId: params.encounterId, participantId: p.id, unit: unitShown, volley: tier, wounds: woundLine(p), ...(reinforced ? { reinforced } : {}), ...(woundsSet ? { woundsSet } : {}), message: `${p.name}: ${describeUnit(p)}${reinforced ? ` · models ${String(reinforced.modelsBefore)} → ${String(reinforced.models)}, HP ${String(reinforced.hpBefore)} → ${String(reinforced.hp)}/${String(reinforced.maxHp)}` : ''}${woundsNote}` };
         },
         aliases: ['unit', 'suppress', 'formation'],
         unknownKeyHints: { band: 'set_unit does not set bands: combat_manage set_band {encounterId, participantId, band} changes any token\'s band (and clears an assumed one)' },
-        description: 'Set a unit token\'s suppressed / inMelee / brokenFormation / packed flags, routed / morale / breakAt for break tests, mobRule, and saves (the drilled save bonus each model adds against an area; null clears); reports the volley tier'
+        description: 'Set a unit token\'s suppressed / inMelee / brokenFormation / packed flags, routed / morale / breakAt for break tests, mobRule, saves (the drilled save bonus each model adds against an area; null clears) and wounded (each wounded model\'s current HP, the live count kept and HP moved to match; [] heals every wound, null drops the list); reports the volley tier and the wound line (wounds: \'4 alive: 2 unhurt, 1 at 5/9, 1 at 2/9\')'
     },
     set_environment: {
         schema: SetEnvironmentSchema,
@@ -2028,7 +2115,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             };
         },
         aliases: ['environment', 'medium'],
-        description: "Set the encounter's environment {medium: air | water | vacuum, depthFt?, pressure?, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?, light?: bright | dim | darkness}: water runs the underwater rules (swim speed or half speed, no ranged attacks, melee at disadvantage unless piercing or a swimmer, pressure damage at turn start); darkness lets tokens attempt a Hide from foes without darkvision (get shows canHide). Replaces the whole object: pass medium again when setting light in a water fight"
+        description: "Set the encounter's environment {medium: air | water | vacuum, depthFt?, pressure?, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?, light?: bright | dim | darkness}: water runs the underwater rules (swim speed or half speed, no ranged attacks, melee at disadvantage unless piercing or a swimmer, pressure damage at turn start: per model of a unit, with pressure.save a save each); darkness lets tokens attempt a Hide from foes without darkvision (get shows canHide). Replaces the whole object: pass medium again when setting light in a water fight"
     },
     set_intent: {
         schema: SetIntentSchema,
@@ -2397,22 +2484,74 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             if (!engine || !state) return refuse(`Encounter ${params.encounterId} not found (memory or DB)`);
             const p = state.participants.find(x => x.id === params.participantId);
             if (!p) return refuse(`Participant ${params.participantId} not in this encounter`);
+            // Lane L: an offered save is answered by its saveRef; everything is checked before the spend.
+            if (params.saveRef) {
+                const problem = legendaryOfferProblem(p, params.saveRef);
+                if (problem) return refuse(problem);
+                // Lane K: a concentration offer puts the spell back; refused if it cannot come back (a new spell since, 0 HP, no sheet).
+                const offer = (p.pendingLegendaryOffers ?? []).find(o => o.ref === params.saveRef);
+                if (offer?.kind === 'concentration') {
+                    const blocked = concentrationRestoreProblem(getDb(), p.id, offer.concentration, { hp: p.hp });
+                    if (blocked) return refuse(`${blocked} (offer ${offer.ref}). Nothing spent.`);
+                }
+            }
+            // Lanes O and K: an ongoing tick's or a stunt's answer heals HP back: read the sheet's HP first
+            // (a character_manage edit between calls), and write the refund through after.
+            const heals = !!params.saveRef && (p.pendingLegendaryOffers ?? []).some(o => o.ref === params.saveRef && (o.kind === 'ongoing' || o.kind === 'stunt'));
+            if (heals) syncParticipantHpFromDb(state);
+            const hpBefore = p.hp;
             const spent = engine.useLegendaryResistance(p.id);
             if (!spent.success) return refuse(`${p.name}: ${spent.error ?? 'legendary resistance refused'}`);
-            new EncounterRepository(getDb()).saveState(params.encounterId, state);
-            // Legendary resistances last the day, so the sheet keeps the count.
-            const charRepo = new CharacterRepository(getDb());
-            const mirrored = !!charRepo.findById(p.id);
-            if (mirrored) charRepo.update(p.id, { legendaryResistancesRemaining: spent.remaining });
-            logConditionChange(params.encounterId, state, 'legendary_resistance', p.id, `${p.name} uses a legendary resistance: ${params.reason}`, params.reason);
+            // Lane K: the handler's reversal writes the concentration row back (the engine never touches the database).
+            const answer = params.saveRef ? answerLegendaryOffer({
+                removeCondition: (id, conditionId) => engine.removeCondition(id, conditionId),
+                heal: (id, amount) => engine.heal(id, amount),
+                restoreConcentration: (id, snap) => restoreConcentrationRow(getDb(), id, snap)
+            }, p, params.saveRef) : undefined;
+            if (heals) {
+                // A refund that lifts the creature off 0 wakes its sheet too (the dying Unconscious and Prone go).
+                if (hpBefore <= 0 && p.hp > 0) clearDyingOnRow(p.id);
+                saveEncounterState(new EncounterRepository(getDb()), params.encounterId, state);
+            } else new EncounterRepository(getDb()).saveState(params.encounterId, state);
+            // Legendary resistances last the day, so the sheet keeps the count (exact id: a prefix match is another creature's sheet).
+            const mirrored = mirrorLegendaryToSheet(getDb(), p.id, spent.remaining);
+            // Lane K: HP healed back reaches the sheet too (exact id), or the next action's sync would undo it.
+            if (answer?.refunded) {
+                const repo = new CharacterRepository(getDb());
+                if (repo.findById(p.id)?.id === p.id) repo.update(p.id, { hp: p.hp });
+            }
+            const undone = answer?.conditionEnded ? `: ${answer.conditionEnded.name} ends`
+                : answer?.concentrationRestored ? `: concentration on ${answer.concentrationRestored.spell} holds`
+                : answer?.refunded ? `: ${answer.refunded} HP back` : '';
+            logConditionChange(params.encounterId, state, 'legendary_resistance', p.id, `${p.name} uses a legendary resistance: ${params.reason}${answer ? ` (${answer.offer.ref}, ${offerSaveLabel(answer.offer)}${undone})` : ''}`, params.reason);
+            const lr = `LR ${spent.remaining}/${p.legendaryResistances} left`;
+            // Without saveRef the spend undoes nothing: name the offers it could have answered.
+            const open = answer ? [] : (p.pendingLegendaryOffers ?? []);
+            const openOffers = open.map(o => ({ saveRef: o.ref, kind: o.kind, condition: o.condition, ...(o.conditionId !== undefined ? { conditionId: o.conditionId } : {}), ...(o.refund !== undefined ? { refund: o.refund } : {}) }));
+            // Lane K: how to undo each kind by hand, the resistance being already spent.
+            const byHand = (o: (typeof open)[number]) => o.kind === 'concentration' && o.concentration
+                ? `restore the spell with ${concentrationRestoreCall(p.id, o.concentration, false)}`
+                : o.kind === 'stunt' || o.kind === 'ongoing'
+                    ? `heal the ${o.refund ?? 0} HP back with adjust_hp {encounterId, participantId: '${p.id}', delta: ${o.refund ?? 0}, reason}`
+                    : `end the condition with remove_condition {encounterId, participantId: '${p.id}', conditionId}`;
+            const openNote = open.length
+                ? ` This spend answered no offer, so nothing was undone. Open: ${open.map(o => `saveRef '${o.ref}' (${offerSaveLabel(o)}${(o.kind === 'ongoing' || o.kind === 'stunt') && o.refund ? `, refund ${o.refund}` : ''})`).join(', ')}. If it was for one of those, ${open.every(o => o.kind === 'save_ends') ? byHand(open[0]) : open.map(o => `${o.ref}: ${byHand(o)}`).join('; ')} (the resistance is already spent); next time pass saveRef to spend and undo in one call.`
+                : '';
             return {
                 success: true, actionType: 'legendary_resistance', encounterId: params.encounterId, participantId: p.id,
                 remaining: spent.remaining, of: p.legendaryResistances, mirroredToCharacter: mirrored,
-                message: `👑 ${p.name} turns a failed save into a success (${params.reason}); LR ${spent.remaining}/${p.legendaryResistances} left`
+                ...(answer ? { saveRef: answer.offer.ref } : {}),
+                ...(answer?.conditionEnded ? { conditionEnded: answer.conditionEnded } : {}),
+                ...(answer?.concentrationRestored ? { concentrationRestored: answer.concentrationRestored } : {}),
+                ...(answer?.refunded ? { refunded: answer.refunded, hp: p.hp } : {}),
+                ...(openOffers.length ? { openOffers } : {}),
+                message: answer
+                    ? `👑 ${p.name} turns the failed ${offerSaveLabel(answer.offer)} into a success (${params.reason})${undone}; ${lr}`
+                    : `👑 ${p.name} turns a failed save into a success (${params.reason}); ${lr}${openNote}`
             };
         },
         aliases: ['use_legendary_resistance', 'legendary_save'],
-        description: 'Spend a legendary resistance to turn a failed save into a success; mirrors the count to the sheet and logs'
+        description: 'Spend a legendary resistance to turn a failed save into a success; mirrors the count to the sheet (exact id) and logs. saveRef answers an offered save: the failed save becomes a success, so its save_ends condition ends, a broken concentration is restored, or a stunt\'s damage is healed back; an offered ongoing or pressure save (ong-…): the damage the success would have avoided is healed back, on the sheet too'
     },
     use_ability: {
         schema: UseAbilitySchema,
@@ -2496,7 +2635,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 // Play report 5: cover from the user to each target (stated per target wins), riders on the save.
                 originId: p.id, cover: params.cover as Record<string, unknown> | undefined,
                 onFail: params.savingThrow?.onFail, onSuccess: params.savingThrow?.onSuccess,
-                area: isArea, modelsInArea: params.modelsInArea as ModelsInArea | undefined
+                area: isArea, modelsInArea: params.modelsInArea as ModelsInArea | undefined, encounterId: params.encounterId
             }, ability.name);
             // Play report 5 #5: a tracked token the ability killed is killed on its sheet.
             const killed = await settleAreaDeaths(params.encounterId, state, area.targets, ability.name);
@@ -2523,6 +2662,8 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
                 targets: area.targets,
                 ...unitLinesOf(area.targets),
                 ...saveSourcesOf(area.targets, params.savingThrow?.ability),
+                // Lane K: a legendary resistance a concentration save offered (summary keeps it whole).
+                ...(area.legendaryOffers.length ? { legendaryOffers: area.legendaryOffers } : {}),
                 ...(area.missing.length ? { missingTargets: area.missing } : {}),
                 ...(killed.length ? { killed } : {}),
                 message
@@ -2538,7 +2679,7 @@ const definitions: Record<CombatManageAction, ActionDefinition> = {
             return applyDamage(params, ctx);
         },
         aliases: ['damage', 'deal_damage', 'environment_damage', 'hazard'],
-        description: "Damage with no actor (a hazard, a trap, a bite rolled off-turn): rolls once on logged dice, each target saves, resistances and concentration apply, units owe break tests. area: true (or modelsInArea) resolves a unit token model by model, each model saving on its own die; without it a unit loses one model at most. Never touches the action economy. Works in an encounter or on character sheets with none"
+        description: "Damage with no actor (a hazard, a trap, a bite rolled off-turn): rolls once on logged dice, each target saves, resistances and concentration apply, units owe break tests. area: true (or modelsInArea) resolves a unit token model by model, each model saving on its own die; without it a unit loses one model at most. Never touches the action economy. Works in an encounter or on character sheets with none. A concentrating target's failed CON save asks legendary resistance: autoLegendaryResistance spends one (the spell holds); otherwise it is offered (in a fight with a saveRef that restores the spell; on the sheets with the concentration_manage restore call to paste), in legendaryOffers"
     },
     battle_cry: {
         schema: BattleCrySchema,
@@ -2904,7 +3045,7 @@ async function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionCon
         cover: params.cover as Record<string, unknown> | undefined,
         onFail: params.save?.onFail, onSuccess: params.save?.onSuccess,
         ...(bandRule && actorBand ? { bandScaleFor: (t: { band?: string }) => bandDamageMultiplier(bandRule, actorBand, t.band) } : {}),
-        area: isArea, modelsInArea: params.modelsInArea as ModelsInArea | undefined
+        area: isArea, modelsInArea: params.modelsInArea as ModelsInArea | undefined, encounterId
     }, params.source);
     // Play report 2, item 6: with an actor, every target it dropped to 0 is a
     // kill on its growth track (perKill, perBandAbove), in order; an auto
@@ -2947,6 +3088,8 @@ async function applyDamageInEncounter(params: ApplyDamageParams, ctx: SessionCon
         ...unitLinesOf(area.targets),
         // Play report 7 (lane G1): what each save took, where output_mode 'summary' keeps it whole.
         ...saveSourcesOf(area.targets, params.save?.ability),
+        // Lane K: a legendary resistance a concentration save offered (saveRef and the call), kept whole the same way.
+        ...(area.legendaryOffers.length ? { legendaryOffers: area.legendaryOffers } : {}),
         ...(area.breakTests.length ? { breakTests: area.breakTests } : {}),
         ...(killed.length ? { killed } : {}),
         ...(growth.length ? { growth } : {}),
@@ -2984,6 +3127,8 @@ async function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string
     const bandRule = params.actorId ? bandRuleFor(db, ruleWorld, [actorBand]) : undefined;
     const statedCover = params.cover as Record<string, unknown> | undefined;
     const sheetKills: Array<{ id: string; name: string; cause: string }> = [];
+    // Lane K: a failed concentration save off a fight: the sheet's autoLegendaryResistance spends, else the repair is reported.
+    const legendaryOffers: LegendaryReplyRow[] = [];
     const targets = rows.map(({ id, row }) => {
         const sheet = row!;
         let damageTaken = damageRolled;
@@ -3010,6 +3155,8 @@ async function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string
             const norm = normalizeCondition(entry, id);
             mirrorConditionToRow(id, 'add', label, norm?.duration, norm?.sourceId ?? `${params.source} (${save!.saved ? 'saved' : 'failed save'})`);
             conditionsApplied.push(label);
+            // Lane O: ongoing damage ticks on a token's turns, and a sheet outside a fight has none: say so, never drop it silently.
+            if (norm?.ongoingEffects?.length) lines.push(`⚠️ ${sheet.name} — ${label}: its ongoing damage ticks on a token in a fight; outside one the sheet keeps the condition's name only`);
         }
         const mod = damageWithModifiers(damageTaken, params.damageType, sheet as DamageDefences);
         damageTaken = mod.finalDamage;
@@ -3026,7 +3173,8 @@ async function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string
         const defeated = hpAfter <= 0;
         // Play report 7 (lane H): the sheet's declared save:con sides and conditions, on a logged d20.
         const concentration = damageTaken > 0
-            ? concentrationAfterDamage(id, damageTaken, defeated && hpBefore > 0, sheetConcentrationDie(db, id, 'combat_manage'), concentrationRepo, charRepo)
+            ? concentrationAfterDamage(id, damageTaken, defeated && hpBefore > 0, sheetConcentrationDie(db, id, 'combat_manage'), concentrationRepo, charRepo, 0,
+                concentrationLegendaryHook(db, id, legendaryOffers))
             : undefined;
         // Play report 5 #5, outside a fight: a tracked sheet dropped to 0 is
         // DYING (unconscious, prone; no saves are rolled round by round — the
@@ -3113,6 +3261,8 @@ async function applyDamageToSheets(params: ApplyDamageParams, refuse: (m: string
         ...(params.damageType ? { damageType: params.damageType } : {}),
         targets,
         ...saveSourcesOf(targets, params.save?.ability),
+        // Lane K: off a fight no encounter row holds an offer: the repair call, kept whole by output_mode summary.
+        ...(legendaryOffers.length ? { legendaryOffers } : {}),
         ...(killed.length ? { killed } : {}),
         ...(growth.length ? { growth } : {}),
         message
@@ -3146,19 +3296,20 @@ Aliases: start/begin→create, state/status→get, finish/stop→end, restore/re
    🏷 BANDS: in a banded world a token with no band of its own (explicit, sheet, creature or preset) takes the world's lowest band (of the ladder the fight's bands sit on, when the world has several), assumed: the reply lists bandAssumed and a warning, get shows (assumed), and execute, called strikes, CONSEQUENCE DUE, cleave and the other band lines print (band assumed). A band on none of the world's ladders is named in warnings at create. band spec requireBand: true refuses such a token instead. set_band {encounterId, participantId, band, reason?} changes a token's band from the next roll (never retroactively) and clears the mark. See docs/table-rules/ad-hoc-tokens.md
 2. get - View current state
 3. advance {confirm?} - Move to next turn. A living player character (pc row, heroes' side) whose turn is untouched (no action, bonus action, movement or other combat action) is not passed: TURN NOT TAKEN, writes: none. If the player passes or holds, advance {encounterId, confirm: true} (alias skipTurn: true) passes it (skippedTurn in the reply, logged). Never held: LAIR, HP 0, incapacitated, surprised, enemies, npc rows, sheetless tokens, agent-driven tokens (auto_on_turn); a world opts out with world_manage update {environment: {pcTurnGuard: 'off'}}. See docs/table-rules/turns.md
-   🎲 A save_ends condition's end-of-turn save is a 5e saving throw (play report 7): the sheet's ability and save proficiency (a unit token's drilled unit.saves too), the creature's untagged {advantage_on | disadvantage_on, value: 'save:<ability>'} mechanics, restrained on a DEX save and exhaustion 3+; two d20s on advantage or disadvantage, both cancel. The reply's endOfTurnSaves rows (kept by output_mode summary) and turnStartNotes say the dice, the sources and whether it ended
+   🎲 A save_ends condition's end-of-turn save is a 5e saving throw (play report 7): the sheet's ability and save proficiency (a unit token's drilled unit.saves too), the creature's untagged {advantage_on | disadvantage_on, value: 'save:<ability>'} mechanics, restrained on a DEX save and exhaustion 3+; two d20s on advantage or disadvantage, both cancel. Plain 5e: the total against the DC; a natural 1 or 20 means nothing. A failed save by a creature with legendary resistance left spends one by itself (autoLegendaryResistance; the condition ends) or is offered: 'LR 2/3 left, spend one?' with the call to paste, legendary_resistance {…, saveRef}; a player character is asked, never spent for. The reply's endOfTurnSaves rows and legendaryOffers (both kept whole by output_mode summary) and turnStartNotes say the dice, the sources and whether it ended. See docs/table-rules/legendary-resistance.md
+   🔥 ONGOING DAMAGE (play report 7 follow-up): add_condition {participantId, condition: {name, ongoing: {damage: number | dice, damageType?, when: start | end, save?: {ability, dc, onSuccess?: none | half | end}}}, area?, modelsInArea?} (create's conditions and save riders take ongoing too) ticks on the bearer's turn: rolled once on the fight's dice, logged and printed (turnDamage in the reply). On a unit it follows its source's shape: single target lands on the most wounded model, capped at it, and ends when that model dies; an area (add_condition area / modelsInArea, or a rider from an area on a unit) ticks per model inside, each with its own save. A creature's failed tick save offers legendary resistance (saveRef 'ong-…' heals the tick back). Water pressure is an area too. A unit a tick carries through its break point owes BREAK TEST DUE; a concentrating creature saves. See docs/table-rules/ongoing-damage.md
 4. death_save {participantId, outcome?} - roll (or post) a death save for a downed tracked character; advance rolls them itself on the creature's turn unless deathSaveMode is prompt (DEATH SAVE DUE); stabilise with combat_action stabilize. See docs/table-rules/dying.md
 5. lair_action - Execute boss lair action (LAIR turn only; once per round; damage takes dice; a creature that rolled 20 acts first). An area: a unit token in it saves model by model (a spaced unit needs modelsInArea: {id: n}); area: false makes it one target (a unit loses one model at most)
    legendary_action {participantId, cost?, description} - a non-attack legendary action off its turn (attacks: combat_action attack with legendaryCost)
-   legendary_resistance {participantId, reason} - turn a failed save into a success
+   legendary_resistance {participantId, reason, saveRef?} - turn a failed save into a success (mirrored to the sheet). saveRef ('eot-2-boss-1', from an offered end-of-turn save) undoes that save: its save_ends condition ends; offers lapse when the creature's next turn starts. Engine saves spend one by themselves only with autoLegendaryResistance, never for a player character (asked instead)
    use_ability {participantId, ability, targetIds?, damage?: number | dice, damageType?, savingThrow?: {ability, dc}} - a limited ability (breath weapon): spends its actionCost (action by default; action|bonus on its own turn only, reaction|none off-turn too), marks a recharge ability spent (it rolls a d6 at the start of its turn) or a perRest ability spent until rest_manage short/long (mirrored to the sheet), saves per target. area: true (a breath, a cone) makes a unit token in it save model by model (modelsInArea: {id: n} for a spaced unit); without it a unit takes one model at most. An ability with grantsAction (Action Surge) costs nothing, banks one extra action this turn and is spent until restore_ability or a rest (mirrored to the sheet). get shows ⚡ extra actions N
-   apply_damage {encounterId?, targetIds, dice: number | dice, source, actorId?, damageType?, save?: {ability, dc, half?}} - damage with no actor (a hazard, a trap, an off-turn bite): one logged roll, a save per target, resistances, concentration and break tests; no action spent. Without encounterId it writes to the sheets. With actorId, the band rule's damageScale scales each target by the band gap (bandScale per target), and a target it drops to 0 credits the kill to the actor's growth track: perKill, perBandAbove (growth: [{victimId, track, pool, delta, from, to, growthReady?, growthApplied?}] and a ⬆ GROWTH line). area: true (rubble, a blast) or modelsInArea makes a unit token save model by model (unitArea per target, and unitLines, one line per unit, which output_mode summary keeps; a spaced unit needs modelsInArea: {id: n}; each model killed is a kill credited); without it a unit takes one model at most (unitCap). Guide: docs/table-rules/units.md
+   apply_damage {encounterId?, targetIds, dice: number | dice, source, actorId?, damageType?, save?: {ability, dc, half?}} - damage with no actor (a hazard, a trap, an off-turn bite): one logged roll, a save per target, resistances, concentration and break tests; no action spent. Without encounterId it writes to the sheets. With actorId, the band rule's damageScale scales each target by the band gap (bandScale per target), and a target it drops to 0 credits the kill to the actor's growth track: perKill, perBandAbove (growth: [{victimId, track, pool, delta, from, to, growthReady?, growthApplied?}] and a ⬆ GROWTH line). area: true (rubble, a blast) or modelsInArea makes a unit token save model by model (unitArea per target, and unitLines, one line per unit, which output_mode summary keeps; a spaced unit needs modelsInArea: {id: n}; each model killed is a kill credited); without it a unit takes one model at most, the most wounded first (unitCap). A unit's models keep their wounds: repeated damage adds up, and each unit target reports wounds ('4 alive: 2 unhurt, 1 at 5/9, 1 at 2/9'). Guide: docs/table-rules/units.md
    battle_cry {participantId, name?: 'Waaagh!', range?: 60, match?: {species?, band?, tag?, nameIncludes?}, rounds?: 1, attackAdvantage?, damageBonus?: number | dice, speedBonus?, moraleBonus?, ability?, actionCost?} - buffs the caller and matching allies in range until the start of the caller's next turn; actionCost action|bonus only on the caller's turn, none (default) is free and may be called out of turn
    😲 SURPRISE: create {…, surprised: ['gob-1']} or set_surprised {encounterId, participantIds, surprised?: true, reason?} (round 1, before their first turn) - the flagged creatures' round-1 turn passes on advance (noted), and until then they cannot react (no opportunity attacks, readied triggers or reaction attacks), act or take legendary actions. get shows 😲 surprised; STATE_JSON surprised: true. surprised: false clears a flag set by mistake
    🤲 SUBDUE (play report 7): create participants [{…, subdue: true}], add_participant {subdue: true} or set_subdue {encounterId, participantId, subdue, onSubdue?, reason?} - a standing order 'take them alive': the token's opportunity attacks and readied melee swings are non-lethal (a target they drop is knocked out: stable, no kill, no corpse; a PC reactor is offered attack {reaction, nonlethal: true}). A ranged shot can't be non-lethal, so it is settled when readied: combat_action ready / set_intent readied with a ranged attack (attack.ranged: true, or a profile with ranged: true) under the order is refused (writes: none) unless attack.onSubdue is 'hold' (the trigger holds fire; reaction and shot kept) or 'fire' (lethal, 'subdue order overridden'). An order put on a token already holding a ranged shot is flagged (readiedNeedsOnSubdue) and the shot holds until set_subdue {onSubdue} answers. No swing at a target already at 0 HP; a unit is never subdued. trigger_readied (like a move) carries reactionLines, one line per reaction (a knockout, a held shot, an override), which output_mode 'summary' keeps whole. See docs/table-rules/subdue-and-mounts.md
    🐎 MOUNTS (play report 7): mount {encounterId, riderId, mountId, controlled?: true, free?: true} / dismount {encounterId, riderId, position?, free?} - mounting and dismounting cost half the rider's speed on its own turn (free: true sets the scene). A controlled mount moves on its rider's turn: combat_action move {actorId: rider} spends the MOUNT's movement (dash {actorId: mount} widens it), the rider moves free and is credited the feet; its own slot passes on advance; it may only Dash, Disengage or Dodge. An independent mount (controlled: false) keeps its turn and carries the rider (the rider's own move is refused: dismount first). Opportunity attacks on the pair come once per reactor and strike the rider by default. Falls: a shoved mount or a rider knocked prone rolls the rider's DC 10 DEX save on the fight's dice (fail: dismounted, prone within 5 ft); a mount at 0 HP, prone or removed drops its rider prone. Replies carry mounts[] when a rider falls
    budget {partyLevels | partyId, creatures: [{creature | cr | xp, count?}] | encounterId} - read-only 5e XP budget: TRIVIAL/EASY/MEDIUM/HARD/DEADLY
-   set_environment {encounterId, environment: {medium: air | water | vacuum, depthFt?, pressure?: {startsAtFt, damagePerRound, unlessTag?}, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?}} - the medium of the fight (create takes environment too). Water: movement budget is swimSpeed else half speed; ranged attacks refused unless rangedAllowed; melee at disadvantage unless the damage type is listed (piercing) or the attacker carries the swim tag ('aquatic'); pressure damage at the start of each turn at depthFt >= startsAtFt unless tagged. A token on a terrain.water cell swims the same way in an air fight. get shows ⟨water · 40 ft⟩
+   set_environment {encounterId, environment: {medium: air | water | vacuum, depthFt?, pressure?: {startsAtFt, damagePerRound, unlessTag?, damageType?, save?: {ability, dc, half?}}, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?}} - the medium of the fight (create takes environment too). Water: movement budget is swimSpeed else half speed; ranged attacks refused unless rangedAllowed; melee at disadvantage unless the damage type is listed (piercing) or the attacker carries the swim tag ('aquatic'); pressure damage at the start of each turn at depthFt >= startsAtFt unless tagged: an area, so every model of a unit takes it separately (each with its own save when pressure.save is set; wounds add up), and any other token makes one plain-5e save (legendary resistance offered, saveRef refunds). Each tick prints a line and a turnDamage row; a unit it carries through its break point owes BREAK TEST DUE. See docs/table-rules/ongoing-damage.md. A token on a terrain.water cell swims the same way in an air fight. get shows ⟨water · 40 ft⟩
 6. end - Finish combat
    board {encounterId, attackerId, targetId, rooms?, name?} (request 5) - both must be vessel tokens (character_manage create_vessel rows): opens a NEW boarding encounter linked by parent_id, notes the target's rooms (given, or its spatial deck plan), and leaves the void fight running. Add boarders with add_participant on the child; end {winner?, summary?} on the child writes boardingResult to the parent; get on the parent lists boardings. Vessel tokens: shields absorb before the hull (shieldsAbsorbed), regen at turn start; sections are system parts with roles — drive crippled = speed 0, guns crippled = that weapon refused, bridge crippled = disadvantage, reactor dead = reactor breach d6 each turn (1 destroys). Aim at a section with combat_action attack atPart.
 
@@ -3172,7 +3323,7 @@ For CORPSES after combat, use corpse_manage tool.`,
         seed: z.string().optional().describe('Seed for a replayable new encounter (create only; omit for crypto dice)'),
         participants: z.array(z.any()).optional().describe("Array of participants (create only). Shape per entry: { id: <character UUID — always the UUID>, name, hp, maxHp, initiativeBonus?: number (default 0, #103), ac?: number (falls back to attacker-side derivation), isEnemy?: boolean, position?: {x,y}, plus optional statline: size, reach, movementSpeed, attackBonus, attackDamage, attackDamageType, attacksPerAction, attacks [{name, attackBonus, damage, damageType?, part?, item?, reachFt?, ranged?, twoHanded?, default?}], abilities [{name, recharge?, perRest?, grantsAction?, ready?}], fightingStyle, legendaryActions, legendaryResistances, legendaryResistancesRemaining, autoLegendaryResistance, hasLairActions, cr, band, regeneration, parts, unit, intent, species, tags, stats: {str, dex, con, int, wis, cha} (or abilityScores, long or short keys; missing ones 10; initiativeBonus defaults to the DEX modifier), context?: ['ambush'] (play report 7: tags its initiative roll asserts; an effect mechanic {type: 'advantage_on' | 'disadvantage_on', value: 'initiative' | 'check:dex', condition?: '<tag>'} on the token rolls initiative twice, keeping the higher or lower; untagged ones fire without context; the initiative row names the source and both dice) }. A key a participant does not take is named in ignoredParams as participants[i].key"),
         terrain: z.any().optional().describe('Terrain configuration (create only); water: ["x,y"] cells run the underwater rules for a token standing there'),
-        environment: z.any().optional().describe("create / set_environment: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?}, rangedAllowed? (default false in water), meleeDisadvantageUnlessDamageType? (default ['piercing']), swimTag? (default 'aquatic'), light?: 'bright' | 'dim' | 'darkness'}. set_environment replaces the whole object (medium defaults to air). light: 'darkness' lets tokens attempt a Hide from foes without darkvision (get shows canHide)"),
+        environment: z.any().optional().describe("create / set_environment: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound: number | dice, unlessTag?, damageType?, save?: {ability, dc, half? (default true)}} (an area: every model of a unit takes it separately, each with its own save; any other token one save, legendary resistance offered), rangedAllowed? (default false in water), meleeDisadvantageUnlessDamageType? (default ['piercing']), swimTag? (default 'aquatic'), light?: 'bright' | 'dim' | 'darkness'}. set_environment replaces the whole object (medium defaults to air). light: 'darkness' lets tokens attempt a Hide from foes without darkvision (get shows canHide)"),
         characterId: z.string().optional().describe('Character ID (death_save, add_participant)'),
         // FINDINGS #34 mirror block — add_participant + includeParty params
         includeParty: z.boolean().optional().describe('Include the active party in the new encounter (create / spawn_quick_enemy)'),
@@ -3194,8 +3345,9 @@ For CORPSES after combat, use corpse_manage tool.`,
         value: z.number().optional().describe('adjust_hp: set HP to exactly this'),
         delta: z.number().optional().describe('adjust_hp: shift HP by this amount'),
         reason: z.string().optional().describe('adjust_hp / legendary_resistance (required) / add_condition / remove_condition / legendary_action / use_ability: why — logged'),
-        condition: z.any().optional().describe('add_condition / remove_condition: a name ("prone") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?, level?}; remove also takes the object add_condition returned. For a hold, pass fromGrapple instead of hand-writing the source'),
+        condition: z.any().optional().describe('add_condition / remove_condition: a name ("prone") or {name|type, duration?, durationType?, source?, saveDC?, saveAbility?, level?, ongoing?: {damage: number | dice, damageType?, when: start | end, save?: {ability, dc, onSuccess?: none | half | end}}}; remove also takes the object add_condition returned. For a hold, pass fromGrapple instead of hand-writing the source. ongoing ticks on the bearer\'s turn by its source\'s shape (docs/table-rules/ongoing-damage.md)'),
         conditionId: z.string().optional().describe('remove_condition: one condition instance id'),
+        saveRef: z.string().optional().describe(`(mirror) ${LEGENDARY_SAVE_REF_DESCRIBE}`),
         replace: z.boolean().optional().describe('add_condition: drop existing conditions of the same type first'),
         mirrorToCharacter: z.boolean().optional().describe('add_condition / remove_condition: also edit the character sheet'),
         fromGrapple: z.string().optional().describe("add_condition: the holder (participant id or name) — writes source 'grapple: <holder id>' so grapple execute and break recognise the hold"),
@@ -3295,9 +3447,10 @@ For CORPSES after combat, use corpse_manage tool.`,
             onSuccess: areaSaveRiderSchema().optional()
         }).optional().describe(`apply_damage: {ability, dc, half? (default true), onFail?: {conditions: ['prone', {name, duration?, source?}], mirrorToCharacter?}, onSuccess?} each target saves; riders land on the targets with that result. ${ENGINE_SAVE_DESCRIBE}`),
         cover: coverByTargetSchema().optional().describe(`apply_damage / use_ability / lair_action / trigger_readied (mirror): ${COVER_BY_TARGET_DESCRIBE}`),
-        area: z.boolean().optional().describe(`apply_damage / use_ability / lair_action (mirror): ${AREA_DESCRIBE}. A lair action is an area unless area: false; apply_damage and use_ability are when modelsInArea is given`),
-        modelsInArea: modelsInAreaSchema().optional().describe(`apply_damage / use_ability / lair_action (mirror): ${MODELS_IN_AREA_DESCRIBE}`),
+        area: z.boolean().optional().describe(`apply_damage / use_ability / lair_action / add_condition (mirror): ${AREA_DESCRIBE}. A lair action is an area unless area: false; apply_damage and use_ability are when modelsInArea is given. add_condition: the condition's ongoing damage came from an area, so on a unit it ticks per model inside (unset: single target, the most wounded model)`),
+        modelsInArea: modelsInAreaSchema().optional().describe(`apply_damage / use_ability / lair_action / add_condition (mirror): ${MODELS_IN_AREA_DESCRIBE}. add_condition: the models inside the area that left the ongoing damage`),
         saves: unitSavesSchema().nullable().optional().describe(`set_unit (mirror): ${UNIT_SAVES_DESCRIBE}. Replaces the block; null clears`),
+        wounded: unitWoundedSchema().nullable().optional().describe(`set_unit (mirror): ${UNIT_WOUNDED_DESCRIBE}. [5, 2] sets them (HP moves, the live count kept); [] heals every wound; null drops the list`),
         level: coverEnum().optional().describe('set_cover: half | three-quarters | total | none'),
         subdue: z.boolean().optional().describe("add_participant / set_subdue (mirror; create takes it per participant): play report 7 #5, a standing order 'take them alive' — the token's opportunity attacks and readied melee swings knock out instead of killing. set_subdue: false lifts it"),
         riderId: z.string().optional().describe('mount / dismount (mirror): play report 7 #10, the rider token'),

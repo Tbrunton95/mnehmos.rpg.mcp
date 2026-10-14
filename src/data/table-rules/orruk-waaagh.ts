@@ -132,6 +132,8 @@ export const ORRUK_WAAAGH_PRESET: RulePresetEntry[] = [
             },
             contestedBy: 'unbind',
             range: 120,
+            // Play report 7 follow-up: a stomp is an area; a unit under it goes model by model.
+            area: { shape: 'cylinder', size: 20 },
             effects: [{ type: 'damage', dice: '4d6', damageType: 'bludgeoning', save: { ability: 'dex' }, saveEffect: 'half' }],
             miscast: { on: 'double', table: 'Waaagh! Overload' }
         }
@@ -141,6 +143,8 @@ export const ORRUK_WAAAGH_PRESET: RulePresetEntry[] = [
             castingRoll: { dice: '2d6', target: 6 },
             contestedBy: 'unbind',
             range: 15,
+            // Play report 7 follow-up: a line of spew is an area.
+            area: { shape: 'line', size: 30 },
             effects: [{ type: 'damage', dice: '2d6', damageType: 'acid', save: { ability: 'dex' }, saveEffect: 'half' }]
         }
     },

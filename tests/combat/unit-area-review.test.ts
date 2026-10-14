@@ -151,14 +151,16 @@ describe('area damage on units: adversarial review (play report 7 #1)', () => {
         d20s(20, 1, 20, 1, 1, 20, 1, 1, 1, 1, 1, 1);
         const res = await manageRaw({ action: 'apply_damage', targetIds: ['militia', 'm2'], dice: 12, source: 'Fire Breath of the great drake Ignathrax, rolling down the ridge', area: true, save: { ability: 'dex', dc: 13 } });
         const s = summary(res);
+        // Lane W: the line names the survivors' wounds ("(3 at 3/9)").
         expect(s.unitLines).toEqual([
-            'Militia — 6 in the area: 3 failed, 3 saved; 12 / 6 vs 9 HP each: 3 dead, 3/6 left; BREAK TEST DUE (morale 6)',
+            'Militia — 6 in the area: 3 failed, 3 saved; 12 / 6 vs 9 HP each: 3 dead, 3/6 left (3 at 3/9); BREAK TEST DUE (morale 6)',
             'Second Militia — 6 in the area: 6 failed, 0 saved; 12 / 6 vs 9 HP each: 6 dead, 0/6 left'
         ]);
-        // Three models are left: one fails and dies, two save and stand.
+        // Three models are left, each on 3: one fails and dies; two save, but
+        // their 6 meets the 3 they had left (lane W: before, two stood whole: "1 dead, 2/6 left").
         d20s(20, 1, 20);
         const ab =await manageRaw({ action: 'use_ability', participantId: 'drake', ability: 'Fire Breath', targetIds: ['militia'], damage: 12, savingThrow: { ability: 'dex', dc: 13 }, area: true });
-        expect(summary(ab).unitLines).toEqual(['Militia — 3 in the area: 1 failed, 2 saved; 12 / 6 vs 9 HP each: 1 dead, 2/6 left']);
+        expect(summary(ab).unitLines).toEqual(['Militia — 3 in the area: 1 failed, 2 saved; 12 / 6 vs 9 HP each (wounded first: 3 at 3/9): 3 dead, 0/6 left']);
     });
 
     it("output_mode 'summary' keeps each unit's line on lair_action (its prose was cut at 300 characters)", async () => {
@@ -186,16 +188,20 @@ describe('area damage on units: adversarial review (play report 7 #1)', () => {
         d20s(20, 1, 20, 1, 1, 20);
         const res = await actRaw({ action: 'cast_spell', actorId: 'mage', spellName: 'Fireball', targetIds: ['militia'] });
         const s = summary(res);
-        expect(s.unitLines).toEqual(['Militia — 6 in the sphere: 3 failed, 3 saved; 12 / 6 vs 9 HP each: 3 dead, 3/6 left; BREAK TEST DUE (morale 6)']);
+        // Lane W: the three that saved stand on 3 each, named on the line.
+        expect(s.unitLines).toEqual(['Militia — 6 in the sphere: 3 failed, 3 saved; 12 / 6 vs 9 HP each: 3 dead, 3/6 left (3 at 3/9); BREAK TEST DUE (morale 6)']);
     });
 
-    it('a world spell given modelsInArea says the count was not used (it has no area flag)', async () => {
+    it('a world spell given modelsInArea says the count was not used (it has no area flag), and hits one model at most', async () => {
         await setup([MILITIA()], { mage: true });
         await handleTableRules({ worldId: W, action: 'define', kind: 'spell', name: 'Quake', spec: { effects: [{ type: 'damage', dice: '20' }] } }, ctx as any);
         const res = await actRaw({ action: 'cast_spell', actorId: 'mage', spellName: 'Quake', targetId: 'militia', modelsInArea: { militia: 2 } });
         const text = res.content[0].text;
-        expect(text).toMatch(/modelsInArea ignored: Quake is a world spell with no area flag/);
-        expect(tok('militia').hp).toBe(34);
+        // Play report 7 follow-up (lane S): an unmarked world spell is a single
+        // blow, so 20 takes one 9-HP model, not 20 off the pool (it was 34).
+        expect(text).toMatch(/modelsInArea ignored: Quake has no area flag, so it hits one model of a unit at most/);
+        expect(text).toMatch(/one model at most: 20 → 9/);
+        expect(tok('militia').hp).toBe(45);
     });
 
     it('kill credit counts the models and says when the per-band credit read an assumed band', async () => {

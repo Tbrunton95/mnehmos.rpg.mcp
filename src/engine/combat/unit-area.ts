@@ -16,14 +16,21 @@
  *
  * Damage to a unit that is not an area hits one model at most (unitCapFor),
  * as a single blow does (engine.ts executeAttack).
+ *
+ * Lane W (owner: "Track each model's wounds"): a model that survives keeps
+ * its wound, so the models inside are taken most wounded first and hpLost is
+ * what they took, the survivors' wounds included. The caller lands it with
+ * engine.applyDamage(id, roll.hpLost, { models: roll.modelDamage }); a bare
+ * applyDamage(id, hpLost) would spread the total through the models instead.
  */
 import type Database from 'better-sqlite3';
 import type { CombatEngine, CombatParticipant } from './engine.js';
-import { areaOnUnit, liveModels, unitAreaLine, unitSaveBonus, type UnitAreaResult } from './units.js';
+import { areaOnUnit, liveModels, modelsAtHp, unitAreaLine, unitSaveBonus, unitCapFor, unitCapLine, type UnitAreaResult } from './units.js';
 import { rollParticipantSave, engineSaveDeclarations, toLongAbility } from './saves.js';
 import type { BandDamageScale } from '../table-rules.js';
 
-export { liveModels };
+// Lane W: the cap moved into units.ts so the engine can use it; same names here.
+export { liveModels, unitCapFor, unitCapLine };
 
 /** modelsInArea after its schema: {targetId: n}, '*' for every unit target. */
 export type ModelsInArea = Record<string, number>;
@@ -67,29 +74,22 @@ export function areaCountRefusal(needs: UnitAreaNeed[]): Error & { writes: 'none
     return err;
 }
 
-/** Models of a unit that went down between two HP readings (the kills a blow or an area credits). */
+/**
+ * Models of a unit that went down between two HP readings (the kills a blow
+ * or an area credits). Lane W: with wounds the pool alone cannot say how many
+ * models a reading held, so the count is read back through this process's
+ * writes to the unit (the pool's own reading when there is no record).
+ */
 export function modelsKilledBetween(unit: NonNullable<CombatParticipant['unit']>, hpBefore: number, hpAfter: number): number {
-    return Math.max(0, liveModels({ hp: hpBefore, unit }) - liveModels({ hp: hpAfter, unit }));
-}
-
-/** A blow that is not an area takes one model at most: the front model's HP. */
-export function unitCapFor(target: Pick<CombatParticipant, 'hp' | 'unit'>, damage: number): { damage: number; cap?: { before: number; after: number } } {
-    if (!target.unit || target.hp <= 0 || damage <= 0) return { damage };
-    const models = liveModels(target);
-    const front = target.hp - (models - 1) * target.unit.hpPerModel;
-    if (damage <= front) return { damage };
-    return { damage: front, cap: { before: damage, after: front } };
-}
-
-export function unitCapLine(cap: { before: number; after: number }): string {
-    return `one model at most: ${cap.before} → ${cap.after} (not an area: pass area: true, or modelsInArea, for an area effect)`;
+    const now = { hp: hpAfter, unit };
+    return Math.max(0, modelsAtHp(now, hpBefore) - liveModels(now));
 }
 
 /** One model's save, as the reply reports it. */
 export interface UnitModelSave { model: number; natural: number; rolls: number[]; total: number; saved: boolean }
 
 /** targets[].unitArea: what the area did to the unit. */
-export interface UnitAreaReport extends UnitAreaResult {
+export interface UnitAreaReport extends Omit<UnitAreaResult, 'modelDamage'> {
     inAreaSource: 'packed' | 'given';
     shape: string;
     /** The modifier each model rolled with (the token's ability modifier, proficiency if any, drilled, cover). */
@@ -110,8 +110,14 @@ export interface UnitAreaReport extends UnitAreaResult {
 
 export interface UnitAreaRoll {
     report: UnitAreaReport;
-    /** HP off the pool: the dead models' HP. */
+    /** HP off the pool: what the models took (lane W: the dead models' HP and the survivors' wounds). */
     hpLost: number;
+    /**
+     * Lane W: the damage each model inside takes, most wounded first. Pass it
+     * as engine.applyDamage(id, hpLost, { models: modelDamage }) so each model
+     * keeps its own wound.
+     */
+    modelDamage: number[];
     /** Most models inside saved (ties count as failed): the unit's saved flag. */
     majoritySaved: boolean;
     /**
@@ -215,18 +221,20 @@ export function rollUnitArea(
         half = scaled(half);
     }
 
-    const result = areaOnUnit(target, { damage: full, half, modelsInArea: inside, ...(saves ? { saves } : {}) });
+    const area = areaOnUnit(target, { damage: full, half, modelsInArea: inside, ...(saves ? { saves } : {}) });
+    // The per-model list goes to the caller, not the reply (a big unit's report stays short).
+    const { modelDamage, ...result } = area;
     const shape = opts.shape ?? 'area';
     const report: UnitAreaReport = {
         ...result, inAreaSource, shape,
         ...(saveBonus ? { saveBonus } : {}),
         ...(rows ? { saves: rows } : {}),
         ...labels,
-        line: unitAreaLine(target, result, shape)
+        line: unitAreaLine(target, area, shape)
     };
     const { standing } = result;
     const riderResult = saves && standing.saved + standing.failed > 0 ? (standing.saved > standing.failed ? 'saved' as const : 'failed' as const) : undefined;
-    return { report, hpLost: result.hpLost, majoritySaved: result.saved > result.failed, ...(riderResult ? { riderResult } : {}), damageModifier: fullMod.modifier, ...(bandScale ? { bandScale } : {}) };
+    return { report, hpLost: result.hpLost, modelDamage, majoritySaved: result.saved > result.failed, ...(riderResult ? { riderResult } : {}), damageModifier: fullMod.modifier, ...(bandScale ? { bandScale } : {}) };
 }
 
 /**

@@ -331,6 +331,10 @@ export const SKAVEN_HORNED_RAT_PRESET: RulePresetEntry[] = [
     {
         kind: 'spell', name: 'Plague', spec: {
             castingRoll: { dice: '2d6', ability: 'int', target: 7 }, contestedBy: 'unbind', range: 60,
+            // Play report 7 follow-up: a cloud is an area; its Plagued rider stays one save per token.
+            // Warp Lightning (a bolt) and the Dreaded Thirteenth Spell (everyone in one
+            // unit is not an area shape) stay single-target: one model of a unit at most.
+            area: { shape: 'sphere', size: 20 },
             effects: [
                 { type: 'damage', dice: '2d6', damageType: 'poison', save: { ability: 'con' }, saveEffect: 'half' },
                 { type: 'condition', condition: 'Plagued', duration: 3, save: { ability: 'con' } }
