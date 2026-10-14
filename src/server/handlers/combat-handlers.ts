@@ -3,8 +3,8 @@ import { loadAutoMechanics, autoAttackBonus, autoAcBonus, autoDamageBonus, apply
 import * as pda from '../../render/pda.js';
 import { randomUUID } from 'crypto';
 import type Database from 'better-sqlite3';
-import { CombatEngine, CombatParticipant, CombatState, CombatActionResult } from '../../engine/combat/engine.js';
-import { normalizeConditions, normalizeCondition, ConditionType, DurationType, type ConditionInput } from '../../engine/combat/conditions.js';
+import { CombatEngine, CombatParticipant, CombatState, CombatActionResult, type TurnDamageEvent } from '../../engine/combat/engine.js';
+import { normalizeConditions, normalizeCondition, ConditionType, DurationType, stampOngoingShape, type ConditionInput } from '../../engine/combat/conditions.js';
 import { ConditionInputSchema, conditionInputSchema, footprintCells, EnvironmentSchema, sizeRank, edgeDistanceSquares, effectiveReachFt } from '../../schema/encounter.js';
 import { resolveCover, totalCoverRefusal, ignoreCoverFor, coverArithmetic, saveArithmetic, ignoredCoverLine, canHideReport, coverEnum, coverByTargetSchema, COVER_BY_TARGET_DESCRIBE, type CoverResolution, type IgnoreCoverScopes } from '../../engine/combat/cover.js';
 import { applyScheduledOps } from '../../engine/scheduled-ops.js';
@@ -33,7 +33,7 @@ import { resolveWorldId, bandOrderFor, bandRuleFor, bandDamageMultiplier, loadRu
 import { castWorldSpell, sheetSpecies } from './world-spell.js';
 import { creditKill, growthLine, growthConditionsOnToken } from '../growth.js';
 import { peerConsequence, calledStrikeProblem, resolveCalledStrike, crippledPart, preparedOutcome } from '../../engine/combat/table-rules-combat.js';
-import { volleyTier, describeUnit, breakTestDue, moraleModifiers, type BreakTest } from '../../engine/combat/units.js';
+import { volleyTier, describeUnit, breakTestDue, moraleModifiers, woundLine, setUnitHp, type BreakTest } from '../../engine/combat/units.js';
 import { rollUnitArea, unitsNeedingCount, areaCountRefusal, unitCapFor, unitCapLine, unitSavesLine, unitSummaryLine, modelsKilledBetween, liveModels, type ModelsInArea, type UnitAreaReport } from '../../engine/combat/unit-area.js';
 import { upsertPart, findPart, resolveAttackSource, holdingPart } from '../../engine/combat/parts.js';
 import { compareBands } from '../../engine/table-rules.js';
@@ -44,6 +44,8 @@ import { CombatActionLogRepository } from '../../storage/repos/combat-action-log
 import { startConcentration, checkConcentration, breakConcentration, concentrationAfterDamage } from '../../engine/magic/concentration.js';
 import { rollParticipantSave, toLongAbility, saveSidesNote, saveSourcesRow, ENGINE_SAVE_DESCRIBE, type ParticipantSaveResult, type SaveSourcesRow } from '../../engine/combat/saves.js';
 import { fightConcentrationDie, concentrationLabelled, concentrationLine, concentrationOutcome, concentrationSourcesRow, engineSaverSides, saveDieLabels, type ConcentrationOutcome } from '../../engine/combat/saves.js';
+import { fightConcentrationLegendary, concentrationLegendaryHook, type LegendaryReplyRow } from './legendary-saves.js';
+import type { LegendaryOfferRow } from '../../engine/combat/legendary-resistance.js';
 import type { Character } from '../../schema/character.js';
 import { getPatternGenerator, PATTERN_DESCRIPTIONS } from '../terrain-patterns.js';
 import { hydrateExtras, matchPreset, type ExtrasRow } from '../../engine/combat/participant-extras.js';
@@ -107,7 +109,9 @@ export function syncParticipantHpFromDb(state: CombatState): CombatState {
                     participant.isStabilized = false;
                     applyDyingConditions(participant);
                 }
-                participant.hp = character.hp;
+                // Lane W: a unit token's pool moves through its models (a drop spreads, a rise heals).
+                if (participant.unit) setUnitHp(participant, character.hp);
+                else participant.hp = character.hp;
                 // Play report 5 #4: a knockout's Unconscious leaves too, so it is no longer "stable at 0" (a sleep spell's stays).
                 if (rose && clearNonlethalUnconscious(participant).length) participant.isStabilized = false;
             }
@@ -235,6 +239,82 @@ export async function settleAreaDeaths(encounterId: string, state: CombatState, 
     return killed;
 }
 
+/**
+ * Play report 7 follow-up (lane O): what the damage a turn's start or end
+ * dealt by itself (water pressure, ongoing damage; engine.turnDamage) owes.
+ * Call it in the same call as the engine's turn processing, on the same
+ * state, before anything else writes HP: a unit's count before the ticks is
+ * read back through this process's writes (lane W).
+ *  - a break test for each unit the ticks carried through its breakAt, one
+ *    per unit, from its HP before its first tick to now, with its morale terms;
+ *  - unitLines (output_mode summary keeps them), the break test named;
+ *  - a concentrating creature's CON save (a tick is damage; 0 HP ends it),
+ *    on the fight's dice with its declared sides (lane H), on the row too;
+ *  - a tracked creature a tick dropped is marked dying on its sheet; one it
+ *    killed (massive damage, a third failure at 0) is killed with a corpse,
+ *    as a death save's death is settled.
+ * `lines` carries the concentration and break test lines (the caller prints
+ * the killed with its own). Nothing when no tick landed.
+ */
+export async function settleTurnDamage(engine: CombatEngine, encounterId: string): Promise<{ turnDamage?: TurnDamageEvent[]; breakTests?: BreakTest[]; unitLines?: string[]; killed: KilledRecord[]; lines: string[] }> {
+    const events = engine.turnDamage;
+    const state = engine.getState();
+    if (!events.length || !state) return { killed: [], lines: [] };
+    const db = getDb();
+    const breakTests: BreakTest[] = [];
+    const lines: string[] = [];
+    // A tick is damage: concentration holds or breaks on it, as on every road that deals damage.
+    const concentrationRepo = new ConcentrationRepository(db);
+    const charRepo = new CharacterRepository(db);
+    for (const ev of events) {
+        const dropped = ev.hpBefore > 0 && ev.hpAfter <= 0;
+        if (ev.damage <= 0 && !dropped) continue;
+        // Lane K's rule on this road too: a failed save spends a legendary resistance
+        // (the spell holds) or offers one, reversible with saveRef; the offer joins
+        // the engine's legendaryOffers, which every caller of this function replies.
+        const rows: LegendaryReplyRow[] = [];
+        const c = concentrationAfterDamage(ev.participantId, ev.damage, dropped, fightConcentrationDie(engine, db, ev.participantId), concentrationRepo, charRepo, 0,
+            concentrationLegendaryHook(db, ev.participantId, rows, { engine, encounterId }));
+        for (const row of rows) if (row.saveRef && row.kind !== 'aura') engine.legendaryOffers.push(row as LegendaryOfferRow);
+        if (!c) continue;
+        ev.concentration = c;
+        ev.line += `\n   ${concentrationLine(c)}`;
+        lines.push(`🧠 ${ev.name}: ${concentrationLine(c, '      ')}`);
+    }
+    // Lane O review: those CON saves rolled on the fight's dice after the
+    // caller's getState(); take it again so the stored RNG position counts
+    // them (the callers save this same state object). Without it the next
+    // call, reloaded from the row, drew the concentration die a second time.
+    engine.getState();
+    const firstHp = new Map<string, number>();
+    for (const ev of events) if (!firstHp.has(ev.participantId)) firstHp.set(ev.participantId, ev.hpBefore);
+    const breakFor = new Map<string, BreakTest>();
+    for (const [id, hpBefore] of firstHp) {
+        const p = state.participants.find(x => x.id === id);
+        if (!p?.unit || p.hp >= hpBefore) continue;
+        const bt = breakTestDue(p, hpBefore, { moraleBonus: moraleModifiers(p, state.participants, sheetSpecies(db)) });
+        if (bt) { breakTests.push(bt); breakFor.set(id, bt); lines.push(`⚠️ ${bt.line}`); }
+    }
+    // One line per unit tick; the unit's last tick names the break test it owes.
+    const lastUnitTick = new Map<string, TurnDamageEvent>();
+    for (const ev of events) if (ev.unitLine) lastUnitTick.set(ev.participantId, ev);
+    const unitLines = events.filter(ev => ev.unitLine).map(ev => unitSummaryLine(ev.name, { line: ev.unitLine! }, lastUnitTick.get(ev.participantId) === ev ? breakFor.get(ev.participantId) : undefined));
+    const killed: KilledRecord[] = [];
+    for (const ev of events) {
+        if (ev.dying?.dropped) markRowDying(ev.participantId);
+        if (!ev.dying?.dead) continue;
+        const cause = `${ev.source === 'pressure' ? `water pressure` : ev.condition ?? 'ongoing damage'} (${ev.dying.instantDeath ? 'massive damage' : 'third failed death save'})`;
+        const k = await settleDeath({ id: ev.participantId, name: ev.name }, cause, encounterId);
+        if (k) killed.push(k);
+    }
+    return {
+        turnDamage: events,
+        ...(breakTests.length ? { breakTests } : {}),
+        ...(unitLines.length ? { unitLines } : {}),
+        killed, lines
+    };
+}
+
 /** One line per settled death for a banner. */
 export function killedLines(killed: KilledRecord[]): string[] {
     return killed.map(k => k.error ? `☠ ${k.name} is dead (${k.cause}) — the sheet kill failed: ${k.error}` : `☠ ${k.name} is dead (${k.cause})${k.corpseId ? ` — corpse ${k.corpseId.slice(0, 8)}` : ''}`);
@@ -280,7 +360,13 @@ export function settleKnockout(result: Pick<CombatActionResult, 'knockedOut'>, t
 
 function unitView(p: CombatParticipant) {
     const t = volleyTier(p);
-    return { liveModels: t?.models ?? 0, volley: t?.dice ?? null, volleyReason: t?.reason };
+    return { liveModels: t?.models ?? 0, volley: t?.dice ?? null, volleyReason: t?.reason, wounds: woundLine(p) };
+}
+
+/** Lane W: the unit as the state view shows it: the wound line in place of the per-model list (a big unit stays short). */
+function unitStateView(p: CombatParticipant) {
+    const { wounded: _wounded, ...unit } = p.unit!;
+    return { ...unit, ...unitView(p) };
 }
 
 /** True when the id is a character row (tokens without one have nothing to mirror). */
@@ -544,7 +630,7 @@ export function buildStateJson(state: CombatState, encounterId: string, sessionI
             ...(p.senses ? { senses: p.senses } : {}),
             ...(p.buffs?.length ? { buffs: p.buffs } : {}),
             ...(p.parts?.length ? { parts: p.parts } : {}),
-            ...(p.unit ? { unit: { ...p.unit, ...unitView(p) } } : {}),
+            ...(p.unit ? { unit: unitStateView(p) } : {}),
             ...(p.intent ? { intent: p.intent } : {}),
             ...(p.readied ? { readied: p.readied } : {}),
             // Play report 7 #5: the standing order 'take them alive'.
@@ -1499,7 +1585,7 @@ Example (use real UUID from context for player character!):
                 difficultTerrain: z.array(z.string()).optional().describe('Array of "x,y" strings for difficult terrain'),
                 water: z.array(z.string()).optional().describe('Array of "x,y" strings for water terrain (streams, rivers)')
             }).optional().describe('CRIT-003: Terrain configuration for collision'),
-            environment: EnvironmentSchema.optional().describe("The medium of the fight: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound, unlessTag?}, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?}"),
+            environment: EnvironmentSchema.optional().describe("The medium of the fight: {medium: 'air'|'water'|'vacuum', depthFt?, pressure?: {startsAtFt, damagePerRound, unlessTag?, damageType?, save?: {ability, dc, half?}}, rangedAllowed?, meleeDisadvantageUnlessDamageType?, swimTag?}. Pressure is an area: every model of a unit takes it separately"),
             surprised: z.array(z.string()).optional().describe('Participant ids caught flat-footed: their round-1 turn passes and they cannot react, act or take legendary actions until it has')
         })
     },
@@ -2081,8 +2167,17 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
     // nothing. Read here, never stored on the token.
     const declaredInit = initiativeDeclarations(parsed.participants.map((p, i) => ({ id: participants[i].id, name: p.name, initiative: p.initiative, context: p.context })));
 
+    // Generate encounter ID
+    // The random suffix keeps two creates with one seed in the same millisecond
+    // (a batch) from colliding on id.
+    const encounterId = `encounter-${seed ?? 'combat'}-${Date.now()}-${randomUUID().slice(0, 8)}`;
+    // Lane L: minted before the start, so a call the engine prints at create (a
+    // surprised first slot's offered legendary resistance) names this fight.
+    engine.encounterId = encounterId;
+
     // Start encounter
-    const state = engine.startEncounter(participants, { initiativeSources: declaredInit.sources, saverSides: engineSaverSides(() => getDb()) });
+    // Lane O: the medium is known before the start, so a surprised first slot's turn start (and the next one) takes its pressure.
+    const state = engine.startEncounter(participants, { initiativeSources: declaredInit.sources, saverSides: engineSaverSides(() => getDb()), ...(parsed.environment ? { environment: parsed.environment } : {}) });
 
     // CRIT-003: Add terrain to state if provided
     if (parsed.terrain && state) {
@@ -2097,10 +2192,6 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
         for (const p of state.participants) p.movementRemaining = engine.effectiveSpeed(p);
     }
 
-    // Generate encounter ID
-    // The random suffix keeps two creates with one seed in the same millisecond
-    // (a batch) from colliding on id.
-    const encounterId = `encounter-${seed ?? 'combat'}-${Date.now()}-${randomUUID().slice(0, 8)}`;
     // Store with session namespace
     getCombatManager().create(`${ctx.sessionId}:${encounterId}`, engine);
 
@@ -2150,6 +2241,15 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
     });
+    // Lane O: a surprised first slot passed at create ticked its turn start and end
+    // (pressure, ongoing damage): owe what they owe, and write the HP they took
+    // to the sheets they took it from (only those: a create never syncs a sheet).
+    const ticks = await settleTurnDamage(engine, encounterId);
+    for (const id of new Set((ticks.turnDamage ?? []).map(t => t.participantId))) {
+        const p = state.participants.find(x => x.id === id);
+        const charRepo = new CharacterRepository(db);
+        if (p && charRepo.findById(id)?.id === id) charRepo.update(id, { hp: p.hp });
+    }
     // F1: repo.create validates a hand-listed token map; save the whole engine
     // state straight after so every participant field and the RNG position
     // (rngState, refreshed by getState) are stored from the first write.
@@ -2170,7 +2270,14 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
         // Play report 7 #7 (lane F): a context tag that fired nothing on a token's initiative.
         ...(declaredInit.warnings.length ? { warnings: declaredInit.warnings } : {}),
         // Lane H review: a surprised first slot's save_ends saves, as advance reports them (output_mode summary keeps them).
-        ...(engine.endOfTurnSaves.length ? { endOfTurnSaves: engine.endOfTurnSaves } : {})
+        ...(engine.endOfTurnSaves.length ? { endOfTurnSaves: engine.endOfTurnSaves } : {}),
+        // Lane L: a legendary resistance those saves offered, with the call to paste (output_mode summary keeps it whole).
+        ...(engine.legendaryOffers.length ? { legendaryOffers: engine.legendaryOffers } : {}),
+        // Lane O: the ticks that slot's turn dealt, as advance reports them.
+        ...(ticks.turnDamage ? { turnDamage: ticks.turnDamage } : {}),
+        ...(ticks.breakTests ? { breakTests: ticks.breakTests } : {}),
+        ...(ticks.unitLines ? { unitLines: ticks.unitLines } : {}),
+        ...(ticks.killed.length ? { killed: ticks.killed } : {})
     };
     const formattedText = formatCombatStateText(state, encounterId);
 
@@ -2180,6 +2287,7 @@ export async function handleCreateEncounter(args: unknown, ctx: SessionContext) 
     output += `${initiativeBannerLine(initiative, firstUp)}\n`;
     // A surprised first actor's slot already passed (and ticked) at start.
     for (const note of engine.turnStartNotes) output += `${note}\n`;
+    for (const line of [...ticks.lines, ...killedLines(ticks.killed)]) output += `${line}\n`;
     output += formattedText;
     
     // Append JSON for frontend parsing (marked clearly)
@@ -2342,11 +2450,14 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             : parsed.targetId ? parsed.targetId.split(',').map(t => t.trim()).filter(Boolean) : [];
         const cast = await castWorldSpell({
             engine, db: getDb(), rule: worldSpell.rule, worldId: worldSpell.worldId,
-            actorId: parsed.actorId, targetIds, unbinderId: parsed.unbinderId, damage: parsed.damage, boost: parsed.boost
+            actorId: parsed.actorId, targetIds, unbinderId: parsed.unbinderId, damage: parsed.damage, boost: parsed.boost,
+            // Play report 7 follow-up (lane S): an area world spell (its rule's area) on a unit goes model by model;
+            // castWorldSpell refuses a spaced unit with no count and notes a count an unmarked spell does not use.
+            modelsInArea: parsed.modelsInArea as ModelsInArea | undefined,
+            // Lane K: a concentration save's legendary resistance offer names this fight.
+            encounterId: parsed.encounterId
         });
         output = cast.output;
-        // Play report 7 #1: a world spell carries no area flag, so a count given for a unit is not used.
-        if (parsed.modelsInArea !== undefined) output += `\n(modelsInArea ignored: ${worldSpell.rule.name} is a world spell with no area flag, so its damage comes off a unit's pool as one number. For an area on a unit, combat_manage apply_damage {area: true, modelsInArea})\n`;
         result = cast.result;
         // Play report 5 #5: a world spell's damage follows the dying track to
         // the sheets: a drop mirrors Unconscious + Prone, a death runs the kill.
@@ -2894,6 +3005,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
 
         // Play report 7 (lane H): the concentration save's sources, for the reply below (only when it took one).
         let attackConcentration: (ConcentrationOutcome & { targetId: string; name: string }) | undefined;
+        // Lane K: a legendary resistance offered on that save, for the reply's top-level legendaryOffers.
+        let attackLegendaryOffer: LegendaryReplyRow | undefined;
         // Check concentration if target took damage and is concentrating
         if (result.success && result.damage && result.damage > 0) {
             const db = getDb();
@@ -2911,8 +3024,13 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 // Play report 7 (lane H): the target's declared save:con sides and conditions, on the fight's dice.
                 const concentrationCheck = checkConcentration(targetChar, result.damage, concentrationRepo, conBonus,
                     fightConcentrationDie(engine, db, parsed.targetId));
-                if (concentrationLabelled(concentrationCheck)) {
-                    attackConcentration = { targetId: parsed.targetId, name: targetChar.name, ...concentrationOutcome(concentrationCheck) };
+                // Lane K: a failed save spends a legendary resistance (the spell holds) or offers one (reversible with saveRef).
+                const held = concentrationCheck.broken ? concentrationRepo.findByCharacterId(parsed.targetId) : null;
+                const legendary = held ? fightConcentrationLegendary(engine, db, parsed.targetId, parsed.encounterId, held) : undefined;
+                if (legendary?.holds) { concentrationCheck.broken = false; concentrationCheck.reason = 'damage'; }
+                attackLegendaryOffer = legendary?.row;
+                if (concentrationLabelled(concentrationCheck) || legendary) {
+                    attackConcentration = { targetId: parsed.targetId, name: targetChar.name, ...concentrationOutcome({ ...concentrationCheck, ...legendary?.fields }) };
                 }
                 if (concentrationCheck.broken) {
                     // Break concentration
@@ -3095,6 +3213,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     maneuver.dc = plan.dc;
                     maneuver.save = {
                         ability: save.ability, dc: plan.dc, natural: save.natural, total: save.total, saved: save.saved, ...(save.legendaryResisted ? { legendaryResisted: true } : {}),
+                        // Lane L review: a failed save's offer (a player character is asked, never spent for).
+                        ...(save.legendaryResistanceAvailable ? { legendaryResistanceAvailable: save.legendaryResistanceAvailable } : {}),
+                        ...(save.legendaryResistanceAskPlayer ? { legendaryResistanceAskPlayer: true } : {}),
                         // Play report 7 (lane G1): the target's declared save sides and conditions, both dice.
                         ...(save.rolls.length > 1 ? { rolls: save.rolls } : {}),
                         ...(save.advantageSources ? { advantageSources: save.advantageSources } : {}),
@@ -3108,7 +3229,11 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 }
             }
             resultRec.maneuver = maneuver;
-            const save = maneuver.save as { ability: string; natural: number; total: number; saved: boolean; rolls?: number[]; advantageSources?: string[]; disadvantageSources?: string[] } | undefined;
+            const save = maneuver.save as { ability: string; natural: number; total: number; saved: boolean; rolls?: number[]; advantageSources?: string[]; disadvantageSources?: string[]; legendaryResisted?: boolean; legendaryResistanceAvailable?: number; legendaryResistanceAskPlayer?: boolean } | undefined;
+            // Lane L review: a legendary resistance spent on the save, or offered after it failed.
+            const legendaryNote = !save ? ''
+                : save.legendaryResisted ? ' (legendary resistance)'
+                : save.legendaryResistanceAvailable ? `; ⭐ ${save.legendaryResistanceAvailable} legendary resistance(s) left: ${save.legendaryResistanceAskPlayer ? 'ask the player' : 'the GM may spend one'}` : '';
             const applied = maneuver.applied as { condition?: string; dropped?: string | null; part?: string; note?: string } | undefined;
             const appliedLine = !applied ? ''
                 : applied.condition === 'prone' ? `; ${targetNow.name} is prone`
@@ -3117,7 +3242,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 : `; ${applied.note}`;
             ruleLines.push(`RULE maneuver ${plan.name}: ${used
                 ? `superiority die ${plan.die} = ${maneuver.roll} on the ${plan.def.dieTo} (${plan.poolBefore} → ${plan.poolBefore - 1} left)`
-                : `not spent (${maneuver.note ?? 'the attack missed'}; ${plan.poolBefore} left)`}${save ? `; ${save.ability.slice(0, 3).toUpperCase()} save ${save.total} vs DC ${plan.dc} ${save.saved ? 'saved' : 'FAILED'}${saveSidesNote({ ...save, rolls: save.rolls ?? [save.natural] })}` : ''}${appliedLine}`);
+                : `not spent (${maneuver.note ?? 'the attack missed'}; ${plan.poolBefore} left)`}${save ? `; ${save.ability.slice(0, 3).toUpperCase()} save ${save.total} vs DC ${plan.dc} ${save.saved ? 'saved' : 'FAILED'}${saveSidesNote({ ...save, rolls: save.rolls ?? [save.natural] })}${legendaryNote}` : ''}${appliedLine}`);
         }
         for (const note of source.notes) ruleLines.push(`⚖️ ${note}`);
         for (const note of (result.situational ?? []).slice().reverse()) ruleLines.unshift(`⚖️ ${note}`);
@@ -3139,7 +3264,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         }
         if (targetNow?.unit) {
             const t = volleyTier(targetNow);
-            resultRec.targetUnit = { models: t?.models, maxModels: t?.maxModels, volley: t?.dice ?? null };
+            resultRec.targetUnit = { models: t?.models, maxModels: t?.maxModels, volley: t?.dice ?? null, wounds: woundLine(targetNow) };
             ruleLines.push(`UNIT ${targetNow.name}: ${describeUnit(targetNow)}`);
             // Item 12: a unit carried through its breakAt owes a break test.
             const due = result.target ? breakTestDue(targetNow, result.target.hpBefore, { moraleBonus: moraleModifiers(targetNow, afterState?.participants ?? [], sheetSpecies(getDb())) }) : null;
@@ -3213,6 +3338,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             if (row) resultRec.saveSources = [...((resultRec.saveSources as SaveSourcesRow[] | undefined) ?? []), row];
             ruleLines.push(`🧠 ${attackConcentration.name}: ${concentrationLine(attackConcentration)}`);
         }
+        // Lane K: the offer at the reply's top level, where output_mode summary keeps the call whole.
+        if (attackLegendaryOffer) resultRec.legendaryOffers = [attackLegendaryOffer];
 
         output = formatAttackResult(result);
         // Rule and audit lines start on their own line under the contact block.
@@ -3854,12 +3981,16 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             unitArea?: UnitAreaReport;
             /** Play report 7 #1: a spell that is not an area took one model at most. */
             unitCap?: { before: number; after: number };
+            /** Lane W: a unit target's models after the spell, compactly. */
+            wounds?: string;
         }[] = [];
         const damageType = resolution.damageType || 'force';
         // Play report 7 (lane G1): what each target's save took (declared mechanics, conditions), for saveSources.
         const spellSaveSources: SaveSourcesRow[] = [];
         // Play report 7 (lane H): concentration saves that took a declared source or left a tagged one waiting.
         const spellConcentration: Array<ConcentrationOutcome & { targetId: string; name: string }> = [];
+        // Lane K: the legendary resistances offered on those saves, for the reply's top-level legendaryOffers.
+        const spellLegendaryOffers: LegendaryReplyRow[] = [];
 
         // Get spell's save info
         const damageEffect = spell.effects.find(e => e.type === 'damage');
@@ -3946,7 +4077,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 // Play report 5 #5: a tracked target dropped to 0 is dying (its
                 // sheet mirrors Unconscious + Prone); one already down takes a
                 // failed save; massive damage kills (settled after the loop).
-                const dying = damageDealt > 0 ? engine.applyDamage(tid, damageDealt) : undefined;
+                // Lane W: an area on a unit lands model by model, each keeping its wound.
+                const dying = damageDealt > 0 ? engine.applyDamage(tid, damageDealt, unitRoll ? { models: unitRoll.modelDamage } : {}) : undefined;
                 if (dying?.dropped) markRowDying(tid);
 
                 // CRITICAL FIX: Get fresh state AFTER damage was applied
@@ -3982,6 +4114,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     ...(tc && (tc.kind !== 'none' || tc.ignored) ? { cover: { kind: tc.kind, source: tc.source, via: tc.via, saveBonus: tcBonus } } : {}),
                     ...(unitRoll ? { unitArea: unitRoll.report } : {}),
                     ...(spellCap?.cap ? { unitCap: spellCap.cap } : {}),
+                    // Lane W: the unit's models after the spell, compactly.
+                    ...(updatedTarget?.unit ? { wounds: woundLine(updatedTarget) } : {}),
                     ...(dying ? { dying } : {})
                 });
                 {
@@ -3998,8 +4132,13 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     // Play report 7 (lane H): the target's declared save:con sides and conditions, on the fight's dice.
                     const concentrationCheck = checkConcentration(targetChar, damageDealt, concentrationRepo, 0,
                         fightConcentrationDie(engine, db, tid));
-                    if (concentrationLabelled(concentrationCheck)) {
-                        const c = concentrationOutcome(concentrationCheck);
+                    // Lane K: a failed save spends a legendary resistance (the spell holds) or offers one (reversible with saveRef).
+                    const held = concentrationCheck.broken ? concentrationRepo.findByCharacterId(tid) : null;
+                    const legendary = held ? fightConcentrationLegendary(engine, db, tid, parsed.encounterId, held) : undefined;
+                    if (legendary?.holds) { concentrationCheck.broken = false; concentrationCheck.reason = 'damage'; }
+                    if (legendary?.row) spellLegendaryOffers.push(legendary.row);
+                    if (concentrationLabelled(concentrationCheck) || legendary) {
+                        const c = concentrationOutcome({ ...concentrationCheck, ...legendary?.fields });
                         spellConcentration.push({ targetId: tid, name: targetParticipant.name, ...c });
                         const row = concentrationSourcesRow({ id: tid, name: targetParticipant.name }, c);
                         if (row) spellSaveSources.push(row);
@@ -4063,6 +4202,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     const row = saveSourcesRow({ id: tp.id, name: tp.name }, save);
                     if (row) spellSaveSources.push(row);
                     if (save.legendaryResisted) conditionLines.push(`⭐ Legendary resistance spent: the failed save becomes a success`);
+                    // Lane L review: the offer, as the damage roads print it (a player character is asked, never spent for).
+                    else if (save.legendaryResistanceAvailable) conditionLines.push(`⭐ Failed with ${save.legendaryResistanceAvailable} legendary resistance(s) left: ${save.legendaryResistanceAskPlayer ? 'ask the player' : 'the GM may spend one'}`);
                     if (save.saved) continue;
                 }
                 for (const name of effect.conditions!) {
@@ -4153,7 +4294,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                     output += `  • ${dr.name}: d20(${dr.saveRoll}) + ${(dr.saveTotal || 0) - dr.saveRoll} = ${dr.saveTotal} [${saveResult}]${dr.save ? saveSidesNote(dr.save) : ''}\n`;
                     for (const c of [...(dr.save?.conditionalAdvantage ?? []), ...(dr.save?.conditionalDisadvantage ?? [])]) output += `    conditional: ${c}\n`;
                     if (dr.save?.legendaryResisted) output += `    ⭐ Legendary resistance spent: the failed save becomes a success\n`;
-                    else if (dr.save?.legendaryResistanceAvailable) output += `    ⭐ Failed with ${dr.save.legendaryResistanceAvailable} legendary resistance(s) left: the GM may spend one\n`;
+                    else if (dr.save?.legendaryResistanceAvailable) output += `    ⭐ Failed with ${dr.save.legendaryResistanceAvailable} legendary resistance(s) left: ${dr.save.legendaryResistanceAskPlayer ? 'ask the player' : 'the GM may spend one'}\n`;
                     output += `    → ${dr.damageDealt} dmg${modTag(dr.damageModifier)} | ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
                 } else {
                     output += `  • ${dr.name}: ${dr.damageDealt} dmg${modTag(dr.damageModifier)} | ${dr.hpBefore} → ${dr.hpAfter} HP${defeatIcon}\n`;
@@ -4183,7 +4324,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
                 output += `\n🎲 ${only.name} ${only.save.ability.toUpperCase()} save: d20(${only.save.rolls.join(',')}) ${only.save.modifier >= 0 ? '+' : '-'} ${Math.abs(only.save.modifier)} = ${only.save.total} vs DC ${spellSaveDC} [${only.save.parts.join(', ')}]${saveSidesNote(only.save)}\n`;
                 for (const c of [...(only.save.conditionalAdvantage ?? []), ...(only.save.conditionalDisadvantage ?? [])]) output += `   conditional: ${c}\n`;
                 if (only.save.legendaryResisted) output += `⭐ Legendary resistance spent: the failed save becomes a success\n`;
-                else if (only.save.legendaryResistanceAvailable) output += `⭐ Failed with ${only.save.legendaryResistanceAvailable} legendary resistance(s) left: the GM may spend one\n`;
+                else if (only.save.legendaryResistanceAvailable) output += `⭐ Failed with ${only.save.legendaryResistanceAvailable} legendary resistance(s) left: ${only.save.legendaryResistanceAskPlayer ? 'ask the player' : 'the GM may spend one'}\n`;
             }
         } else {
             output = `\n✨ ${actor.name} casts ${spell.name}!\n`;
@@ -4206,7 +4347,8 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
             if (dr.unitArea) {
                 const sl = unitSavesLine(dr.unitArea);
                 output += `\n🎯 ${dr.name} — ${dr.unitArea.line}${sl ? `\n   ${sl}` : ''}\n`;
-            } else if (dr.unitCap) output += `\n🎯 ${dr.name}: ${unitCapLine(dr.unitCap)}\n`;
+            } else if (dr.unitCap) output += `\n🎯 ${dr.name}: ${unitCapLine(dr.unitCap)}${dr.wounds ? `; ${dr.wounds}` : ''}\n`;
+            else if (dr.wounds && (dr.damageDealt ?? 0) > 0) output += `\n🎯 ${dr.name}: ${dr.wounds}\n`;
         }
         if (!spellArea && parsed.modelsInArea !== undefined) output += `\n(modelsInArea ignored: ${spell.name} is not an area spell)\n`;
         if (conditionLines.length) output += `\n${conditionLines.join('\n')}\n`;
@@ -4256,6 +4398,7 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         // Play report 7 (lane G1): what each save took, lifted to the reply's top level below so output_mode 'summary' keeps it.
         if (spellSaveSources.length) (result as { saveSources?: SaveSourcesRow[] }).saveSources = spellSaveSources;
         if (spellConcentration.length) (result as { concentrationSaves?: unknown }).concentrationSaves = spellConcentration;
+        if (spellLegendaryOffers.length) (result as { legendaryOffers?: unknown }).legendaryOffers = spellLegendaryOffers;
         if (spellAttackSituational.length) result.situational = spellAttackSituational;
         // Play report 7 #7 (lane F): the declared sources the spell attack roll took.
         if (spellAttackSources.advantageSources) result.advantageSources = spellAttackSources.advantageSources;
@@ -4431,7 +4574,9 @@ export async function handleExecuteCombatAction(args: unknown, ctx: SessionConte
         const saveSources = (r as { saveSources?: unknown[] } | undefined)?.saveSources;
         // Play report 7 (lane G2): each reaction's line (a move's opportunity and readied attacks), kept whole the same way.
         const reactionLines = (r as { reactionLines?: string[] } | undefined)?.reactionLines;
-        output += `\n\n<!-- STATE_JSON\n${JSON.stringify({ ...stateJson, actionResult, ...(turnWarning && offTurn ? { offTurn } : {}), ...(unitLines?.length ? { unitLines } : {}), ...(saveSources?.length ? { saveSources } : {}), ...(reactionLines?.length ? { reactionLines } : {}) })}\nSTATE_JSON -->`;
+        // Lane K: a legendary resistance a concentration save offered (saveRef and the call), kept whole the same way.
+        const legendaryOffers = (r as { legendaryOffers?: unknown[] } | undefined)?.legendaryOffers;
+        output += `\n\n<!-- STATE_JSON\n${JSON.stringify({ ...stateJson, actionResult, ...(turnWarning && offTurn ? { offTurn } : {}), ...(unitLines?.length ? { unitLines } : {}), ...(saveSources?.length ? { saveSources } : {}), ...(reactionLines?.length ? { reactionLines } : {}), ...(legendaryOffers?.length ? { legendaryOffers } : {}) })}\nSTATE_JSON -->`;
     }
 
     if (turnWarning) {
@@ -4523,6 +4668,11 @@ export async function handleAdvanceTurn(args: unknown, ctx: SessionContext) {
         const k = await settleDeath({ id: ev.participantId, name: ev.name }, `third failed death save (round ${ev.round})`, parsed.encounterId);
         if (k) killed.push(k);
     }
+    // Play report 7 follow-up (lane O): what the turn's pressure and ongoing
+    // ticks owe (break tests, unit lines, the sheet of a creature they dropped
+    // or killed), read in this call on this state.
+    const ticks = await settleTurnDamage(engine, parsed.encounterId);
+    killed.push(...ticks.killed);
 
     // Save state
     if (state) {
@@ -4539,6 +4689,7 @@ export async function handleAdvanceTurn(args: unknown, ctx: SessionContext) {
     let output = `\n⏭️ TURN ENDED: ${previousParticipant?.name}\n`;
     if (skippedTurn) output += `${turnPassedLine(skippedTurn.name)}\n`;
     for (const note of engine.turnStartNotes) output += `♻️ ${note}\n`;
+    for (const line of ticks.lines) output += `${line}\n`;
     for (const line of killedLines(killed)) output += `${line}\n`;
     output += state ? formatCombatStateText(state, parsed.encounterId) : 'No combat state';
     
@@ -4553,6 +4704,12 @@ export async function handleAdvanceTurn(args: unknown, ctx: SessionContext) {
             turnStartNotes: engine.turnStartNotes,
             // Play report 7 (lane H): each save_ends end-of-turn save (output_mode summary keeps the rows whole).
             ...(engine.endOfTurnSaves.length ? { endOfTurnSaves: engine.endOfTurnSaves } : {}),
+            // Lane L: each legendary resistance offered on those saves: saveRef and the call to paste.
+            ...(engine.legendaryOffers.length ? { legendaryOffers: engine.legendaryOffers } : {}),
+            // Lane O: each pressure or ongoing tick, the break tests they owe, each unit's line (summary keeps them).
+            ...(ticks.turnDamage ? { turnDamage: ticks.turnDamage } : {}),
+            ...(ticks.breakTests ? { breakTests: ticks.breakTests } : {}),
+            ...(ticks.unitLines ? { unitLines: ticks.unitLines } : {}),
             ...(engine.deathSaveEvents.length ? { deathSaves: engine.deathSaveEvents } : {}),
             ...(killed.length ? { killed } : {}),
             ...(due ? { deathSaveDue: due } : {}),
@@ -4799,7 +4956,8 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
     // turn start, so the economy left from the turn it dropped would refuse
     // its first swing: start the turn now (action, movement, reaction reset).
     const turnStarted = result.regainedHp && answersDue && state.turnOrder[state.currentTurnIndex] === id;
-    const turnStartNotes = turnStarted ? engine.beginTurn(id) : [];
+    // Lane O: the turn start's ticks (pressure, ongoing damage) and their saves read the provider here too.
+    const turnStartNotes = turnStarted ? engine.beginTurn(id, { encounterId: parsed.encounterId, saverSides: engineSaverSides(() => getDb()) }) : [];
     // Play report 5 #5: the sheet follows. A natural 20 writes 1 HP (the next
     // sync used to revert it) and wakes the row; three failures run the kill.
     const charRepo = new CharacterRepository(getDb());
@@ -4811,6 +4969,8 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
         clearNonlethalOnRow(id);
     }
     if (result.isDead) killed = await settleDeath(participant, `third failed death save (round ${state.round})`, parsed.encounterId);
+    // Lane O: after the wake-up, so a tick that drops the creature again marks its sheet dying again.
+    const ticks = turnStarted ? await settleTurnDamage(engine, parsed.encounterId) : undefined;
 
     // FINDINGS #63 (PDA Wave B): СМЕРТЬ — rail render, and the death save
     // gains a JSON embed for the first time (it was banner-only: a #38
@@ -4827,7 +4987,7 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
     } as Parameters<typeof pda.renderDeath>[0]);
     if (posted) output += `\n(posted: ${posted} — no die rolled)`;
     if (result.regainedHp) output += `\n${participant.name} is back at 1 HP, conscious (the sheet says so too)${participant.conditions.some(c => String(c.type) === 'prone') ? '; prone until they stand' : ''}.`;
-    if (turnStarted) output += `\n${participant.name} takes this turn: action, bonus action, movement and reaction are fresh.${turnStartNotes.map(n => `\n♻️ ${n}`).join('')}`;
+    if (turnStarted) output += `\n${participant.name} takes this turn: action, bonus action, movement and reaction are fresh.${turnStartNotes.map(n => `\n♻️ ${n}`).join('')}${[...(ticks?.lines ?? []), ...killedLines(ticks?.killed ?? [])].map(l => `\n${l}`).join('')}`;
     if (result.isStabilized) output += `\n${participant.name} is STABLE: unconscious, no more saves; 1 HP returns after 1d4 hours, or any healing wakes them.`;
     if (killed) output += `\n${killedLines([killed]).join('\n')}`;
     else if (result.isDead) output += `\n☠ ${participant.name} is dead (third failed death save).`;
@@ -4837,7 +4997,13 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
     const repo = new EncounterRepository(db);
     saveEncounterState(repo, parsed.encounterId, engine.getState()!);
 
-    output += `\n<!-- STATE_JSON\n${JSON.stringify({ deathSave: { participantId: id, characterId: id, characterName: participant.name, ...(result.roll !== undefined ? { roll: result.roll } : {}), ...(posted ? { posted } : {}), isNat20: result.isNat20, isNat1: result.isNat1, success: result.success, successes: result.successes, failures: result.failures, stabilized: result.isStabilized, isStabilized: result.isStabilized, dead: result.isDead, isDead: result.isDead, regainedHp: result.regainedHp, hp: participant.hp, sheetHp: row ? participant.hp : undefined, ...(turnStarted ? { turnStarted: true } : {}) }, ...(killed ? { killed } : {}), ...(turnStartNotes.length ? { turnStartNotes } : {}) })}\nSTATE_JSON -->`;
+    output += `\n<!-- STATE_JSON\n${JSON.stringify({ deathSave: { participantId: id, characterId: id, characterName: participant.name, ...(result.roll !== undefined ? { roll: result.roll } : {}), ...(posted ? { posted } : {}), isNat20: result.isNat20, isNat1: result.isNat1, success: result.success, successes: result.successes, failures: result.failures, stabilized: result.isStabilized, isStabilized: result.isStabilized, dead: result.isDead, isDead: result.isDead, regainedHp: result.regainedHp, hp: participant.hp, sheetHp: row ? participant.hp : undefined, ...(turnStarted ? { turnStarted: true } : {}) }, ...(killed ? { killed } : {}), ...(turnStartNotes.length ? { turnStartNotes } : {}),
+        // Lane O: the ticks of the turn the natural 20 started, as advance reports them.
+        ...(ticks?.turnDamage ? { turnDamage: ticks.turnDamage } : {}),
+        ...(ticks?.breakTests ? { breakTests: ticks.breakTests } : {}),
+        ...(ticks?.unitLines ? { unitLines: ticks.unitLines } : {}),
+        ...(turnStarted && engine.legendaryOffers.length ? { legendaryOffers: engine.legendaryOffers } : {}),
+        ...(ticks?.killed.length ? { turnDamageKilled: ticks.killed } : {}) })}\nSTATE_JSON -->`;
 
     return {
         content: [{
@@ -4850,7 +5016,7 @@ export async function handleRollDeathSave(args: unknown, ctx: SessionContext) {
 /** Play report 5 #6: conditions an area save applies to a target that failed (onFail) or passed (onSuccess). */
 export function areaSaveRiderSchema() {
     return z.object({
-        conditions: z.array(conditionInputSchema()).min(1).describe("Conditions applied to each target with that result: 'prone' or {name, duration?, durationType?, source?, saveDC?, saveAbility?, level?}. Unknown names are kept as custom conditions with no mechanics (pair 'Buried' with 'restrained' for the mechanics). A same-type condition is replaced, never stacked; the source defaults to '<effect> (failed save)' / '(saved)'"),
+        conditions: z.array(conditionInputSchema()).min(1).describe("Conditions applied to each target with that result: 'prone' or {name, duration?, durationType?, source?, saveDC?, saveAbility?, level?, ongoing?}. ongoing: {damage, damageType?, when: start | end, save?} ticks on the target's turns: from an area on a unit it ticks per model on the models still standing inside, otherwise on one model (docs/table-rules/ongoing-damage.md). Unknown names are kept as custom conditions with no mechanics (pair 'Buried' with 'restrained' for the mechanics). A same-type condition is replaced, never stacked; the source defaults to '<effect> (failed save)' / '(saved)'"),
         mirrorToCharacter: z.boolean().optional().describe('Also write them to the character sheet (default: the token only)')
     }).strict();
 }
@@ -4880,6 +5046,8 @@ export interface AreaSaveOptions {
     modelsInArea?: ModelsInArea | number;
     /** Play report 7 #1: the template's shape for the unit line ('cone'); default 'area'. */
     areaShape?: string;
+    /** Lane K: the encounter the calls in a legendary resistance offer name (default: the engine's own id). */
+    encounterId?: string;
 }
 
 export interface AreaSaveTarget {
@@ -4893,6 +5061,8 @@ export interface AreaSaveTarget {
     defeated?: boolean;
     legendaryResisted?: boolean;
     legendaryResistanceAvailable?: number;
+    /** Lane L: a player-controlled creature: the resistance is the player's to spend, never spent for them. */
+    legendaryResistanceAskPlayer?: boolean;
     hpBefore?: number;
     /** Set when a resistance, immunity or vulnerability changed the damage. */
     damageModifier?: 'immune' | 'resistant' | 'vulnerable';
@@ -4916,6 +5086,8 @@ export interface AreaSaveTarget {
     unitArea?: UnitAreaReport;
     /** Play report 7 #1: damage that is not an area took one model of a unit at most. */
     unitCap?: { before: number; after: number };
+    /** Lane W: a unit target's models after the damage: "4 alive: 2 unhurt, 1 at 5/9, 1 at 2/9". */
+    wounds?: string;
     /**
      * Play report 7 (lane G1): what put the save at advantage or disadvantage
      * (the target's untagged save:<ability> mechanics, its standard
@@ -4962,12 +5134,14 @@ export function saveSourcesOf(targets: ReadonlyArray<{ targetId: string; targetN
  * as 5e rolls a breath weapon once; every die and save goes through the
  * engine so it is seeded and reaches roll_log. The caller saves the state.
  */
-export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, purpose: string): { targets: AreaSaveTarget[]; damageRolled?: number; damageRolls?: number[]; lines: string[]; missing: string[]; breakTests: BreakTest[] } {
+export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, purpose: string): { targets: AreaSaveTarget[]; damageRolled?: number; damageRolls?: number[]; lines: string[]; missing: string[]; breakTests: BreakTest[]; legendaryOffers: LegendaryReplyRow[] } {
     const state = engine.getState()!;
     const targets: AreaSaveTarget[] = [];
     const breakTests: BreakTest[] = [];
     const lines: string[] = [];
     const missing: string[] = [];
+    // Lane K: legendary resistances the targets' concentration saves offered, for the reply's top-level legendaryOffers.
+    const legendaryOffers: LegendaryReplyRow[] = [];
     let damageRolled: number | undefined;
     let damageRolls: number[] | undefined;
     // Play report 7 #1: a spaced unit in an area needs its count before any
@@ -4984,7 +5158,7 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
         damageRolled = opts.damage;
     }
     if (!opts.targetIds?.length || (damageRolled === undefined && !opts.savingThrow)) {
-        return { targets, damageRolled, damageRolls, lines, missing, breakTests };
+        return { targets, damageRolled, damageRolls, lines, missing, breakTests, legendaryOffers };
     }
     const halfOnSave = opts.halfDamageOnSave ?? true;
     const db = getDb();
@@ -5055,8 +5229,10 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
         const shieldsAbsorbed = shieldsBefore !== undefined && after?.shields ? Math.max(0, shieldsBefore - after.shields.current) : 0;
         // Concentration on the encounter's d20; 0 HP ends it outright. Play
         // report 7 (lane H): the target's declared save:con sides and conditions.
+        // Lane K: a failed save spends a legendary resistance (the spell holds) or offers one (reversible with saveRef).
         const concentration = damageTaken > 0
-            ? concentrationAfterDamage(targetId, damageTaken, defeated && hpBefore > 0, fightConcentrationDie(engine, db, targetId), concentrationRepo, charRepo)
+            ? concentrationAfterDamage(targetId, damageTaken, defeated && hpBefore > 0, fightConcentrationDie(engine, db, targetId), concentrationRepo, charRepo, 0,
+                concentrationLegendaryHook(db, targetId, legendaryOffers, { engine, encounterId: opts.encounterId }))
             : undefined;
         // Item 12: a unit carried through its breakAt owes a break test.
         const breakTest = after?.unit && damageTaken > 0
@@ -5091,10 +5267,13 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
             ...(mod.modifier !== 'normal' ? { damageModifier: mod.modifier } : {}),
             ...(bandScale ? { bandScale } : {}),
             ...(unitCap ? { unitCap } : {}),
+            // Lane W: the unit's models after the blow, compactly.
+            ...(after?.unit ? { wounds: woundLine(after) } : {}),
             ...(shieldsAbsorbed ? { shieldsAbsorbed } : {}),
             ...(after?.shields ? { shields: { current: after.shields.current, max: after.shields.max } } : {}),
             ...(save?.legendaryResisted ? { legendaryResisted: true } : {}),
             ...(save?.legendaryResistanceAvailable ? { legendaryResistanceAvailable: save.legendaryResistanceAvailable } : {}),
+            ...(save?.legendaryResistanceAskPlayer ? { legendaryResistanceAskPlayer: true } : {}),
             // Play report 7 (lane G1): the sources the save took, both dice, a tagged mechanic's hint.
             ...(save ? saveLabelsOf(save) : {}),
             ...(concentration ? { concentration } : {}),
@@ -5109,21 +5288,21 @@ export function resolveAreaSave(engine: CombatEngine, opts: AreaSaveOptions, pur
                 : ` - ${ability} Save: ${save.natural} + ${save.total - save.natural} = ${save.total} vs DC ${opts.savingThrow.dc}`;
             line += saved ? ' ✓ SAVED' : ' ✗ FAILED';
             line += save.legendaryResisted ? ' (legendary resistance)'
-                : save.legendaryResistanceAvailable ? ` (${save.legendaryResistanceAvailable} legendary resistance(s) left)` : '';
+                : save.legendaryResistanceAvailable ? ` (${save.legendaryResistanceAvailable} legendary resistance(s) left${save.legendaryResistanceAskPlayer ? ': ask the player' : ''})` : '';
             line += saveSidesNote(save);
             for (const c of [...(save.conditionalAdvantage ?? []), ...(save.conditionalDisadvantage ?? [])]) line += `\n   conditional: ${c}`;
         }
         line += `\n   Damage: ${damageTaken}${opts.damageType ? ` ${opts.damageType}` : ''}${mod.modifier !== 'normal' ? ` (${mod.modifier})` : ''}${bandScale ? ` ×${bandScale.multiplier} band (${bandScale.before} → ${bandScale.after})${bandAssumedTag(target, state.participants.find(o => o.id === opts.originId))}` : ''}`;
         if (unitCap) line += `\n   ${unitCapLine(unitCap)}`;
         if (shieldsAbsorbed && after?.shields) line += `\n   Shields: −${shieldsAbsorbed}, ${after.shields.current}/${after.shields.max} left`;
-        if (after) line += `\n   HP: ${after.hp}/${after.maxHp}${after.hp <= 0 ? dyingTail(after, dying) : ''}`;
+        if (after) line += `\n   HP: ${after.hp}/${after.maxHp}${after.hp <= 0 ? dyingTail(after, dying) : ''}${after.unit && after.hp > 0 ? ` (${woundLine(after)})` : ''}`;
         if (dying?.failuresAdded) line += `\n   🩸 hit while down: +${dying.failuresAdded} failed death save${dying.failuresAdded > 1 ? 's' : ''}`;
         if (concentration) line += `\n   ${concentrationLine(concentration)}`;
         if (breakTest) line += `\n   ${breakTest.line}`;
         if (conditionsApplied.length) line += `\n   Conditions: ${conditionsApplied.join(', ')}`;
         lines.push(line);
     }
-    return { targets, damageRolled, damageRolls, lines, missing, breakTests };
+    return { targets, damageRolled, damageRolls, lines, missing, breakTests, legendaryOffers };
 }
 
 /**
@@ -5143,7 +5322,8 @@ function resolveUnitAreaTarget(
         damage: ctx.damage, halfOnSave: ctx.halfOnSave, savingThrow: opts.savingThrow, damageType: opts.damageType,
         coverBonus: ctx.coverBonus, purpose, modelsInArea: opts.modelsInArea, shape: opts.areaShape, bandScaleFor: opts.bandScaleFor
     });
-    const dying = roll.hpLost > 0 ? engine.applyDamage(target.id, roll.hpLost) : undefined;
+    // Lane W: each model inside keeps its own wound (or dies).
+    const dying = roll.hpLost > 0 ? engine.applyDamage(target.id, roll.hpLost, { models: roll.modelDamage }) : undefined;
     if (dying?.dropped) markRowDying(target.id);
     const after = engine.getState()!.participants.find(p => p.id === target.id);
     const breakTest = after?.unit && roll.hpLost > 0
@@ -5157,6 +5337,10 @@ function resolveUnitAreaTarget(
         if (!norm) continue;
         const { id: _riderId, ...rest } = norm;
         if (rest.sourceId === undefined) rest.sourceId = `${purpose} (${roll.riderResult === 'saved' ? 'saved' : 'failed save'})`;
+        // Lane O: ongoing damage from an area follows its shape: it ticks per
+        // model on the models of this area still standing inside.
+        const standingInside = roll.report.standing.failed + roll.report.standing.saved;
+        if (standingInside > 0) stampOngoingShape(rest, { kind: 'area', models: standingInside });
         engine.removeConditionsByType(target.id, rest.type);
         engine.applyCondition(target.id, rest);
         conditionsApplied.push(label);
@@ -5168,6 +5352,7 @@ function resolveUnitAreaTarget(
         saved: roll.majoritySaved, damageTaken: roll.hpLost,
         hpBefore, hpAfter: after?.hp, defeated: after ? after.hp <= 0 : undefined,
         unitArea: roll.report,
+        ...(after?.unit ? { wounds: woundLine(after) } : {}),
         // Play report 7 (lane G1): the sources every model's save took, as on any target.
         ...saveLabelsOf(roll.report),
         ...(cover && (cover.kind !== 'none' || cover.ignored) ? { cover: { kind: cover.kind, source: cover.source, via: cover.via, saveBonus: ctx.coverBonus, ...(opts.savingThrow && !ctx.dexSave && cover.kind !== 'none' ? { note: 'cover adds to DEX saves only' } : {}) } } : {}),
@@ -5182,8 +5367,8 @@ function resolveUnitAreaTarget(
     if (savesLine) line += `\n   ${savesLine}`;
     // Play report 7 #3: a band-scaled area on a unit whose band was assumed says so.
     const bandTag = roll.bandScale ? bandAssumedTag(target, engine.getState()!.participants.find(o => o.id === opts.originId)) : '';
-    line += `\n   Damage: ${roll.hpLost}${opts.damageType ? ` ${opts.damageType}` : ''} off the pool (${roll.report.modelsKilled} model${roll.report.modelsKilled === 1 ? '' : 's'})${roll.damageModifier !== 'normal' ? ` (${roll.damageModifier})` : ''}${roll.bandScale ? ` ×${roll.bandScale.multiplier} band per model (${roll.bandScale.before} → ${roll.bandScale.after})${bandTag}` : ''}`;
-    if (after) line += `\n   HP: ${after.hp}/${after.maxHp}`;
+    line += `\n   Damage: ${roll.hpLost}${opts.damageType ? ` ${opts.damageType}` : ''} off the pool (${roll.report.modelsKilled} model${roll.report.modelsKilled === 1 ? '' : 's'} dead)${roll.damageModifier !== 'normal' ? ` (${roll.damageModifier})` : ''}${roll.bandScale ? ` ×${roll.bandScale.multiplier} band per model (${roll.bandScale.before} → ${roll.bandScale.after})${bandTag}` : ''}`;
+    if (after) line += `\n   HP: ${after.hp}/${after.maxHp}${after.unit && after.hp > 0 ? ` (${woundLine(after)})` : ''}`;
     if (breakTest) line += `\n   ${breakTest.line}`;
     if (conditionsApplied.length) line += `\n   Conditions (${roll.riderResult === 'saved' ? 'most still standing saved' : 'most still standing failed'}): ${conditionsApplied.join(', ')}`;
     return { target: rec, line, breakTest };
@@ -5235,6 +5420,8 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
     const unitLines: string[] = [];
     // Play report 7 (lane G1): what each save took, for the reply's saveSources (summary keeps it whole too).
     let saveSources: SaveSourcesRow[] | undefined;
+    // Lane K: legendary resistances a concentration save offered, for the reply's legendaryOffers (summary keeps them whole).
+    let legendaryOffers: LegendaryReplyRow[] = [];
     // Apply damage to targets if specified
     if (parsed.targetIds && parsed.targetIds.length > 0 && ((parsed.damage !== undefined && parsed.damage !== 0) || parsed.savingThrow)) {
         const area = resolveAreaSave(engine, {
@@ -5242,12 +5429,13 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
             savingThrow: parsed.savingThrow, halfDamageOnSave: parsed.halfDamageOnSave,
             // Play report 5: cover per target (no origin token for a lair), riders on the save.
             cover: parsed.cover as Record<string, unknown> | undefined, onFail: parsed.savingThrow?.onFail, onSuccess: parsed.savingThrow?.onSuccess,
-            area: lairArea, modelsInArea: parsed.modelsInArea
+            area: lairArea, modelsInArea: parsed.modelsInArea, encounterId: parsed.encounterId
         }, 'lair');
         if (typeof parsed.damage === 'string') output += `🎲 ${parsed.damage}: ${area.damageRolled}\n`;
         output += area.lines.join('\n') + '\n';
         for (const t of area.targets) if (t.unitArea) unitLines.push(unitSummaryLine(t.targetName, t.unitArea, t.breakTest));
         saveSources = saveSourcesOf(area.targets, parsed.savingThrow?.ability).saveSources;
+        legendaryOffers = area.legendaryOffers;
         // Play report 5 #5: a tracked token the lair killed is killed on its sheet too.
         const killed = await settleAreaDeaths(parsed.encounterId, state, area.targets, 'lair action');
         for (const line of killedLines(killed)) output += `${line}\n`;
@@ -5269,7 +5457,8 @@ export async function handleExecuteLairAction(args: unknown, ctx: SessionContext
             text: output
         }],
         ...(unitLines.length ? { unitLines } : {}),
-        ...(saveSources ? { saveSources } : {})
+        ...(saveSources ? { saveSources } : {}),
+        ...(legendaryOffers.length ? { legendaryOffers } : {})
     };
 }
 

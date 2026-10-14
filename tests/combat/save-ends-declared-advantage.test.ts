@@ -11,7 +11,8 @@
  * (the sheet's ability and save proficiency on the world's curve, else the
  * token's scores). The engine applies restrained and exhaustion 3+ from the
  * token's own conditions, rolls two dice on advantage or disadvantage under
- * one labelled purpose, keeps the right one for the degree, and says what
+ * one labelled purpose, keeps the right one against the DC (plain 5e since
+ * lane L: total >= DC, no natural-die step), and says what
  * happened in a turn note and an endOfTurnSaves row (output_mode summary keeps
  * it). The provider is passed again on every advance, so a fight rehydrated in
  * a new process reads it too.
@@ -89,7 +90,7 @@ describe('the engine rolls the end-of-turn save with the provider\'s sides and t
     const WEB = { name: 'webbed', durationType: 'save_ends', saveDC: 13, saveAbility: 'dex' };
     const NET = { name: 'restrained', durationType: 'save_ends', saveDC: 13, saveAbility: 'dex' };
 
-    it('Danger Sense on a save_ends DEX save: two dice, the higher kept for the degree; the log, the note and the row name it', () => {
+    it('Danger Sense on a save_ends DEX save: two dice, the higher kept against the DC; the log, the note and the row name it', () => {
         const e = engine([WEB]);
         d20s(4, 17);
         e.nextTurnWithConditions({ saverSides: dangerSense });
@@ -164,15 +165,17 @@ describe('the engine rolls the end-of-turn save with the provider\'s sides and t
         expect(e.drainRollRecords().filter(r => r.forId === 'varek').map(r => r.purpose)).toEqual(['save vs webbed']);
     });
 
-    it('a natural 1 still fails and a natural 20 still succeeds by one step, on the kept die (the old degree rule)', () => {
+    it('plain 5e on the kept die: the total meets the DC or it does not; a natural 1 or 20 changes nothing (lane L)', () => {
         const a = engine([WEB]);
         d20s(1, 1);
         a.nextTurnWithConditions({ saverSides: () => ({ advantage: [], disadvantage: [], modifier: { total: 12, parts: [] } }) });
-        expect(a.endOfTurnSaves[0]).toMatchObject({ natural: 1, total: 13, saved: false });
+        expect(a.endOfTurnSaves[0]).toMatchObject({ natural: 1, total: 13, saved: true });
+        expect(varek(a).conditions).toEqual([]);
         const b = engine([WEB]);
         d20s(20);
         b.nextTurnWithConditions({ saverSides: () => ({ advantage: [], disadvantage: [], modifier: { total: -9, parts: [] } }) });
-        expect(b.endOfTurnSaves[0]).toMatchObject({ natural: 20, total: 11, saved: true });
+        expect(b.endOfTurnSaves[0]).toMatchObject({ natural: 20, total: 11, saved: false });
+        expect(varek(b).conditions.map(c => c.type)).toEqual(['webbed']);
     });
 });
 

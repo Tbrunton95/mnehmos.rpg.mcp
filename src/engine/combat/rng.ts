@@ -456,9 +456,9 @@ export interface CheckResult {
  * The degree of one d20 already rolled against a DC: the margin decides
  * (10 or more over crits, 10 or more under crit-fails), a natural 20 lifts
  * it one step and a natural 1 drops it one. checkDegreeDetailed rolls its die
- * and asks this; play report 7 (lane H): the engine's end-of-turn save keeps
- * one of two dice at advantage and asks the same, so one die reads exactly
- * as it always did.
+ * and asks this. No save uses it: every save the engine rolls is plain 5e,
+ * total against DC (play report 7 follow-up, lane L, moved the save_ends
+ * end-of-turn save off it).
  */
 export function checkDegreeOf(roll: number, modifier: number, dc: number): CheckResult {
     const total = roll + modifier;

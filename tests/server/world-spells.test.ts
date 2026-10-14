@@ -235,6 +235,38 @@ describe('castWorldSpell', () => {
         expect(spy).toHaveBeenCalledWith(expect.objectContaining({ purpose: 'concentration (adv: Steady Mind (save:con))', forId: 'vex' }));
     });
 
+    it("lane K: a concentrating target's failed save asks legendary resistance: auto spends (the spell holds), otherwise the saveRef offer restores it", async () => {
+        // CON 10 (+0): a natural 1 against DC 10 fails.
+        mkChar('hag', { characterType: 'enemy', stats: { str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 16 }, hp: 60, maxHp: 60, legendaryResistances: 3, legendaryResistancesRemaining: 3, autoLegendaryResistance: true });
+        new ConcentrationRepository(getDb()).create({ characterId: 'hag', activeSpell: 'Hex', spellLevel: 1, targetIds: [], startedAt: 1, maxDuration: 10, saveDCBase: 10 } as any);
+        fixCasting({ 'cast ': [6, 5], 'Smite': [3, 4] });
+        const spy = vi.spyOn(CombatEngine.prototype, 'rollD20');
+        spy.mockReturnValueOnce(1);
+        const encounterId = await encounter([{ id: 'hag', name: 'Hag', hp: 60, maxHp: 60, initiative: 2, isEnemy: true }]);
+        const res = await act({ encounterId, action: 'cast_spell', actorId: 'lex', spellName: 'Smite', targetId: 'hag' });
+        const sj = stateOf(res.content[0].text);
+        expect(sj.actionResult.concentrationSaves).toEqual([expect.objectContaining({ targetId: 'hag', spell: 'Hex', broken: false, legendaryResisted: true, legendaryRemaining: 2, legendaryOf: 3 })]);
+        expect(res.content[0].text).toMatch(/🧠 Concentration on Hex: CON save 1 vs DC 10 ✗ failed → 👑 legendary resistance \(LR 2\/3 left\): held/);
+        expect(new ConcentrationRepository(getDb()).findByCharacterId('hag')?.activeSpell).toBe('Hex');
+        expect(sheet('hag').legendaryResistancesRemaining).toBe(2);
+        expect(sj.legendaryOffers).toBeUndefined();
+
+        // Without autoLegendaryResistance the spell breaks and the offer names this fight.
+        mkChar('crone', { characterType: 'enemy', stats: { str: 10, dex: 10, con: 10, int: 10, wis: 10, cha: 16 }, hp: 60, maxHp: 60, legendaryResistances: 3, legendaryResistancesRemaining: 3 });
+        new ConcentrationRepository(getDb()).create({ characterId: 'crone', activeSpell: 'Bane', spellLevel: 1, targetIds: [], startedAt: 1, maxDuration: 10, saveDCBase: 10 } as any);
+        spy.mockReturnValueOnce(1);
+        const second = await encounter([{ id: 'crone', name: 'Crone', hp: 60, maxHp: 60, initiative: 2, isEnemy: true }]);
+        const again = await act({ encounterId: second, action: 'cast_spell', actorId: 'lex', spellName: 'Smite', targetId: 'crone' });
+        const sj2 = stateOf(again.content[0].text);
+        const c = sj2.actionResult.concentrationSaves[0];
+        expect(c).toMatchObject({ broken: true, legendaryOffer: { saveRef: 'con-1-crone-1', remaining: 3, of: 3 } });
+        expect(c.legendaryOffer.call).toBe(`combat_manage legendary_resistance {encounterId: '${second}', participantId: 'crone', saveRef: 'con-1-crone-1', reason: 'concentration save on Bane'}`);
+        expect(sj2.legendaryOffers).toEqual([expect.objectContaining({ kind: 'concentration', condition: 'Bane', saveRef: 'con-1-crone-1' })]);
+        expect(new ConcentrationRepository(getDb()).isConcentrating('crone')).toBe(false);
+        const offers = new EncounterRepository(getDb()).loadState(second)!.participants.find(p => p.id === 'crone')!.pendingLegendaryOffers;
+        expect(offers).toEqual([expect.objectContaining({ ref: 'con-1-crone-1', kind: 'concentration', concentration: { spell: 'Bane', spellLevel: 1, targetIds: [], startedAt: 1, maxDuration: 10, saveDCBase: 10 } })]);
+    });
+
     it('a condition effect lands on a failed save; a pool effect moves the target pool', async () => {
         mkChar('vex', { resourcePools: { faith: { current: 4, max: 10 } } });
         await define('spell', 'Doom', { castingRoll: { target: 5 }, effects: [

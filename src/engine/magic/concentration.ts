@@ -8,6 +8,7 @@ import { Character, NPC } from '../../schema/character.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { CharacterRepository } from '../../storage/repos/character.repo.js';
 import { saveModifier, saveDieLabels, concentrationOutcome, type SaveDie, type SaveDieLabels } from '../combat/saves.js';
+import type { LegendaryOutcome } from '../combat/legendary-resistance.js';
 import { cryptoInt } from '../../math/crypto-dice.js';
 
 /**
@@ -281,6 +282,11 @@ export function checkAutomaticConcentrationBreak(
  * when the character was not concentrating. Play report 7 (lane H): with a
  * concentrationDie the save's labels ride the result (nothing extra without
  * a source).
+ *
+ * Lane K: a failed save asks `onFailedSave` (the handlers' legendary
+ * resistance) before the spell ends, with the concentration row as it
+ * stands: `holds` (a resistance spent) keeps the spell; otherwise what it
+ * returns (an offer, or a report off the fight) rides the result.
  */
 export function concentrationAfterDamage(
     characterId: string,
@@ -289,8 +295,9 @@ export function concentrationAfterDamage(
     d20: () => number | SaveDie,
     concentrationRepo: ConcentrationRepository,
     characterRepo: CharacterRepository,
-    extraSaveBonus = 0
-): ({ spell: string; broken: boolean; reason: 'damage' | 'failed_save' | 'death'; saveRoll?: number; saveTotal?: number; saveDC?: number } & SaveDieLabels) | undefined {
+    extraSaveBonus = 0,
+    onFailedSave?: (held: ConcentrationState) => (LegendaryOutcome & { holds?: boolean }) | undefined
+): ({ spell: string; broken: boolean; reason: 'damage' | 'failed_save' | 'death'; saveRoll?: number; saveTotal?: number; saveDC?: number } & SaveDieLabels & LegendaryOutcome) | undefined {
     if (!concentrationRepo.isConcentrating(characterId)) return undefined;
     const character = characterRepo.findById(characterId);
     if (!character) return undefined;
@@ -301,9 +308,19 @@ export function concentrationAfterDamage(
     }
     if (damage <= 0) return undefined;
     const check = checkConcentration(character, damage, concentrationRepo, extraSaveBonus, d20);
+    let legendary: LegendaryOutcome = {};
+    if (check.broken && onFailedSave) {
+        const held = concentrationRepo.findByCharacterId(characterId);
+        const answer = held ? onFailedSave(held) : undefined;
+        if (answer) {
+            const { holds, ...fields } = answer;
+            legendary = fields;
+            if (holds) check.broken = false;
+        }
+    }
     if (check.broken) breakConcentration({ characterId, reason: 'damage', damageAmount: damage }, concentrationRepo, characterRepo);
     return {
-        ...concentrationOutcome({ ...check, spell }),
+        ...concentrationOutcome({ ...check, spell, ...legendary }),
         reason: check.broken ? 'failed_save' : 'damage'
     };
 }

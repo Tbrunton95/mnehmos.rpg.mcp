@@ -27,6 +27,8 @@ import { startConcentration, breakConcentration } from '../../engine/magic/conce
 import { loggedD20, loggedRoll } from '../../math/logged-d20.js';
 import { AuraTriggerSchema } from '../../schema/aura.js';
 import { Token } from '../../schema/encounter.js';
+import { auraLegendaryNote, auraLegendaryRow, type LegendaryReplyRow } from '../handlers/legendary-saves.js';
+import type { CombatParticipant } from '../../engine/combat/engine.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CONSTANTS
@@ -263,13 +265,20 @@ async function handleProcess(args: z.infer<typeof ProcessSchema>): Promise<objec
         }
     );
 
-    return {
-        success: true,
-        actionType: 'process',
-        targetId: args.targetId,
-        trigger: args.trigger,
-        effectCount: results.length,
-        effects: results.map(r => ({
+    // Lane K: a failed aura save by a creature with legendary resistance left
+    // carries the offer ('LR 2/3 left, spend one?' and the call; a player
+    // character is asked). The report writes nothing, so nothing is ever
+    // spent here, autoLegendaryResistance or not: on a spend the save
+    // succeeds and none of the effect applies.
+    const target = tokens.find(t => t.id === args.targetId) as (Token & Pick<CombatParticipant, 'legendaryResistances' | 'legendaryResistancesRemaining'>) | undefined;
+    // Lane K review: the offers at the top level too, where output_mode summary keeps each call whole.
+    const legendaryOffers: LegendaryReplyRow[] = [];
+    const effects = results.map(r => {
+        const failedSave = r.saveDC !== undefined && r.saveRoll !== undefined && !r.succeeded;
+        const legendary = failedSave && target ? auraLegendaryNote(db, target, args.encounterId, r.auraName) : undefined;
+        const row = legendary && target ? auraLegendaryRow(target, r.auraName, legendary) : undefined;
+        if (row) legendaryOffers.push(row);
+        return {
             auraName: r.auraName,
             trigger: r.trigger,
             damageDealt: r.damageDealt,
@@ -278,8 +287,18 @@ async function handleProcess(args: z.infer<typeof ProcessSchema>): Promise<objec
             conditionsApplied: r.conditionsApplied,
             saveRoll: r.saveRoll,
             saveDC: r.saveDC,
-            succeeded: r.succeeded
-        }))
+            succeeded: r.succeeded,
+            ...(legendary ?? {})
+        };
+    });
+    return {
+        success: true,
+        actionType: 'process',
+        targetId: args.targetId,
+        trigger: args.trigger,
+        effectCount: results.length,
+        effects,
+        ...(legendaryOffers.length ? { legendaryOffers } : {})
     };
 }
 
@@ -373,7 +392,7 @@ const definitions: Record<AuraManageAction, ActionDefinition> = {
         schema: ProcessSchema,
         handler: handleProcess,
         aliases: ['trigger', 'apply'],
-        description: 'Process aura effects for a trigger'
+        description: 'Process aura effects for a trigger (a report: writes nothing; a failed save by a legendary creature carries the offer)'
     },
     remove: {
         schema: RemoveSchema,
@@ -425,7 +444,9 @@ EFFECT TRIGGERS:
 WORKFLOW:
 1. create - Create aura when spell is cast
 2. process - Process effects on trigger events
-3. expire - Check for duration expiration each round`,
+3. expire - Check for duration expiration each round
+
+process is a report: it rolls each save and die and writes no damage or condition to a token. A failed save by a creature with legendary resistance left carries the offer on its row (legendaryResistanceAvailable, legendaryOffer {remaining, of, askPlayer?, call, line}) and in the reply's top-level legendaryOffers (kind 'aura', kept whole by output_mode summary): combat_manage legendary_resistance {encounterId, participantId, reason} spends one, and on a spend the save succeeds, so apply none of that effect. Nothing is spent here, autoLegendaryResistance or not; a player character is asked. See docs/table-rules/legendary-resistance.md`,
     actionSchemas: router.actionSchemas,
     inputSchema: z.object({
         action: z.string().describe(`Action: ${ACTIONS.join(', ')}`),
@@ -501,12 +522,14 @@ export async function handleAuraManage(args: unknown, _ctx: SessionContext): Pro
             case 'process':
                 output = RichFormatter.header(`Aura Effects (${parsed.trigger})`, '');
                 if (parsed.effectCount > 0) {
-                    parsed.effects.forEach((e: { auraName: string; damageDealt?: number; damageType?: string; healingDone?: number; conditionsApplied?: string[] }) => {
+                    parsed.effects.forEach((e: { auraName: string; damageDealt?: number; damageType?: string; healingDone?: number; conditionsApplied?: string[]; legendaryOffer?: { line: string } }) => {
                         output += `- **${e.auraName}**: `;
                         if (e.damageDealt) output += `${e.damageDealt} ${e.damageType} damage`;
                         if (e.healingDone) output += `${e.healingDone} healing`;
                         if (e.conditionsApplied?.length) output += `Conditions: ${e.conditionsApplied.join(', ')}`;
                         output += '\n';
+                        // Lane K: the failed save's legendary resistance offer, on its own line.
+                        if (e.legendaryOffer) output += `  ${e.legendaryOffer.line}\n`;
                     });
                 } else {
                     output += 'No effects triggered.\n';

@@ -26,6 +26,7 @@ import { CorpseRepository } from '../../storage/repos/corpse.repo.js';
 import { worldProgression } from '../../engine/progression.js';
 import { damageWithModifiers, type DamageDefences, type DamageModifier } from '../../engine/combat/damage-modifiers.js';
 import { concentrationAfterDamage } from '../../engine/magic/concentration.js';
+import { concentrationLegendaryHook, type LegendaryReplyRow } from '../handlers/legendary-saves.js';
 import { ConcentrationRepository } from '../../storage/repos/concentration.repo.js';
 import { creditKill, growthLine } from '../growth.js';
 import { volleyTier } from '../../engine/combat/units.js';
@@ -164,7 +165,7 @@ const CastSpellSchema = z.object({
     boost: spellBoostSchema().optional().describe('World spell: spend a pool for +modifier and/or extraDice on the casting roll; sideEffect pools move too (growth-checked). Refused if the pool cannot pay'),
     cover: coverEnum().optional().describe("Play report 5 #1: the target's cover (targetId or targetIds; with several targets it is every target's default and coverByTarget overrides one): a spell attack rolls against AC +2 / +5, a DEX save takes the same bonus, total refuses a spell that chooses its creatures (Fire Bolt, Hold Person) before the slot is spent, and an area spell skips that target. Unset: standing cover, else the map. Spell Sniper (the sheet's ignoreCover.spells) lifts it by itself"),
     coverByTarget: coverByTargetSchema().optional().describe(`Play report 5 #1 (several targets): ${COVER_BY_TARGET_DESCRIBE}. An area target behind total cover is unaffected unless given 'none'`),
-    modelsInArea: modelsInAreaSchema().optional().describe(`${MODELS_IN_AREA_DESCRIBE}. An area spell (areaOfEffect: Burning Hands, Fireball) on a unit goes model by model, each model saving on the fight's dice; any other spell takes one model at most`)
+    modelsInArea: modelsInAreaSchema().optional().describe(`${MODELS_IN_AREA_DESCRIBE}. An area spell (areaOfEffect: Burning Hands, Fireball; a world spell whose rule has area: Foot of Gork, Green Puke, Plague) on a unit goes model by model, each model saving on the fight's dice; any other spell takes one model at most`)
 });
 
 const VolleySchema = z.object({
@@ -1098,7 +1099,7 @@ Everything else auto-calculated. Returns: roll result, damage dealt, HP change. 
 
 🔮 CAST_SPELL (minimal call):
 { action: "cast_spell", encounterId, actorId, spellName, targetId }
-Validates spell, rolls damage, applies effects, handles saves - all automatic. An area spell (areaOfEffect: Burning Hands, Fireball) on a unit token goes model by model, each model saving on the fight's dice (result unitAreas; a spaced unit needs modelsInArea: {id: n}, refused before the slot is spent without it); any other spell takes one model of a unit at most (unitCaps). A world spell (table_rules kind spell) takes boost {pool, delta, modifier?, extraDice?, sideEffect?: [{pool, delta}]}: spend a pool (warpstone -1) for +modifier / +extraDice on the casting roll, with side-effect pools (taint +1); refused if the pool cannot pay. Spell costs, boosts and side effects all run the growth check (growth_track rungs fire or are offered; result worldSpell.boost / growthApplied / growthReady).
+Validates spell, rolls damage, applies effects, handles saves - all automatic. An area spell (areaOfEffect: Burning Hands, Fireball) on a unit token goes model by model, each model saving on the fight's dice (result unitAreas; a spaced unit needs modelsInArea: {id: n}, refused before the slot is spent without it); any other spell takes one model of a unit at most (unitCaps). A world spell is an area when its rule has area {shape, size} (refused before any cost or the casting roll without a spaced unit's count); otherwise it hits one model of a unit at most. A world spell (table_rules kind spell) takes boost {pool, delta, modifier?, extraDice?, sideEffect?: [{pool, delta}]}: spend a pool (warpstone -1) for +modifier / +extraDice on the casting roll, with side-effect pools (taint +1); refused if the pool cannot pay. Spell costs, boosts and side effects all run the growth check (growth_track rungs fire or are offered; result worldSpell.boost / growthApplied / growthReady).
 
 💚 SUPPORT:
 - heal - Restore HP to a target
@@ -1504,6 +1505,8 @@ async function executeOnSheets(args: Record<string, unknown>, g: GrappleContext,
     const defeated = hpAfter <= 0;
     let killed = false; let corpseId: string | undefined;
     let concentration: ConcentrationOutcome | undefined;
+    // Lane K: a failed concentration save off a fight: the sheet's autoLegendaryResistance spends, else the repair is reported.
+    const legendaryOffers: LegendaryReplyRow[] = [];
     if (defeated) {
         // The same death as character_manage kill: one verb for 'this thing is dead'.
         const spell = new ConcentrationRepository(db).findByCharacterId(target.id)?.activeSpell;
@@ -1517,7 +1520,8 @@ async function executeOnSheets(args: Record<string, unknown>, g: GrappleContext,
         repo.update(target.id, { hp: hpAfter });
         if (damage > 0) {
             // Play report 7 (lane H): the survivor's declared save:con sides and sheet conditions, on a logged d20.
-            const c = concentrationAfterDamage(target.id, damage, false, sheetConcentrationDie(db, target.id, 'combat_action'), new ConcentrationRepository(db), repo);
+            const c = concentrationAfterDamage(target.id, damage, false, sheetConcentrationDie(db, target.id, 'combat_action'), new ConcentrationRepository(db), repo, 0,
+                concentrationLegendaryHook(db, target.id, legendaryOffers));
             if (c) concentration = { ...c };
         }
     }
@@ -1526,7 +1530,7 @@ async function executeOnSheets(args: Record<string, unknown>, g: GrappleContext,
     const growth = killed ? await creditKill(db, g.worldId, actor.id, { id: target.id, name: target.name, band: target.band }, actor.band) : undefined;
     let message = `${check.note}: ${damage}${damageType ? ` ${damageType}` : ''} damage (${detail}) — HP ${hpBefore} → ${hpAfter}`;
     if (killed) message += `. ${target.name} is dead${corpseId ? `; corpse ${corpseId.slice(0, 8)} on the ground` : ''}`;
-    if (concentration) message += `. Concentration on ${String(concentration.spell)}: ${concentration.reason === 'death' ? 'ends at 0 HP' : concentration.broken ? 'BROKEN' : 'held'}${concentration.reason === 'death' ? '' : concentrationSidesNote(concentration)}`;
+    if (concentration) message += `. Concentration on ${String(concentration.spell)}: ${concentration.reason === 'death' ? 'ends at 0 HP' : concentration.legendaryResisted ? `failed → 👑 legendary resistance${concentration.legendaryRemaining !== undefined ? ` (LR ${concentration.legendaryRemaining}${concentration.legendaryOf !== undefined ? `/${concentration.legendaryOf}` : ''} left)` : ''}: held` : concentration.broken ? 'BROKEN' : 'held'}${concentration.reason === 'death' ? '' : concentrationSidesNote(concentration)}${concentration.legendaryOffer ? ` ${concentration.legendaryOffer.line}` : ''}`;
     message += `. No encounter: written to the sheet${killed ? ' and the corpse ledger' : ''}.`;
     if (growth) message += `\n⬆ ${growthLine(growth)}`;
     return {
@@ -1540,6 +1544,8 @@ async function executeOnSheets(args: Record<string, unknown>, g: GrappleContext,
         ...(concentration ? { concentration } : {}),
         // Play report 7 (lane H): the concentration save's sources, as every engine save reports them.
         ...(concentrationRow ? { saveSources: [concentrationRow] } : {}),
+        // Lane K: off a fight no encounter row holds an offer: the repair call, kept whole by output_mode summary.
+        ...(legendaryOffers.length ? { legendaryOffers } : {}),
         ...(growth ? { growth } : {}),
         writesTo: 'sheet', message
     };
@@ -1865,7 +1871,7 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
     const shown = (r: { rolls: number[]; kept: number }, mode: GrappleRollMode) => r.rolls.length > 1 ? `d20(${r.rolls.join(',')} ${mode === 'advantage' ? 'adv' : 'dis'} → ${r.kept})` : `d20(${r.rolls[0]})`;
     const breakdown = atk && def
         ? `${actor.name} ${shown(atk, actorMode)}+${atkStat}stat+${atkProf}prof${atkSkill.expertise ? ' (expertise)' : ''}${bonus ? `+${bonus}situational` : ''} = ${atkTotal}  vs  ${target.name} ${shown(def, defMode)}+${defStat}stat+${defProf}prof${defSkill.expertise ? ' (expertise)' : ''} = ${defTotal}`
-        : saveResult ? `${target.name} ${saveResult.ability.slice(0, 3).toUpperCase()} save d20(${saveResult.rolls.join(',')})${saveResult.modifier >= 0 ? '+' : ''}${saveResult.modifier} = ${saveResult.total} vs DC ${saveResult.dc} (${saveResult.dcSource}) — ${saveResult.saved ? 'SAVED' : 'FAILED'}${saveResult.legendaryResisted ? ' (legendary resistance)' : ''}${saveSidesNote(saveResult)}; no contest rolled`
+        : saveResult ? `${target.name} ${saveResult.ability.slice(0, 3).toUpperCase()} save d20(${saveResult.rolls.join(',')})${saveResult.modifier >= 0 ? '+' : ''}${saveResult.modifier} = ${saveResult.total} vs DC ${saveResult.dc} (${saveResult.dcSource}) — ${saveResult.saved ? 'SAVED' : 'FAILED'}${saveResult.legendaryResisted ? ' (legendary resistance)' : ''}${!saveResult.saved && saveResult.legendaryResistanceAvailable ? `; ⭐ ${saveResult.legendaryResistanceAvailable} legendary resistance(s) left: ${saveResult.legendaryResistanceAskPlayer ? 'ask the player' : 'the GM may spend one'}` : ''}${saveSidesNote(saveResult)}; no contest rolled`
         : posted ? `posted by the GM: ${posted.toUpperCase()} — no contest rolled` : `auto-win: ${auto} — no contest rolled`;
 
     let actionSpent: string | undefined;
@@ -1902,6 +1908,7 @@ function grappleResolve(args: Record<string, unknown>, g: GrappleContext, move: 
             modifier: saveResult.modifier, total: saveResult.total, saved: saveResult.saved, parts: saveResult.parts,
             ...(saveResult.legendaryResisted ? { legendaryResisted: true } : {}),
             ...(saveResult.legendaryResistanceAvailable ? { legendaryResistanceAvailable: saveResult.legendaryResistanceAvailable } : {}),
+            ...(saveResult.legendaryResistanceAskPlayer ? { legendaryResistanceAskPlayer: true } : {}),
             // Play report 7 (lane G1): the target's declared save sides and conditions, as on every engine save.
             ...(saveResult.advantageSources ? { advantageSources: saveResult.advantageSources } : {}),
             ...(saveResult.disadvantageSources ? { disadvantageSources: saveResult.disadvantageSources } : {}),

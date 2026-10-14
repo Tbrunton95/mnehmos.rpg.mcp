@@ -204,17 +204,18 @@ describe('the save_ends end-of-turn save, pushed further', () => {
         ]);
     });
 
-    it('a natural die that overturns the total says so on the line (13 vs DC 13 failing reads as a natural 1)', () => {
+    it('lane L: plain 5e, so the line follows the total (13 vs DC 13 saves on a natural 1; 11 fails on a natural 20) and names no natural die', () => {
         const a = engineWith([WEBBED]);
         d20s(1);
         a.nextTurnWithConditions({ saverSides: () => ({ advantage: [], disadvantage: [], modifier: { total: 12, parts: ['DEX +1', 'bonus +11'] } }) });
-        expect(a.endOfTurnSaves[0]).toMatchObject({ natural: 1, total: 13, saved: false });
-        expect(a.endOfTurnSaves[0].line).toMatch(/= 13 vs DC 13 \(DEX \+1, bonus \+11\) ✗ failed on a natural 1: still webbed$/);
+        expect(a.endOfTurnSaves[0]).toMatchObject({ natural: 1, total: 13, saved: true });
+        expect(a.endOfTurnSaves[0].line).toMatch(/= 13 vs DC 13 \(DEX \+1, bonus \+11\) ✓ saved: webbed ends$/);
         const b = engineWith([WEBBED]);
         d20s(20);
         b.nextTurnWithConditions({ saverSides: () => ({ advantage: [], disadvantage: [], modifier: { total: -9, parts: ['DEX -9'] } }) });
-        expect(b.endOfTurnSaves[0].line).toMatch(/= 11 vs DC 13 \(DEX -9\) ✓ saved on a natural 20: webbed ends$/);
-        // A natural die that agrees with the total adds nothing.
+        expect(b.endOfTurnSaves[0]).toMatchObject({ natural: 20, total: 11, saved: false });
+        expect(b.endOfTurnSaves[0].line).toMatch(/= 11 vs DC 13 \(DEX -9\) ✗ failed: still webbed$/);
+        // A natural 20 that meets the DC reads the same as any other success.
         const c = engineWith([WEBBED]);
         d20s(20);
         c.nextTurnWithConditions();

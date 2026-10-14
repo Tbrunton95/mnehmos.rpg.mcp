@@ -8,8 +8,37 @@ import type Database from 'better-sqlite3';
 import { computedSkillModifier, OVERRIDE_SKILLS } from '../engine/skill-modifier.js';
 import { worldProgression } from '../engine/progression.js';
 import { DAY_366_PRESET } from '../data/table-rules/day-366.js';
+import { ORRUK_WAAAGH_PRESET } from '../data/table-rules/orruk-waaagh.js';
+import { SKAVEN_HORNED_RAT_PRESET } from '../data/table-rules/skaven-horned-rat.js';
 
 export const DAY_366_PRINCIPLE_TEXT_MIGRATION_ID = '2026-10-11-day-366-principle-text';
+
+export const WORLD_SPELL_AREA_MIGRATION_ID = '2026-10-14-world-spell-areas';
+
+/**
+ * Play report 7 follow-up (lane S): the preset spells the owner named as
+ * areas (a stomp, a line, a cloud). The area each gets is the one its preset
+ * now ships, read from the preset so the two never drift.
+ */
+export const PRESET_AREA_SPELL_NAMES = ['Foot of Gork', 'Green Puke', 'Plague'] as const;
+
+/**
+ * Each area spell's preset area and the other spells its preset ships. The
+ * names are generic ('Plague'), so a row counts as the preset's only where its
+ * world also holds one of those siblings: a world that never imported the
+ * preset keeps its own spell of that name as the GM wrote it.
+ */
+function presetSpellAreas(): Map<string, { area: unknown; siblings: string[] }> {
+    const out = new Map<string, { area: unknown; siblings: string[] }>();
+    for (const preset of [ORRUK_WAAAGH_PRESET, SKAVEN_HORNED_RAT_PRESET]) {
+        const spells = preset.filter(e => e.kind === 'spell').map(e => e.name);
+        for (const e of preset) {
+            if (e.kind !== 'spell' || !(PRESET_AREA_SPELL_NAMES as readonly string[]).includes(e.name)) continue;
+            if (e.spec.area) out.set(e.name, { area: e.spec.area, siblings: spells.filter(n => n !== e.name) });
+        }
+    }
+    return out;
+}
 
 /**
  * The day-366 principle texts as the preset shipped them before play report 2
@@ -208,6 +237,37 @@ export const DATA_MIGRATIONS: DataMigration[] = [
                 touched.push(r.name);
             }
             return touched.length ? `${touched.length} principle text(s) generalised: ${touched.join(', ')}` : 'no old preset text found';
+        }
+    },
+    {
+        id: WORLD_SPELL_AREA_MIGRATION_ID,
+        description: "Foot of Gork, Green Puke and Plague are areas (play report 7 follow-up): an already-imported spell row of those names whose spec has no area key gets the area its preset now ships, so a unit under it goes model by model. A spec that already names an area (or area: null) is the GM's and is untouched, and so is a spell of that name in a world that holds no other spell of the preset (the GM's own, not an import)",
+        run(db) {
+            let rows: Array<{ id: string; world_id: string; name: string; spec: string | null }>;
+            try {
+                rows = db.prepare(`SELECT id, world_id, name, spec FROM table_rules WHERE kind = 'spell' AND name IN (${PRESET_AREA_SPELL_NAMES.map(() => '?').join(', ')}) ORDER BY name, world_id`)
+                    .all(...PRESET_AREA_SPELL_NAMES) as typeof rows;
+            } catch { return 'no table_rules'; }
+            const areas = presetSpellAreas();
+            const write = db.prepare('UPDATE table_rules SET spec = ?, updated_at = ? WHERE id = ?');
+            const now = new Date().toISOString();
+            const touched: string[] = [];
+            const leftAlone: string[] = [];
+            for (const r of rows) {
+                const preset = areas.get(r.name);
+                if (!preset) continue;
+                let spec: unknown;
+                try { spec = JSON.parse(r.spec ?? '{}'); } catch { continue; }
+                if (!spec || typeof spec !== 'object' || Array.isArray(spec) || 'area' in spec) continue;
+                const imported = db.prepare(`SELECT 1 FROM table_rules WHERE world_id = ? AND kind = 'spell' AND name IN (${preset.siblings.map(() => '?').join(', ')}) LIMIT 1`)
+                    .get(r.world_id, ...preset.siblings);
+                if (!imported) { leftAlone.push(`${r.name} (${r.world_id})`); continue; }
+                write.run(JSON.stringify({ ...(spec as Record<string, unknown>), area: preset.area }), now, r.id);
+                touched.push(`${r.name} (${r.world_id})`);
+            }
+            const alone = leftAlone.length ? `${leftAlone.length} left alone (their world holds no other spell of the preset): ${leftAlone.join(', ')}` : '';
+            if (!touched.length) return alone ? `no preset spell row marked; ${alone}` : 'no unmarked preset area spell found';
+            return `${touched.length} preset spell row(s) marked as areas: ${touched.join(', ')}${alone ? `; ${alone}` : ''}`;
         }
     }
 ];

@@ -160,8 +160,9 @@ describe('encounter conditions at create', () => {
             type: 'stunned', durationType: 'save_ends', saveDC: 1, saveAbility: 'constitution'
         });
 
-        // DC 1 with no ability scores: only a natural 1 fails. A condition
-        // that silently went permanent would still be there after ten rounds.
+        // DC 1 with no ability scores: every plain-5e save succeeds (a natural
+        // 1 is no automatic failure on a save). A condition that silently went
+        // permanent would still be there after twenty turns.
         for (let turn = 0; turn < 20 && persistedToken(encounterId, 'hero').conditions.length > 0; turn++) {
             await handleAdvanceTurn({ encounterId }, ctx);
         }

@@ -63,6 +63,30 @@ export enum Ability {
 }
 
 /**
+ * Play report 7 follow-up (lane O): an ongoing effect's save, the plain-5e
+ * save every engine save rolls (total against the DC; a natural 1 or 20
+ * means nothing). onSuccess: 'none' (the default) takes no damage that tick,
+ * 'half' halves it, 'end' takes none and ends the condition (on a unit's
+ * area: the models that save leave the area).
+ */
+export interface OngoingSave {
+    ability: Ability;
+    dc: number;
+    onSuccess?: 'none' | 'half' | 'end';
+}
+
+/**
+ * Lane O (owner: "ongoing damage follows its source's shape"): where the
+ * damage lands on a unit token. 'single' (a single-target hit, and every
+ * legacy effect with no shape): the most wounded model takes each tick,
+ * capped at it, and the condition ends when that model dies. 'area': the
+ * models recorded inside (min with those standing, most wounded first) each
+ * take it with their own save; the count drops by the models killed. On a
+ * creature that is not a unit the shape changes nothing: one creature.
+ */
+export type OngoingShape = { kind: 'single' } | { kind: 'area'; models: number };
+
+/**
  * Ongoing effect that occurs each turn
  */
 export interface OngoingEffect {
@@ -74,6 +98,61 @@ export interface OngoingEffect {
     dice?: string;
     /** When the effect triggers */
     trigger: 'start_of_turn' | 'end_of_turn';
+    /** Lane O: the damage type (resistances read it). */
+    damageType?: string;
+    /** Lane O: a save against each tick. */
+    save?: OngoingSave;
+    /** Lane O: the shape of the source (unset: single). */
+    shape?: OngoingShape;
+}
+
+/**
+ * Lane O: ongoing damage as callers write it on a condition (add_condition,
+ * a save rider, create): `ongoing: {damage: 3 | '1d6', damageType?, when:
+ * 'start' | 'end', save?: {ability, dc, onSuccess?}}`, one or a list.
+ * ConditionInputSchema (schema/encounter.ts) validates it whole first (its
+ * types are lenient there so a refusal names the field), so this reads it
+ * leniently, as normalizeCondition reads character-row data.
+ */
+export interface OngoingInput {
+    damage?: number | string;
+    damageType?: string;
+    when?: string;
+    save?: { ability?: string; dc?: number; onSuccess?: string };
+}
+
+const ON_SUCCESS = ['none', 'half', 'end'] as const;
+
+/** Lane O: one ongoing input as the engine's effect, single-target until a road stamps its shape. */
+export function ongoingEffectFrom(input: OngoingInput): OngoingEffect {
+    const ability = input.save?.ability ? parseAbility(input.save.ability) : undefined;
+    const onSuccess = ON_SUCCESS.find(o => o === input.save?.onSuccess);
+    return {
+        type: 'damage',
+        ...(typeof input.damage === 'string' ? { dice: input.damage.trim() } : { amount: Math.max(0, Math.floor(input.damage ?? 0)) }),
+        trigger: input.when === 'end' ? 'end_of_turn' : 'start_of_turn',
+        ...(input.damageType ? { damageType: input.damageType } : {}),
+        ...(input.save && ability && typeof input.save.dc === 'number' ? { save: { ability, dc: input.save.dc, ...(onSuccess ? { onSuccess } : {}) } } : {}),
+        shape: { kind: 'single' }
+    };
+}
+
+/**
+ * Lane O: stamp the source's shape on every ongoing damage effect of a
+ * condition (a rider from an area on a unit: the standing models inside;
+ * add_condition {area}). Returns the condition.
+ */
+export function stampOngoingShape<T extends Pick<Condition, 'ongoingEffects'>>(condition: T, shape: OngoingShape): T {
+    for (const e of condition.ongoingEffects ?? []) if (e.type === 'damage') e.shape = { ...shape };
+    return condition;
+}
+
+/** Lane O: what an ongoing effect ticks, for a reply ('1d6 fire at the start of its turn (area: 4 models)'). */
+export function ongoingSummary(e: OngoingEffect): string {
+    const dmg = e.dice ?? String(e.amount ?? 0);
+    const save = e.save ? `, ${e.save.ability.slice(0, 3).toUpperCase()} save DC ${e.save.dc} (${e.save.onSuccess ?? 'none'} on a success)` : '';
+    const shape = e.shape?.kind === 'area' ? `area: ${e.shape.models} model${e.shape.models === 1 ? '' : 's'}` : 'single target';
+    return `${dmg}${e.damageType ? ` ${e.damageType}` : ''} at the ${e.trigger === 'end_of_turn' ? 'end' : 'start'} of its turn${save} (${shape})`;
 }
 
 /**
@@ -146,6 +225,8 @@ export type ConditionInput = string | {
     saveAbility?: string;
     /** Exhaustion level (1-6), stored as metadata.level */
     level?: number;
+    /** Lane O: ongoing damage (one or a list), stored as ongoingEffects, single-target until a road stamps its shape. */
+    ongoing?: OngoingInput | OngoingInput[];
 };
 
 /**
@@ -183,6 +264,8 @@ export function normalizeCondition(input: ConditionInput, participantId: string)
         ?? (raw.duration !== undefined ? DurationType.ROUNDS : DurationType.PERMANENT);
     const sourceId = raw.sourceId ?? raw.source;
     const saveAbility = parseAbility(raw.saveAbility);
+    // Lane O: ongoing damage rides the condition as its ongoingEffects.
+    const ongoing = raw.ongoing === undefined ? [] : (Array.isArray(raw.ongoing) ? raw.ongoing : [raw.ongoing]);
 
     return {
         // Same instance-id scheme as CombatEngine.applyCondition
@@ -193,6 +276,7 @@ export function normalizeCondition(input: ConditionInput, participantId: string)
         ...(sourceId !== undefined ? { sourceId } : {}),
         ...(raw.saveDC !== undefined ? { saveDC: raw.saveDC } : {}),
         ...(saveAbility ? { saveAbility } : {}),
+        ...(ongoing.length ? { ongoingEffects: ongoing.map(ongoingEffectFrom) } : {}),
         ...(raw.level !== undefined ? { metadata: { level: raw.level } } : {})
     };
 }

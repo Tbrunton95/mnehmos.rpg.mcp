@@ -15,6 +15,7 @@ import { UNPRINTABLE_POOLS } from '../render/pda.js';
 import { scheduledWriteOpSchema } from './scheduled-ops.js';
 import { hpModeSchema } from './forms.js';
 import { EffectCategorySchema, EffectMechanicSchema } from '../schema/improvisation.js';
+import { AreaShapeSchema } from '../schema/spell.js';
 
 /**
  * What a roll_table entry does to the character it is rolled for, in this
@@ -60,6 +61,19 @@ const abilityBonusesSchema = () => z.preprocess(
         : v,
     z.object({ str: z.number().int(), dex: z.number().int(), con: z.number().int(), int: z.number().int(), wis: z.number().int(), cha: z.number().int() }).partial().strict()
 );
+
+/**
+ * Play report 7 follow-up (lane S): a world spell's area, as an SRD spell's
+ * areaOfEffect: {shape, size in feet}. A damage effect aimed at the targets
+ * then resolves on a unit token model by model. The shape names the area on
+ * the unit's line ("6 in the cylinder"); the size is the GM's reference:
+ * which models are inside comes from modelsInArea (combat_map aoe's hint),
+ * or every live model of a packed unit.
+ */
+export const worldSpellAreaSchema = () => z.object({
+    shape: z.preprocess((v) => typeof v === 'string' ? v.trim().toLowerCase() : v, AreaShapeSchema),
+    size: z.number().positive()
+}).passthrough();
 
 /** What a vessel section does; the engine reads crippled/dead sections by role. */
 export const VESSEL_SECTION_ROLES = ['drive', 'guns', 'bridge', 'reactor', 'hangar', 'other'] as const;
@@ -298,6 +312,14 @@ export const RuleSpecSchemas = {
         /** Feet, edge to edge; checked when both tokens are placed. */
         range: z.number().min(0).optional(),
         castingTime: z.enum(['action', 'bonus', 'reaction']).optional(),
+        /**
+         * Play report 7 follow-up (lane S): {shape: cone | cube | cylinder |
+         * line | sphere, size (ft)}. With it, a damage effect aimed at the
+         * targets resolves on a unit token model by model (one save per model
+         * inside); without it (or null), a unit takes one model at most.
+         * Effects aimed at the caster and condition effects stay one save per token.
+         */
+        area: worldSpellAreaSchema().nullable().optional(),
         effects: z.array(z.object({
             type: z.enum(['damage', 'healing', 'condition', 'pool']),
             dice: z.string().optional(),
@@ -462,12 +484,30 @@ export function parseRuleSpec<K extends RuleKind>(kind: K, spec: unknown): RuleS
     return parsed.data as RuleSpec<K>;
 }
 
+/**
+ * Play report 7 follow-up (lane S): keys a stored spec may hold that do not
+ * parse (an area written before the engine read one, kept by passthrough).
+ * On read such a key is dropped so the rest keeps its defaults (cost [],
+ * known true), instead of the whole spec falling back to the raw JSON.
+ */
+const LENIENT_ON_READ: Partial<Record<RuleKind, string[]>> = { spell: ['area'] };
+
+function lenientStoredSpec(kind: RuleKind, spec: unknown): RuleSpec<RuleKind> {
+    const keys = LENIENT_ON_READ[kind];
+    if (keys && spec && typeof spec === 'object' && !Array.isArray(spec) && keys.some(k => k in spec)) {
+        const rest = { ...(spec as Record<string, unknown>) };
+        for (const k of keys) delete rest[k];
+        try { return parseRuleSpec(kind, rest); } catch { /* still unreadable: raw */ }
+    }
+    return spec as RuleSpec<RuleKind>;
+}
+
 function rowToRule(r: RuleRow): TableRule {
     let spec: unknown = {};
     try { spec = JSON.parse(r.spec); } catch { /* stored spec unreadable: defaults */ }
     const kind = r.kind as RuleKind;
     let parsed: RuleSpec<RuleKind>;
-    try { parsed = parseRuleSpec(kind, spec); } catch { parsed = spec as RuleSpec<RuleKind>; }
+    try { parsed = parseRuleSpec(kind, spec); } catch { parsed = lenientStoredSpec(kind, spec); }
     return { id: r.id, worldId: r.world_id, kind, name: r.name, spec: parsed, enabled: r.enabled === 1 };
 }
 
@@ -793,7 +833,8 @@ export function creatureToParticipant(spec: CreatureSpec, opts: { id: string; na
         regeneration: spec.regeneration,
         band: spec.band,
         parts,
-        unit: spec.unit ? copy(spec.unit) : undefined,
+        // Lane W review: a statblock's unit starts unhurt (a template, not the last fight's wounds).
+        unit: spec.unit ? (({ wounded: _w, ...u }) => copy(u))(spec.unit) : undefined,
         species: spec.species,
         tags: spec.tags ? [...spec.tags] : undefined,
         swimSpeed: spec.swimSpeed,

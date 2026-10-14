@@ -37,8 +37,8 @@ This adds the following to the world:
   - **5-9, Green Puke.** Allies within 10 ft take 1d6 acid. The GM applies this damage.
   - **10-12, Wot a Rush.** Nothing happens.
 - **Three spells.**
-  - **Foot of Gork.** Casting roll 2d6, target 7. It deals 4d6 bludgeoning, with a DEX save for half. On a double it rolls the Waaagh! Overload table. It gets +1 per 3 Orruks within 40 ft (maximum +4), and at +4 it overloads.
-  - **Green Puke.** Target 6. It deals 2d6 acid, with a DEX save for half.
+  - **Foot of Gork.** Casting roll 2d6, target 7. A stomp: a 20-ft cylinder (`area`). It deals 4d6 bludgeoning, with a DEX save for half. On a double it rolls the Waaagh! Overload table. It gets +1 per 3 Orruks within 40 ft (maximum +4), and at +4 it overloads.
+  - **Green Puke.** Target 6. A 30-ft line (`area`). It deals 2d6 acid, with a DEX save for half.
   - **Mighty Waaagh!** Target 8. It gives the caster +2 `waaagh`.
 - **Three principles** that the boot packet shows.
 
@@ -70,6 +70,8 @@ character_manage adjust_pool {characterId, pool: 'waaagh', value: 0, max: 10, sh
 ```
 
 Wurrzag casts with `combat_action cast_spell {spellName: 'Foot of Gork', targetId}`. The more boyz stand around him, the higher his total. At +4 he also rolls on Waaagh! Overload. Mighty Waaagh! fills his `waaagh` pool, which is yours to spend in the fiction.
+
+Foot of Gork and Green Puke are areas, so on a unit token they go model by model: one DEX save per model inside against the casting total, and deaths counted per model. A packed unit has every model inside. A spaced unit needs `modelsInArea: {<id>: n}`, read off `combat_map aoe`; without it the cast is refused before anything is rolled. See [units.md, World spells](units.md#world-spells).
 
 ### Azhag (a warboss with a kunnin' streak)
 

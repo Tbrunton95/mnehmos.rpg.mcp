@@ -174,8 +174,9 @@ describe('Combat Conditions', () => {
         });
 
         it('lets a normalized save-ends condition end on a successful save', () => {
-            // CON 14 (+2) vs DC 1: only a natural 1 fails, so ten rounds of
-            // end-of-turn saves is plenty. A permanent stun would survive all.
+            // CON 14 (+2) vs DC 1: every plain-5e save succeeds (a natural 1
+            // is no automatic failure on a save), so the first end-of-turn
+            // save ends it. A permanent stun would survive all twenty turns.
             const fighter = engine.getState()!.participants.find(p => p.id === 'fighter')!;
             fighter.conditions.push(normalizeCondition({
                 type: 'Stunned', durationType: 'SAVE_ENDS', saveDC: 1, saveAbility: 'con'

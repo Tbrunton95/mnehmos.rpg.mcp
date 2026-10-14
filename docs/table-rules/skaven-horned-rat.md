@@ -116,7 +116,7 @@ All nine spells are world spells: a 2d6 casting roll plus the Seer's INT modifie
 | Skitterleap | 6 | condition Skitterleaped, 1 round |
 | Wither | 6 | condition Withered, 3 rounds, CON save |
 | Death Frenzy | 7 | condition Death Frenzy on the target (a buff on a tide) , 3 rounds |
-| Plague | 7 | 2d6 poison, CON save half, and Plagued (3 rounds, CON save) |
+| Plague | 7 | a 20-ft sphere (`area`): 2d6 poison, CON save half, and Plagued (3 rounds, CON save) |
 | Curse of the Horned Rat | 8 | condition Cursed by the Horned Rat, 3 rounds, WIS save |
 | Dreaded Thirteenth Spell | 8 | 6d6 force, CON save half |
 | Warp Lightning (warpstone) | 5 | +2 on the roll, 3d6 force; costs `warpstone -1, warpstone_taint +1` |
@@ -126,6 +126,8 @@ All nine spells are world spells: a 2d6 casting roll plus the Seer's INT modifie
 combat_action cast_spell {encounterId, actorId, spellName: 'Warp Lightning', targetId}
 combat_action cast_spell {encounterId, actorId, spellName: 'Dreaded Thirteenth Spell', targetId, unbinderId: <rival seer>}
 ```
+
+**On a unit.** Plague is an area, so on a unit token its poison goes model by model: one CON save per model inside, deaths counted per model. A spaced unit needs `modelsInArea: {<id>: n}`, and without it the cast is refused before the warp is spent or the dice are rolled. Its Plagued rider is one CON save for the whole unit. Warp Lightning (a bolt) and the Dreaded Thirteenth Spell are single-target, so they kill one model of a unit at most. The Thirteenth Spell changes everyone in one unit in the lore, but that is not an area shape: 6d6 CON per model would wipe a full unit with one cast. It stays single-target until a later `targetsWholeUnit` flag. See [units.md, World spells](units.md#world-spells).
 
 ### The warpstone boost
 

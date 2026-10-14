@@ -2,6 +2,47 @@ import { PartSchema, UnitSchema, ReadiedSchema, SizeCategorySchema, AttackProfil
 import type { SizeCategory } from './token-extras.js';
 import { z } from 'zod';
 import { DurationType, parseAbility, parseDurationType } from '../engine/combat/conditions.js';
+import { parseDiceTerms } from '../engine/combat/dice-terms.js';
+
+/** Lane O: a dice expression the fight's dice can roll ('1d6', '2d4+1'), checked when it is written, not at the tick. */
+const diceText = () => z.string().min(1).refine(s => { try { parseDiceTerms(s); return true; } catch { return false; } }, { message: "not a dice expression: use notation like '1d6' or '2d4+1', or a number" });
+
+/**
+ * Play report 7 follow-up (lane O): ongoing damage on a condition, as callers
+ * write it (add_condition, a save rider, create's conditions). One effect or
+ * a list. The road it arrives by stamps its shape: single, unless an area on
+ * a unit put it there (add_condition {area, modelsInArea}; a rider from an
+ * area on a unit records the standing models inside).
+ */
+export function ongoingInputSchema() {
+    // Lenient types, checked whole in superRefine: inside the condition union a
+    // type failure reads as a bare "Invalid input"; a refinement names the field.
+    const one = z.object({
+        damage: z.union([z.number(), z.string()]).optional().describe("Required. Each tick's damage: a whole number or dice ('1d6'), rolled once per tick on the fight's logged dice"),
+        damageType: z.string().optional().describe('Resistances, immunities and vulnerabilities read it'),
+        when: z.string().optional().describe("Required: 'start' | 'end', the start or the end of the bearer's turn"),
+        save: z.object({
+            ability: z.string().optional().describe("Required: 'dex', 'Dexterity' or 'dexterity'"),
+            dc: z.number().optional().describe('Required: 1-30'),
+            onSuccess: z.string().optional().describe("'none' (default: no damage that tick) | 'half' | 'end' (no damage, and the condition ends; on a unit's area the models that save leave it)")
+        }).strict().optional().describe("A plain-5e save against each tick (total against the DC); a creature's failed save offers or spends legendary resistance (saveRef refunds the damage); a unit's models each save and never spend it")
+    }).strict().superRefine((o, ctx) => {
+        const issue = (path: (string | number)[], message: string) => ctx.addIssue({ code: z.ZodIssueCode.custom, path, message });
+        if (o.damage === undefined) issue(['damage'], "ongoing needs damage: a whole number or dice ('1d6')");
+        else if (typeof o.damage === 'number' && !(Number.isInteger(o.damage) && o.damage >= 0)) issue(['damage'], `ongoing damage ${o.damage}: a whole number, 0 or more`);
+        else if (typeof o.damage === 'string') { try { parseDiceTerms(o.damage); } catch { issue(['damage'], `ongoing damage '${o.damage}' is not a dice expression: use notation like '1d6' or '2d4+1', or a number`); } }
+        if (o.when !== 'start' && o.when !== 'end') issue(['when'], `ongoing needs when: 'start' | 'end' (the start or the end of the bearer's turn)${o.when !== undefined ? `; '${o.when}' is neither` : ''}`);
+        if (o.save) {
+            if (!o.save.ability || !parseAbility(o.save.ability)) issue(['save', 'ability'], `ongoing save needs ability: an ability name or str/dex/con/int/wis/cha${o.save.ability ? `; '${o.save.ability}' is not one` : ''}`);
+            if (o.save.dc === undefined || !Number.isInteger(o.save.dc) || o.save.dc < 1 || o.save.dc > 30) issue(['save', 'dc'], 'ongoing save needs dc: a whole number from 1 to 30');
+            if (o.save.onSuccess !== undefined && !['none', 'half', 'end'].includes(o.save.onSuccess)) issue(['save', 'onSuccess'], `ongoing save onSuccess '${o.save.onSuccess}': one of none, half, end`);
+        }
+    });
+    // No transform after the refinement: zod drops a dirty value at a transform, and the condition union then reads it as a bare "Invalid input".
+    return z.preprocess(v => (v && typeof v === 'object' && !Array.isArray(v) ? [v] : v), z.array(one).min(1));
+}
+
+export const ONGOING_DESCRIBE = "Play report 7 follow-up: ongoing damage {damage: number | dice, damageType?, when: 'start' | 'end', save?: {ability, dc, onSuccess?: 'none' | 'half' | 'end'}} (or a list). Every tick is rolled once, logged and printed. On a unit it follows its source's shape: single-target (the default) lands on the most wounded model, capped at it, and ends when that model dies; an area (add_condition area / modelsInArea, or a rider from an area on a unit) ticks per model inside, each with its own save. See docs/table-rules/ongoing-damage.md";
 
 export const ConditionSchema = z.object({
     id: z.string(),
@@ -44,7 +85,8 @@ export function conditionInputSchema() {
         sourceId: z.string().optional(),
         saveDC: z.number().optional().describe('Required with durationType save_ends'),
         saveAbility: z.string().optional().describe('Ability name or abbreviation (con); required with durationType save_ends'),
-        level: z.number().int().min(1).max(6).optional().describe('Exhaustion level 1-6 (2 halves speed, 3+ disadvantage on attacks and saves, 5 speed 0)')
+        level: z.number().int().min(1).max(6).optional().describe('Exhaustion level 1-6 (2 halves speed, 3+ disadvantage on attacks and saves, 5 speed 0)'),
+        ongoing: ongoingInputSchema().optional().describe(ONGOING_DESCRIBE)
     }).strict().superRefine((c, ctx) => {
         if (!(c.type || c.name || '').trim()) {
             ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'condition object needs a name or type' });
@@ -296,8 +338,15 @@ export const EnvironmentSchema = z.object({
     depthFt: z.number().min(0).optional().describe('Depth of the water, in feet (pressure compares against it)'),
     pressure: z.object({
         startsAtFt: z.number().min(0).describe('Pressure damage applies at this depth or deeper'),
-        damagePerRound: z.union([z.number().int().min(0), z.string().min(1)]).describe('Damage at the start of each turn: a number or dice'),
-        unlessTag: z.string().optional().describe('Tokens with this tag are spared (default: the swim tag)')
+        damagePerRound: z.union([z.number().int().min(0), diceText()]).describe('Damage at the start of each turn: a number or dice'),
+        unlessTag: z.string().optional().describe('Tokens with this tag are spared (default: the swim tag)'),
+        // Play report 7 follow-up (lane O): pressure is an area (the owner: "every model in the deep water takes it, each separately").
+        damageType: z.string().optional().describe('Play report 7 follow-up: the damage type (resistances read it, per model on a unit)'),
+        save: z.object({
+            ability: z.string().refine(a => !!parseAbility(a), { message: 'an ability name or str/dex/con/int/wis/cha' }),
+            dc: z.number().int().min(1).max(30),
+            half: z.boolean().optional().describe('A success halves it (default true; false: a success takes none)')
+        }).optional().describe("Play report 7 follow-up: a plain-5e save against each turn's pressure: one for a creature (legendary resistance offered or spent, saveRef refunds), one per model of a unit (never its legendary resistance)")
     }).optional(),
     rangedAllowed: z.boolean().optional().describe('Allow ranged attacks underwater (default false)'),
     light: z.enum(['bright', 'dim', 'darkness']).optional().describe("Play report 5 #1: the light in the fight. 'darkness' lets a token attempt a Hide from any foe without darkvision (canHide in the state view)"),

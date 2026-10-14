@@ -65,6 +65,8 @@ export interface MountEvent {
     save?: {
         ability: 'dexterity'; dc: 10; natural?: number; rolls?: number[]; modifier?: number; total?: number; saved: boolean; autoFail?: string;
         advantageSources?: string[]; disadvantageSources?: string[]; conditionalAdvantage?: string[]; conditionalDisadvantage?: string[];
+        /** Lane L review: a legendary resistance spent on the save (autoLegendaryResistance), or the count offered after it failed (askPlayer: a player character's to spend). */
+        legendaryResisted?: boolean; legendaryResistanceAvailable?: number; legendaryResistanceAskPlayer?: boolean;
     };
     note?: string;
     /**
@@ -129,13 +131,18 @@ function stayMountedSave(engine: CombatEngine, rider: CombatParticipant): NonNul
         ...(r.advantageSources ? { advantageSources: r.advantageSources } : {}),
         ...(r.disadvantageSources ? { disadvantageSources: r.disadvantageSources } : {}),
         ...(r.conditionalAdvantage ? { conditionalAdvantage: r.conditionalAdvantage } : {}),
-        ...(r.conditionalDisadvantage ? { conditionalDisadvantage: r.conditionalDisadvantage } : {})
+        ...(r.conditionalDisadvantage ? { conditionalDisadvantage: r.conditionalDisadvantage } : {}),
+        // Lane L review: the spend or the offer, as on every engine save (a player character is asked, never spent for).
+        ...(r.legendaryResisted ? { legendaryResisted: true } : {}),
+        ...(r.legendaryResistanceAvailable ? { legendaryResistanceAvailable: r.legendaryResistanceAvailable } : {}),
+        ...(r.legendaryResistanceAskPlayer ? { legendaryResistanceAskPlayer: true } : {})
     };
 }
 
 const saveText = (s: NonNullable<MountEvent['save']>) => s.autoFail
     ? `DEX save fails outright (${s.autoFail})`
-    : `DEX save d20=${s.natural}${(s.modifier ?? 0) >= 0 ? '+' : ''}${s.modifier} = ${s.total} vs DC 10 — ${s.saved ? 'stays mounted' : 'fails'}${saveSidesNote({ rolls: s.rolls ?? [s.natural ?? 0], advantageSources: s.advantageSources, disadvantageSources: s.disadvantageSources })}`;
+    : `DEX save d20=${s.natural}${(s.modifier ?? 0) >= 0 ? '+' : ''}${s.modifier} = ${s.total} vs DC 10 — ${s.saved ? `stays mounted${s.legendaryResisted ? ' (legendary resistance)' : ''}` : 'fails'}${saveSidesNote({ rolls: s.rolls ?? [s.natural ?? 0], advantageSources: s.advantageSources, disadvantageSources: s.disadvantageSources })}`
+        + (!s.saved && s.legendaryResistanceAvailable ? `; ⭐ ${s.legendaryResistanceAvailable} legendary resistance(s) left: ${s.legendaryResistanceAskPlayer ? 'ask the player' : 'the GM may spend one'}` : '');
 
 /** The rider was moved or knocked down while mounted: roll the save, and land it on a failure. */
 function riderSaves(engine: CombatEngine, rider: CombatParticipant, mount: CombatParticipant, cause: string, opts: { clearProneOnSuccess: boolean }): MountEvent {
